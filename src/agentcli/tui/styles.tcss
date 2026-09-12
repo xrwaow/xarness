@@ -1,0 +1,156 @@
+Screen {
+    layout: vertical;
+    background: $c-bg;
+}
+
+#chat-log {
+    height: 1fr;
+    padding: 0;
+    background: $c-bg;
+    scrollbar-color: $c-bg;
+    scrollbar-background: $c-bg;
+}
+
+.msg {
+    margin-bottom: 1;
+}
+
+UserMessage {
+    width: 1fr;
+    background: $c-surface;
+    color: $c-text;
+    padding: 1 0;
+}
+
+AssistantMessage {
+    height: auto;
+    color: $c-text;
+    padding: 0 1;
+}
+
+.assistant-row {
+    height: auto;
+}
+
+.assistant-marker {
+    width: 1;
+    margin-right: 1;
+    color: $c-muted;
+}
+
+.assistant-live {
+    width: 1fr;
+    color: $c-text;
+}
+
+.assistant-md {
+    width: 1fr;
+    height: auto;
+    color: $c-text;
+    margin: 0;
+    overflow-y: hidden;
+}
+
+.assistant-content {
+    width: 1fr;
+    height: auto;
+}
+
+ThinkingBlock,
+PendingIndicator {
+    height: auto;
+    padding: 0 1;
+}
+
+.thinking-summary {
+    height: auto;
+}
+
+.thinking-elapsed {
+    color: $c-muted;
+}
+
+.thinking-done-summary {
+    color: $c-muted;
+}
+
+.thinking-row {
+    height: auto;
+    display: none;
+}
+
+ThinkingBlock.expanded .thinking-row {
+    display: block;
+}
+
+.thinking-marker {
+    width: 2;
+}
+
+.thinking-text {
+    width: 1fr;
+    color: $c-reasoning;
+    text-style: italic;
+}
+
+ThinkingBlock:hover .thinking-summary {
+    text-style: underline;
+}
+
+.pending-elapsed {
+    color: $c-muted;
+}
+
+ErrorLine {
+    color: $c-error;
+}
+
+StatusBar {
+    height: 1;
+    background: $c-bg;
+    padding: 0 1;
+}
+
+#input-wrap {
+    height: auto;
+    padding: 0;
+}
+
+ChatInput {
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    border: none;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+}
+
+MarkdownFence {
+    margin: 0;
+    background: $c-bg;
+}
+
+#code-content {
+    padding: 1 0 !important;
+}
+
+MarkdownBlock {
+    padding: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+
+Markdown {
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: $c-bg;
+}
+
+MarkdownDocument {
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: $c-bg;
+}

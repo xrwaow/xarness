@@ -1,0 +1,35 @@
+# agentcli configuration.
+#
+# Copy this file to ~/.config/agentcli/config.yaml (or pass --config).
+# The API key itself is never stored here: api_key_env names the environment
+# variable that holds it.
+
+# Switch with: agentcli chat --profile <name>
+default_profile: openai
+
+profiles:
+  openai:
+    base_url: "https://api.openai.com/v1"   # OpenAI-compatible endpoint
+    api_key_env: "OPENAI_API_KEY"
+    model_id: "gpt-4.1"
+    shown_name: "GPT-4.1"                   # display name in the UI
+    max_context: 128000
+    cot_strength: "medium"                  # off | low | medium | high
+
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"
+    model_id: "deepseek-reasoner"
+    shown_name: "DeepSeek R1"
+    max_context: 64000
+    cot_strength: "high"
+
+# A flat single-profile file (no `profiles:` key) also works:
+#
+# provider:
+#   base_url: "https://api.openai.com/v1"
+#   api_key_env: "OPENAI_API_KEY"
+#   model_id: "gpt-4.1"
+#   shown_name: "GPT-4.1"
+#   max_context: 128000
+#   cot_strength: "medium"
