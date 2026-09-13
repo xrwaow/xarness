@@ -16,29 +16,29 @@ from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
 from textual.worker import Worker
 
+from pathlib import Path
+
 from .. import theme
 from ..config import ProviderProfile
 from ..controller import ChatController
+from ..file_search import search_files
 from ..events import (
-    ContentDelta,
-    ReasoningDelta,
-    StreamError,
-    ToolCallArgumentsDelta,
-    ToolCallStarted,
-    ToolCallStatus,
-    TurnComplete,
+    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
+    ToolCallStarted, ToolCallStatus, TurnComplete,
 )
 from ..tools import ToolRegistry, default_registry
 from .widgets import (
-    AssistantMessage,
-    ChatInput,
-    ErrorLine,
-    PendingIndicator,
-    StatusBar,
-    ThinkingBlock,
-    ToolCallBlock,
-    UserMessage,
+    AssistantMessage, ChatInput, ErrorLine, PendingIndicator,
+    StatusBar, SuggestionPopup, ThinkingBlock, ToolCallBlock, UserMessage,
 )
+
+
+SLASH_COMMANDS = [
+    ("tools", "list available tools"),
+    ("sessions", "list saved sessions"),
+    ("model", "choose what model and reasoning effort to use"),
+    ("resume", "resume a previous session"),
+]
 
 
 class AgentApp(App[None]):
@@ -57,6 +57,8 @@ class AgentApp(App[None]):
         api_key: str | None,
         controller: ChatController | None = None,
         tool_registry: ToolRegistry | None = None,
+        workspace: Path | None = None,
+        session_name: str | None = None,
     ) -> None:
         super().__init__()
         self.profile = profile
@@ -64,6 +66,8 @@ class AgentApp(App[None]):
         self.controller = controller or ChatController(
             profile, api_key, tool_registry=self.tool_registry
         )
+        self.workspace = workspace
+        self.session_name = session_name
         self.total_in = 0
         self.total_out = 0
         self.last_in = 0
@@ -71,6 +75,7 @@ class AgentApp(App[None]):
         self._queued: list[str] = []
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
+        self._at_search_timer = None
 
     def get_css_variables(self) -> dict[str, str]:
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
@@ -83,6 +88,7 @@ class AgentApp(App[None]):
                 id="chat-input",
                 placeholder="Send a message…  (Enter: send · Shift+Enter: newline · Ctrl+T: thoughts)",
             )
+        yield SuggestionPopup(id="suggestion-popup")
 
     def on_mount(self) -> None:
         self.query_one("#chat-input", ChatInput).focus()
@@ -106,7 +112,73 @@ class AgentApp(App[None]):
     # Submission / turn lifecycle
 
     def on_chat_input_chat_submitted(self, event: ChatInput.ChatSubmitted) -> None:
-        self._submit(event.text)
+        text = event.text.strip()
+        if text.startswith("/"):
+            self._handle_slash_command(text)
+            return
+        self._submit(text)
+
+    def _handle_slash_command(self, text: str) -> None:
+        parts = text[1:].split(maxsplit=1)
+        cmd = parts[0] if parts else ""
+        chat = self.query_one("#chat-log", VerticalScroll)
+        if cmd == "tools":
+            names = ", ".join(t["function"]["name"] for t in self.tool_registry.schema())
+            chat.mount(ErrorLine(f"tools: {names}"))
+        elif cmd == "sessions":
+            from ..session_store import list_sessions
+            names = list_sessions()
+            chat.mount(ErrorLine("sessions: " + (", ".join(names) if names else "(none saved)")))
+        elif cmd in ("model", "resume"):
+            chat.mount(ErrorLine(f"/{cmd} isn't wired to a picker screen yet"))
+        else:
+            chat.mount(ErrorLine(f"unknown command: /{cmd}"))
+
+    def on_chat_input_slash_query(self, event: ChatInput.SlashQuery) -> None:
+        q = event.query.lower()
+        matches = [(name, f"/{name}  {desc}") for name, desc in SLASH_COMMANDS if name.startswith(q)]
+        self._show_popup(matches)
+
+    def on_chat_input_at_query(self, event: ChatInput.AtQuery) -> None:
+        if self._at_search_timer is not None:
+            self._at_search_timer.stop()
+        self._at_search_timer = self.set_timer(0.15, lambda: self._run_at_search(event.query))
+
+    @work(exclusive=True, group="at-search")
+    async def _run_at_search(self, query: str) -> None:
+        root = self.workspace or Path.cwd()
+        results = await search_files(root, query)
+        self._show_popup([(r, r) for r in results])
+
+    def on_chat_input_popup_dismiss(self, event: ChatInput.PopupDismiss) -> None:
+        self._hide_popup()
+
+    def on_chat_input_popup_nav(self, event: ChatInput.PopupNav) -> None:
+        self.query_one("#suggestion-popup", SuggestionPopup).move_highlight(event.direction)
+
+    def on_chat_input_popup_confirm(self, event: ChatInput.PopupConfirm) -> None:
+        popup = self.query_one("#suggestion-popup", SuggestionPopup)
+        value = popup.selected_value
+        chat_input = self.query_one("#chat-input", ChatInput)
+        was_slash = chat_input.popup_active == "slash"
+        self._hide_popup()
+        if value is None:
+            return
+        if was_slash:
+            chat_input.set_command(value)
+        else:
+            chat_input.insert_mention(value)
+
+    def _show_popup(self, items: list[tuple[str, str]]) -> None:
+        popup = self.query_one("#suggestion-popup", SuggestionPopup)
+        popup.set_items(items)
+        if items:
+            popup.add_class("visible")
+        else:
+            popup.remove_class("visible")
+
+    def _hide_popup(self) -> None:
+        self.query_one("#suggestion-popup", SuggestionPopup).remove_class("visible")
 
     def _submit(self, text: str) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
@@ -256,6 +328,10 @@ class AgentApp(App[None]):
             self.total_out += event.usage.output_tokens
             self.last_in = event.usage.input_tokens
         self._refresh_status()
+
+        if self.session_name:
+            from ..session_store import save_session
+            save_session(self.session_name, self.profile.model_id, self.controller.conversation)
 
     def action_toggle_thoughts(self) -> None:
         if self._last_thinking is not None:

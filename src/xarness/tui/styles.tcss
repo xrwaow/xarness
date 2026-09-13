@@ -203,3 +203,18 @@ Screen > .screen--selection {
     background: $c-highlight;
     color: $c-bg;
 }
+
+SuggestionPopup {
+    layer: overlay;
+    dock: bottom;
+    offset-y: -1;
+    width: 60;
+    max-height: 10;
+    background: $c-surface;
+    border: solid $c-border;
+    display: none;
+}
+
+SuggestionPopup.visible {
+    display: block;
+}

@@ -19,7 +19,8 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
-from textual.widgets import Markdown, Static, TextArea
+from textual.widgets import Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
 
 from .. import theme
@@ -27,6 +28,9 @@ from ..events import ToolCallStatus
 
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_SLASH_RE = re.compile(r"^/(\w*)$")
+_AT_RE = re.compile(r"(?:^|\s)@(\S*)$")
+
 
 def _split_settled(text: str) -> tuple[str, str]:
     """Split text at the end of the last complete fenced code block.
@@ -134,6 +138,30 @@ class ShimmerText(Static):
             color = _lerp_hex(self.base_color, self.peak_color, intensity)
             text.append(ch, style=Style(color=color, bold=intensity > 0.6))
         self.update(text)
+
+
+class SuggestionPopup(OptionList):
+    """Floating suggestion list for slash commands and @-file mentions."""
+
+    def set_items(self, items: list[tuple[str, str]]) -> None:
+        self.clear_options()
+        for value, label in items:
+            self.add_option(Option(label, id=value))
+        if items:
+            self.highlighted = 0
+
+    @property
+    def selected_value(self) -> str | None:
+        if self.highlighted is None:
+            return None
+        option = self.get_option_at_index(self.highlighted)
+        return option.id if option else None
+
+    def move_highlight(self, delta: int) -> None:
+        if self.option_count == 0:
+            return
+        current = self.highlighted or 0
+        self.highlighted = (current + delta) % self.option_count
 
 
 class UserMessage(Static):
@@ -452,18 +480,49 @@ class StatusBar(Static):
 
 
 class ChatInput(TextArea):
-    """Persistent multi-line input bar: Enter submits, Shift+Enter newlines."""
+    """Persistent multi-line input bar: Enter submits, Shift+Enter newlines.
+
+    Detects '/' (slash commands, must start the input) and '@' (file
+    mentions, anywhere) and posts query messages so App can drive a
+    SuggestionPopup. When a popup is active, arrow/enter/tab/escape are
+    redirected to popup navigation instead of normal TextArea behavior.
+    """
 
     class ChatSubmitted(Message):
         def __init__(self, text: str) -> None:
             self.text = text
             super().__init__()
 
+    class SlashQuery(Message):
+        def __init__(self, query: str) -> None:
+            self.query = query
+            super().__init__()
+
+    class AtQuery(Message):
+        def __init__(self, query: str) -> None:
+            self.query = query
+            super().__init__()
+
+    class PopupNav(Message):
+        def __init__(self, direction: int) -> None:
+            self.direction = direction
+            super().__init__()
+
+    class PopupConfirm(Message):
+        pass
+
+    class PopupDismiss(Message):
+        pass
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "newline", "Newline", priority=True, show=False),
         Binding("alt+enter", "newline", "Newline", priority=True, show=False),
     ]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.popup_active: str | None = None
 
     def on_mount(self) -> None:
         base = TextAreaTheme.get_builtin_theme("css")
@@ -481,7 +540,49 @@ class ChatInput(TextArea):
         self.register_theme(no_line_highlight)
         self.theme = "xarness-input"
 
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._check_triggers()
+
+    def _check_triggers(self) -> None:
+        text = self.text
+        slash_match = _SLASH_RE.match(text) if "\n" not in text else None
+        if slash_match:
+            self.popup_active = "slash"
+            self.post_message(self.SlashQuery(slash_match.group(1)))
+            return
+
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        prefix = line[:col]
+        at_match = _AT_RE.search(prefix)
+        if at_match:
+            self.popup_active = "at"
+            self.post_message(self.AtQuery(at_match.group(1)))
+            return
+
+        if self.popup_active is not None:
+            self.popup_active = None
+            self.post_message(self.PopupDismiss())
+
+    def _on_key(self, event: events.Key) -> None:
+        if self.popup_active is not None and event.key in ("up", "down", "enter", "tab", "escape"):
+            event.prevent_default()
+            event.stop()
+            if event.key == "up":
+                self.post_message(self.PopupNav(-1))
+            elif event.key == "down":
+                self.post_message(self.PopupNav(1))
+            elif event.key in ("enter", "tab"):
+                self.post_message(self.PopupConfirm())
+            elif event.key == "escape":
+                self.popup_active = None
+                self.post_message(self.PopupDismiss())
+            return
+        super()._on_key(event)
+
     def action_submit(self) -> None:
+        if self.popup_active is not None:
+            return
         text = self.text.strip()
         if not text:
             return
@@ -490,3 +591,18 @@ class ChatInput(TextArea):
 
     def action_newline(self) -> None:
         self.insert("\n")
+
+    def insert_mention(self, value: str) -> None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        prefix = line[:col]
+        at_col = prefix.rfind("@")
+        if at_col == -1:
+            return
+        self.replace(f"@{value} ", (row, at_col), (row, col))
+        self.popup_active = None
+
+    def set_command(self, value: str) -> None:
+        self.load_text(f"/{value} ")
+        self.popup_active = None
+        self.move_cursor(self.document.end)

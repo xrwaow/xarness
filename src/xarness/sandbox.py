@@ -1,16 +1,18 @@
 """Bubblewrap-based sandbox for filesystem/shell tool execution.
 
-Every filesystem-touching or shell-executing tool runs inside a bwrap
-sandbox scoped to the workspace directory, with no network access by
-default. Tools that need the network (web search) run outside the sandbox,
-in this process — see tools.py's ``web_search`` handler — so no tool the
-model can reach ever gets a raw socket into the sandbox itself.
+read_file/write_file use one-shot bwrap invocations (run_in_sandbox).
+run_bash uses a persistent shell (SandboxSession) so cwd, env vars, and
+background jobs survive across multiple calls within one chat session.
+Tools that need the network (web search) run outside the sandbox entirely,
+in the harness process — no tool the model can reach ever gets a raw socket
+into the sandbox itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import shutil
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,7 +26,6 @@ class SandboxConfig:
     """Paths and policy for one sandboxed session."""
 
     workspace: Path
-    # alias -> host path, mounted read-only at /workspace/.refs/<alias>
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
     timeout_seconds: float = 60.0
@@ -41,7 +42,6 @@ class SandboxConfig:
             raise SandboxUnavailable(f"workspace directory does not exist: {self.workspace}")
 
     def ref_path(self, alias: str) -> str:
-        """Path the sandboxed process sees for a given external reference."""
         return f"/workspace/.refs/{alias}"
 
     def _system_ro_binds(self) -> list[str]:
@@ -50,10 +50,6 @@ class SandboxConfig:
             p = Path(path)
             if p.exists():
                 args += ["--ro-bind", str(p), str(p)]
-        # Merged-/usr distros (Fedora, Arch, modern Debian/Ubuntu) have
-        # /bin, /lib, /lib64, /sbin as symlinks into /usr at the real root.
-        # Recreate them inside the sandbox; fall back to a real bind if a
-        # given distro still uses separate top-level directories.
         for link, target in (
             ("/bin", "usr/bin"),
             ("/lib", "usr/lib"),
@@ -94,6 +90,7 @@ async def run_in_sandbox(
     command: list[str],
     input_bytes: bytes | None = None,
 ) -> SandboxResult:
+    """One-shot: spawn, run, tear down. Used by read_file/write_file."""
     argv = config.build_argv(command)
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -116,13 +113,77 @@ async def run_in_sandbox(
     )
 
 
-def validate_relpath(path: str) -> str | None:
-    """Return an error message if path escapes the workspace, else None.
+class SandboxSession:
+    """One persistent shell running inside one bwrap sandbox for a whole chat.
 
-    This is defense-in-depth, not the real enforcement — bwrap's mount
-    namespace is what actually stops escapes. This just gives the model
-    (and you, debugging) a clean error instead of a bwrap-level failure.
+    cwd, env vars, and background jobs survive across multiple run_bash
+    calls within the same conversation. Calls are serialized against each
+    other via a lock — one command completes before the next starts.
     """
+
+    def __init__(self, config: SandboxConfig) -> None:
+        self._config = config
+        self._proc: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_started(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            return
+        argv = self._config.build_argv(["/bin/sh"])
+        self._proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+    async def run(self, command: str) -> SandboxResult:
+        async with self._lock:
+            await self._ensure_started()
+            assert self._proc is not None and self._proc.stdin and self._proc.stdout
+            marker = f"__xarness_done_{uuid.uuid4().hex}__"
+            self._proc.stdin.write(f"{command}\necho {marker} $?\n".encode())
+            await self._proc.stdin.drain()
+
+            output: list[str] = []
+
+            async def _read_until_marker() -> int:
+                while True:
+                    line = await self._proc.stdout.readline()
+                    if not line:
+                        return -1
+                    text = line.decode(errors="replace")
+                    if text.startswith(marker):
+                        return int(text[len(marker):].strip() or "-1")
+                    output.append(text)
+
+            try:
+                exit_code = await asyncio.wait_for(
+                    _read_until_marker(), timeout=self._config.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                await self.close()
+                return SandboxResult(exit_code=-1, stdout="".join(output), stderr="", timed_out=True)
+
+            return SandboxResult(exit_code=exit_code, stdout="".join(output), stderr="")
+
+    async def close(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            await asyncio.wait_for(self._proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            self._proc.kill()
+            await self._proc.wait()
+        finally:
+            self._proc = None
+
+
+def validate_relpath(path: str) -> str | None:
+    """Defense-in-depth path check; bwrap's mount namespace is the real
+    enforcement — this just gives a clean error instead of a bwrap failure."""
     p = Path(path)
     if p.is_absolute():
         return f"path must be relative to the workspace, got absolute path '{path}'"
