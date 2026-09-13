@@ -1,6 +1,6 @@
 """Configuration loading and validation.
 
-Config file layout (YAML), default path ``~/.config/agentcli/config.yaml``:
+Config file layout (YAML), default path ``~/.config/xarness/config.yaml``:
 
 Named profiles (switch with ``--profile``)::
 
@@ -21,7 +21,8 @@ Flat single-profile form (no ``profiles:`` key)::
       ...
 
 The API key itself is never stored in the config; ``api_key_env`` names the
-environment variable that holds it.
+environment variable that holds it. Set ``api_key_env`` to null (or "") for
+providers that need no key (e.g. local models).
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-DEFAULT_CONFIG_PATH = Path("~/.config/agentcli/config.yaml").expanduser()
+DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.yaml").expanduser()
 
 
 class ConfigError(Exception):
@@ -54,7 +55,7 @@ class ProviderProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     base_url: str
-    api_key_env: str = "OPENAI_API_KEY"
+    api_key_env: str | None = "OPENAI_API_KEY"
     model_id: str
     shown_name: str | None = None
     max_context: int = Field(default=128_000, gt=0)
@@ -68,7 +69,15 @@ class ProviderProfile(BaseModel):
             raise ValueError("must be an http(s) URL, e.g. https://api.openai.com/v1")
         return value
 
-    @field_validator("api_key_env", "model_id", "shown_name")
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, value: str | None) -> str | None:
+        """Treat null/blank as "no key needed" (local models), not an error."""
+        if value is not None and not value.strip():
+            return None
+        return value
+
+    @field_validator("model_id", "shown_name")
     @classmethod
     def _validate_non_empty(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
@@ -181,8 +190,13 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def resolve_api_key(profile: ProviderProfile) -> str:
-    """Read the API key from the env var named by ``api_key_env``."""
+def resolve_api_key(profile: ProviderProfile) -> str | None:
+    """Read the API key from the env var named by ``api_key_env``.
+
+    Returns None when the profile needs no key (``api_key_env`` is null).
+    """
+    if profile.api_key_env is None:
+        return None
     key = os.environ.get(profile.api_key_env)
     if not key:
         raise ConfigError(

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentcli"
+name = "xarness"
 version = "0.1.0"
 description = "Terminal chat client for OpenAI-compatible LLM APIs (UI/config layer of a CLI agent tool)."
 readme = "README.md"
@@ -22,10 +22,10 @@ dev = [
 ]
 
 [project.scripts]
-agentcli = "agentcli.cli:main"
+xarness = "xarness.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentcli"]
+packages = ["src/xarness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

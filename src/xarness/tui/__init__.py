@@ -1,4 +1,4 @@
-"""Textual TUI layer for agentcli."""
+"""Textual TUI layer for xarness."""
 
 from .app import AgentApp
 

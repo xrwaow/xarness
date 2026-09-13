@@ -7,8 +7,7 @@ Screen {
     height: 1fr;
     padding: 0;
     background: $c-bg;
-    scrollbar-color: $c-bg;
-    scrollbar-background: $c-bg;
+    scrollbar-size: 0 0; /* hide the scrollbar visual; wheel/key scrolling still works */
 }
 
 .msg {
@@ -93,11 +92,50 @@ ThinkingBlock.expanded .thinking-row {
     text-style: italic;
 }
 
-ThinkingBlock:hover .thinking-summary {
+ThinkingBlock:hover .thinking-summary,
+ToolCallBlock:hover .toolcall-summary {
     text-style: underline;
+    color: $c-highlight;
 }
 
 .pending-elapsed {
+    color: $c-muted;
+}
+
+ToolCallBlock {
+    height: auto;
+    padding: 0 1;
+}
+
+.toolcall-summary {
+    height: auto;
+}
+
+.toolcall-dot {
+    width: 1;
+    margin-right: 1;
+}
+
+.toolcall-summary-text {
+    color: $c-muted;
+}
+
+.toolcall-row {
+    height: auto;
+    display: none;
+}
+
+ToolCallBlock.expanded .toolcall-row {
+    display: block;
+}
+
+.toolcall-marker {
+    width: 2;
+    border-left: solid $c-border;
+}
+
+.toolcall-body {
+    width: 1fr;
     color: $c-muted;
 }
 
@@ -153,4 +191,15 @@ MarkdownDocument {
     margin: 0 !important;
     padding: 0 !important;
     background: $c-bg;
+}
+
+/* List bullets/numbers render as plain text color, not the theme accent. */
+MarkdownBullet {
+    color: $c-text !important;
+}
+
+/* Text selection uses the theme's highlight color instead of Textual's blue. */
+Screen > .screen--selection {
+    background: $c-highlight;
+    color: $c-bg;
 }

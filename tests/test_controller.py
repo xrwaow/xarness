@@ -4,16 +4,20 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from agentcli.config import CotStrength, ProviderProfile
-from agentcli.controller import ChatController
-from agentcli.events import (
+from xarness.config import CotStrength, ProviderProfile
+from xarness.controller import ChatController
+from xarness.events import (
     ContentDelta,
     ProcessingStarted,
     ReasoningDelta,
     StreamError,
+    ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
     TurnComplete,
     Usage,
 )
+from xarness.tools import ToolResult, default_registry
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1",
@@ -30,9 +34,15 @@ class FakeClient:
         self.script = script
         self.delay = delay
         self.received_wire: list[list[dict[str, Any]]] = []
+        self.received_tools: list[dict[str, Any]] | None = None
 
-    async def stream(self, wire_messages: Sequence[dict[str, Any]]) -> AsyncIterator[Any]:
+    async def stream(
+        self,
+        wire_messages: Sequence[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[Any]:
         self.received_wire.append(list(wire_messages))
+        self.received_tools = tools
         yield ProcessingStarted()
         for event in self.script:
             if self.delay:
@@ -112,3 +122,92 @@ def test_multi_turn_history_accumulates() -> None:
         {"role": "user", "content": "second"},
     ]
     assert len(controller.conversation.messages) == 4
+
+
+def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
+    client = FakeClient(
+        [
+            ToolCallStarted("call_1", "test_tool"),
+            ToolCallArgumentsDelta("call_1", '{"a"'),
+            ToolCallArgumentsDelta("call_1", ": 1}"),
+            ToolCallArgumentsDone("call_1", "test_tool", '{"a": 1}'),
+            TurnComplete(has_tool_calls=True),
+        ]
+    )
+    controller = ChatController(PROFILE, "key", client=client)
+
+    events = asyncio.run(collect(controller, "use the tool"))
+
+    assert events[-1].has_tool_calls is True
+    assistant = controller.conversation.messages[1]
+    assert assistant.role == "assistant"
+    assert assistant.tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "test_tool", "arguments": '{"a": 1}'},
+        }
+    ]
+
+
+def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> None:
+    client = FakeClient(
+        [
+            ToolCallStarted("call_1", "test_tool"),
+            ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+    )
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "use the tool"))
+
+    controller.record_tool_result("call_1", ToolResult(ok=True, output="success!"))
+    client.script = [ContentDelta("all done"), TurnComplete(usage=Usage(4, 2))]
+    events = asyncio.run(_drain(controller.continue_after_tools()))
+
+    assert events[-1].has_tool_calls is False
+    # The follow-up request replays: user, assistant tool-call turn (content
+    # omitted — tool-call-only assistant message), tool result, and the model
+    # answers in plain content.
+    assert client.received_wire[-1] == [
+        {"role": "user", "content": "use the tool"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "test_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "success!"},
+    ]
+    assert [m.role for m in controller.conversation.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+
+def test_tools_schema_is_passed_to_client() -> None:
+    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    controller = ChatController(PROFILE, "key", client=client, tool_registry=default_registry())
+
+    asyncio.run(collect(controller, "hello"))
+
+    assert client.received_tools == default_registry().schema()
+
+
+def test_no_registry_sends_no_tools() -> None:
+    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    controller = ChatController(PROFILE, "key", client=client)
+
+    asyncio.run(collect(controller, "hello"))
+
+    assert client.received_tools is None
+
+
+async def _drain(stream: AsyncIterator[Any]) -> list[Any]:
+    return [event async for event in stream]

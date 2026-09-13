@@ -1,4 +1,4 @@
-"""Widgets for the agentcli chat TUI.
+"""Widgets for the xarness chat TUI.
 
 Widgets are dumb views: they render what the app feeds them from stream
 events and hold no conversation state of their own (the reasoning text inside
@@ -23,6 +23,7 @@ from textual.widgets import Markdown, Static, TextArea
 from textual.widgets.text_area import TextAreaTheme
 
 from .. import theme
+from ..events import ToolCallStatus
 
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -226,6 +227,7 @@ class ThinkingBlock(Vertical):
         self._duration: float | None = None
         self._done = False
         self._start = time.monotonic()
+        self.summary_text = "Thinking"
 
     def compose(self):
         with Horizontal(classes="thinking-summary"):
@@ -288,7 +290,98 @@ class ThinkingBlock(Vertical):
         elapsed_static.remove_class("thinking-elapsed")
         elapsed_static.add_class("thinking-done-summary")
         duration = f"{self._duration:.1f}s" if self._duration is not None else "…"
-        elapsed_static.update(Text(f"Thought for {duration}", style=f"italic {theme.PALETTE['muted']}"))
+        self.summary_text = f"Thought for {duration}"
+        elapsed_static.update(Text(self.summary_text, style=f"italic {theme.PALETTE['muted']}"))
+
+
+class ToolCallBlock(Vertical):
+    """One tool call: colored status dot + name, expandable to see args/output.
+
+    Collapsed by default, same interaction pattern as ThinkingBlock — click
+    anytime to toggle. The dot is amber while the call is in flight, green
+    once it succeeds, red on failure (including argument parse errors).
+    """
+
+    _STATUS_COLOR_KEY: ClassVar[dict[ToolCallStatus, str]] = {
+        ToolCallStatus.MAKING_CALL: "warning",
+        ToolCallStatus.PARSING_ERROR: "error",
+        ToolCallStatus.CALL_SUCCEEDED: "success",
+        ToolCallStatus.CALL_FAILED: "error",
+    }
+
+    _STATUS_VERB: ClassVar[dict[ToolCallStatus, str]] = {
+        ToolCallStatus.MAKING_CALL: "Running",
+        ToolCallStatus.PARSING_ERROR: "Failed",
+        ToolCallStatus.CALL_SUCCEEDED: "Ran",
+        ToolCallStatus.CALL_FAILED: "Failed",
+    }
+
+    def __init__(self, call_id: str, name: str) -> None:
+        super().__init__(classes="msg toolcall")  # no "expanded" — starts collapsed
+        self.call_id = call_id
+        # DOMNode already exposes a read-only `name`; the tool's name lives here.
+        self.tool_name = name
+        self.accumulated_arguments = ""
+        self._status = ToolCallStatus.MAKING_CALL
+        self._output_text = ""
+
+    def compose(self):
+        with Horizontal(classes="toolcall-summary"):
+            yield Static("•", classes="toolcall-dot", markup=False)
+            yield ShimmerText(f"Running {self.tool_name}", *theme.SHIMMER_THINKING, classes="toolcall-shimmer")
+        with Horizontal(classes="toolcall-row"):
+            yield Static("", classes="toolcall-marker", markup=False)
+            yield Static("", classes="toolcall-body", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh_dot()
+
+    @property
+    def status(self) -> ToolCallStatus:
+        return self._status
+
+    def append_arguments(self, text: str) -> None:
+        self.accumulated_arguments += text
+        self._refresh_body()
+
+    def set_result(self, status: ToolCallStatus, output: str = "", error: str = "") -> None:
+        """Move to a terminal state; output and error are mutually exclusive."""
+        self._status = status
+        self._output_text = output or error
+        self._refresh_dot()
+        self._refresh_body()
+        self._swap_to_static_summary()
+
+    def toggle(self) -> None:
+        if self.has_class("expanded"):
+            self.remove_class("expanded")
+        else:
+            self.add_class("expanded")
+
+    def on_click(self, event: events.Click) -> None:
+        self.toggle()
+        event.stop()
+
+    def _refresh_dot(self) -> None:
+        if self.is_mounted:
+            color = theme.PALETTE[self._STATUS_COLOR_KEY[self._status]]
+            self.query_one(".toolcall-dot", Static).update(Text("•", style=color))
+
+    def _refresh_body(self) -> None:
+        if not self.is_mounted:
+            return
+        body = self.accumulated_arguments
+        if self._output_text:
+            body = f"{body}\n{self._output_text}" if body else self._output_text
+        self.query_one(".toolcall-body", Static).update(body)
+
+    def _swap_to_static_summary(self) -> None:
+        summary_row = self.query_one(".toolcall-summary", Horizontal)
+        shimmer = summary_row.query(".toolcall-shimmer")
+        if shimmer:
+            shimmer.remove()
+        verb = self._STATUS_VERB[self._status]
+        summary_row.mount(Static(f"{verb} {self.tool_name}", classes="toolcall-summary-text", markup=False))
 
 
 class PendingIndicator(Horizontal):
@@ -375,18 +468,18 @@ class ChatInput(TextArea):
     def on_mount(self) -> None:
         base = TextAreaTheme.get_builtin_theme("css")
         no_line_highlight = TextAreaTheme(
-            name="agentcli-input",
+            name="xarness-input",
             base_style=base.base_style,
             gutter_style=base.gutter_style,
             cursor_style=base.cursor_style,
             cursor_line_style=Style(),
             cursor_line_gutter_style=base.cursor_line_gutter_style,
             bracket_matching_style=base.bracket_matching_style,
-            selection_style=base.selection_style,
+            selection_style=Style(bgcolor=theme.PALETTE["highlight"], color=theme.PALETTE["bg"]),
             syntax_styles=base.syntax_styles,
         )
         self.register_theme(no_line_highlight)
-        self.theme = "agentcli-input"
+        self.theme = "xarness-input"
 
     def action_submit(self) -> None:
         text = self.text.strip()

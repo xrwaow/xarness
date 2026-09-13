@@ -9,7 +9,8 @@ is sufficient — no threading a theme object through every widget.
 from __future__ import annotations
 
 # Semantic keys every theme must define:
-#   bg, surface, border, text, muted, user, reasoning, accent, accent2, status, error
+#   bg, surface, border, text, muted, user, reasoning, accent, accent2, status,
+#   error, success, warning, highlight
 THEMES: dict[str, dict[str, str]] = {
     "ayu-darker": {
         "bg": "#121212",              # background
@@ -23,6 +24,9 @@ THEMES: dict[str, dict[str, str]] = {
         "accent2": "#feb454",         # terminal.ansi.yellow / warning
         "status": "#5ac1fe",          # text.accent
         "error": "#ef7177",           # error
+        "success": "#aad84c",         # green status dot / tool call succeeded
+        "warning": "#feb454",         # amber status dot / call in flight
+        "highlight": "#bfbdb6",       # generic UI emphasis (hover, focus)
     },
     "one-light": {
         "bg": "#fafafa",
@@ -36,6 +40,9 @@ THEMES: dict[str, dict[str, str]] = {
         "accent2": "#c18401",
         "status": "#4078f2",
         "error": "#e45649",
+        "success": "#50a14f",
+        "warning": "#c18401",
+        "highlight": "#383a42",
     },
 }
 

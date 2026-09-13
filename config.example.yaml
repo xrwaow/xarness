@@ -1,10 +1,11 @@
-# agentcli configuration.
+# xarness configuration.
 #
-# Copy this file to ~/.config/agentcli/config.yaml (or pass --config).
+# Copy this file to ~/.config/xarness/config.yaml (or pass --config).
 # The API key itself is never stored here: api_key_env names the environment
-# variable that holds it.
+# variable that holds it. Set api_key_env to null (or "") for providers that
+# need no key, e.g. local models.
 
-# Switch with: agentcli chat --profile <name>
+# Switch with: xarness chat --profile <name>
 default_profile: openai
 
 profiles:

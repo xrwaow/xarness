@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agentcli.config import ConfigError, CotStrength, load_config
+from xarness.config import ConfigError, CotStrength, load_config, resolve_api_key
 
 
 def write(tmp_path: Path, content: str) -> Path:
@@ -46,6 +46,52 @@ model_id: "gpt-4.1"
     profile = load_config(path)
     assert profile.model_id == "gpt-4.1"
     assert profile.cot_strength is CotStrength.MEDIUM  # default
+
+
+def test_null_api_key_env_needs_no_key(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        """
+provider:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key_env: null
+  model_id: "qwen"
+""",
+    )
+    profile = load_config(path)
+    assert profile.api_key_env is None
+    assert resolve_api_key(profile) is None
+
+
+def test_empty_api_key_env_is_normalized_to_none(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        """
+provider:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key_env: ""
+  model_id: "qwen"
+""",
+    )
+    assert load_config(path).api_key_env is None
+
+
+def test_resolve_api_key_reads_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = write(
+        tmp_path,
+        """
+provider:
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "MY_KEY"
+  model_id: "gpt-4.1"
+""",
+    )
+    profile = load_config(path)
+    monkeypatch.setenv("MY_KEY", "sk-test")
+    assert resolve_api_key(profile) == "sk-test"
+    monkeypatch.delenv("MY_KEY")
+    with pytest.raises(ConfigError, match="MY_KEY"):
+        resolve_api_key(profile)
 
 
 def test_named_profiles_with_default(tmp_path: Path) -> None:

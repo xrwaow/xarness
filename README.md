@@ -1,4 +1,4 @@
-# agentcli
+# xarness
 
 A terminal chat client for OpenAI-compatible LLM APIs, built with
 [Textual](https://github.com/Textualize/textual). Codex-CLI-style interface:
@@ -22,19 +22,20 @@ pip install -e .
 Copy the sample config and set your API key:
 
 ```sh
-mkdir -p ~/.config/agentcli
-cp config.example.yaml ~/.config/agentcli/config.yaml
+mkdir -p ~/.config/xarness
+cp config.example.yaml ~/.config/xarness/config.yaml
 export OPENAI_API_KEY=sk-...
 ```
 
-Config lives at `~/.config/agentcli/config.yaml` by default; override with
+Config lives at `~/.config/xarness/config.yaml` by default; override with
 `--config`. The key is read from the environment variable named by
-`api_key_env` — it is never stored in the YAML file.
+`api_key_env` — it is never stored in the YAML file. For providers that need
+no key (e.g. local models), set `api_key_env: null`.
 
 Multiple profiles are supported; switch with `--profile`:
 
 ```sh
-agentcli chat --profile deepseek
+xarness chat --profile deepseek
 ```
 
 If the file has no top-level `profiles:` key, it is treated as a single flat
@@ -43,10 +44,12 @@ profile (see the commented example in `config.example.yaml`).
 ## Run
 
 ```sh
-agentcli chat            # default profile
-agentcli chat --profile deepseek
-agentcli chat --config ./my-config.yaml
+xarness                    # default profile
+xarness chat --profile deepseek
+xarness chat --config ./my-config.yaml
 ```
+
+(bare `xarness` behaves like `xarness chat`)
 
 ## Keys
 
@@ -77,7 +80,7 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 ## Layout of the code
 
 ```
-src/agentcli/
+src/xarness/
   cli.py          argument parsing, boots the TUI
   config.py       pydantic config models, YAML loading, profile selection
   client.py       async httpx SSE client, reasoning-effort mapping

@@ -26,7 +26,11 @@ class Message:
     tool_calls: list[dict[str, Any]] | None = None
 
     def to_wire(self) -> dict[str, Any]:
-        message: dict[str, Any] = {"role": self.role, "content": self.content}
+        message: dict[str, Any] = {"role": self.role}
+        # Per spec, an assistant message that only calls tools should omit
+        # content entirely — some providers reject an empty string there.
+        if self.content or self.role != "assistant" or not self.tool_calls:
+            message["content"] = self.content
         if self.name is not None:
             message["name"] = self.name
         if self.tool_call_id is not None:
