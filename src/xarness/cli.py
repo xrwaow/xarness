@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, resolve_api_key
+from .config import (
+    DEFAULT_CONFIG_PATH, ConfigError, list_profile_names, load_config, resolve_api_key, resolve_profile_name
+)
 from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
 
 
@@ -92,6 +94,7 @@ def _run_chat(args: argparse.Namespace) -> None:
     try:
         profile = load_config(args.config, args.profile)
         api_key = resolve_api_key(profile)
+        profile_names = list_profile_names(args.config)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
@@ -120,12 +123,19 @@ def _run_chat(args: argparse.Namespace) -> None:
         if session_store.session_path(args.session).exists():
             conversation = session_store.load_session(args.session)
 
+    try:
+        profile_name = resolve_profile_name(args.config, args.profile)
+    except ConfigError:
+        profile_name = None
+
     app = AgentApp(
         profile,
         api_key,
         tool_registry=registry,
         workspace=workspace,
         session_name=args.session,
+        config_path=args.config,
+        profile_name=profile_name,
     )
     if conversation is not None:
         app.controller.conversation = conversation

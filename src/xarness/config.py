@@ -99,12 +99,8 @@ class _NamedConfig(BaseModel):
     profiles: dict[str, ProviderProfile]
 
 
-def load_config(path: Path, profile_name: str | None = None) -> ProviderProfile:
-    """Load and validate the config file, returning the selected profile.
-
-    Selection order: explicit ``--profile`` > ``default_profile`` > the only
-    profile when exactly one is defined.
-    """
+def _read_config_data(path: Path) -> dict[str, Any]:
+    """Read and parse the config file into a top-level mapping."""
     if not path.exists():
         raise ConfigError(
             f"config file not found: {path}\n"
@@ -124,11 +120,37 @@ def load_config(path: Path, profile_name: str | None = None) -> ProviderProfile:
         raise ConfigError(f"{path} is empty")
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a YAML mapping at the top level")
+    return data
 
-    has_profiles = isinstance(data.get("profiles"), dict)
-    if has_profiles:
+
+def load_config(path: Path, profile_name: str | None = None) -> ProviderProfile:
+    """Load and validate the config file, returning the selected profile.
+
+    Selection order: explicit ``--profile`` > ``default_profile`` > the only
+    profile when exactly one is defined.
+    """
+    data = _read_config_data(path)
+
+    if isinstance(data.get("profiles"), dict):
         return _from_named_profiles(data, path, profile_name)
     return _from_flat(data, path, profile_name)
+
+
+def list_profile_names(path: Path) -> list[str]:
+    """List the profile names defined in the config file, without resolving one.
+
+    Returns an empty list for the flat single-profile form (nothing to switch
+    between). Raises :class:`ConfigError` for a missing/malformed file, and for
+    a named-profiles section that fails validation.
+    """
+    data = _read_config_data(path)
+    if not isinstance(data.get("profiles"), dict):
+        return []
+    try:
+        config = _NamedConfig.model_validate(data)
+    except ValidationError as exc:
+        raise ConfigError(f"invalid config in {path}:\n{_format_validation_error(exc)}") from exc
+    return list(config.profiles)
 
 
 def _from_named_profiles(data: dict[str, Any], path: Path, profile_name: str | None) -> ProviderProfile:
@@ -204,3 +226,57 @@ def resolve_api_key(profile: ProviderProfile) -> str | None:
             "the API key is read from the environment, never from the config file"
         )
     return key
+
+def resolve_profile_name(path: Path, profile_name: str | None = None) -> str:
+    """Return the name of the profile load_config would select, without full
+    validation — used to label the active profile in the /model picker."""
+    if not path.exists():
+        raise ConfigError(f"config file not found: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must contain a YAML mapping at the top level")
+    if isinstance(data.get("profiles"), dict):
+        names = list(data["profiles"])
+        selected = profile_name or data.get("default_profile")
+        if selected is None:
+            if len(names) == 1:
+                return names[0]
+            raise ConfigError(f"{path} defines multiple profiles but no 'default_profile'")
+        return selected
+    return "default"
+
+
+def load_all_profiles(path: Path) -> dict[str, ProviderProfile]:
+    """Return every profile in the config file, keyed by name.
+
+    A flat single-profile config is keyed "default".
+    """
+    if not path.exists():
+        raise ConfigError(f"config file not found: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from exc
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"could not parse {path} as YAML:\n{exc}") from exc
+    if data is None:
+        raise ConfigError(f"{path} is empty")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must contain a YAML mapping at the top level")
+
+    if isinstance(data.get("profiles"), dict):
+        try:
+            config = _NamedConfig.model_validate(data)
+        except ValidationError as exc:
+            raise ConfigError(f"invalid config in {path}:\n{_format_validation_error(exc)}") from exc
+        return dict(config.profiles)
+
+    inner: Any = data.get("provider", data)
+    if not isinstance(inner, dict):
+        raise ConfigError(f"'provider' in {path} must be a mapping of profile fields")
+    try:
+        return {"default": ProviderProfile.model_validate(inner)}
+    except ValidationError as exc:
+        raise ConfigError(f"invalid config in {path}:\n{_format_validation_error(exc)}") from exc

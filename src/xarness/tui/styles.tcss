@@ -218,3 +218,16 @@ SuggestionPopup {
 SuggestionPopup.visible {
     display: block;
 }
+
+ResumeScreen, ModelPickerScreen {
+    align: center middle;
+}
+
+#resume-modal, #model-modal {
+    width: 70;
+    height: auto;
+    max-height: 20;
+    background: $c-surface;
+    border: solid $c-border;
+    padding: 1;
+}

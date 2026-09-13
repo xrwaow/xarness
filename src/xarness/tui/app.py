@@ -19,7 +19,7 @@ from textual.worker import Worker
 from pathlib import Path
 
 from .. import theme
-from ..config import ProviderProfile
+from ..config import ConfigError, ProviderProfile, load_all_profiles, resolve_api_key
 from ..controller import ChatController
 from ..file_search import search_files
 from ..events import (
@@ -27,6 +27,8 @@ from ..events import (
     ToolCallStarted, ToolCallStatus, TurnComplete,
 )
 from ..tools import ToolRegistry, default_registry
+from .model_screen import ModelPickerScreen
+from .resume_screen import ResumeScreen
 from .widgets import (
     AssistantMessage, ChatInput, ErrorLine, PendingIndicator,
     StatusBar, SuggestionPopup, ThinkingBlock, ToolCallBlock, UserMessage,
@@ -59,6 +61,8 @@ class AgentApp(App[None]):
         tool_registry: ToolRegistry | None = None,
         workspace: Path | None = None,
         session_name: str | None = None,
+        config_path: Path | None = None,
+        profile_name: str | None = None,
     ) -> None:
         super().__init__()
         self.profile = profile
@@ -68,6 +72,8 @@ class AgentApp(App[None]):
         )
         self.workspace = workspace
         self.session_name = session_name
+        self.config_path = config_path
+        self.profile_name = profile_name
         self.total_in = 0
         self.total_out = 0
         self.last_in = 0
@@ -76,6 +82,7 @@ class AgentApp(App[None]):
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
         self._at_search_timer = None
+        self._profiles_cache: dict[str, ProviderProfile] = {}
 
     def get_css_variables(self) -> dict[str, str]:
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
@@ -129,10 +136,122 @@ class AgentApp(App[None]):
             from ..session_store import list_sessions
             names = list_sessions()
             chat.mount(ErrorLine("sessions: " + (", ".join(names) if names else "(none saved)")))
-        elif cmd in ("model", "resume"):
-            chat.mount(ErrorLine(f"/{cmd} isn't wired to a picker screen yet"))
+        elif cmd == "resume":
+            self.push_screen(ResumeScreen(), self._on_resume_selected)
+        elif cmd == "model":
+            if self.config_path is None:
+                chat.mount(ErrorLine("/model unavailable: no config path known"))
+                return
+            try:
+                self._profiles_cache = load_all_profiles(self.config_path)
+            except ConfigError as exc:
+                chat.mount(ErrorLine(f"/model failed: {exc}"))
+                return
+            self.push_screen(
+                ModelPickerScreen(list(self._profiles_cache), self.profile_name),
+                self._on_model_selected,
+            )
         else:
             chat.mount(ErrorLine(f"unknown command: /{cmd}"))
+
+    async def _load_session(self, name: str | None) -> None:
+        """push_screen callback for /resume: load and replay the picked session."""
+        if name is None:
+            return
+        from ..session_store import load_session
+        conversation = load_session(name)
+        self.controller.conversation = conversation
+        self.session_name = name
+        await self._render_history()
+
+    async def _switch_profile(self, name: str | None) -> None:
+        """push_screen callback for /model: swap profile + client underneath the
+        existing conversation. History carries over unchanged."""
+        if name is None:
+            return
+        chat = self.query_one("#chat-log", VerticalScroll)
+        try:
+            profile = load_config(self.config_path, name)
+            api_key = resolve_api_key(profile)
+        except ConfigError as exc:
+            await chat.mount(ErrorLine(f"/model: can't switch to {name}: {exc}"))
+            return
+        new_controller = ChatController(profile, api_key, tool_registry=self.tool_registry)
+        new_controller.conversation = self.controller.conversation
+        self.controller = new_controller
+        self.profile = profile
+        self._refresh_status()
+
+    async def _on_resume_selected(self, name: str | None) -> None:
+        if not name:
+            return
+        from ..session_store import load_session
+        self.controller.conversation = load_session(name)
+        self.session_name = name
+        await self._render_history()
+
+    def _on_model_selected(self, name: str | None) -> None:
+        if not name:
+            return
+        profile = self._profiles_cache.get(name)
+        if profile is None:
+            return
+        try:
+            api_key = resolve_api_key(profile)
+        except ConfigError as exc:
+            chat = self.query_one("#chat-log", VerticalScroll)
+            chat.mount(ErrorLine(f"could not switch model: {exc}"))
+            return
+        old_conversation = self.controller.conversation
+        self.profile = profile
+        self.profile_name = name
+        self.controller = ChatController(profile, api_key, tool_registry=self.tool_registry)
+        self.controller.conversation = old_conversation
+        self._refresh_status()
+
+    async def _render_history(self) -> None:
+        """Rebuild #chat-log from self.controller.conversation.messages.
+
+        Used by /resume. Best-effort reconstruction: tool-call status is
+        inferred from whether the recorded tool-role content starts with
+        "error: " (see ChatController.record_tool_result), since the
+        original ToolCallStatus enum value isn't itself persisted.
+        """
+        chat = self.query_one("#chat-log", VerticalScroll)
+        await chat.remove_children()
+        messages = self.controller.conversation.messages
+        tool_results = {m.tool_call_id: m for m in messages if m.role == "tool" and m.tool_call_id}
+
+        for message in messages:
+            if message.role == "user":
+                await chat.mount(UserMessage(message.content))
+            elif message.role == "assistant":
+                if message.reasoning:
+                    thinking = ThinkingBlock()
+                    await chat.mount(thinking)
+                    thinking.append_reasoning(message.reasoning)
+                    thinking.finish(None, estimate_if_unknown=False)
+                if message.content:
+                    assistant = AssistantMessage()
+                    await chat.mount(assistant)
+                    await assistant.append_delta(message.content)
+                    await assistant.finalize()
+                for call in message.tool_calls or []:
+                    call_id = call.get("id", "")
+                    fn = call.get("function", {})
+                    block = ToolCallBlock(call_id, fn.get("name", ""))
+                    await chat.mount(block)
+                    block.append_arguments(fn.get("arguments", ""))
+                    result = tool_results.get(call_id)
+                    if result is not None:
+                        is_error = result.content.startswith("error: ")
+                        status = ToolCallStatus.CALL_FAILED if is_error else ToolCallStatus.CALL_SUCCEEDED
+                        block.set_result(
+                            status,
+                            output="" if is_error else result.content,
+                            error=result.content[len("error: "):] if is_error else "",
+                        )
+        chat.scroll_end(animate=False)
 
     def on_chat_input_slash_query(self, event: ChatInput.SlashQuery) -> None:
         q = event.query.lower()
@@ -194,6 +313,11 @@ class AgentApp(App[None]):
             self._worker = self._run_turn(text)
 
     def action_interrupt(self) -> None:
+        chat_input = self.query_one("#chat-input", ChatInput)
+        if chat_input.popup_active is not None:
+            chat_input.popup_active = None
+            self._hide_popup()
+            return
         if self._turn_busy and self._worker is not None:
             self._worker.cancel()
 

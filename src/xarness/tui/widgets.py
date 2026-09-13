@@ -278,15 +278,31 @@ class ThinkingBlock(Vertical):
         if self.has_class("expanded") and not self._done:
             self._follow_scroll()
 
-    def finish(self, duration: float | None) -> None:
-        """Collapse to a static summary. First call wins — app.py calls this
-        twice (once when content starts, once at turn-complete); a later call
-        is timed against full generation finishing, not reasoning ending, so
-        it's ignored once we already have a duration."""
+    def finish(self, duration: float | None, estimate_if_unknown: bool = True) -> None:
+        """Collapse to a static summary. First call wins.
+
+        When duration is None: if estimate_if_unknown (the live-streaming
+        case), fall back to elapsed-since-start. If not (history replay,
+        where "elapsed since start" would be meaningless), show "…" instead.
+        """
         if self._done:
             return
         self._done = True
-        self._duration = duration if duration is not None else time.monotonic() - self._start
+        if duration is not None:
+            self._duration = duration
+        elif estimate_if_unknown:
+            self._duration = time.monotonic() - self._start
+        else:
+            self._duration = None
+        self._swap_to_static_summary()
+
+    def finish_unknown(self) -> None:
+        """Finish without a measurable duration (history replay) — the summary
+        shows "Thought for …s" instead of a number."""
+        if self._done:
+            return
+        self._done = True
+        self._duration = None
         self._swap_to_static_summary()
 
     def toggle(self) -> None:
@@ -582,6 +598,7 @@ class ChatInput(TextArea):
 
     def action_submit(self) -> None:
         if self.popup_active is not None:
+            self.post_message(self.PopupConfirm())
             return
         text = self.text.strip()
         if not text:
