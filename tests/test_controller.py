@@ -17,7 +17,7 @@ from xarness.events import (
     TurnComplete,
     Usage,
 )
-from xarness.tools import ToolResult, default_registry
+from xarness.tools import ToolResult, build_registry
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1",
@@ -193,11 +193,13 @@ def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> Non
 
 def test_tools_schema_is_passed_to_client() -> None:
     client = FakeClient([ContentDelta("hi"), TurnComplete()])
-    controller = ChatController(PROFILE, "key", client=client, tool_registry=default_registry())
+    controller = ChatController(
+        PROFILE, "key", client=client, tool_registry=build_registry(None, None)
+    )
 
     asyncio.run(collect(controller, "hello"))
 
-    assert client.received_tools == default_registry().schema()
+    assert client.received_tools == build_registry(None, None).schema()
 
 
 def test_no_registry_sends_no_tools() -> None:
@@ -207,6 +209,65 @@ def test_no_registry_sends_no_tools() -> None:
     asyncio.run(collect(controller, "hello"))
 
     assert client.received_tools is None
+
+
+def test_compact_replaces_history_with_summary() -> None:
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first question"))
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    asyncio.run(collect(controller, "second question"))
+
+    client.script = [ContentDelta("summary text"), TurnComplete()]
+    summary = asyncio.run(controller.compact())
+
+    assert summary == "summary text"
+    # Everything except the first message was folded into a summary user message.
+    assert [m.role for m in controller.conversation.messages] == ["user", "user"]
+    assert "summary text" in controller.conversation.messages[1].content
+    # The summarizer round saw the rendered transcript (the first message is
+    # kept verbatim, so only the rest is summarized), with no tools attached.
+    summarizer_prompt = client.received_wire[-1][0]["content"]
+    assert "second question" in summarizer_prompt
+    assert "assistant: one" in summarizer_prompt
+    # The summarizer round ran without tools.
+    assert client.received_tools is None
+
+
+def test_compact_preserves_trailing_tool_call_round() -> None:
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first question"))
+
+    client.script = [
+        ToolCallStarted("call_1", "test_tool"),
+        ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+        TurnComplete(has_tool_calls=True),
+    ]
+    asyncio.run(collect(controller, "use the tool"))
+
+    client.script = [ContentDelta("summary text"), TurnComplete()]
+    asyncio.run(controller.compact())
+
+    # The tool result recorded after compaction must pair with the preserved
+    # assistant tool-call round on the wire.
+    controller.record_tool_result("call_1", ToolResult(ok=True, output="ok"))
+    assert [m.role for m in controller.conversation.messages] == [
+        "user", "user", "assistant", "tool",
+    ]
+    wire = controller.conversation.to_wire()
+    assert wire[2]["tool_calls"][0]["id"] == "call_1"
+    assert wire[3]["tool_call_id"] == "call_1"
+
+
+def test_compact_without_history_is_a_noop() -> None:
+    client = FakeClient([])
+    controller = ChatController(PROFILE, "key", client=client)
+
+    summary = asyncio.run(controller.compact())
+
+    assert summary == "nothing to compact yet"
+    assert controller.conversation.messages == []
 
 
 async def _drain(stream: AsyncIterator[Any]) -> list[Any]:

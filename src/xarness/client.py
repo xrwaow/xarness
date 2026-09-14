@@ -103,6 +103,11 @@ class ChatClient:
         self._profile = profile
         self._api_key = api_key
 
+    def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
+        """Repoint this client at a new provider profile mid-session."""
+        self._profile = profile
+        self._api_key = api_key
+
     def build_payload(
         self,
         wire_messages: Sequence[dict[str, Any]],

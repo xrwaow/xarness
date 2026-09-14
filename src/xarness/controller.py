@@ -25,6 +25,7 @@ from .conversation import Conversation, Message
 from .events import (
     ContentDelta,
     ReasoningDelta,
+    StreamError,
     StreamEvent,
     ToolCallArgumentsDelta,
     ToolCallArgumentsDone,
@@ -80,6 +81,78 @@ class ChatController:
         content = result.output if result.ok else f"error: {result.error}"
         self.conversation.add(Message(role="tool", tool_call_id=call_id, content=content))
 
+    def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
+        """Point the session at a new provider profile.
+
+        The client instance, conversation, and tool registry carry over —
+        only the endpoint/key change. Clients that don't support in-place
+        re-targeting (test fakes) simply keep streaming their script.
+        """
+        self.profile = profile
+        switch = getattr(self._client, "switch_profile", None)
+        if switch is not None:
+            switch(profile, api_key)
+
+    async def compact(self) -> str:
+        """Summarize the conversation and replace older messages with it.
+
+        Keeps the system prompt and the trailing assistant tool-call message
+        (the tool result that follows a mid-turn compaction must pair with
+        it on the wire); everything in between becomes a single summary user
+        message. Returns the summary text.
+        """
+        messages = self.conversation.messages
+        keep_from = len(messages)
+        if messages and messages[-1].role == "assistant" and messages[-1].tool_calls:
+            keep_from -= 1  # preserve the round that requested this compaction
+        compactable = messages[1:keep_from]
+        if len(messages) < 2 or not compactable:
+            return "nothing to compact yet"
+
+        transcript = "\n\n".join(self._render_for_summary(m) for m in compactable)
+        summary = await self._summarize(transcript)
+        summary_message = Message(
+            role="user",
+            content=f"[earlier conversation, summarized]\n\n{summary}",
+        )
+        self.conversation.messages = [messages[0], summary_message, *messages[keep_from:]]
+        return summary
+
+    @staticmethod
+    def _render_for_summary(message: Message) -> str:
+        """One message as plain text for the summarizer prompt."""
+        role = message.role
+        parts = [f"{role}: {message.content}"] if message.content else [f"{role}:"]
+        for call in message.tool_calls or []:
+            fn = call.get("function", {})
+            parts.append(f"  {role} called {fn.get('name', '?')}({fn.get('arguments', '')})")
+        if role == "tool" and message.tool_call_id:
+            parts.append(f"  (result for call {message.tool_call_id})")
+        return "\n".join(parts)
+
+    async def _summarize(self, transcript: str) -> str:
+        """One-off summarization round through the same client, no tools."""
+        prompt = (
+            "Summarize the following conversation between a user and a coding "
+            "assistant. Preserve the task the user wants, key decisions, file "
+            "paths, and the current state of any work in progress. Be concise — "
+            "a few short paragraphs at most. Reply with the summary only.\n\n"
+            "--- conversation ---\n"
+            f"{transcript}"
+        )
+        parts: list[str] = []
+        async for event in self._client.stream([{"role": "user", "content": prompt}]):
+            if isinstance(event, ContentDelta):
+                parts.append(event.text)
+            elif isinstance(event, StreamError):
+                raise RuntimeError(event.message)
+            elif isinstance(event, TurnComplete):
+                break
+        summary = "".join(parts).strip()
+        if not summary:
+            raise RuntimeError("summarization returned no content")
+        return summary
+
     async def _stream_round(self) -> AsyncIterator[StreamEvent]:
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
@@ -109,6 +182,10 @@ class ChatController:
                 pending[event.call_id] = {"name": event.name, "arguments": event.arguments_json}
             elif isinstance(event, TurnComplete):
                 reasoning = "".join(reasoning_parts) or None
+                reasoning_seconds: float | None = None
+                if first_reasoning_at is not None:
+                    end = first_content_at or time.monotonic()
+                    reasoning_seconds = end - first_reasoning_at
                 tool_calls_wire = [
                     {
                         "id": call_id,
@@ -125,13 +202,10 @@ class ChatController:
                         role="assistant",
                         content="".join(content_parts),
                         reasoning=reasoning,
+                        reasoning_seconds=reasoning_seconds,
                         tool_calls=tool_calls_wire or None,
                     )
                 )
-                reasoning_seconds: float | None = None
-                if first_reasoning_at is not None:
-                    end = first_content_at or time.monotonic()
-                    reasoning_seconds = end - first_reasoning_at
                 usage = event.usage or self._estimate_usage(content_parts)
                 event = TurnComplete(
                     usage=usage,

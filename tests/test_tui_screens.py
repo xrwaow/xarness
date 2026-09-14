@@ -23,7 +23,7 @@ from xarness.events import (
     Usage,
 )
 from xarness.tui.app import AgentApp
-from xarness.tui.model_screen import ModelPickerScreen
+from xarness.tui.picker_screen import PickerScreen
 from xarness.tui.resume_screen import ResumeScreen
 from xarness.tui.widgets import (
     AssistantMessage,
@@ -45,12 +45,20 @@ PROFILE = ProviderProfile(
 class FakeClient:
     def __init__(self, script: list[Any]) -> None:
         self.script = script
+        self.received_tools: list[dict[str, Any]] | None = None
+        self._profile = PROFILE
+        self._api_key = "test-key"
+
+    def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
+        self._profile = profile
+        self._api_key = api_key
 
     async def stream(
         self,
         wire_messages: Sequence[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
+        self.received_tools = tools
         yield ProcessingStarted()
         for event in self.script:
             yield event
@@ -154,6 +162,19 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
             chat = app.query_one("#chat-log")
             self.assertEqual(len(chat.children), 0)
 
+    async def test_startup_replays_preloaded_conversation(self) -> None:
+        """cli.py --session loads a conversation before run(): mount replays it
+        into the chat log without anyone calling _render_history manually."""
+        app = make_app([])
+        conversation = Conversation()
+        conversation.add(Message(role="user", content="old question"))
+        conversation.add(Message(role="assistant", content="old answer"))
+        app.controller.conversation = conversation
+        async with app.run_test():
+            self.assertEqual(len(app.query(UserMessage)), 1)
+            self.assertEqual(len(app.query(AssistantMessage)), 1)
+            self.assertIn("old question", app.query_one(UserMessage).text)
+
     async def test_replay_assistant_without_reasoning(self) -> None:
         app = make_app([])
         conversation = Conversation()
@@ -214,32 +235,43 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
                     await app.push_screen(screen, results.append)
                     await pilot.pause()
 
+                    # Newest session first (beta was saved after alpha).
                     names = [item.session_name for item in screen.query(ListItem)]
-                    self.assertEqual(names, ["alpha-chat", "beta-chat"])
+                    self.assertEqual(names, ["beta-chat", "alpha-chat"])
 
                     # Live filtering narrows the list.
                     await pilot.press("b", "e", "t")
                     names = [item.session_name for item in screen.query(ListItem)]
                     self.assertEqual(names, ["beta-chat"])
 
-                    # Enter in the search box picks the highlighted session.
+                    # Clear the filter, navigate with arrows (search box keeps
+                    # focus), and pick with enter.
+                    await pilot.press("backspace", "backspace", "backspace")
+                    await pilot.press("down", "down")  # beta-chat -> alpha-chat
                     await pilot.press("enter")
-                    self.assertEqual(results, ["beta-chat"])
+                    self.assertEqual(results, ["alpha-chat"])
 
     async def test_slash_resume_loads_session_and_replays(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(session_store, "SESSIONS_DIR", Path(tmp)):
                 saved = Conversation()
                 saved.add(Message(role="user", content="old question"))
-                saved.add(Message(role="assistant", content="old answer"))
+                saved.add(
+                    Message(
+                        role="assistant",
+                        content="old answer",
+                        reasoning="deliberating",
+                        reasoning_seconds=80.0,
+                    )
+                )
                 session_store.save_session("my-session", "alpha-model", saved)
 
                 app = make_app(
                     [ContentDelta("fresh reply"), TurnComplete(usage=Usage(10, 2))]
                 )
                 async with app.run_test() as pilot:
-                    # First enter confirms the slash-command popup, second submits.
-                    await pilot.press("/", "r", "e", "s", "u", "m", "e", "enter", "enter")
+                    # Enter on the slash-command popup completes and runs it.
+                    await pilot.press("/", "s", "e", "s", "s", "i", "o", "n", "s", "enter")
                     for _ in range(50):
                         await pilot.pause()
                         if isinstance(app.screen, ResumeScreen):
@@ -256,8 +288,15 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
                     # History replayed into the chat log.
                     self.assertEqual(len(app.query(UserMessage)), 1)
                     self.assertEqual(len(app.query(AssistantMessage)), 1)
+
+                    # Persisted thinking time survives the round-trip.
                     self.assertEqual(
-                        [m.content for m in app.controller.conversation.messages],
+                        app.query_one(ThinkingBlock).summary_text, "Thought for 1m 20s"
+                    )
+                    # ensure_system_message() prepends the mode-aware prompt.
+                    self.assertEqual(app.controller.conversation.messages[0].role, "system")
+                    self.assertEqual(
+                        [m.content for m in app.controller.conversation.messages[1:]],
                         ["old question", "old answer"],
                     )
 
@@ -265,7 +304,8 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("m", "o", "r", "e", "enter")
                     await wait_until_idle(app)
                     data = json.loads((Path(tmp) / "my-session.json").read_text())
-                    contents = [m["content"] for m in data["messages"]]
+                    self.assertEqual(data["messages"][0]["role"], "system")
+                    contents = [m["content"] for m in data["messages"][1:]]
                     self.assertEqual(
                         contents, ["old question", "old answer", "more", "fresh reply"]
                     )
@@ -304,19 +344,18 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
                 app = make_app(
                     [ContentDelta("reply"), TurnComplete(usage=Usage(10, 2))],
                     config_path=config_path,
-                    profile_names=["alpha", "beta"],
                 )
                 conversation = Conversation()
                 conversation.add(Message(role="user", content="carried over"))
                 app.controller.conversation = conversation
 
                 async with app.run_test() as pilot:
-                    await pilot.press("/", "m", "o", "d", "e", "l", "enter", "enter")
+                    await pilot.press("/", "m", "o", "d", "e", "l", "enter")
                     for _ in range(50):
                         await pilot.pause()
-                        if isinstance(app.screen, ModelPickerScreen):
+                        if isinstance(app.screen, PickerScreen):
                             break
-                    self.assertIsInstance(app.screen, ModelPickerScreen)
+                    self.assertIsInstance(app.screen, PickerScreen)
 
                     await pilot.press("down")  # highlight beta
                     await pilot.press("enter")
@@ -352,7 +391,7 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
             write_config(config_path, beta_key_env=None)
             env = {"ALPHA_KEY": "a-key"}  # beta needs no key, but its base_url is unreachable
             with patch.dict(os.environ, env):
-                app = make_app([], config_path=config_path, profile_names=["alpha", "beta"])
+                app = make_app([], config_path=config_path)
                 async with app.run_test() as pilot:
                     await pilot.press("/", "m", "o", "d", "e", "l", "enter")
                     await pilot.pause()
@@ -364,6 +403,42 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
                     # Beta resolved (its api_key_env is null so no key needed);
                     # the switch went through to the beta profile.
                     self.assertEqual(app.profile.model_id, "beta-model")
+
+
+# ----------------------------------------------------------------------
+# /new
+
+
+class TestSlashNew(unittest.IsolatedAsyncioTestCase):
+    async def test_slash_new_starts_fresh_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(session_store, "SESSIONS_DIR", Path(tmp)):
+                app = make_app(
+                    [ContentDelta("reply"), TurnComplete(usage=Usage(10, 2))],
+                    session_name="old-session",
+                )
+                async with app.run_test() as pilot:
+                    await pilot.press("h", "i", "enter")
+                    await wait_until_idle(app)
+                    self.assertEqual(len(app.query(UserMessage)), 1)
+
+                    # Enter on the popup completes and runs /new in one step.
+                    await pilot.press("/", "n", "e", "w", "enter")
+                    await pilot.pause()
+
+                    # Chat log cleared; conversation reset to just the system prompt.
+                    self.assertEqual(len(app.query(UserMessage)), 0)
+                    messages = app.controller.conversation.messages
+                    self.assertEqual([m.role for m in messages], ["system"])
+
+                    # Fresh session file name; usage counters reset.
+                    self.assertNotEqual(app.session_name, "old-session")
+                    self.assertEqual((app.total_in, app.total_out, app.last_in), (0, 0, 0))
+
+                    # The new session works: sending appends to the fresh conversation.
+                    await pilot.press("x", "enter")
+                    await wait_until_idle(app)
+                    self.assertEqual(app.controller.conversation.messages[-1].content, "reply")
 
 
 if __name__ == "__main__":

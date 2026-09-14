@@ -2,11 +2,36 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from rich.markup import escape
+from textual import events
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView
 
 from .. import session_store
+
+
+def _relative_time(iso: str | None) -> str:
+    """Format an ISO timestamp as age from now: 5m / 3h / 12d."""
+    if not iso:
+        return "?"
+    try:
+        updated = datetime.fromisoformat(iso)
+    except ValueError:
+        return "?"
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    minutes = int((datetime.now(timezone.utc) - updated).total_seconds()) // 60
+    if minutes < 1:
+        return "<1m"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    return f"{hours // 24}d"
 
 
 class ResumeScreen(ModalScreen[str | None]):
@@ -23,19 +48,39 @@ class ResumeScreen(ModalScreen[str | None]):
 
     def compose(self):
         with Vertical(id="resume-modal"):
+            yield Label("Resume session", id="resume-title")
             yield Input(placeholder="Type to search", id="resume-search")
             yield ListView(*self._build_items(self._entries), id="resume-list")
 
     def _build_items(self, entries: list[tuple[str, dict]]) -> list[ListItem]:
         items = []
         for name, meta in entries:
-            updated = meta.get("updated_at", "?")
-            count = meta.get("message_count", 0)
-            items.append(ListItem(Label(f"{updated}   {name}   ({count} msgs)")))
+            age = _relative_time(meta.get("updated_at"))
+            item = ListItem(Label(f"{escape(name)}  [dim]{age}[/]"))
+            item.session_name = name
+            items.append(item)
         return items
 
     def on_mount(self) -> None:
         self.query_one("#resume-search", Input).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        """Up/down in the search box moves the list highlight."""
+        if event.key not in ("up", "down"):
+            return
+        event.prevent_default()
+        event.stop()
+        listview = self.query_one("#resume-list", ListView)
+        if event.key == "up":
+            listview.action_cursor_up()
+        else:
+            listview.action_cursor_down()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the search box picks the highlighted session."""
+        listview = self.query_one("#resume-list", ListView)
+        if listview.index is not None:
+            listview.action_select_cursor()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.lower()

@@ -58,6 +58,19 @@ def _fmt_tokens(count: int) -> str:
     return f"{count / 1_000_000:.2f}M"
 
 
+def _format_duration(seconds: float) -> str:
+    """Human duration: 5.3s · 42s · 2m 15s · 1h 04m."""
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
 def _lerp_hex(c1: str, c2: str, t: float) -> str:
     c1, c2 = c1.lstrip("#"), c2.lstrip("#")
     r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
@@ -115,10 +128,10 @@ class ShimmerText(Static):
         if self._timer is not None:
             self._timer.stop()
 
-    def set_label(self, label: str) -> None:
-        """Swap the label and restart the sweep from the leading edge."""
-        self.label = label
-        self.phase = 0.0
+    def set_colors(self, base_color: str, peak_color: str) -> None:
+        """Recolor in place (used when the app switches themes live)."""
+        self.base_color = base_color
+        self.peak_color = peak_color
         self._render_frame()
 
     def _tick(self) -> None:
@@ -143,6 +156,8 @@ class ShimmerText(Static):
 class SuggestionPopup(OptionList):
     """Floating suggestion list for slash commands and @-file mentions."""
 
+    can_focus = False
+
     def set_items(self, items: list[tuple[str, str]]) -> None:
         self.clear_options()
         for value, label in items:
@@ -164,29 +179,49 @@ class SuggestionPopup(OptionList):
         self.highlighted = (current + delta) % self.option_count
 
 
-class UserMessage(Static):
-    """A submitted user message: full-width surface highlight, dim marker."""
+class UserMessage(Vertical):
+    """A submitted user message: full-width surface highlight, dim marker.
+
+    Marker + content columns so wrapped lines hang-indent under the text
+    after "›" instead of returning to the left edge of the surface. Text
+    color comes from CSS ($c-text) so live /theme switches recolor it.
+
+    Initial content is rendered in compose(): Textual dispatches on_mount
+    before the widget counts as mounted, so mount-time updates get skipped
+    by any is_mounted guard and must not be the only render path.
+    """
 
     def __init__(self, text: str) -> None:
-        super().__init__("", classes="msg user", markup=False)
+        super().__init__(classes="msg user")
         self._text = text
-        self._apply()
+        self._suffix = ""
+
+    def compose(self):
+        with Horizontal(classes="user-row"):
+            yield Static("›", classes="user-marker", markup=False)
+            yield Static(self._build_content(), classes="user-content", markup=False)
+
+    def _build_content(self) -> Text:
+        line = Text(self._text)
+        if self._suffix:
+            line.append(self._suffix, style=theme.PALETTE["muted"])
+        return line
 
     @property
     def text(self) -> str:
         return self._text
 
-    def _apply(self, suffix: str = "") -> None:
-        line = Text()
-        line.append("› ", style=theme.PALETTE["muted"])
-        line.append(self._text, style=theme.PALETTE["text"])
-        if suffix:
-            line.append(suffix, style=theme.PALETTE["muted"])
-        self.update(line)
+    def apply_palette(self) -> None:
+        """(Re)render the content with the current palette (used by /theme).
+        Pre-mount calls are no-ops: compose() renders from the same state."""
+        if not self.is_mounted:
+            return
+        self.query_one(".user-content", Static).update(self._build_content())
 
     def mark_queued(self) -> None:
         """Note that this message is waiting for the current turn to finish."""
-        self._apply("   (queued)")
+        self._suffix = "   (queued)"
+        self.apply_palette()
 
 
 class AssistantMessage(Vertical):
@@ -333,8 +368,17 @@ class ThinkingBlock(Vertical):
         elapsed_static = self.query_one("#thinking-elapsed", Static)
         elapsed_static.remove_class("thinking-elapsed")
         elapsed_static.add_class("thinking-done-summary")
-        duration = f"{self._duration:.1f}s" if self._duration is not None else "…"
+        self._refresh_summary_color()
+
+    def recolor(self) -> None:
+        """Re-render the settled summary with the current palette (/theme)."""
+        if self._done and self.is_mounted:
+            self._refresh_summary_color()
+
+    def _refresh_summary_color(self) -> None:
+        duration = _format_duration(self._duration) if self._duration is not None else "…"
         self.summary_text = f"Thought for {duration}"
+        elapsed_static = self.query_one(".thinking-done-summary", Static)
         elapsed_static.update(Text(self.summary_text, style=f"italic {theme.PALETTE['muted']}"))
 
 
@@ -371,14 +415,11 @@ class ToolCallBlock(Vertical):
 
     def compose(self):
         with Horizontal(classes="toolcall-summary"):
-            yield Static("•", classes="toolcall-dot", markup=False)
+            yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
             yield ShimmerText(f"Running {self.tool_name}", *theme.SHIMMER_THINKING, classes="toolcall-shimmer")
         with Horizontal(classes="toolcall-row"):
             yield Static("", classes="toolcall-marker", markup=False)
             yield Static("", classes="toolcall-body", markup=False)
-
-    def on_mount(self) -> None:
-        self._refresh_dot()
 
     @property
     def status(self) -> ToolCallStatus:
@@ -405,6 +446,10 @@ class ToolCallBlock(Vertical):
     def on_click(self, event: events.Click) -> None:
         self.toggle()
         event.stop()
+
+    def recolor(self) -> None:
+        """Re-apply the status-dot color with the current palette (/theme)."""
+        self._refresh_dot()
 
     def _refresh_dot(self) -> None:
         if self.is_mounted:
@@ -452,11 +497,34 @@ class PendingIndicator(Horizontal):
         )
 
 
+class ToolWritingIndicator(Horizontal):
+    """Single amber-dot 'Writing tools' shimmer shown while tool-call
+    arguments are still streaming — replaces the per-block 'Running [tool]'
+    shinies, which only make sense once a call actually executes."""
+
+    def compose(self):
+        yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
+        yield ShimmerText("Writing tools", *theme.SHIMMER_THINKING, classes="toolwriting-shimmer")
+
+
 class ErrorLine(Static):
-    """A request-level failure, rendered inline in the scrollback."""
+    """A request-level failure, rendered inline in the scrollback.
+
+    Color comes from CSS ($c-error) so theme switches recolor it live.
+    """
 
     def __init__(self, message: str) -> None:
-        super().__init__(Text(f"✗ {message}", style=theme.PALETTE["error"]), classes="msg error")
+        super().__init__(Text(f"✗ {message}"), classes="msg error")
+
+
+class NoticeLine(Static):
+    """Muted one-line status notice (e.g. 'worked for 2m 15s').
+
+    Color comes from CSS ($c-muted) so theme switches recolor it live.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(Text(message), classes="msg notice")
 
 
 class StatusBar(Static):
@@ -467,6 +535,7 @@ class StatusBar(Static):
         *,
         shown_name: str,
         effort: str,
+        mode: str,
         total_in: int,
         total_out: int,
         context_used: int,
@@ -478,6 +547,7 @@ class StatusBar(Static):
         line = Text()
         line.append(shown_name, style=f"bold {palette['status']}")
         line.append(f" · effort {effort}", style=palette["muted"])
+        line.append(f" · {mode}", style=palette["accent2"] if mode == "write" else palette["muted"])
         line.append("  │  ", style=palette["border"])
         line.append("in ", style=palette["muted"])
         line.append(_fmt_tokens(total_in), style=palette["text"])
@@ -541,12 +611,20 @@ class ChatInput(TextArea):
         self.popup_active: str | None = None
 
     def on_mount(self) -> None:
+        self.apply_input_theme()
+
+    def apply_input_theme(self) -> None:
+        """(Re)build the TextArea theme from the current palette.
+
+        Called on mount and again when /theme switches palettes live; the
+        cursor and selection colors come from the theme config.
+        """
         base = TextAreaTheme.get_builtin_theme("css")
         no_line_highlight = TextAreaTheme(
             name="xarness-input",
             base_style=base.base_style,
             gutter_style=base.gutter_style,
-            cursor_style=base.cursor_style,
+            cursor_style=Style(bgcolor=theme.PALETTE["cursor"], color=theme.PALETTE["bg"]),
             cursor_line_style=Style(),
             cursor_line_gutter_style=base.cursor_line_gutter_style,
             bracket_matching_style=base.bracket_matching_style,
@@ -554,6 +632,9 @@ class ChatInput(TextArea):
             syntax_styles=base.syntax_styles,
         )
         self.register_theme(no_line_highlight)
+        # Assigning the same name wouldn't re-run the theme watcher, so bounce
+        # through the builtin to force the new colors to be applied.
+        self.theme = "css"
         self.theme = "xarness-input"
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -594,7 +675,9 @@ class ChatInput(TextArea):
                 self.popup_active = None
                 self.post_message(self.PopupDismiss())
             return
-        super()._on_key(event)
+        # NOTE: no super()._on_key() here — Textual already dispatches
+        # TextArea._on_key via the MRO; calling it manually creates an
+        # un-awaited coroutine (RuntimeWarning) with no extra effect.
 
     def action_submit(self) -> None:
         if self.popup_active is not None:
@@ -618,8 +701,3 @@ class ChatInput(TextArea):
             return
         self.replace(f"@{value} ", (row, at_col), (row, col))
         self.popup_active = None
-
-    def set_command(self, value: str) -> None:
-        self.load_text(f"/{value} ")
-        self.popup_active = None
-        self.move_cursor(self.document.end)

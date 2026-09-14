@@ -8,12 +8,14 @@ streaming — are driven by stream events, never by timers.
 from __future__ import annotations
 
 import asyncio
-from typing import ClassVar
+import time
+from typing import ClassVar, Literal
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
+from textual.widgets import OptionList, TextArea
 from textual.worker import Worker
 
 from pathlib import Path
@@ -21,25 +23,32 @@ from pathlib import Path
 from .. import theme
 from ..config import ConfigError, ProviderProfile, load_all_profiles, resolve_api_key
 from ..controller import ChatController
+from ..conversation import Conversation, Message
 from ..file_search import search_files
 from ..events import (
-    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
+    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDone,
     ToolCallStarted, ToolCallStatus, TurnComplete,
 )
-from ..tools import ToolRegistry, default_registry
-from .model_screen import ModelPickerScreen
+from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
+from ..sandbox import SandboxConfig, SandboxSession
+from ..tools import ToolRegistry, build_registry
+from .ask_screen import AskScreen
+from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
-    AssistantMessage, ChatInput, ErrorLine, PendingIndicator,
-    StatusBar, SuggestionPopup, ThinkingBlock, ToolCallBlock, UserMessage,
+    AssistantMessage, ChatInput, ErrorLine, NoticeLine, PendingIndicator,
+    ShimmerText, StatusBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
+    ToolWritingIndicator, UserMessage, _format_duration,
 )
 
 
 SLASH_COMMANDS = [
     ("tools", "list available tools"),
-    ("sessions", "list saved sessions"),
     ("model", "choose what model and reasoning effort to use"),
-    ("resume", "resume a previous session"),
+    ("sessions", "resume a previous session"),
+    ("mode", "switch between plan (read-only) and write mode"),
+    ("theme", "choose a color theme"),
+    ("new", "start a new chat"),
 ]
 
 
@@ -49,7 +58,7 @@ class AgentApp(App[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+t", "toggle_thoughts", "Thoughts", priority=True),
-        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("ctrl+c", "copy_or_quit", "Copy / Quit", priority=True),
         Binding("escape", "interrupt", "Interrupt", priority=True),
     ]
 
@@ -63,10 +72,21 @@ class AgentApp(App[None]):
         session_name: str | None = None,
         config_path: Path | None = None,
         profile_name: str | None = None,
+        sandbox: SandboxConfig | None = None,
+        sandbox_session: SandboxSession | None = None,
     ) -> None:
         super().__init__()
         self.profile = profile
-        self.tool_registry = tool_registry or default_registry()
+        self.api_key = api_key
+        # Kept on the app so /mode can rebuild a registry without re-deriving
+        # the sandbox setup.
+        self.sandbox = sandbox
+        self.sandbox_session = sandbox_session
+        self.mode: Literal["plan", "write"] = "write"
+        self.tool_registry = tool_registry or build_registry(
+            sandbox, sandbox_session, mode=self.mode,
+            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
+        )
         self.controller = controller or ChatController(
             profile, api_key, tool_registry=self.tool_registry
         )
@@ -83,23 +103,44 @@ class AgentApp(App[None]):
         self._worker: Worker | None = None
         self._at_search_timer = None
         self._profiles_cache: dict[str, ProviderProfile] = {}
+        self.ensure_system_message()
+
+    def ensure_system_message(self) -> None:
+        """Make sure the conversation leads with the mode-aware system prompt.
+
+        Called at startup, after a conversation swap (/resume, cli.py's
+        existing-session load), and on /mode. An existing system message is
+        updated IN PLACE rather than appended: there is exactly one, at index
+        0, and rewriting it means a mode switch applies from the very next
+        round onward without duplicating prompts in the history.
+        """
+        conversation = self.controller.conversation
+        content = system_prompt_for(GENERAL_SYSTEM_PROMPT, self.mode)
+        if conversation.messages and conversation.messages[0].role == "system":
+            conversation.messages[0].content = content
+        else:
+            conversation.messages.insert(0, Message(role="system", content=content))
 
     def get_css_variables(self) -> dict[str, str]:
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
-        yield StatusBar(id="status-bar")
         with Container(id="input-wrap"):
+            yield SuggestionPopup(id="suggestion-popup")
             yield ChatInput(
                 id="chat-input",
                 placeholder="Send a message…  (Enter: send · Shift+Enter: newline · Ctrl+T: thoughts)",
             )
-        yield SuggestionPopup(id="suggestion-popup")
+        yield StatusBar(id="status-bar")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_status()
+        # A conversation loaded before mount (e.g. `--session <name>` resume
+        # in cli.py) has never been rendered — replay it into the chat log.
+        if any(m.role != "system" for m in self.controller.conversation.messages):
+            await self._render_history()
 
     # ------------------------------------------------------------------
     # Status bar
@@ -109,6 +150,7 @@ class AgentApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_status(
             shown_name=self.profile.display_name,
             effort=self.profile.cot_strength.value,
+            mode=self.mode,
             total_in=self.total_in,
             total_out=self.total_out,
             context_used=context_used,
@@ -133,11 +175,9 @@ class AgentApp(App[None]):
             names = ", ".join(t["function"]["name"] for t in self.tool_registry.schema())
             chat.mount(ErrorLine(f"tools: {names}"))
         elif cmd == "sessions":
-            from ..session_store import list_sessions
-            names = list_sessions()
-            chat.mount(ErrorLine("sessions: " + (", ".join(names) if names else "(none saved)")))
-        elif cmd == "resume":
-            self.push_screen(ResumeScreen(), self._on_resume_selected)
+            self.push_screen(ResumeScreen(), self._on_session_selected)
+        elif cmd == "new":
+            self._start_new_session()
         elif cmd == "model":
             if self.config_path is None:
                 chat.mount(ErrorLine("/model unavailable: no config path known"))
@@ -148,46 +188,97 @@ class AgentApp(App[None]):
                 chat.mount(ErrorLine(f"/model failed: {exc}"))
                 return
             self.push_screen(
-                ModelPickerScreen(list(self._profiles_cache), self.profile_name),
+                PickerScreen(
+                    list(self._profiles_cache),
+                    current=self.profile_name,
+                    title="Switch model",
+                ),
                 self._on_model_selected,
             )
+        elif cmd == "mode":
+            new_mode = "plan" if self.mode == "write" else "write"
+            self.mode = new_mode
+            self.tool_registry = build_registry(
+                self.sandbox, self.sandbox_session, mode=new_mode,
+                ask_callback=self._ask_user, compact_callback=self._compact_conversation,
+            )
+            self.controller.tools = self.tool_registry  # rewire to the new registry
+            self.ensure_system_message()
+            self._refresh_status()
+        elif cmd == "theme":
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if arg:
+                self._handle_theme_command(arg)
+            else:
+                # No argument: open the picker, same interaction as /model.
+                self.push_screen(
+                    PickerScreen(
+                        list(theme.THEMES),
+                        current=theme.CURRENT_THEME,
+                        title="Color theme",
+                    ),
+                    self._on_theme_selected,
+                )
         else:
             chat.mount(ErrorLine(f"unknown command: /{cmd}"))
 
-    async def _load_session(self, name: str | None) -> None:
-        """push_screen callback for /resume: load and replay the picked session."""
-        if name is None:
-            return
-        from ..session_store import load_session
-        conversation = load_session(name)
-        self.controller.conversation = conversation
-        self.session_name = name
-        await self._render_history()
+    def _on_theme_selected(self, name: str | None) -> None:
+        if name:
+            self._apply_theme(name)
 
-    async def _switch_profile(self, name: str | None) -> None:
-        """push_screen callback for /model: swap profile + client underneath the
-        existing conversation. History carries over unchanged."""
-        if name is None:
-            return
+    def _handle_theme_command(self, arg: str) -> None:
+        """Apply an explicitly named theme, or report the available ones."""
         chat = self.query_one("#chat-log", VerticalScroll)
-        try:
-            profile = load_config(self.config_path, name)
-            api_key = resolve_api_key(profile)
-        except ConfigError as exc:
-            await chat.mount(ErrorLine(f"/model: can't switch to {name}: {exc}"))
+        if arg not in theme.THEMES:
+            chat.mount(ErrorLine(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}"))
             return
-        new_controller = ChatController(profile, api_key, tool_registry=self.tool_registry)
-        new_controller.conversation = self.controller.conversation
-        self.controller = new_controller
-        self.profile = profile
+        self._apply_theme(arg)
+
+    def _apply_theme(self, name: str) -> None:
+        """Switch palette live: CSS variables, input caret, shimmers, dots,
+        summaries, status bar — anything that baked palette colors at render
+        time must be re-rendered here, or the switched theme drifts from the
+        same theme set at startup."""
+        theme.set_theme(name)
+        self.refresh_css()
+        self.query_one("#chat-input", ChatInput).apply_input_theme()
+        for shimmer in self.query(ShimmerText):
+            colors = (
+                theme.SHIMMER_PROCESSING if shimmer.id == "pending-shimmer"
+                else theme.SHIMMER_THINKING
+            )
+            shimmer.set_colors(*colors)
+        for message in self.query(UserMessage):
+            message.apply_palette()
+        for block in self.query(ToolCallBlock):
+            block.recolor()
+        for thinking in self.query(ThinkingBlock):
+            thinking.recolor()
+        for block in self.query(ToolCallBlock):
+            block.recolor()
         self._refresh_status()
 
-    async def _on_resume_selected(self, name: str | None) -> None:
+    def _start_new_session(self) -> None:
+        """Slash /new: fresh conversation, fresh session file (unless disabled)."""
+        self.controller.conversation = Conversation()
+        if self.session_name is not None:
+            from ..session_store import new_session_name
+            self.session_name = new_session_name()
+        self.ensure_system_message()
+        self.total_in = self.total_out = self.last_in = 0
+        self._last_thinking = None
+        self._queued.clear()
+        chat = self.query_one("#chat-log", VerticalScroll)
+        chat.remove_children()
+        self._refresh_status()
+
+    async def _on_session_selected(self, name: str | None) -> None:
         if not name:
             return
         from ..session_store import load_session
         self.controller.conversation = load_session(name)
         self.session_name = name
+        self.ensure_system_message()
         await self._render_history()
 
     def _on_model_selected(self, name: str | None) -> None:
@@ -202,11 +293,11 @@ class AgentApp(App[None]):
             chat = self.query_one("#chat-log", VerticalScroll)
             chat.mount(ErrorLine(f"could not switch model: {exc}"))
             return
-        old_conversation = self.controller.conversation
+        # Swap the provider underneath the existing controller: client,
+        # conversation, and tools all carry over.
+        self.controller.switch_profile(profile, api_key)
         self.profile = profile
         self.profile_name = name
-        self.controller = ChatController(profile, api_key, tool_registry=self.tool_registry)
-        self.controller.conversation = old_conversation
         self._refresh_status()
 
     async def _render_history(self) -> None:
@@ -230,11 +321,15 @@ class AgentApp(App[None]):
                     thinking = ThinkingBlock()
                     await chat.mount(thinking)
                     thinking.append_reasoning(message.reasoning)
-                    thinking.finish(None, estimate_if_unknown=False)
-                if message.content:
+                    thinking.finish(message.reasoning_seconds, estimate_if_unknown=False)
+                # Tool-call-only rounds render no AssistantMessage body; an
+                # empty assistant message with no tool calls replays as
+                # "(no output)", matching the live-stream finalize path.
+                if message.content or not message.tool_calls:
                     assistant = AssistantMessage()
                     await chat.mount(assistant)
-                    await assistant.append_delta(message.content)
+                    if message.content:
+                        await assistant.append_delta(message.content)
                     await assistant.finalize()
                 for call in message.tool_calls or []:
                     call_id = call.get("id", "")
@@ -256,20 +351,31 @@ class AgentApp(App[None]):
     def on_chat_input_slash_query(self, event: ChatInput.SlashQuery) -> None:
         q = event.query.lower()
         matches = [(name, f"/{name}  {desc}") for name, desc in SLASH_COMMANDS if name.startswith(q)]
+        # Exact match first (stable sort keeps declaration order otherwise), so
+        # typing "/mode" highlights /mode rather than /model.
+        matches.sort(key=lambda m: m[0] != q)
         self._show_popup(matches)
 
     def on_chat_input_at_query(self, event: ChatInput.AtQuery) -> None:
+        self._cancel_at_search()
+        self._at_search_timer = self.set_timer(0.15, lambda: self._run_at_search(event.query))
+
+    def _cancel_at_search(self) -> None:
         if self._at_search_timer is not None:
             self._at_search_timer.stop()
-        self._at_search_timer = self.set_timer(0.15, lambda: self._run_at_search(event.query))
+            self._at_search_timer = None
 
     @work(exclusive=True, group="at-search")
     async def _run_at_search(self, query: str) -> None:
+        chat_input = self.query_one("#chat-input", ChatInput)
+        if chat_input.popup_active != "at":
+            return  # dismissed (e.g. escape) while the search was pending
         root = self.workspace or Path.cwd()
         results = await search_files(root, query)
         self._show_popup([(r, r) for r in results])
 
     def on_chat_input_popup_dismiss(self, event: ChatInput.PopupDismiss) -> None:
+        self._cancel_at_search()
         self._hide_popup()
 
     def on_chat_input_popup_nav(self, event: ChatInput.PopupNav) -> None:
@@ -280,11 +386,33 @@ class AgentApp(App[None]):
         value = popup.selected_value
         chat_input = self.query_one("#chat-input", ChatInput)
         was_slash = chat_input.popup_active == "slash"
+        chat_input.popup_active = None
         self._hide_popup()
+        chat_input.focus()
         if value is None:
             return
         if was_slash:
-            chat_input.set_command(value)
+            # Slash commands take no arguments: complete and run in one Enter.
+            chat_input.load_text("")
+            self._handle_slash_command(f"/{value}")
+        else:
+            chat_input.insert_mention(value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """Mouse click on a popup option: insert it immediately, keep focus on input."""
+        event.stop()
+        chat_input = self.query_one("#chat-input", ChatInput)
+        was_slash = chat_input.popup_active == "slash"
+        value = event.option.id
+        self._hide_popup()
+        chat_input.popup_active = None
+        chat_input.focus()
+        if value is None:
+            return
+        if was_slash:
+            # Consistent with Enter: clicking a slash command runs it.
+            chat_input.load_text("")
+            self._handle_slash_command(f"/{value}")
         else:
             chat_input.insert_mention(value)
 
@@ -312,14 +440,40 @@ class AgentApp(App[None]):
         if not self._turn_busy:
             self._worker = self._run_turn(text)
 
+    def action_copy_or_quit(self) -> None:
+        """ctrl+c: copy the active selection if there is one, quit otherwise."""
+        focused = self.focused
+        if isinstance(focused, TextArea) and focused.selected_text:
+            self.copy_to_clipboard(focused.selected_text)
+            return
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
+            return
+        self.exit()
+
     def action_interrupt(self) -> None:
         chat_input = self.query_one("#chat-input", ChatInput)
-        if chat_input.popup_active is not None:
+        popup = self.query_one("#suggestion-popup", SuggestionPopup)
+        if chat_input.popup_active is not None or popup.has_class("visible"):
             chat_input.popup_active = None
+            self._cancel_at_search()
             self._hide_popup()
             return
         if self._turn_busy and self._worker is not None:
             self._worker.cancel()
+
+    async def _ask_user(self, questions: list[str]) -> list[str] | None:
+        """Callback for the ask tool: surface the questions, await the answers.
+
+        Runs inside the turn worker, so wait_for_dismiss is allowed; it makes
+        the awaited result the screen's dismiss value (the answers).
+        """
+        return await self.push_screen(AskScreen(questions), wait_for_dismiss=True)
+
+    async def _compact_conversation(self) -> str:
+        """Callback for the compact tool: summarize + truncate the history."""
+        return await self.controller.compact()
 
     @work(group="turn")
     async def _run_turn(self, text: str) -> None:
@@ -332,10 +486,14 @@ class AgentApp(App[None]):
         """
         self._turn_busy = True
         chat = self.query_one("#chat-log", VerticalScroll)
+        turn_start = time.monotonic()
         tool_blocks: dict[str, ToolCallBlock] = {}
         indicator: PendingIndicator | None = None
         indicator_live = False
+        writing: ToolWritingIndicator | None = None
+        pending_writes = 0
         thinking: ThinkingBlock | None = None
+        had_stream_error = False
 
         stream = self.controller.send(text)
         try:
@@ -347,6 +505,8 @@ class AgentApp(App[None]):
                 thinking = None
                 assistant = None
                 tool_blocks = {}
+                writing = None
+                pending_writes = 0
                 round_has_tools = False
 
                 async for event in stream:
@@ -376,13 +536,21 @@ class AgentApp(App[None]):
                             indicator_live = False
                         if thinking is not None:
                             thinking.finish(duration=None)
+                        # One shared "Writing tools" shimmer while arguments
+                        # stream; per-call blocks appear once args are complete.
+                        pending_writes += 1
+                        if writing is None:
+                            writing = ToolWritingIndicator()
+                            await chat.mount(writing)
+                    elif isinstance(event, ToolCallArgumentsDone):
                         block = ToolCallBlock(event.call_id, event.name)
+                        block.append_arguments(event.arguments_json)
                         tool_blocks[event.call_id] = block
                         await chat.mount(block)
-                    elif isinstance(event, ToolCallArgumentsDelta):
-                        block = tool_blocks.get(event.call_id)
-                        if block is not None:
-                            block.append_arguments(event.text)
+                        pending_writes = max(0, pending_writes - 1)
+                        if pending_writes == 0 and writing is not None:
+                            await self._dismiss_indicator(writing)
+                            writing = None
                     elif isinstance(event, TurnComplete):
                         round_has_tools = event.has_tool_calls
                         await self._complete_round(event, thinking, assistant)
@@ -391,14 +559,21 @@ class AgentApp(App[None]):
                             await self._dismiss_indicator(indicator)
                             indicator_live = False
                         await chat.mount(ErrorLine(event.message))
+                        had_stream_error = True
 
                     if follow:
                         chat.scroll_end(animate=False)
 
+                if writing is not None:
+                    await self._dismiss_indicator(writing)
+                    writing = None
                 if indicator_live:
                     await self._dismiss_indicator(indicator)
 
                 if not round_has_tools:
+                    if not had_stream_error:
+                        worked = _format_duration(time.monotonic() - turn_start)
+                        await chat.mount(NoticeLine(f"worked for {worked}"))
                     break
 
                 # Execute the calls this round requested, in stream order.
@@ -415,6 +590,8 @@ class AgentApp(App[None]):
 
                 stream = self.controller.continue_after_tools()
         except asyncio.CancelledError:
+            if writing is not None and writing.is_mounted:
+                await writing.remove()
             if indicator is not None and indicator_live:
                 await self._dismiss_indicator(indicator)
             if thinking is not None and not thinking.done:

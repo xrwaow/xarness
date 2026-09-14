@@ -1,6 +1,6 @@
 """Bubblewrap-based sandbox for filesystem/shell tool execution.
 
-read_file/write_file use one-shot bwrap invocations (run_in_sandbox).
+read_file/edit_file use one-shot bwrap invocations (run_in_sandbox).
 run_bash uses a persistent shell (SandboxSession) so cwd, env vars, and
 background jobs survive across multiple calls within one chat session.
 Tools that need the network (web search) run outside the sandbox entirely,
@@ -35,7 +35,7 @@ class SandboxConfig:
             raise SandboxUnavailable(
                 "bwrap (bubblewrap) not found on PATH; install it "
                 "(e.g. `sudo dnf install bubblewrap` on Fedora) "
-                "before using read_file/write_file/run_bash tools"
+                "before using read_file/edit_file/run_bash tools"
             )
         self.workspace = self.workspace.resolve()
         if not self.workspace.is_dir():
@@ -90,7 +90,7 @@ async def run_in_sandbox(
     command: list[str],
     input_bytes: bytes | None = None,
 ) -> SandboxResult:
-    """One-shot: spawn, run, tear down. Used by read_file/write_file."""
+    """One-shot: spawn, run, tear down. Used by read_file/edit_file."""
     argv = config.build_argv(command)
     proc = await asyncio.create_subprocess_exec(
         *argv,

@@ -1,6 +1,6 @@
 """Tool registry and the built-in tools.
 
-test_tool has no filesystem or process access. read_file/write_file/run_bash
+test_tool has no filesystem or process access. read_file/edit_file/run_bash
 execute inside a bwrap sandbox (see sandbox.py) scoped to one workspace
 directory, with no network access — run_bash uses a persistent SandboxSession
 so shell state survives across calls within one chat. web_search is the one
@@ -37,6 +37,13 @@ class Tool:
 
 @dataclass(slots=True)
 class ToolRegistry:
+    """Named tool set exposed to the model.
+
+    ``max_calls_per_turn`` is reserved for per-turn call limiting in a later
+    phase; it is stored but not yet enforced.
+    """
+
+    max_calls_per_turn: int | None = None
     _tools: dict[str, Tool] = field(default_factory=dict)
 
     def register(self, tool: Tool) -> None:
@@ -130,63 +137,163 @@ web_search_tool = Tool(
 )
 
 
-def _make_fs_tools(sandbox: SandboxConfig, session: SandboxSession) -> list[Tool]:
+def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     async def _read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
         error = validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
-        result = await run_in_sandbox(sandbox, ["cat", path])
+
+        count_result = await run_in_sandbox(sandbox, ["wc", "-l", path])
+        if count_result.exit_code != 0:
+            return ToolResult(ok=False, error=count_result.stderr.strip() or "read failed")
+        try:
+            total_lines = int(count_result.stdout.split()[0])
+        except (IndexError, ValueError):
+            return ToolResult(ok=False, error=f"could not count lines in {path}")
+
+        if "offset" in args or "limit" in args:
+            start = int(args.get("offset") or 1)
+            count = int(args.get("limit") or 2000)
+        elif total_lines > 500:
+            start, count = 1, 200
+        else:
+            start, count = 1, total_lines or 1
+
+        end = start + count - 1
+        result = await run_in_sandbox(sandbox, ["sed", "-n", f"{start},{end}p", path])
         if result.exit_code != 0:
             return ToolResult(ok=False, error=result.stderr.strip() or "read failed")
-        return ToolResult(ok=True, output=result.stdout)
 
-    async def _write_file(args: dict[str, Any]) -> ToolResult:
-        path = args.get("path", "")
-        content = args.get("content", "")
-        error = validate_relpath(path)
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
-        if path.startswith(".refs/") or path.startswith("./.refs/"):
-            return ToolResult(ok=False, error="'.refs/' is read-only")
-        result = await run_in_sandbox(sandbox, ["tee", path], input_bytes=content.encode())
-        if result.exit_code != 0:
-            return ToolResult(ok=False, error=result.stderr.strip() or "write failed")
-        return ToolResult(ok=True, output=f"wrote {len(content)} bytes to {path}")
+        output = result.stdout
+        if end < total_lines:
+            output += (
+                f"\n[showing lines {start}-{end} of {total_lines}; "
+                "pass offset/limit for more]"
+            )
+        return ToolResult(ok=True, output=output)
 
+    return Tool(
+        name="read_file",
+        description=(
+            "Read a file's contents. Paths are relative to the workspace root, "
+            "or '.refs/<alias>' for externally referenced files. Large files "
+            "(over 500 lines) return only the first 200 lines by default; pass "
+            "offset/limit to read further chunks."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line to start reading from (default 1)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "maximum lines to return (default 200 on large files, "
+                        "2000 otherwise)"
+                    ),
+                },
+            },
+            "required": ["path"],
+        },
+        handler=_read_file,
+    )
+
+
+def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
     async def _edit_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
+        mode = args.get("mode", "")
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
         error = validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
-        if path.startswith(".refs/") or path.startswith("./.refs/"):
+        if path.startswith((".refs/", "./.refs/")):
             return ToolResult(ok=False, error="'.refs/' is read-only")
-        if not old_string:
-            return ToolResult(ok=False, error="'old_string' must not be empty", parse_error=True)
 
-        read_result = await run_in_sandbox(sandbox, ["cat", path])
-        if read_result.exit_code != 0:
-            return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
-
-        current = read_result.stdout
-        occurrences = current.count(old_string)
-        if occurrences == 0:
-            return ToolResult(ok=False, error="old_string not found in file")
-        if occurrences > 1:
-            return ToolResult(
-                ok=False,
-                error=f"old_string is not unique ({occurrences} matches); "
-                "include more surrounding context to disambiguate",
+        if mode == "create":
+            exists = await run_in_sandbox(sandbox, ["test", "-e", path])
+            if exists.exit_code == 0:
+                return ToolResult(
+                    ok=False,
+                    error=f"{path} already exists; use mode='replace' to modify it",
+                )
+            write_result = await run_in_sandbox(
+                sandbox, ["tee", path], input_bytes=new_string.encode()
             )
+            if write_result.exit_code != 0:
+                return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+            return ToolResult(ok=True, output=f"created {path} ({len(new_string)} bytes)")
 
-        updated = current.replace(old_string, new_string, 1)
-        write_result = await run_in_sandbox(sandbox, ["tee", path], input_bytes=updated.encode())
-        if write_result.exit_code != 0:
-            return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
-        return ToolResult(ok=True, output=f"applied edit to {path}")
+        if mode == "replace":
+            if not old_string:
+                return ToolResult(
+                    ok=False,
+                    error="'old_string' is required when mode='replace'",
+                    parse_error=True,
+                )
 
+            read_result = await run_in_sandbox(sandbox, ["cat", path])
+            if read_result.exit_code != 0:
+                return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
+
+            current = read_result.stdout
+            occurrences = current.count(old_string)
+            if occurrences == 0:
+                return ToolResult(ok=False, error="old_string not found in file")
+            if occurrences > 1:
+                return ToolResult(
+                    ok=False,
+                    error=f"old_string is not unique ({occurrences} matches); "
+                    "include more surrounding context to disambiguate",
+                )
+
+            updated = current.replace(old_string, new_string, 1)
+            write_result = await run_in_sandbox(
+                sandbox, ["tee", path], input_bytes=updated.encode()
+            )
+            if write_result.exit_code != 0:
+                return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+            return ToolResult(ok=True, output=f"applied edit to {path}")
+
+        return ToolResult(
+            ok=False,
+            error="'mode' must be 'replace' or 'create'",
+            parse_error=True,
+        )
+
+    return Tool(
+        name="edit_file",
+        description=(
+            "Create a new file or edit an existing one. With mode='create', "
+            "write new_string to a path that must not already exist. With "
+            "mode='replace', replace one exact, unique occurrence of "
+            "old_string with new_string — include enough surrounding context "
+            "(a few lines) to disambiguate if the snippet could appear more "
+            "than once. Cannot write under '.refs/', which is read-only."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "mode": {"type": "string", "enum": ["replace", "create"]},
+                "old_string": {
+                    "type": "string",
+                    "description": "required when mode='replace'",
+                },
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "mode", "new_string"],
+        },
+        handler=_edit_file,
+    )
+
+
+def _make_run_bash_tool(session: SandboxSession) -> Tool:
     async def _run_bash(args: dict[str, Any]) -> ToolResult:
         command = args.get("command", "")
         if not command:
@@ -200,73 +307,108 @@ def _make_fs_tools(sandbox: SandboxConfig, session: SandboxSession) -> list[Tool
             error="" if result.exit_code == 0 else f"exit code {result.exit_code}",
         )
 
-    return [
-        Tool(
-            name="read_file",
-            description=(
-                "Read a file's contents. Paths are relative to the workspace root, "
-                "or '.refs/<alias>' for externally referenced files."
-            ),
-            parameters_schema={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-            handler=_read_file,
+    return Tool(
+        name="run_bash",
+        description=(
+            "Run a shell command inside the sandboxed workspace. No network access. "
+            "The shell persists across calls within this chat — cwd and exported "
+            "variables carry over."
         ),
-        Tool(
-            name="write_file",
-            description="Write content to a file in the workspace. Cannot write under '.refs/', which is read-only.",
-            parameters_schema={
-                "type": "object",
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"],
-            },
-            handler=_write_file,
-        ),
-        Tool(
-            name="edit_file",
-            description=(
-                "Replace one exact occurrence of old_string with new_string in a "
-                "file. old_string must match exactly and uniquely — include enough "
-                "surrounding context (a few lines) to disambiguate if the snippet "
-                "could appear more than once."
-            ),
-            parameters_schema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                },
-                "required": ["path", "old_string", "new_string"],
-            },
-            handler=_edit_file,
-        ),
-        Tool(
-            name="run_bash",
-            description=(
-                "Run a shell command inside the sandboxed workspace. No network access. "
-                "The shell persists across calls within this chat — cwd and exported "
-                "variables carry over."
-            ),
-            parameters_schema={
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-            },
-            handler=_run_bash,
-        ),
-    ]
+        parameters_schema={
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+        handler=_run_bash,
+    )
 
 
-def default_registry(
-    sandbox: SandboxConfig | None = None, session: SandboxSession | None = None
+def _make_ask_tool(ask_callback: Callable[[list[str]], Awaitable[list[str] | None]]) -> Tool:
+    """ask: hand questions to the user and return their answers as the result."""
+
+    async def _ask_user(args: dict[str, Any]) -> ToolResult:
+        raw = args.get("questions")
+        if isinstance(raw, str):
+            raw = [raw]
+        questions = [q.strip() for q in raw or [] if isinstance(q, str) and q.strip()]
+        if not questions:
+            return ToolResult(ok=False, error="'questions' must be a non-empty list", parse_error=True)
+        answers = await ask_callback(questions)
+        if answers is None:
+            return ToolResult(ok=True, output="(user skipped the questions — no answers given)")
+        pairs = [f"Q: {q}\nA: {a}" for q, a in zip(questions, answers)]
+        return ToolResult(ok=True, output="\n\n".join(pairs))
+
+    return Tool(
+        name="ask",
+        description=(
+            "Ask the user one or more questions and wait for their answers. "
+            "Use when you need a decision, a missing detail, or confirmation "
+            "before acting. Keep questions short and self-contained."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "the questions to ask (one or more)",
+                }
+            },
+            "required": ["questions"],
+        },
+        handler=_ask_user,
+    )
+
+
+def _make_compact_tool(compact_callback: Callable[[], Awaitable[str]]) -> Tool:
+    """compact: summarize the conversation so far to free context window."""
+
+    async def _compact(args: dict[str, Any]) -> ToolResult:
+        summary = await compact_callback()
+        return ToolResult(ok=True, output=f"conversation compacted. {summary}")
+
+    return Tool(
+        name="compact",
+        description=(
+            "Compact the conversation: everything before this turn is replaced "
+            "with a short summary, freeing context window. Use when the chat is "
+            "long and earlier details no longer need to be verbatim. The current "
+            "turn is not affected."
+        ),
+        parameters_schema={"type": "object", "properties": {}},
+        handler=_compact,
+    )
+
+
+def build_registry(
+    sandbox: SandboxConfig | None,
+    session: SandboxSession | None,
+    mode: str = "write",
+    allow_subagent: bool = True,
+    max_calls_per_turn: int | None = None,
+    ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
+    compact_callback: Callable[[], Awaitable[str]] | None = None,
 ) -> ToolRegistry:
-    registry = ToolRegistry()
+    """Build the tool set for one session.
+
+    plan mode exposes read_file (plus the always-on test_tool/web_search);
+    write mode additionally exposes edit_file and run_bash. ``ask_callback``
+    enables the ask tool (prompts the user in the TUI); ``compact_callback``
+    enables the compact tool (summarizes + truncates the conversation).
+    ``allow_subagent`` is reserved for subagent registration in a later phase.
+    """
+    registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
     registry.register(test_tool)
     registry.register(web_search_tool)
-    if sandbox is not None and session is not None:
-        for tool in _make_fs_tools(sandbox, session):
-            registry.register(tool)
+    if ask_callback is not None:
+        registry.register(_make_ask_tool(ask_callback))
+    if compact_callback is not None:
+        registry.register(_make_compact_tool(compact_callback))
+    if sandbox is not None:
+        registry.register(_make_read_tool(sandbox))  # read_file always available
+        if mode == "write":
+            registry.register(_make_edit_tool(sandbox))  # edit_file
+            if session is not None:
+                registry.register(_make_run_bash_tool(session))  # run_bash
     return registry

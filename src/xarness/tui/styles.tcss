@@ -16,9 +16,25 @@ Screen {
 
 UserMessage {
     width: 1fr;
+    height: auto;
     background: $c-surface;
     color: $c-text;
     padding: 1 0;
+}
+
+.user-row {
+    height: auto;
+}
+
+.user-marker {
+    width: 1;
+    margin-right: 1;
+    color: $c-muted;
+}
+
+.user-content {
+    width: 1fr;
+    color: $c-text;
 }
 
 AssistantMessage {
@@ -139,8 +155,17 @@ ToolCallBlock.expanded .toolcall-row {
     color: $c-muted;
 }
 
+ToolWritingIndicator {
+    height: auto;
+    padding: 0 1;
+}
+
 ErrorLine {
     color: $c-error;
+}
+
+NoticeLine {
+    color: $c-muted;
 }
 
 StatusBar {
@@ -205,29 +230,131 @@ Screen > .screen--selection {
 }
 
 SuggestionPopup {
-    layer: overlay;
-    dock: bottom;
-    offset-y: -1;
-    width: 60;
-    max-height: 10;
+    height: auto;
+    max-height: 8;
     background: $c-surface;
-    border: solid $c-border;
     display: none;
+    /* OptionList's default tall border + padding render as stray vertical
+       bars against the input; keep the popup flat. */
+    border: none;
+    padding: 0;
+    scrollbar-background: $c-surface;
+    scrollbar-color: $c-border;
+    scrollbar-background-hover: $c-surface;
+    scrollbar-color-hover: $c-muted;
+}
+
+SuggestionPopup > .option-list--option {
+    color: $c-text;
+    padding: 0 1;
+}
+
+SuggestionPopup > .option-list--option-highlighted {
+    background: $c-border;
+    color: $c-text;
+}
+
+SuggestionPopup > .option-list--option-hover {
+    background: $c-surface;
+    color: $c-text;
 }
 
 SuggestionPopup.visible {
     display: block;
 }
 
-ResumeScreen, ModelPickerScreen {
+ResumeScreen, PickerScreen {
     align: center middle;
 }
 
-#resume-modal, #model-modal {
-    width: 70;
+#resume-modal, #picker-modal {
+    width: 64;
     height: auto;
     max-height: 20;
     background: $c-surface;
-    border: solid $c-border;
-    padding: 1;
+    border: round $c-border;
+    padding: 1 2;
+}
+
+#resume-title, #picker-title {
+    color: $c-muted;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#resume-search {
+    border: none;
+    border-bottom: solid $c-border;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#resume-search > .input--placeholder {
+    color: $c-muted;
+}
+
+#resume-search:focus {
+    border: none;
+    border-bottom: solid $c-highlight;
+}
+
+#resume-list {
+    background: $c-surface;
+    border: none;
+    padding: 0;
+}
+
+/* ListView defaults to height: 1fr + Textual's own dark $surface, which
+   renders as a big dark block inside the auto-height modal. */
+#picker-list {
+    height: auto;
+    max-height: 16;
+    background: $c-surface;
+    border: none;
+    padding: 0;
+}
+
+#resume-list > ListItem,
+#picker-list > ListItem {
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+}
+
+#resume-list > ListItem.-highlight,
+#picker-list > ListItem.-highlight {
+    background: $c-border;
+    color: $c-text;
+}
+
+#ask-modal {
+    width: 64;
+    height: auto;
+    background: $c-surface;
+    padding: 1 2;
+}
+
+.ask-question {
+    color: $c-text;
+    margin-bottom: 1;
+}
+
+#ask-modal > Input {
+    border: none;
+    border-bottom: solid $c-border;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#ask-modal > Input:focus {
+    border: none;
+    border-bottom: solid $c-highlight;
+}
+
+.ask-hint {
+    color: $c-muted;
 }

@@ -34,12 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--workspace", type=Path, default=None,
-        help="Directory the read_file/write_file/run_bash tools are sandboxed to "
+        help="Directory the read_file/edit_file/run_bash tools are sandboxed to "
         "(default: current directory).",
     )
     chat.add_argument(
         "--no-fs-tools", action="store_true",
-        help="Disable read_file/write_file/run_bash even if bwrap is available.",
+        help="Disable read_file/edit_file/run_bash even if bwrap is available.",
     )
     chat.add_argument(
         "--ref", action="append", default=[], metavar="ALIAS=PATH",
@@ -47,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--session", default=None,
-        help="Name to save/resume this conversation under.",
+        help="Name to save/resume this conversation under. "
+        "(Default: an auto-generated timestamped name — sessions autosave.)",
+    )
+    chat.add_argument(
+        "--no-session", action="store_true",
+        help="Don't save this conversation as a resumable session.",
     )
 
     sessions = subparsers.add_parser("sessions", help="List or delete saved chat sessions")
@@ -112,14 +117,16 @@ def _run_chat(args: argparse.Namespace) -> None:
             print(f"warning: filesystem/bash tools disabled: {exc}", file=sys.stderr)
             sandbox = session = None
 
-    from .tools import default_registry
+    from . import session_store
+    from .tools import build_registry
     from .tui.app import AgentApp
 
-    registry = default_registry(sandbox, session)
+    registry = build_registry(sandbox, session, mode="write")
+
+    session_name = None if args.no_session else (args.session or session_store.new_session_name())
 
     conversation = None
     if args.session:
-        from . import session_store
         if session_store.session_path(args.session).exists():
             conversation = session_store.load_session(args.session)
 
@@ -133,12 +140,15 @@ def _run_chat(args: argparse.Namespace) -> None:
         api_key,
         tool_registry=registry,
         workspace=workspace,
-        session_name=args.session,
+        session_name=session_name,
         config_path=args.config,
         profile_name=profile_name,
+        sandbox=sandbox,
+        sandbox_session=session,
     )
     if conversation is not None:
         app.controller.conversation = conversation
+        app.ensure_system_message()
 
     try:
         app.run()

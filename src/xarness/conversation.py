@@ -21,6 +21,8 @@ class Message:
     content: str = ""
     # Local-only: reasoning-channel text for assistant messages.
     reasoning: str | None = None
+    # Local-only: seconds spent in the reasoning channel (None if unknown).
+    reasoning_seconds: float | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None

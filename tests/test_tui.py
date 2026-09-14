@@ -12,6 +12,7 @@ from xarness.events import (
     ProcessingStarted,
     ReasoningDelta,
     ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
     ToolCallStarted,
     ToolCallStatus,
     TurnComplete,
@@ -20,9 +21,12 @@ from xarness.events import (
 from xarness.tui.app import AgentApp
 from xarness.tui.widgets import (
     ChatInput,
+    ErrorLine,
+    NoticeLine,
     StatusBar,
     ThinkingBlock,
     ToolCallBlock,
+    ToolWritingIndicator,
     UserMessage,
 )
 
@@ -93,8 +97,8 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(user_messages), 1)
             self.assertIn("hi", user_messages.first().text)
 
-            # Answer streamed and finalized.
-            self.assertEqual(app.controller.conversation.messages[1].content, "The answer is 42")
+            # Answer streamed and finalized. (messages[0] is the system prompt.)
+            self.assertEqual(app.controller.conversation.messages[2].content, "The answer is 42")
 
             # Reasoning block collapsed with a duration label.
             thinking = app.query_one(ThinkingBlock)
@@ -103,8 +107,13 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertRegex(thinking.summary_text, r"Thought for \d+\.\d+s")
 
             # Reasoning stored in conversation history regardless of display.
-            assistant_msg = app.controller.conversation.messages[1]
+            assistant_msg = app.controller.conversation.messages[2]
             self.assertEqual(assistant_msg.reasoning, "pondering deeply")
+            self.assertIsNotNone(assistant_msg.reasoning_seconds)
+
+            # Turn ends with a muted "worked for" summary line.
+            notice = app.query_one(NoticeLine)
+            self.assertRegex(str(notice.content), r"worked for \d+\.\d?s")
 
             # Status bar reflects usage and headroom.
             status = app.query_one(StatusBar).text
@@ -125,7 +134,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             await wait_until_idle(app)
 
             self.assertEqual(len(app.query(ThinkingBlock)), 0)
-            self.assertEqual(app.controller.conversation.messages[1].content, "plain answer")
+            self.assertEqual(app.controller.conversation.messages[2].content, "plain answer")
 
     async def test_ctrl_t_toggles_thoughts(self) -> None:
         app, _client = make_app(
@@ -151,17 +160,42 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(thinking.has_class("expanded"))
 
     async def test_queued_message_runs_after_current_turn(self) -> None:
-        app, client = make_app([ContentDelta("first reply"), TurnComplete(usage=Usage(10, 2))], delay=0.3)
+        """A message submitted mid-turn is queued and runs after it."""
+        class GatedClient:
+            """Holds the first turn open until the test releases it, so the
+            second submit reliably lands while the turn is busy."""
+
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+                self._calls = 0
+
+            async def stream(self, wire_messages, tools=None):
+                self._calls += 1
+                yield ProcessingStarted()
+                if self._calls == 1:
+                    yield ContentDelta("first reply")
+                    await self.gate.wait()
+                    yield TurnComplete(usage=Usage(10, 2))
+                else:
+                    yield ContentDelta("second reply")
+                    yield TurnComplete(usage=Usage(30, 5))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
         async with app.run_test() as pilot:
             await pilot.press("a", "enter")
-            # Submit again while the first turn is still running.
-            await pilot.press("b", "enter")
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if app._turn_busy:
+                    break
             self.assertTrue(app._turn_busy)
 
-            client.script = [
-                ContentDelta("second reply"),
-                TurnComplete(usage=Usage(30, 5)),
-            ]
+            # Submit again while the first turn is still running.
+            await pilot.press("b", "enter")
+            self.assertEqual(app._queued, ["b"])
+
+            client.gate.set()
             await wait_until_idle(app)
 
             self.assertEqual(len(app.query(UserMessage)), 2)
@@ -175,6 +209,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             [
                 ToolCallStarted("call_1", "test_tool"),
                 ToolCallArgumentsDelta("call_1", "{}"),
+                ToolCallArgumentsDone("call_1", "test_tool", "{}"),
                 TurnComplete(has_tool_calls=True),
             ]
         )
@@ -192,13 +227,116 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(block.accumulated_arguments, "{}")
             self.assertEqual(block._output_text, "success!")
 
-            # Conversation: user, assistant tool-call turn, tool result, final answer.
+            # Conversation: system, user, assistant tool-call turn, tool result,
+            # final answer.
             roles = [m.role for m in app.controller.conversation.messages]
-            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
-            tool_msg = app.controller.conversation.messages[2]
+            self.assertEqual(
+                roles, ["system", "user", "assistant", "tool", "assistant"]
+            )
+            tool_msg = app.controller.conversation.messages[3]
             self.assertEqual(tool_msg.tool_call_id, "call_1")
             self.assertEqual(tool_msg.content, "success!")
-            self.assertEqual(app.controller.conversation.messages[3].content, "tool says hi")
+            self.assertEqual(app.controller.conversation.messages[4].content, "tool says hi")
+
+    async def test_parallel_tool_calls_show_single_writing_indicator(self) -> None:
+        """While args stream: one 'Writing tools' shimmer, no per-call blocks.
+        Blocks appear (and the indicator leaves) once args are done."""
+        app, client = make_app(
+            [
+                ToolCallStarted("call_1", "test_tool"),
+                ToolCallStarted("call_2", "web_search"),
+                ToolCallArgumentsDelta("call_1", "{}"),
+                ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+                ToolCallArgumentsDone("call_2", "web_search", '"x"'),
+                TurnComplete(has_tool_calls=True),
+            ],
+            delay=0.3,
+        )
+        client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=Usage(5, 2))]
+        ]
+        async with app.run_test() as pilot:
+            # Submit directly: pilot.press drains the whole turn, which would
+            # hide the mid-round state this test inspects.
+            app._submit("go")
+
+            # Wait for call_1's args to finish: its block mounts while call_2
+            # is still streaming — one block plus the shared indicator.
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if len(app.query(ToolCallBlock)) == 1:
+                    break
+            self.assertEqual(len(app.query(ToolCallBlock)), 1)
+            self.assertEqual(len(app.query(ToolWritingIndicator)), 1)
+
+            await wait_until_idle(app)
+            # Indicator gone; both blocks settled.
+            self.assertEqual(len(app.query(ToolWritingIndicator)), 0)
+            self.assertEqual(len(app.query(ToolCallBlock)), 2)
+
+    async def test_ask_tool_returns_user_answers(self) -> None:
+        """The ask tool surfaces AskScreen; answers become the tool result."""
+        app, client = make_app(
+            [
+                ToolCallStarted("call_1", "ask"),
+                ToolCallArgumentsDone(
+                    "call_1", "ask", '{"questions": ["Which db?", "Confirm?"]}'
+                ),
+                TurnComplete(has_tool_calls=True),
+            ],
+            delay=0.05,
+        )
+        client.next_scripts = [
+            [ContentDelta("got it"), TurnComplete(usage=Usage(5, 2))]
+        ]
+        async with app.run_test() as pilot:
+            await pilot.press("a", "s", "k", "enter")
+
+            from xarness.tui.ask_screen import AskScreen
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if isinstance(app.screen, AskScreen):
+                    break
+            self.assertIsInstance(app.screen, AskScreen)
+
+            # Answer both questions; Enter on the last one submits.
+            await pilot.press("p", "g", "enter", "y", "e", "s", "enter")
+            await wait_until_idle(app)
+
+            tool_msg = app.controller.conversation.messages[3]
+            self.assertIn("Q: Which db?", tool_msg.content)
+            self.assertIn("A: pg", tool_msg.content)
+            self.assertIn("A: yes", tool_msg.content)
+            self.assertEqual(app.controller.conversation.messages[4].content, "got it")
+
+    async def test_slash_theme_opens_picker_and_switches(self) -> None:
+        from xarness import theme
+        from xarness.tui.picker_screen import PickerScreen
+
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            theme.set_theme("ayu-darker")
+            # Bare /theme opens the picker (same interaction as /model).
+            await pilot.press("/", "t", "h", "e", "m", "e", "enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, PickerScreen)
+
+            # The list is focused: up/down moves the cursor, enter selects.
+            list_view = app.screen.query_one("#picker-list")
+            self.assertTrue(list_view.has_focus)
+            await pilot.press("down")
+            self.assertEqual(list_view.index, 1)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(theme.CURRENT_THEME, "one-light")
+            self.assertEqual(app.get_css_variables()["c-bg"], theme.PALETTE["bg"])
+
+            # Unknown theme name reports the available options.
+            app._handle_theme_command("nope")
+            await pilot.pause()
+            errors = app.query(ErrorLine)
+            self.assertTrue(errors)
+            self.assertIn("unknown theme", str(errors.last().content))
 
 
 if __name__ == "__main__":

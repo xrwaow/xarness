@@ -2,7 +2,7 @@
 
 import asyncio
 
-from xarness.tools import Tool, ToolRegistry, ToolResult, default_registry
+from xarness.tools import Tool, ToolRegistry, ToolResult, build_registry
 
 
 async def _ok(args: dict) -> ToolResult:
@@ -80,8 +80,8 @@ def test_handler_exception_is_contained() -> None:
     assert "RuntimeError: kaboom" in result.error
 
 
-def test_default_registry_has_test_tool() -> None:
-    registry = default_registry()
+def test_write_registry_has_test_tool() -> None:
+    registry = build_registry(None, None, mode="write")
     result = asyncio.run(registry.call("test_tool", "{}"))
     assert result.ok
     assert result.output == "success!"

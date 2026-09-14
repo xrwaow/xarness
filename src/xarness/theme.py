@@ -10,7 +10,7 @@ from __future__ import annotations
 
 # Semantic keys every theme must define:
 #   bg, surface, border, text, muted, user, reasoning, accent, accent2, status,
-#   error, success, warning, highlight
+#   error, success, warning, highlight, cursor
 THEMES: dict[str, dict[str, str]] = {
     "ayu-darker": {
         "bg": "#121212",              # background
@@ -27,6 +27,7 @@ THEMES: dict[str, dict[str, str]] = {
         "success": "#aad84c",         # green status dot / tool call succeeded
         "warning": "#feb454",         # amber status dot / call in flight
         "highlight": "#bfbdb6",       # generic UI emphasis (hover, focus)
+        "cursor": "#d2a6fe",          # input caret block
     },
     "one-light": {
         "bg": "#fafafa",
@@ -43,6 +44,7 @@ THEMES: dict[str, dict[str, str]] = {
         "success": "#50a14f",
         "warning": "#c18401",
         "highlight": "#383a42",
+        "cursor": "#4078f2",
     },
 }
 
@@ -50,6 +52,7 @@ DEFAULT_THEME = "ayu-darker"
 
 PALETTE: dict[str, str] = {}
 CSS_VARIABLES: dict[str, str] = {}
+CURRENT_THEME: str = DEFAULT_THEME
 SHIMMER_PROCESSING: tuple[str, str] = ("", "")
 SHIMMER_THINKING: tuple[str, str] = ("", "")
 
@@ -59,11 +62,13 @@ SHIMMER_SPEED: float = 8.0
 
 
 def set_theme(name: str) -> None:
-    """Select the active palette. Call once, before AgentApp() is built."""
-    global PALETTE, CSS_VARIABLES, SHIMMER_PROCESSING, SHIMMER_THINKING
+    """Select the active palette. Call once, before AgentApp() is built
+    (or from /theme, followed by App.refresh_css())."""
+    global PALETTE, CSS_VARIABLES, CURRENT_THEME, SHIMMER_PROCESSING, SHIMMER_THINKING
     if name not in THEMES:
         raise ValueError(f"unknown theme '{name}', options: {list(THEMES)}")
     PALETTE = THEMES[name]
+    CURRENT_THEME = name
     CSS_VARIABLES = {f"c-{k}": v for k, v in PALETTE.items()}
     SHIMMER_PROCESSING = (PALETTE["muted"], PALETTE["text"])
     SHIMMER_THINKING = (PALETTE["muted"], PALETTE["surface"])

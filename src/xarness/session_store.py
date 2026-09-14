@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,11 @@ SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
 
 def session_path(name: str) -> Path:
     return SESSIONS_DIR / f"{name}.json"
+
+
+def new_session_name() -> str:
+    """Timestamped unique name for a freshly started session."""
+    return f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
 def save_session(name: str, profile_name: str, conversation: Conversation) -> None:
