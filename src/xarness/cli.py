@@ -11,6 +11,7 @@ from . import __version__
 from .config import (
     DEFAULT_CONFIG_PATH, ConfigError, list_profile_names, load_config, resolve_api_key, resolve_profile_name
 )
+from .gitwork import GitInfo
 from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
 
 
@@ -49,6 +50,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--session", default=None,
         help="Name to save/resume this conversation under. "
         "(Default: an auto-generated timestamped name — sessions autosave.)",
+    )
+    chat.add_argument(
+        "--no-init-repo",
+        action="store_true",
+        help="Don't auto-initialize a git repo when the workspace has none "
+        "(default: xarness runs `git init` itself so change tracking works "
+        "without setup; your files are never modified by this).",
+    )
+    chat.add_argument(
+        "--no-copy-untracked",
+        action="store_true",
+        help="Don't copy the workspace's untracked files into the agent worktree "
+        "(default copies them so the agent can see files you haven't committed yet; "
+        "they are excluded from /accept's commit unless the agent modified them).",
     )
     chat.add_argument(
         "--no-session", action="store_true",
@@ -95,6 +110,71 @@ def _parse_refs(raw_refs: list[str]) -> dict[str, Path]:
     return refs
 
 
+def _prepare_git(
+    args: argparse.Namespace, workspace: Path, session_name: str | None
+) -> tuple[GitInfo | None, list[str], bool]:
+    """Set up worktree isolation before the TUI boots.
+
+    Returns (git_info, startup notices, fs_tools_ok). fs_tools_ok is False in
+    the one unsafe case: a resumed session whose worktree is gone AND cannot
+    be recreated — the sandbox then stays off rather than falling back to the
+    user's real directory.
+    """
+    from . import gitwork, session_store
+
+    async def _setup() -> tuple[GitInfo | None, list[str], bool]:
+        notices: list[str] = []
+
+        # Resume: reconnect to the persisted worktree if there is one.
+        if args.session and session_store.session_path(args.session).exists():
+            block = session_store.load_git_block(args.session)
+            if block is not None:
+                info = gitwork.GitInfo.from_block(block)
+                if await gitwork.worktree_is_valid(info):
+                    return info, notices, True
+                try:
+                    fresh = await gitwork.recreate_worktree(info)
+                except gitwork.GitWorktreeError as exc:
+                    notices.append(
+                        f"error: this session's agent worktree is gone and could not be "
+                        f"recreated ({exc}); filesystem tools are disabled so the agent "
+                        "cannot touch your real directory — start a new session to edit files"
+                    )
+                    return None, notices, False
+                notices.append(
+                    f"note: previous worktree for this session was removed externally; "
+                    f"recreated a fresh one from branch {fresh.branch} — uncommitted agent "
+                    "changes from before are gone"
+                )
+                return fresh, notices, True
+            # Session predates git tracking (no git block). Set up isolation
+            # now if possible — the session shouldn't be penalized forever for
+            # when it was first created.
+            return await _fresh_isolation(notices)
+
+        # Fresh session: isolate if the workspace can be (repos get a
+        # worktree; non-repos get an auto-initialized one unless declined).
+        return await _fresh_isolation(notices)
+
+    async def _fresh_isolation(notices: list[str]) -> tuple[GitInfo | None, list[str], bool]:
+        try:
+            info, notes = await gitwork.setup_isolation(
+                workspace,
+                session_name or session_store.new_session_name(),
+                copy_untracked=not args.no_copy_untracked,
+                allow_init=not args.no_init_repo,
+            )
+        except gitwork.GitWorktreeError as exc:
+            notices.append(
+                f"warning: git worktree isolation unavailable ({exc}); "
+                f"the agent will edit {workspace} directly"
+            )
+            return None, notices, True
+        return info, notices + notes, True
+
+    return asyncio.run(_setup())
+
+
 def _run_chat(args: argparse.Namespace) -> None:
     try:
         profile = load_config(args.config, args.profile)
@@ -107,23 +187,35 @@ def _run_chat(args: argparse.Namespace) -> None:
     refs = _parse_refs(args.ref)
     workspace = args.workspace or Path.cwd()
 
+    from . import session_store
+
+    session_name = None if args.no_session else (args.session or session_store.new_session_name())
+
+    fs_tools_enabled = not args.no_fs_tools
+    git_info: GitInfo | None = None
+    git_notices: list[str] = []
+    if fs_tools_enabled:
+        git_info, git_notices, fs_tools_enabled = _prepare_git(args, workspace, session_name)
+
     sandbox: SandboxConfig | None = None
     session: SandboxSession | None = None
-    if not args.no_fs_tools:
+    if fs_tools_enabled:
+        effective_workspace = git_info.worktree if git_info is not None else workspace
         try:
-            sandbox = SandboxConfig(workspace=workspace, external_refs=refs)
+            sandbox = SandboxConfig(
+                workspace=effective_workspace,
+                external_refs=refs,
+                git_dir=git_info.git_common_dir if git_info is not None else None,
+            )
             session = SandboxSession(sandbox)
         except SandboxUnavailable as exc:
             print(f"warning: filesystem/bash tools disabled: {exc}", file=sys.stderr)
             sandbox = session = None
+    else:
+        effective_workspace = workspace
 
-    from . import session_store
-    from .tools import build_registry
+    from .tools import build_registry  # noqa: F401  (registry built by AgentApp)
     from .tui.app import AgentApp
-
-    registry = build_registry(sandbox, session, mode="write")
-
-    session_name = None if args.no_session else (args.session or session_store.new_session_name())
 
     conversation = None
     if args.session:
@@ -138,13 +230,14 @@ def _run_chat(args: argparse.Namespace) -> None:
     app = AgentApp(
         profile,
         api_key,
-        tool_registry=registry,
-        workspace=workspace,
+        workspace=effective_workspace,
         session_name=session_name,
         config_path=args.config,
         profile_name=profile_name,
         sandbox=sandbox,
         sandbox_session=session,
+        git_info=git_info,
+        startup_notices=git_notices,
     )
     if conversation is not None:
         app.controller.conversation = conversation

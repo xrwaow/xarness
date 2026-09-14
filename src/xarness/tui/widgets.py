@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import ClassVar
+from typing import ClassVar, cast
 
 from rich.style import Style
 from rich.text import Text
@@ -25,6 +25,7 @@ from textual.widgets.text_area import TextAreaTheme
 
 from .. import theme
 from ..events import ToolCallStatus
+from ..gitwork import DiffStat
 
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -471,6 +472,183 @@ class ToolCallBlock(Vertical):
             shimmer.remove()
         verb = self._STATUS_VERB[self._status]
         summary_row.mount(Static(f"{verb} {self.tool_name}", classes="toolcall-summary-text", markup=False))
+
+
+def _colorize_diff(text: str) -> Text:
+    """Unified diff as rich text: + lines green, - lines red, hunk headers
+    and metadata dimmed. Plain line-prefix coloring — no diff parser."""
+    palette = theme.PALETTE
+    out = Text()
+    for line in text.splitlines():
+        if line.startswith(("diff ", "index ", "+++ ", "--- ", "new file", "deleted file", "old mode", "new mode", "similarity ", "rename ", "Binary ")):
+            style = palette["muted"]
+        elif line.startswith("@@"):
+            style = palette["status"]
+        elif line.startswith("+"):
+            style = palette["success"]
+        elif line.startswith("-"):
+            style = palette["error"]
+        else:
+            style = palette["text"]
+        out.append(line, style=style)
+        out.append("\n", style=palette["text"])
+    return out
+
+
+# Sentinel: no diff section currently shown (None is a valid *key* — the full diff).
+_NO_DIFF: object = object()
+
+
+class DiffSummary(Vertical):
+    """Live "Edited N files +A -D" bar above the chat input.
+
+    Collapsed by default, same click-to-expand interaction as ThinkingBlock:
+    clicking the summary line toggles the per-file list; each file row's
+    [diff] affordance (and the summary line's own [diff], which opens the
+    full multi-file diff) posts a ``DiffRequested`` the App fulfills with a
+    git call, since the widget holds no git state itself. Hidden entirely
+    when there are no pending changes.
+    """
+
+    class DiffRequested(Message):
+        def __init__(self, key: str | None) -> None:
+            self.key = key  # None = the full multi-file diff
+            super().__init__()
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._stat: DiffStat | None = None
+        self._active_key: str | None | object = _NO_DIFF
+        self._active_text = ""
+
+    def compose(self):
+        with Horizontal(id="diff-summary-row"):
+            yield Static("", id="diff-summary-text", markup=False)
+            full_btn = Static(
+                Text("[diff]", style=theme.PALETTE["status"]), id="diff-open-full", markup=False
+            )
+            full_btn.diff_key = None  # type: ignore[attr-defined]
+            yield full_btn
+        with Vertical(id="diff-body"):
+            yield Vertical(id="diff-files")
+            yield Static("", id="diff-content", markup=False)
+
+    @property
+    def active_diff_key(self) -> str | None | object:
+        return self._active_key
+
+    @property
+    def diff_shown(self) -> bool:
+        return self._active_key is not _NO_DIFF
+
+    def toggle(self) -> None:
+        if self.has_class("expanded"):
+            self.remove_class("expanded")
+        else:
+            self.add_class("expanded")
+
+    def on_click(self, event: events.Click) -> None:
+        # Rows (and the summary line's [diff]) carry a ``diff_key`` attribute;
+        # clicks on anything else toggle the expanded file list.
+        node = event.widget
+        while node is not None and node is not self:
+            diff_key = getattr(node, "diff_key", _NO_DIFF)
+            if diff_key is not _NO_DIFF:
+                event.stop()
+                self.post_message(self.DiffRequested(cast("str | None", diff_key)))
+                return
+            node = node.parent
+        self.toggle()
+        event.stop()
+
+    async def set_summary(self, stat: DiffStat) -> None:
+        """Rebuild the summary + per-file rows; becomes visible."""
+        self._stat = stat
+        count = len(stat.files)
+        label = Text()
+        label.append(
+            f"Edited {count} file{'s' if count != 1 else ''}",
+            style=f"bold {theme.PALETTE['text']}",
+        )
+        label.append("  ", style=theme.PALETTE["border"])
+        label.append(f"+{stat.additions}", style=theme.PALETTE["success"])
+        label.append(" ", style=theme.PALETTE["text"])
+        label.append(f"-{stat.deletions}", style=theme.PALETTE["error"])
+        self.query_one("#diff-summary-text", Static).update(label)
+
+        files = self.query_one("#diff-files", Vertical)
+        await files.remove_children()
+        for f in stat.files:
+            # Row layout: name  dir/  +N -M — the whole row is clickable and
+            # requests that file's unified diff.
+            row = Horizontal(classes="diff-file-row")
+            row.diff_key = f.path  # type: ignore[attr-defined]
+            await files.mount(row)
+            name = Text(f.path, style=theme.PALETTE["text"])
+            if f.is_new:
+                name.append("  new", style=f"italic {theme.PALETTE['accent']}")
+            row.mount(Static(name, classes="diff-file-name", markup=False))
+            directory = f.path.rsplit("/", 1)[0] + "/" if "/" in f.path else "."
+            row.mount(Static(
+                Text(directory, style=theme.PALETTE["muted"]),
+                classes="diff-file-dir", markup=False,
+            ))
+            stats = Text(f"+{f.additions}", style=theme.PALETTE["success"])
+            stats.append(f" -{f.deletions}", style=theme.PALETTE["error"])
+            row.mount(Static(stats, classes="diff-file-stats", markup=False))
+        self.add_class("visible")
+
+    async def clear(self) -> None:
+        """Hide entirely — no pending changes (or no worktree)."""
+        self._stat = None
+        self._active_key = _NO_DIFF
+        self._active_text = ""
+        self.remove_class("expanded")
+        self.remove_class("visible")
+        if self.is_mounted:
+            content = self.query_one("#diff-content", Static)
+            content.update("")
+            content.remove_class("show")
+            await self.query_one("#diff-files", Vertical).remove_children()
+
+    def show_diff(self, key: str | None, text: str) -> None:
+        """Display one file's (or the full) unified diff inline."""
+        self._active_key = key
+        self._active_text = text
+        self.add_class("visible")
+        self.add_class("expanded")
+        content = self.query_one("#diff-content", Static)
+        content.update(_colorize_diff(text))
+        content.add_class("show")
+        content.scroll_home(animate=False)
+        self._mark_active_row(key)
+
+    def hide_diff(self) -> None:
+        self._active_key = _NO_DIFF
+        self._active_text = ""
+        if self.is_mounted:
+            content = self.query_one("#diff-content", Static)
+            content.update("")
+            content.remove_class("show")
+            self._mark_active_row(None)
+
+    def _mark_active_row(self, key: str | None) -> None:
+        """Highlight the row whose diff is currently displayed."""
+        for row in self.query(".diff-file-row"):
+            if getattr(row, "diff_key", _NO_DIFF) == key:
+                row.add_class("active")
+            else:
+                row.remove_class("active")
+
+    def recolor(self) -> None:
+        """Re-render with the current palette (/theme)."""
+        if not self.is_mounted:
+            return
+        self.query_one("#diff-open-full", Static).update(
+            Text("[diff]", style=theme.PALETTE["status"])
+        )
+        if self._active_key is not _NO_DIFF:
+            self.query_one("#diff-content", Static).update(_colorize_diff(self._active_text))
 
 
 class PendingIndicator(Horizontal):

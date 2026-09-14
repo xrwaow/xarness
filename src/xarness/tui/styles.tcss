@@ -160,6 +160,11 @@ ToolWritingIndicator {
     padding: 0 1;
 }
 
+ErrorLine,
+NoticeLine {
+    padding: 0 1;
+}
+
 ErrorLine {
     color: $c-error;
 }
@@ -261,6 +266,118 @@ SuggestionPopup > .option-list--option-hover {
 
 SuggestionPopup.visible {
     display: block;
+}
+
+DiffSummary {
+    display: none;
+    height: auto;
+    background: $c-surface;
+    padding: 0 1;
+}
+
+DiffSummary.visible {
+    display: block;
+}
+
+#diff-summary-row {
+    height: auto;
+}
+
+#diff-summary-text {
+    width: 1fr;
+    text-overflow: ellipsis;
+}
+
+#diff-open-full {
+    width: auto;
+    margin-left: 2;
+}
+
+DiffSummary:hover #diff-summary-row,
+.diff-file-row:hover {
+    text-style: underline;
+}
+
+#diff-body {
+    display: none;
+    height: auto;
+}
+
+DiffSummary.expanded #diff-body {
+    display: block;
+}
+
+#diff-files {
+    height: auto;
+    max-height: 10;
+    overflow-y: auto;
+}
+
+.diff-file-row {
+    height: auto;
+}
+
+.diff-file-row.active {
+    background: $c-border;
+}
+
+.diff-file-name {
+    width: 26;
+    text-overflow: ellipsis;
+}
+
+.diff-file-dir {
+    width: 1fr;
+    color: $c-muted;
+    text-overflow: ellipsis;
+}
+
+.diff-file-stats {
+    width: auto;
+}
+
+#diff-content {
+    display: none;
+    height: auto;
+    max-height: 14;
+    overflow-y: auto;
+    color: $c-text;
+}
+
+#diff-content.show {
+    display: block;
+}
+
+#confirm-modal {
+    width: 64;
+    height: auto;
+    background: $c-surface;
+    padding: 1 2;
+}
+
+#confirm-title {
+    color: $c-error;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#confirm-detail {
+    color: $c-text;
+    margin-bottom: 1;
+}
+
+#confirm-modal > Input {
+    border: none;
+    border-bottom: solid $c-border;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#confirm-modal > Input:focus {
+    border: none;
+    border-bottom: solid $c-highlight;
 }
 
 ResumeScreen, PickerScreen {

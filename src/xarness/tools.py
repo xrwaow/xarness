@@ -293,11 +293,18 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
     )
 
 
-def _make_run_bash_tool(session: SandboxSession) -> Tool:
+def _make_run_bash_tool(
+    session: SandboxSession,
+    git_guard: Callable[[str], str | None] | None = None,
+) -> Tool:
     async def _run_bash(args: dict[str, Any]) -> ToolResult:
         command = args.get("command", "")
         if not command:
             return ToolResult(ok=False, error="'command' is required", parse_error=True)
+        if git_guard is not None:
+            block_reason = git_guard(command)
+            if block_reason:
+                return ToolResult(ok=False, error=block_reason)
         result = await session.run(command)
         if result.timed_out:
             return ToolResult(ok=False, error="command timed out (shell restarted)")
@@ -312,7 +319,9 @@ def _make_run_bash_tool(session: SandboxSession) -> Tool:
         description=(
             "Run a shell command inside the sandboxed workspace. No network access. "
             "The shell persists across calls within this chat — cwd and exported "
-            "variables carry over."
+            "variables carry over. Branch/worktree git operations (checkout <ref>, "
+            "switch, worktree, branch -d/-D, reset --hard, rebase) are managed by "
+            "the harness and rejected; status/diff/log/show/blame/add/commit work."
         ),
         parameters_schema={
             "type": "object",
@@ -389,6 +398,7 @@ def build_registry(
     max_calls_per_turn: int | None = None,
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
     compact_callback: Callable[[], Awaitable[str]] | None = None,
+    git_guard: Callable[[str], str | None] | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
@@ -396,6 +406,8 @@ def build_registry(
     write mode additionally exposes edit_file and run_bash. ``ask_callback``
     enables the ask tool (prompts the user in the TUI); ``compact_callback``
     enables the compact tool (summarizes + truncates the conversation).
+    ``git_guard`` optionally vetoes run_bash commands that would interfere
+    with harness-managed worktree/branch lifecycle (see gitwork.py).
     ``allow_subagent`` is reserved for subagent registration in a later phase.
     """
     registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
@@ -410,5 +422,5 @@ def build_registry(
         if mode == "write":
             registry.register(_make_edit_tool(sandbox))  # edit_file
             if session is not None:
-                registry.register(_make_run_bash_tool(session))  # run_bash
+                registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
     return registry

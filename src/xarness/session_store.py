@@ -22,13 +22,23 @@ def new_session_name() -> str:
     return f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
-def save_session(name: str, profile_name: str, conversation: Conversation) -> None:
+def save_session(
+    name: str,
+    profile_name: str,
+    conversation: Conversation,
+    git: dict | None = None,
+) -> None:
+    """Persist a session. ``git`` is the harness-managed worktree block
+    (see gitwork.GitInfo.to_block); passing None drops any existing block —
+    which is exactly what accept/reject want after resolving a session."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "profile": profile_name,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "messages": [asdict(m) for m in conversation.messages],
     }
+    if git is not None:
+        data["git"] = git
     session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -38,6 +48,19 @@ def load_session(name: str) -> Conversation:
     for raw in data["messages"]:
         conversation.add(Message(**raw))
     return conversation
+
+
+def load_git_block(name: str) -> dict | None:
+    """The persisted worktree block for a session, or None."""
+    path = session_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    block = data.get("git")
+    return block if isinstance(block, dict) else None
 
 
 def list_sessions() -> list[str]:

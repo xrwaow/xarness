@@ -29,6 +29,14 @@ class SandboxConfig:
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
     timeout_seconds: float = 60.0
+    # Host path of the repo's shared git dir (e.g. <repo>/.git). Bound into
+    # the sandbox at its real path so git works inside a linked worktree:
+    # the worktree's `.git` file points here, and its index lives under
+    # <git-dir>/worktrees/<name>/. Read-write because git add/commit must
+    # update worktree state and the shared object store. The user's actual
+    # checkout is never bound — only the object store/refs this worktree
+    # already shares by design.
+    git_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if shutil.which("bwrap") is None:
@@ -40,6 +48,8 @@ class SandboxConfig:
         self.workspace = self.workspace.resolve()
         if not self.workspace.is_dir():
             raise SandboxUnavailable(f"workspace directory does not exist: {self.workspace}")
+        if self.git_dir is not None:
+            self.git_dir = self.git_dir.resolve()
 
     def ref_path(self, alias: str) -> str:
         return f"/workspace/.refs/{alias}"
@@ -68,6 +78,10 @@ class SandboxConfig:
         argv += self._system_ro_binds()
         argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
         argv += ["--bind", str(self.workspace), "/workspace"]
+        if self.git_dir is not None:
+            # Same path as on the host: the worktree's .git file references it
+            # absolutely, so git inside the sandbox resolves it unchanged.
+            argv += ["--bind", str(self.git_dir), str(self.git_dir)]
         for alias, host_path in self.external_refs.items():
             argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
         argv += ["--chdir", "/workspace", "--unshare-all"]
