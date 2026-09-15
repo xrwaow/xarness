@@ -10,7 +10,10 @@ from __future__ import annotations
 
 # Semantic keys every theme must define:
 #   bg, surface, border, text, muted, user, reasoning, accent, accent2, status,
-#   error, success, warning, highlight, cursor
+#   error, success, warning, highlight, cursor,
+#   diff_add, diff_add_bg, diff_del, diff_del_bg, diff_hunk, diff_meta
+# The diff_* keys style unified diffs: added/removed line foreground plus a
+# full-line background tint (GitHub-style), hunk headers, and gutter/metadata text.
 THEMES: dict[str, dict[str, str]] = {
     "ayu-darker": {
         "bg": "#121212",              # background
@@ -28,6 +31,12 @@ THEMES: dict[str, dict[str, str]] = {
         "warning": "#feb454",         # amber status dot / call in flight
         "highlight": "#bfbdb6",       # generic UI emphasis (hover, focus)
         "cursor": "#d2a6fe",          # input caret block
+        "diff_add": "#aad84c",        # added line text
+        "diff_add_bg": "#182e1c",     # added line background tint
+        "diff_del": "#ef7177",        # removed line text
+        "diff_del_bg": "#2f1a1d",     # removed line background tint
+        "diff_hunk": "#5ac1fe",       # @@ hunk headers
+        "diff_meta": "#8a8986",       # line-number gutter / metadata
     },
     "one-light": {
         "bg": "#fafafa",
@@ -45,6 +54,12 @@ THEMES: dict[str, dict[str, str]] = {
         "warning": "#c18401",
         "highlight": "#383a42",
         "cursor": "#4078f2",
+        "diff_add": "#1a7f37",
+        "diff_add_bg": "#e6ffed",
+        "diff_del": "#cf222e",
+        "diff_del_bg": "#ffebe9",
+        "diff_hunk": "#4078f2",
+        "diff_meta": "#a0a1a7",
     },
 }
 
@@ -70,6 +85,20 @@ def set_theme(name: str) -> None:
     PALETTE = THEMES[name]
     CURRENT_THEME = name
     CSS_VARIABLES = {f"c-{k}": v for k, v in PALETTE.items()}
+    # Textual's built-in themes ship blue scrollbars; re-point the scrollbar
+    # variables at the palette so every scrollbar follows the active theme.
+    # The track uses `surface` (not `bg`) so it stays visible against the
+    # pane background — an invisible track makes the bar read as broken
+    # floating slivers.
+    CSS_VARIABLES.update({
+        "scrollbar": PALETTE["border"],
+        "scrollbar-hover": PALETTE["muted"],
+        "scrollbar-active": PALETTE["muted"],
+        "scrollbar-background": PALETTE["surface"],
+        "scrollbar-background-hover": PALETTE["surface"],
+        "scrollbar-background-active": PALETTE["surface"],
+        "scrollbar-corner-color": PALETTE["surface"],
+    })
     SHIMMER_PROCESSING = (PALETTE["muted"], PALETTE["text"])
     SHIMMER_THINKING = (PALETTE["muted"], PALETTE["surface"])
 

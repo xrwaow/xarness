@@ -26,6 +26,11 @@ class SandboxConfig:
     """Paths and policy for one sandboxed session."""
 
     workspace: Path
+    # Workspace-root-relative subdirectory the session is scoped to ("" = the
+    # whole workspace). When set, the whole workspace is bound read-only (so
+    # git and the surrounding project stay visible) and only this subtree is
+    # re-bound read-write on top; the shell starts inside it.
+    subtree: str = ""
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
     timeout_seconds: float = 60.0
@@ -48,11 +53,42 @@ class SandboxConfig:
         self.workspace = self.workspace.resolve()
         if not self.workspace.is_dir():
             raise SandboxUnavailable(f"workspace directory does not exist: {self.workspace}")
+        self.subtree = self.subtree.strip("/")
+        if self.subtree:
+            sub = Path(self.subtree)
+            if sub.is_absolute() or ".." in sub.parts:
+                raise SandboxUnavailable(f"invalid workspace subtree: {self.subtree}")
+            if not (self.workspace / self.subtree).is_dir():
+                raise SandboxUnavailable(
+                    f"workspace subtree directory does not exist: {self.subtree}"
+                )
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
 
     def ref_path(self, alias: str) -> str:
-        return f"/workspace/.refs/{alias}"
+        base = f"/workspace/{self.subtree}" if self.subtree else "/workspace"
+        return f"{base}/.refs/{alias}"
+
+    def validate_relpath(self, path: str) -> str | None:
+        """Defense-in-depth path check; bwrap's mount namespace is the real
+        enforcement — this just gives a clean error instead of a bwrap
+        failure. With a subtree, tool paths must stay inside it (the
+        read-only .refs/ binds live at the subtree root)."""
+        p = Path(path)
+        if p.is_absolute():
+            return f"path must be relative to the workspace, got absolute path '{path}'"
+        if ".." in p.parts:
+            return f"path must not contain '..', got '{path}'"
+        if self.subtree:
+            norm = path[2:] if path.startswith("./") else path
+            if not norm.startswith(".refs/"):
+                inside = norm == self.subtree or norm.startswith(self.subtree + "/")
+                if not inside:
+                    return (
+                        f"this session is scoped to '{self.subtree}/' — paths outside "
+                        f"it (like '{path}') are read-only"
+                    )
+        return None
 
     def _system_ro_binds(self) -> list[str]:
         args: list[str] = []
@@ -77,14 +113,26 @@ class SandboxConfig:
         argv = ["bwrap"]
         argv += self._system_ro_binds()
         argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
-        argv += ["--bind", str(self.workspace), "/workspace"]
+        chdir = "/workspace"
+        if self.subtree:
+            # Whole workspace read-only — git keeps working (the .git file at
+            # the worktree root stays reachable) and the agent can read the
+            # surrounding project — with the session's subtree re-bound
+            # read-write on top (later binds shadow earlier ones).
+            argv += ["--ro-bind", str(self.workspace), "/workspace"]
+            argv += [
+                "--bind", str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
+            ]
+            chdir = f"/workspace/{self.subtree}"
+        else:
+            argv += ["--bind", str(self.workspace), "/workspace"]
         if self.git_dir is not None:
             # Same path as on the host: the worktree's .git file references it
             # absolutely, so git inside the sandbox resolves it unchanged.
             argv += ["--bind", str(self.git_dir), str(self.git_dir)]
         for alias, host_path in self.external_refs.items():
             argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
-        argv += ["--chdir", "/workspace", "--unshare-all"]
+        argv += ["--chdir", chdir, "--unshare-all"]
         if self.allow_network:
             argv += ["--share-net"]
         argv += ["--die-with-parent", "--", *command]
@@ -193,14 +241,3 @@ class SandboxSession:
             await self._proc.wait()
         finally:
             self._proc = None
-
-
-def validate_relpath(path: str) -> str | None:
-    """Defense-in-depth path check; bwrap's mount namespace is the real
-    enforcement — this just gives a clean error instead of a bwrap failure."""
-    p = Path(path)
-    if p.is_absolute():
-        return f"path must be relative to the workspace, got absolute path '{path}'"
-    if ".." in p.parts:
-        return f"path must not contain '..', got '{path}'"
-    return None

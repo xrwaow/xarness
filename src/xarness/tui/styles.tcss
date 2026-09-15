@@ -1,6 +1,10 @@
 Screen {
     layout: vertical;
     background: $c-bg;
+    /* The diff pane owns scrolling when a diff is open; never show the
+       screen-level (outer) scrollbar next to it. Wheel/key scrolling of the
+       screen still works if the content ever exceeds the terminal. */
+    scrollbar-size: 0 0;
 }
 
 #chat-log {
@@ -176,7 +180,7 @@ NoticeLine {
 StatusBar {
     height: 1;
     background: $c-bg;
-    padding: 0 1;
+    padding: 0;
 }
 
 #input-wrap {
@@ -191,7 +195,7 @@ ChatInput {
     border: none;
     background: $c-surface;
     color: $c-text;
-    padding: 0 1;
+    padding: 0;
 }
 
 MarkdownFence {
@@ -240,13 +244,11 @@ SuggestionPopup {
     background: $c-surface;
     display: none;
     /* OptionList's default tall border + padding render as stray vertical
-       bars against the input; keep the popup flat. */
+       bars against the input; keep the popup flat. The scrollbar visual is
+       hidden too — arrow-key highlight (and the wheel) still scroll it. */
     border: none;
     padding: 0;
-    scrollbar-background: $c-surface;
-    scrollbar-color: $c-border;
-    scrollbar-background-hover: $c-surface;
-    scrollbar-color-hover: $c-muted;
+    scrollbar-size: 0 0;
 }
 
 SuggestionPopup > .option-list--option {
@@ -272,11 +274,13 @@ DiffSummary {
     display: none;
     height: auto;
     background: $c-surface;
-    padding: 0 1;
+    padding: 0;
 }
 
 DiffSummary.visible {
     display: block;
+    /* Separator between the diff panel and the chat input below. */
+    border-bottom: solid $c-border;
 }
 
 #diff-summary-row {
@@ -286,11 +290,20 @@ DiffSummary.visible {
 #diff-summary-text {
     width: 1fr;
     text-overflow: ellipsis;
+    color: $c-text;
+    text-style: bold;
 }
 
-#diff-open-full {
+#diff-summary-add {
     width: auto;
     margin-left: 2;
+    color: $c-success;
+}
+
+#diff-summary-del {
+    width: auto;
+    margin-left: 1;
+    color: $c-error;
 }
 
 DiffSummary:hover #diff-summary-row,
@@ -309,8 +322,6 @@ DiffSummary.expanded #diff-body {
 
 #diff-files {
     height: auto;
-    max-height: 10;
-    overflow-y: auto;
 }
 
 .diff-file-row {
@@ -324,6 +335,7 @@ DiffSummary.expanded #diff-body {
 .diff-file-name {
     width: 26;
     text-overflow: ellipsis;
+    color: $c-text;
 }
 
 .diff-file-dir {
@@ -332,20 +344,51 @@ DiffSummary.expanded #diff-body {
     text-overflow: ellipsis;
 }
 
-.diff-file-stats {
+.diff-file-new {
     width: auto;
+    margin-left: 1;
+    color: $c-accent;
+    text-style: italic;
+}
+
+.diff-file-add {
+    width: auto;
+    margin-left: 2;
+    color: $c-success;
+}
+
+.diff-file-del {
+    width: auto;
+    margin-left: 1;
+    color: $c-error;
 }
 
 #diff-content {
     display: none;
     height: auto;
-    max-height: 14;
+    max-height: 24;
     overflow-y: auto;
+    /* No scrollbar visual: the pane stays keyboard/wheel scrollable, and the
+       gutter would eat width from every diff line. */
+    scrollbar-size: 0 0;
+    /* Textual shows a spurious horizontal scrollbar on scroll containers
+       even with no horizontal overflow; diff lines wrap, so it is useless. */
+    overflow-x: hidden;
     color: $c-text;
+    background: $c-bg;
+    border-top: solid $c-border;
 }
 
 #diff-content.show {
     display: block;
+}
+
+#diff-content:focus {
+    border-top: solid $c-status;
+}
+
+#diff-text {
+    width: 1fr;
 }
 
 #confirm-modal {

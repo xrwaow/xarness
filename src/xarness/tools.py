@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox, validate_relpath
+from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
 
 
 @dataclass(slots=True)
@@ -140,7 +140,7 @@ web_search_tool = Tool(
 def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     async def _read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        error = validate_relpath(path)
+        error = sandbox.validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
 
@@ -209,7 +209,7 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         mode = args.get("mode", "")
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
-        error = validate_relpath(path)
+        error = sandbox.validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
         if path.startswith((".refs/", "./.refs/")):

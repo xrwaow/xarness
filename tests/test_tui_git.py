@@ -14,23 +14,16 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from textual.widgets import Static
 from xarness import gitwork, session_store
 from xarness.conversation import Conversation
 from xarness.controller import ChatController
-from xarness.config import CotStrength, ProviderProfile
 from xarness.gitwork import GitInfo, create_worktree, detect_repo, remove_worktree
 from xarness.events import ContentDelta, ToolCallArgumentsDone, ToolCallStarted, TurnComplete
 from xarness.tui.app import AgentApp
 from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.widgets import DiffSummary, ErrorLine, NoticeLine
-
-PROFILE = ProviderProfile(
-    base_url="https://api.example.test/v1",
-    model_id="test-model",
-    shown_name="Test Model",
-    max_context=1000,
-    cot_strength=CotStrength.MEDIUM,
-)
+from test_tui import PROFILE
 
 
 class FakeClient:
@@ -119,7 +112,6 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
     async def test_diff_summary_hidden_without_git_session(self):
         client = FakeClient([ContentDelta("hi"), TurnComplete(usage=None)])
-        from xarness.controller import ChatController
         controller = ChatController(PROFILE, "k", client=client)
         app = AgentApp(PROFILE, "k", controller=controller)
         async with app.run_test() as pilot:
@@ -131,19 +123,14 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
     async def test_diff_summary_appears_after_tool_turn(self):
         script = [
             ToolCallStarted("c1", "test_tool"),
-            {"done": True},  # placeholder replaced below
-        ]
-        # Build the script explicitly (TurnComplete with tool calls).
-        from xarness.events import ToolCallArgumentsDone
-        script = [
-            ToolCallStarted("c1", "test_tool"),
             ToolCallArgumentsDone("c1", "test_tool", "{}"),
             TurnComplete(has_tool_calls=True),
         ]
         app, info = await self.make_git_app(script)
+        client = app.controller._client
         # Queue: turn-1 final answer, then turn-2's tool round + final answer
         # (a turn only recomputes the summary when it ran tools).
-        app.controller._client.next_scripts = [
+        client.next_scripts = [
             [ContentDelta("done"), TurnComplete(usage=None)],
             [
                 ToolCallStarted("c2", "test_tool"),
@@ -171,20 +158,20 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(summary.has_class("visible"))
             text = str(app.query_one("#diff-summary-text").content)
             self.assertIn("Edited 1 file", text)
-            self.assertIn("+2", text)
-            self.assertIn("-0", text)
+            self.assertIn("+2", str(app.query_one("#diff-summary-add").content))
+            self.assertIn("-0", str(app.query_one("#diff-summary-del").content))
 
             # Expand: per-file rows (name, dir, stats) relative to the root.
             summary.toggle()
             rows = app.query(".diff-file-row")
             self.assertEqual(len(rows), 1)
             self.assertIn("app.py", str(rows.first().query_one(".diff-file-name").content))
-            stats_text = str(rows.first().query_one(".diff-file-stats").content)
-            self.assertIn("+2", stats_text)
-            self.assertIn("-0", stats_text)
+            add_text = str(rows.first().query_one(".diff-file-add").content)
+            del_text = str(rows.first().query_one(".diff-file-del").content)
+            self.assertIn("+2", add_text)
+            self.assertIn("-0", del_text)
 
     async def test_diff_content_renders_requested_diff(self):
-        from xarness.events import ToolCallArgumentsDone
         script = [
             ToolCallStarted("c1", "test_tool"),
             ToolCallArgumentsDone("c1", "test_tool", "{}"),
@@ -203,7 +190,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             await self.wait_until(lambda: summary.active_diff_key == "app.py")
             content = app.query_one("#diff-content")
             self.assertTrue(content.has_class("show"))
-            self.assertIn("app.py", str(content.content))
+            self.assertIn("app.py", str(app.query_one("#diff-text", Static).content))
 
             # Requesting the same key again collapses the diff.
             app.post_message(DiffSummary.DiffRequested("app.py"))
@@ -236,12 +223,61 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             app._handle_slash_command("/diff app.py")
             await self.wait_until(lambda: summary.diff_shown and summary.active_diff_key == "app.py")
             self.assertTrue(summary.has_class("visible"))
-            rendered = str(app.query_one("#diff-content").content)
+            rendered = str(app.query_one("#diff-text", Static).content)
             self.assertIn("app.py", rendered)
             self.assertNotIn("new.py", rendered)
             active = app.query(".diff-file-row.active")
             self.assertEqual(len(active), 1)
             self.assertEqual(active.first().diff_key, "app.py")
+
+    async def test_escape_minimizes_diff_then_collapses_list(self):
+        """esc #1 minimizes an open diff (list stays up, row stays highlighted,
+        focus moves to the list); arrows + enter navigate/open from there;
+        esc #2 collapses the list back to the bare summary line."""
+        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        (info.worktree / "app.py").write_text("agent edit\n")
+        (info.worktree / "new.py").write_text("brand new\n")
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await self.wait_until(lambda: not app._turn_busy)
+            summary = app.query_one("#diff-summary", DiffSummary)
+            content = app.query_one("#diff-content")
+
+            # Open one file's diff; the pane takes focus for arrow-key paging.
+            app._handle_slash_command("/diff app.py")
+            await self.wait_until(lambda: summary.diff_shown)
+            await self.wait_until(lambda: app.focused is content)
+
+            # First escape: minimize the diff, keep the list + highlight, and
+            # hand focus to the summary for keyboard navigation.
+            await pilot.press("escape")
+            await self.wait_until(lambda: not summary.diff_shown)
+            self.assertTrue(summary.has_class("expanded"))
+            self.assertTrue(summary.has_class("visible"))
+            self.assertFalse(content.has_class("show"))
+            await self.wait_until(lambda: app.focused is summary)
+            self.assertEqual(len(app.query(".diff-file-row.active")), 1)
+
+            # Down moves the highlight; enter opens the highlighted diff and
+            # refocuses the pane (so arrows page the diff again).
+            await pilot.press("down")
+            active = app.query(".diff-file-row.active").first()
+            self.assertEqual(active.diff_key, "new.py")
+            await pilot.press("enter")
+            await self.wait_until(
+                lambda: summary.diff_shown and summary.active_diff_key == "new.py"
+            )
+            await self.wait_until(lambda: app.focused is content)
+
+            # Escape minimizes again; a second escape collapses the list —
+            # only the summary line remains and focus returns to the input.
+            await pilot.press("escape")
+            await self.wait_until(lambda: not summary.diff_shown)
+            await pilot.press("escape")
+            await self.wait_until(lambda: not summary.has_class("expanded"))
+            self.assertTrue(summary.has_class("visible"))
+            self.assertFalse(content.has_class("show"))
+            await self.wait_until(lambda: app.focused is app.query_one("#chat-input"))
 
     async def test_slash_diff_without_changes_or_git(self):
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
@@ -293,6 +329,11 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(info.worktree.exists())
             self.assertNotIn("agent/testsess", _git(self.repo, "branch"))
+            # No agent/* branch of any kind survives a confirmed reject.
+            self.assertFalse(any(
+                b.strip().lstrip("* ").startswith("agent/")
+                for b in _git(self.repo, "branch").splitlines()
+            ))
             # User's directory untouched.
             self.assertEqual((self.repo / "app.py").read_text(), "line1\nline2\n")
             # Session JSON no longer carries a git block.

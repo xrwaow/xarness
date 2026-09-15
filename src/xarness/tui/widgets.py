@@ -16,7 +16,7 @@ from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static, TextArea
@@ -253,7 +253,11 @@ class AssistantMessage(Vertical):
         if settled:
             await self._settle(settled)
             self._live_text = remainder
-        self.query_one(".assistant-live", Static).update(self._live_text)
+        # Display-only rstrip: models often end a message with blank lines
+        # before requesting tool calls, and the raw live tail renders them as
+        # a blank gap until finalize() swaps in Markdown (which strips them).
+        # _live_text itself stays intact for the fence-settling logic above.
+        self.query_one(".assistant-live", Static).update(self._live_text.rstrip())
 
     async def _settle(self, chunk: str) -> None:
         self._has_settled = True
@@ -474,24 +478,95 @@ class ToolCallBlock(Vertical):
         summary_row.mount(Static(f"{verb} {self.tool_name}", classes="toolcall-summary-text", markup=False))
 
 
-def _colorize_diff(text: str) -> Text:
-    """Unified diff as rich text: + lines green, - lines red, hunk headers
-    and metadata dimmed. Plain line-prefix coloring — no diff parser."""
-    palette = theme.PALETTE
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _render_diff(text: str) -> Text:
+    """Unified diff as GitHub-style rich text.
+
+    Each file collapses to one `── path` header with new/deleted/renamed
+    badges (the index/mode/---/+++ prologue is parsed and dropped, binary
+    changes become a short notice); +/- lines get a full-line background
+    tint from the theme's diff colors, with old/new line numbers in a
+    muted gutter. Plain stateful parse — no external diff library."""
+    p = theme.PALETTE
     out = Text()
+    header_path: str | None = None
+    header_badges: list[str] = []
+    header_renamed = False
+
+    def flush_header() -> None:
+        nonlocal header_path, header_renamed
+        if header_path is None:
+            return
+        if out:
+            out.append("\n")  # blank separator between files
+        out.append("── ", style=p["border"])
+        out.append(header_path, style=f"bold {p['text']}")
+        if "new" in header_badges:
+            out.append("  new", style=f"italic {p['accent']}")
+        if "deleted" in header_badges:
+            out.append("  deleted", style=f"italic {p['error']}")
+        if header_renamed:
+            out.append("  renamed", style=f"italic {p['accent2']}")
+        out.append("\n")
+        header_path = None
+        header_badges.clear()
+        header_renamed = False
+
+    def row(old: str, new: str, marker: str, body: str, fg: str, bg: str | None) -> None:
+        tint = f" on {bg}" if bg else ""
+        out.append(f"{old:>4} ", style=p["diff_meta"] + tint)
+        out.append(f"{new:>4} ", style=p["diff_meta"] + tint)
+        out.append(f"{marker} ", style=fg + tint)
+        out.append(body, style=fg + tint)
+        out.append("\n", style=tint)
+
+    old_no = new_no = 0
+    in_header = False
     for line in text.splitlines():
-        if line.startswith(("diff ", "index ", "+++ ", "--- ", "new file", "deleted file", "old mode", "new mode", "similarity ", "rename ", "Binary ")):
-            style = palette["muted"]
-        elif line.startswith("@@"):
-            style = palette["status"]
+        if line.startswith("diff --git"):
+            flush_header()
+            header_path = line.split(" b/", 1)[1] if " b/" in line else line[11:].strip()
+            in_header = True
+            continue
+        if in_header and line.startswith(("@@", "Binary")):
+            in_header = False  # prologue ended
+        elif in_header:
+            if line.startswith("new file mode"):
+                header_badges.append("new")
+            elif line.startswith("deleted file mode"):
+                header_badges.append("deleted")
+            elif line.startswith("rename "):
+                header_renamed = True
+            # index/mode/similarity/---/+++ lines: parsed above, not shown
+            continue
+
+        if line.startswith("@@"):
+            flush_header()
+            m = _HUNK_RE.match(line)
+            if m:
+                old_no, new_no = int(m.group(1)), int(m.group(3))
+            out.append(line, style=p["diff_hunk"])
+            out.append("\n")
+        elif line.startswith("Binary"):
+            flush_header()
+            out.append("binary file differs", style=f"italic {p['diff_meta']}")
+            out.append("\n")
         elif line.startswith("+"):
-            style = palette["success"]
+            row("", str(new_no), "+", line[1:], p["diff_add"], p["diff_add_bg"])
+            new_no += 1
         elif line.startswith("-"):
-            style = palette["error"]
+            row(str(old_no), "", "-", line[1:], p["diff_del"], p["diff_del_bg"])
+            old_no += 1
+        elif line.startswith("\\"):
+            out.append("      ⋯ no newline at end of file\n", style=f"italic {p['diff_meta']}")
         else:
-            style = palette["text"]
-        out.append(line, style=style)
-        out.append("\n", style=palette["text"])
+            flush_header()
+            row(str(old_no), str(new_no), " ", line[1:] if line else "", p["text"], None)
+            old_no += 1
+            new_no += 1
+    flush_header()
     return out
 
 
@@ -499,16 +574,56 @@ def _colorize_diff(text: str) -> Text:
 _NO_DIFF: object = object()
 
 
+class DiffText(VerticalScroll):
+    """Capped, focusable diff pane with its own scrollbar. Up/down pages by
+    the pane's full visible height; only when the pane is already scrolled to
+    its top/bottom do the arrows step to the previous/next file's diff. With
+    the full diff (or nothing) open the arrows never step files."""
+
+    can_focus = True
+
+    def _summary(self) -> "DiffSummary | None":
+        node = self.parent
+        while node is not None and not isinstance(node, DiffSummary):
+            node = node.parent
+        return node  # type: ignore[return-value]
+
+    def _step_file(self, delta: int) -> bool:
+        summary = self._summary()
+        if summary is None:
+            return False
+        key = summary._active_key
+        if not isinstance(key, str):
+            return False
+        return summary._request_neighbour(key, delta)
+
+    def action_scroll_up(self) -> None:
+        if self.scroll_offset.y <= 0 and self._step_file(-1):
+            return
+        self.scroll_page_up(animate=False)
+
+    def action_scroll_down(self) -> None:
+        if self.is_vertical_scroll_end and self._step_file(1):
+            return
+        self.scroll_page_down(animate=False)
+
+
 class DiffSummary(Vertical):
     """Live "Edited N files +A -D" bar above the chat input.
 
     Collapsed by default, same click-to-expand interaction as ThinkingBlock:
-    clicking the summary line toggles the per-file list; each file row's
-    [diff] affordance (and the summary line's own [diff], which opens the
-    full multi-file diff) posts a ``DiffRequested`` the App fulfills with a
-    git call, since the widget holds no git state itself. Hidden entirely
-    when there are no pending changes.
+    clicking the summary line toggles the per-file list; clicking a file row
+    posts a ``DiffRequested`` the App fulfills with a git call, since the
+    widget holds no git state itself. Hidden entirely when there are no
+    pending changes.
+
+    Keyboard, once the list has focus (escape minimizes an open diff into
+    this state): up/down move the highlighted row, enter opens its diff, and
+    a further escape (via the app's priority interrupt binding) collapses
+    the list back to the bare summary line.
     """
+
+    can_focus = True  # arrow-key navigation over the file list once minimized
 
     class DiffRequested(Message):
         def __init__(self, key: str | None) -> None:
@@ -521,17 +636,33 @@ class DiffSummary(Vertical):
         self._active_key: str | None | object = _NO_DIFF
         self._active_text = ""
 
+    def _request_neighbour(self, key: str, delta: int) -> bool:
+        """Post a DiffRequested for the file adjacent to ``key`` in the file
+        list (delta -1/+1); True if a request was posted."""
+        if self._stat is None:
+            return False
+        paths = [f.path for f in self._stat.files]
+        try:
+            index = paths.index(key)
+        except ValueError:
+            return False
+        neighbor = index + delta
+        if not 0 <= neighbor < len(paths):
+            return False
+        self.post_message(self.DiffRequested(paths[neighbor]))
+        return True
+
     def compose(self):
         with Horizontal(id="diff-summary-row"):
             yield Static("", id="diff-summary-text", markup=False)
-            full_btn = Static(
-                Text("[diff]", style=theme.PALETTE["status"]), id="diff-open-full", markup=False
-            )
-            full_btn.diff_key = None  # type: ignore[attr-defined]
-            yield full_btn
+            yield Static("", id="diff-summary-add", markup=False)
+            yield Static("", id="diff-summary-del", markup=False)
         with Vertical(id="diff-body"):
             yield Vertical(id="diff-files")
-            yield Static("", id="diff-content", markup=False)
+            # Focusable scroll container: click it (or tab to it) and the
+            # diff scrolls with the keyboard; the wheel scrolls on hover.
+            with DiffText(id="diff-content"):
+                yield Static("", id="diff-text", markup=False)
 
     @property
     def active_diff_key(self) -> str | None | object:
@@ -547,9 +678,25 @@ class DiffSummary(Vertical):
         else:
             self.add_class("expanded")
 
+    def minimize_diff(self) -> None:
+        """Hide the open diff pane but keep the file list up with the last
+        viewed file's row still highlighted, and take focus so arrow keys +
+        enter can open another file's diff (escape again collapses)."""
+        self._active_key = _NO_DIFF
+        self._active_text = ""
+        if self.is_mounted:
+            self.query_one("#diff-text", Static).update("")
+            self.query_one("#diff-content", DiffText).remove_class("show")
+        self.focus()
+
+    def collapse(self) -> None:
+        """Close the expanded file list; only the summary line remains."""
+        self.remove_class("expanded")
+        self.app.query_one("#chat-input", ChatInput).focus()
+
     def on_click(self, event: events.Click) -> None:
-        # Rows (and the summary line's [diff]) carry a ``diff_key`` attribute;
-        # clicks on anything else toggle the expanded file list.
+        # Rows carry a ``diff_key`` attribute; clicks on anything else toggle
+        # the expanded file list.
         node = event.widget
         while node is not None and node is not self:
             diff_key = getattr(node, "diff_key", _NO_DIFF)
@@ -561,41 +708,81 @@ class DiffSummary(Vertical):
         self.toggle()
         event.stop()
 
+    def on_key(self, event: events.Key) -> None:
+        """File-list navigation while focused with no diff open: up/down move
+        the row highlight, enter opens the highlighted file's diff. With a
+        diff open the keys belong to the diff pane (scroll/page), so stay out
+        of the way — they only reach here bubbled up from DiffText."""
+        if self.diff_shown or not self.has_class("expanded") or self._stat is None:
+            return
+        if event.key in ("up", "down", "enter"):
+            event.prevent_default()
+            event.stop()
+            if event.key == "enter":
+                self._open_highlighted()
+            else:
+                self._move_highlight(-1 if event.key == "up" else 1)
+
+    def _active_row_index(self) -> int | None:
+        for index, row in enumerate(self.query(".diff-file-row")):
+            if row.has_class("active"):
+                return index
+        return None
+
+    def _move_highlight(self, delta: int) -> None:
+        rows = list(self.query(".diff-file-row"))
+        if not rows:
+            return
+        current = self._active_row_index()
+        index = 0 if current is None else max(0, min(len(rows) - 1, current + delta))
+        self._mark_active_row(cast("str | None", getattr(rows[index], "diff_key", None)))
+
+    def _open_highlighted(self) -> None:
+        rows = list(self.query(".diff-file-row"))
+        index = self._active_row_index()
+        if index is None or index >= len(rows):
+            return
+        key = getattr(rows[index], "diff_key", None)
+        if key is not None:
+            self.post_message(self.DiffRequested(cast("str | None", key)))
+
     async def set_summary(self, stat: DiffStat) -> None:
         """Rebuild the summary + per-file rows; becomes visible."""
         self._stat = stat
         count = len(stat.files)
-        label = Text()
-        label.append(
-            f"Edited {count} file{'s' if count != 1 else ''}",
-            style=f"bold {theme.PALETTE['text']}",
+        # Colors are CSS ($c-* variables) applied to the Statics — keep the
+        # Text unstyled so /theme recolors these rows live.
+        self.query_one("#diff-summary-text", Static).update(
+            Text(f"Edited {count} file{'s' if count != 1 else ''}")
         )
-        label.append("  ", style=theme.PALETTE["border"])
-        label.append(f"+{stat.additions}", style=theme.PALETTE["success"])
-        label.append(" ", style=theme.PALETTE["text"])
-        label.append(f"-{stat.deletions}", style=theme.PALETTE["error"])
-        self.query_one("#diff-summary-text", Static).update(label)
+        self.query_one("#diff-summary-add", Static).update(Text(f"+{stat.additions}"))
+        self.query_one("#diff-summary-del", Static).update(Text(f"-{stat.deletions}"))
 
         files = self.query_one("#diff-files", Vertical)
         await files.remove_children()
+        # Pad the +/- counts to a uniform width across the file list so the
+        # right-aligned tail (and the "new" badge) sits at the same column
+        # on every row regardless of digit count.
+        add_w = max(len(f"+{f.additions}") for f in stat.files)
+        del_w = max(len(f"-{f.deletions}") for f in stat.files)
         for f in stat.files:
-            # Row layout: name  dir/  +N -M — the whole row is clickable and
-            # requests that file's unified diff.
+            # Row layout: name  dir/  [new]  +N -M — the whole row is
+            # clickable and requests that file's unified diff. The "new"
+            # badge gets its own column so it never wraps the file name.
             row = Horizontal(classes="diff-file-row")
             row.diff_key = f.path  # type: ignore[attr-defined]
             await files.mount(row)
-            name = Text(f.path, style=theme.PALETTE["text"])
+            row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
+            directory = f.path.rsplit("/", 1)[0] + "/" if "/" in f.path else ""
+            row.mount(Static(Text(directory), classes="diff-file-dir", markup=False))
             if f.is_new:
-                name.append("  new", style=f"italic {theme.PALETTE['accent']}")
-            row.mount(Static(name, classes="diff-file-name", markup=False))
-            directory = f.path.rsplit("/", 1)[0] + "/" if "/" in f.path else "."
+                row.mount(Static(Text("new"), classes="diff-file-new", markup=False))
             row.mount(Static(
-                Text(directory, style=theme.PALETTE["muted"]),
-                classes="diff-file-dir", markup=False,
+                Text(f"+{f.additions}".rjust(add_w)), classes="diff-file-add", markup=False,
             ))
-            stats = Text(f"+{f.additions}", style=theme.PALETTE["success"])
-            stats.append(f" -{f.deletions}", style=theme.PALETTE["error"])
-            row.mount(Static(stats, classes="diff-file-stats", markup=False))
+            row.mount(Static(
+                Text(f"-{f.deletions}".rjust(del_w)), classes="diff-file-del", markup=False,
+            ))
         self.add_class("visible")
 
     async def clear(self) -> None:
@@ -606,9 +793,8 @@ class DiffSummary(Vertical):
         self.remove_class("expanded")
         self.remove_class("visible")
         if self.is_mounted:
-            content = self.query_one("#diff-content", Static)
-            content.update("")
-            content.remove_class("show")
+            self.query_one("#diff-text", Static).update("")
+            self.query_one("#diff-content", DiffText).remove_class("show")
             await self.query_one("#diff-files", Vertical).remove_children()
 
     def show_diff(self, key: str | None, text: str) -> None:
@@ -617,20 +803,23 @@ class DiffSummary(Vertical):
         self._active_text = text
         self.add_class("visible")
         self.add_class("expanded")
-        content = self.query_one("#diff-content", Static)
-        content.update(_colorize_diff(text))
+        content = self.query_one("#diff-content", DiffText)
+        self.query_one("#diff-text", Static).update(_render_diff(text))
         content.add_class("show")
-        content.scroll_home(animate=False)
+        content.focus()  # arrow keys page / step files right away
+        # Defer until the container is laid out, or scrolling is a no-op.
+        content.call_after_refresh(content.scroll_home, animate=False)
         self._mark_active_row(key)
 
     def hide_diff(self) -> None:
         self._active_key = _NO_DIFF
         self._active_text = ""
         if self.is_mounted:
-            content = self.query_one("#diff-content", Static)
-            content.update("")
-            content.remove_class("show")
+            self.query_one("#diff-text", Static).update("")
+            self.query_one("#diff-content", DiffText).remove_class("show")
             self._mark_active_row(None)
+            # The diff pane may have held focus; hand it back to the input.
+            self.app.query_one("#chat-input", ChatInput).focus()
 
     def _mark_active_row(self, key: str | None) -> None:
         """Highlight the row whose diff is currently displayed."""
@@ -641,14 +830,15 @@ class DiffSummary(Vertical):
                 row.remove_class("active")
 
     def recolor(self) -> None:
-        """Re-render with the current palette (/theme)."""
+        """Re-render with the current palette (/theme).
+
+        All row/summary/button colors are CSS variables, so the stylesheet
+        recolors them live; only the diff text bakes palette colors into
+        rich styles and needs a re-render."""
         if not self.is_mounted:
             return
-        self.query_one("#diff-open-full", Static).update(
-            Text("[diff]", style=theme.PALETTE["status"])
-        )
         if self._active_key is not _NO_DIFF:
-            self.query_one("#diff-content", Static).update(_colorize_diff(self._active_text))
+            self.query_one("#diff-text", Static).update(_render_diff(self._active_text))
 
 
 class PendingIndicator(Horizontal):

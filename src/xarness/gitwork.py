@@ -33,7 +33,7 @@ import os
 import re
 import shlex
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -68,20 +68,27 @@ class GitInfo:
     worktree: Path
     original_workspace: Path
     git_common_dir: Path
+    # Repo-root-relative posix subdirectory the session is scoped to ("" =
+    # the whole repo). Set when the user's --workspace sits inside a bigger
+    # repo: the sandbox binds only this subtree read-write, and diffs cover
+    # only it, so the rest of the user's repo stays out of the session.
+    subtree: str = ""
     # Untracked files copied from the user's checkout at worktree creation so
     # the agent can see them. Tracked separately so accept can avoid committing
     # the ones the agent never touched (they stay untracked in the user's repo).
     copied_untracked: list[str] = field(default_factory=list)
 
+    @property
+    def agent_workspace(self) -> Path:
+        """Directory the agent works in: the scoped subtree of the worktree,
+        or the worktree root for a whole-repo session."""
+        return self.worktree / self.subtree if self.subtree else self.worktree
+
     def to_block(self) -> dict:
+        """JSON-safe dict for the session file (paths as strings)."""
         return {
-            "session_id": self.session_id,
-            "base_ref": self.base_ref,
-            "branch": self.branch,
-            "worktree": str(self.worktree),
-            "original_workspace": str(self.original_workspace),
-            "git_common_dir": str(self.git_common_dir),
-            "copied_untracked": list(self.copied_untracked),
+            k: str(v) if isinstance(v, Path) else v
+            for k, v in asdict(self).items()
         }
 
     @classmethod
@@ -93,6 +100,7 @@ class GitInfo:
             worktree=Path(block["worktree"]),
             original_workspace=Path(block["original_workspace"]),
             git_common_dir=Path(block["git_common_dir"]),
+            subtree=block.get("subtree", ""),
             copied_untracked=list(block.get("copied_untracked", [])),
         )
 
@@ -148,7 +156,7 @@ async def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str, 
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_GIT_TIMEOUT)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise GitWorktreeError(f"git {' '.join(args)} timed out") from None
@@ -218,6 +226,15 @@ async def init_managed_repo(workspace: Path) -> RepoInfo:
     return repo
 
 
+async def _commit_identity(cwd: Path) -> list[str]:
+    """``-c user.name/email`` overrides for repos with no configured identity
+    (common right after the harness auto-initialized one)."""
+    rc, email, _ = await _run_git(["config", "user.email"], cwd=cwd)
+    if rc == 0 and email.strip():
+        return []
+    return ["-c", "user.name=xarness", "-c", "user.email=xarness@localhost"]
+
+
 async def create_baseline_commit(repo: RepoInfo) -> str:
     """Snapshot the workspace's current state as the repo's first commit.
 
@@ -226,12 +243,9 @@ async def create_baseline_commit(repo: RepoInfo) -> str:
     ``--allow-empty`` covers a completely empty workspace.
     """
     await _run_git(["add", "-A"], cwd=repo.root)
-    rc, email, _ = await _run_git(["config", "user.email"], cwd=repo.root)
-    identity: list[str] = []
-    if rc != 0 or not email.strip():
-        identity = ["-c", "user.name=xarness", "-c", "user.email=xarness@localhost"]
     rc, _, err = await _run_git(
-        [*identity, "commit", "-q", "--allow-empty", "-m", "xarness: baseline snapshot of your workspace"],
+        [*await _commit_identity(repo.root), "commit", "-q", "--allow-empty",
+         "-m", "xarness: baseline snapshot of your workspace"],
         cwd=repo.root,
     )
     if rc != 0:
@@ -251,15 +265,21 @@ def _untracked_from_status(status_z: str) -> list[str]:
     ]
 
 
-async def copy_untracked_files(original: Path, worktree: Path) -> list[str]:
+async def copy_untracked_files(
+    original: Path, worktree: Path, subtree: str = ""
+) -> list[str]:
     """Copy the user's untracked files (and only those — never a blanket
     directory copy, which would drag in gitignored secrets/huge files) into
-    the fresh worktree. Returns the relative paths copied."""
+    the fresh worktree. With ``subtree`` (repo-root relative), only files
+    under it are copied. Returns the relative paths copied."""
     rc, out, _ = await _run_git(["status", "--porcelain", "-uall", "-z"], cwd=original)
     if rc != 0:
         return []
+    prefix = f"{subtree}/" if subtree else ""
     copied: list[str] = []
     for rel in _untracked_from_status(out):
+        if subtree and not rel.startswith(prefix):
+            continue
         src = original / rel
         if not src.is_file():
             continue
@@ -270,19 +290,42 @@ async def copy_untracked_files(original: Path, worktree: Path) -> list[str]:
     return copied
 
 
+async def _free_branch_name(root: Path, base: str) -> str:
+    """``base``, or ``base-2``, ``base-3``, … — first name without a branch.
+
+    Needed because resuming a resolved session reuses its session id, and
+    /accept keeps the agent branch as history: a fresh worktree for the same
+    session must never clobber that kept branch.
+    """
+    candidate, n = base, 2
+    while True:
+        rc, _, _ = await _run_git(
+            ["rev-parse", "-q", "--verify", f"refs/heads/{candidate}"], cwd=root
+        )
+        if rc != 0:
+            return candidate
+        candidate = f"{base}-{n}"
+        n += 1
+
+
 async def create_worktree(
-    repo: RepoInfo, session_id: str, copy_untracked: bool = True
+    repo: RepoInfo, session_id: str, copy_untracked: bool = True, subtree: str = ""
 ) -> GitInfo:
     """Create ``agent/<session-id>`` + its worktree outside the repo tree.
 
     Never touches the user's checkout — ``git worktree add`` only writes to
     the shared git dir and the new worktree path. On an unborn HEAD a
     baseline snapshot commit is created first (a worktree needs a commit).
+
+    With ``subtree`` (repo-root-relative posix path), the session is scoped
+    to that subdirectory: it is created in the worktree if missing (git only
+    checks out tracked files), untracked files are copied only from under
+    it, and GitInfo.subtree scopes the sandbox + diffs to it.
     """
     if repo.base_ref is None:
         repo.base_ref = await create_baseline_commit(repo)
     worktree_path = WORKTREES_DIR / session_id
-    branch = f"agent/{session_id}"
+    branch = await _free_branch_name(repo.root, f"agent/{session_id}")
     WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     if worktree_path.exists():
         # Harness-owned leftover (e.g. a crashed prior run with the same id).
@@ -296,6 +339,8 @@ async def create_worktree(
         raise GitWorktreeError(
             f"git worktree add failed: {err.strip() or out.strip()}"
         )
+    if subtree:
+        (worktree_path / subtree).mkdir(parents=True, exist_ok=True)
     info = GitInfo(
         session_id=session_id,
         base_ref=repo.base_ref,
@@ -303,9 +348,12 @@ async def create_worktree(
         worktree=worktree_path,
         original_workspace=repo.root,
         git_common_dir=repo.git_common_dir,
+        subtree=subtree,
     )
     if copy_untracked:
-        info.copied_untracked = await copy_untracked_files(repo.root, worktree_path)
+        info.copied_untracked = await copy_untracked_files(
+            repo.root, worktree_path, subtree=subtree
+        )
     return info
 
 
@@ -325,6 +373,7 @@ async def setup_isolation(
     back to direct editing exactly as before this feature existed.
     """
     notes: list[str] = []
+    workspace = Path(workspace).resolve()
     repo = await detect_repo(workspace)
     if repo is None:
         if not allow_init:
@@ -340,7 +389,20 @@ async def setup_isolation(
             "your repo has no commits yet — snapshotting the current files as "
             "the baseline commit so the agent's changes can be tracked"
         )
-    info = await create_worktree(repo, session_id, copy_untracked=copy_untracked)
+    subtree = ""
+    if repo.root != workspace:
+        # The workspace is a subdirectory of the repo: scope the session to
+        # it, so the diff/accept surface (and the agent's sandbox) only ever
+        # cover the directory the user actually pointed at.
+        subtree = workspace.relative_to(repo.root).as_posix()
+        notes.append(
+            f"workspace is inside an existing repo — tracking is scoped to "
+            f"{subtree}/; the rest of the repo is visible to the agent but "
+            "read-only"
+        )
+    info = await create_worktree(
+        repo, session_id, copy_untracked=copy_untracked, subtree=subtree
+    )
     notes.append(
         f"git isolation: agent edits go to worktree {info.worktree} "
         f"(branch {info.branch}, base {info.base_ref[:8]}); "
@@ -358,11 +420,10 @@ async def worktree_is_valid(info: GitInfo) -> bool:
     )
     if rc != 0:
         return False
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            if Path(line[len("worktree "):]).resolve() == info.worktree.resolve():
-                return True
-    return False
+    return any(
+        Path(line[len("worktree "):]).resolve() == info.worktree.resolve()
+        for line in out.splitlines() if line.startswith("worktree ")
+    )
 
 
 async def recreate_worktree(info: GitInfo) -> GitInfo:
@@ -388,8 +449,10 @@ async def recreate_worktree(info: GitInfo) -> GitInfo:
             f"could not recreate worktree: {err.strip() or out.strip()}"
         )
     info.copied_untracked = await copy_untracked_files(
-        info.original_workspace, info.worktree
+        info.original_workspace, info.worktree, subtree=info.subtree
     )
+    if info.subtree:
+        (info.worktree / info.subtree).mkdir(parents=True, exist_ok=True)
     return info
 
 
@@ -398,14 +461,10 @@ async def recreate_worktree(info: GitInfo) -> GitInfo:
 
 
 async def stage_untracked(worktree: Path) -> None:
-    """``git add -N`` every untracked file so intent-to-add makes plain
-    ``git diff`` the single source of truth for new files too."""
-    rc, out, _ = await _run_git(["status", "--porcelain", "-uall", "-z"], cwd=worktree)
-    if rc != 0:
-        return
-    paths = _untracked_from_status(out)
-    if paths:
-        await _run_git(["add", "-N", "--", *paths], cwd=worktree)
+    """``git add -N -A`` every path so intent-to-add makes plain ``git diff``
+    the single source of truth for new files too. Idempotent: untracked paths
+    only, safe to call repeatedly."""
+    await _run_git(["add", "-N", "-A"], cwd=worktree)
 
 
 def _clean_numstat_path(raw: str) -> str:
@@ -417,13 +476,33 @@ def _clean_numstat_path(raw: str) -> str:
     return path
 
 
-async def diff_stat(worktree: Path, base_ref: str) -> DiffStat:
-    """Per-file +/- line counts of everything in the worktree vs base_ref
-    (staged, unstaged, intent-to-add, and committed-but-unmerged)."""
+async def _run_diff(
+    worktree: Path, base_ref: str, *extra: str, subtree: str = ""
+) -> str:
+    """Shared plumbing for diff_stat/git_diff: stage untracked paths first,
+    then diff the worktree against base_ref. ``-M`` is passed explicitly so
+    rename detection works regardless of the user's diff.renames config.
+    With ``subtree``, the diff is limited to that worktree subdirectory and
+    its paths are reported relative to it (git --relative), so a session
+    scoped to a workspace inside a bigger repo only sees its own files."""
     await stage_untracked(worktree)
-    rc, out, err = await _run_git(["diff", "--numstat", base_ref], cwd=worktree)
+    args = ["diff", "-M"]
+    if subtree:
+        args.append("--relative")
+    args.append(base_ref)
+    rc, out, err = await _run_git(
+        [*args, *extra], cwd=worktree / subtree if subtree else worktree
+    )
     if rc != 0:
-        raise GitWorktreeError(f"git diff --numstat failed: {err.strip()}")
+        raise GitWorktreeError(f"git diff failed: {err.strip()}")
+    return out
+
+
+async def diff_stat(worktree: Path, base_ref: str, subtree: str = "") -> DiffStat:
+    """Per-file +/- line counts of everything in the worktree vs base_ref
+    (staged, unstaged, intent-to-add, and committed-but-unmerged). With
+    ``subtree``, limited to that subdirectory, paths relative to it."""
+    out = await _run_diff(worktree, base_ref, "--numstat", subtree=subtree)
     files: list[FileDiff] = []
     for line in out.splitlines():
         if not line.strip():
@@ -437,27 +516,24 @@ async def diff_stat(worktree: Path, base_ref: str) -> DiffStat:
             additions=0 if adds == "-" else int(adds or 0),
             deletions=0 if dels == "-" else int(dels or 0),
         ))
-    rc, tree, _ = await _run_git(["ls-tree", "--name-only", "-r", base_ref], cwd=worktree)
+    rc, tree, _ = await _run_git(
+        ["ls-tree", "--name-only", "-r", base_ref],
+        cwd=worktree / subtree if subtree else worktree,
+    )
     base_files = set(tree.splitlines()) if rc == 0 else set()
     for f in files:
         f.is_new = f.path not in base_files
     return DiffStat(files=files)
 
 
-async def full_diff(worktree: Path, base_ref: str) -> str:
-    await stage_untracked(worktree)
-    rc, out, err = await _run_git(["diff", base_ref], cwd=worktree)
-    if rc != 0:
-        raise GitWorktreeError(f"git diff failed: {err.strip()}")
-    return out
-
-
-async def file_diff(worktree: Path, base_ref: str, path: str) -> str:
-    await stage_untracked(worktree)
-    rc, out, err = await _run_git(["diff", base_ref, "--", path], cwd=worktree)
-    if rc != 0:
-        raise GitWorktreeError(f"git diff failed: {err.strip()}")
-    return out
+async def git_diff(
+    worktree: Path, base_ref: str, path: str | None = None, subtree: str = ""
+) -> str:
+    """Unified diff of the worktree vs base_ref (staged, unstaged,
+    intent-to-add, and committed-but-unmerged), optionally limited to one
+    path (subtree-relative when ``subtree`` is set)."""
+    extra: tuple[str, ...] = ("--", path) if path else ()
+    return await _run_diff(worktree, base_ref, *extra, subtree=subtree)
 
 
 # ----------------------------------------------------------------------
@@ -490,12 +566,9 @@ async def commit_worktree_changes(info: GitInfo) -> str:
     rc, _, _ = await _run_git(["diff", "--cached", "--quiet"], cwd=info.worktree)
     if rc == 0:
         return "nothing-staged"
-    rc, email, _ = await _run_git(["config", "user.email"], cwd=info.worktree)
-    identity: list[str] = []
-    if rc != 0 or not email.strip():
-        identity = ["-c", "user.name=xarness agent", "-c", "user.email=xarness@localhost"]
     rc, out, err = await _run_git(
-        [*identity, "commit", "-q", "-m", f"xarness: session {info.session_id} changes"],
+        [*await _commit_identity(info.worktree), "commit", "-q",
+         "-m", f"xarness: session {info.session_id} changes"],
         cwd=info.worktree,
     )
     if rc != 0:
@@ -534,7 +607,7 @@ async def remove_worktree(original_root: Path, worktree: Path, force: bool = Fal
     if force:
         args.append("--force")
     args.append(str(worktree))
-    rc, out, err = await _run_git(args, cwd=original_root)
+    rc, _, _ = await _run_git(args, cwd=original_root)
     if rc != 0:
         # Entry may be stale (dir already gone) — prune, then force the
         # harness-owned directory away as a last resort.

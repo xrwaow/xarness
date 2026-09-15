@@ -111,9 +111,9 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(assistant_msg.reasoning, "pondering deeply")
             self.assertIsNotNone(assistant_msg.reasoning_seconds)
 
-            # Turn ends with a muted "worked for" summary line.
+            # Turn ends with a muted "Worked for" summary line.
             notice = app.query_one(NoticeLine)
-            self.assertRegex(str(notice.content), r"worked for \d+\.\d?s")
+            self.assertRegex(str(notice.content), r"Worked for \d+\.\d?s")
 
             # Status bar reflects usage and headroom.
             status = app.query_one(StatusBar).text

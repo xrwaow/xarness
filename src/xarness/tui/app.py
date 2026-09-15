@@ -18,7 +18,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import OptionList, TextArea
+from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
 
 from .. import theme
@@ -32,7 +32,7 @@ from ..events import (
 from ..file_search import search_files
 from ..gitwork import (
     GitInfo, GitWorktreeError, MergeOutcome, check_blocked_git, commit_worktree_changes,
-    delete_branch, diff_stat, file_diff, full_diff, merge_branch, recreate_worktree,
+    delete_branch, diff_stat, git_diff, merge_branch, recreate_worktree,
     remove_worktree, worktree_is_valid,
 )
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
@@ -158,7 +158,7 @@ class AgentApp(App[None]):
         if any(m.role != "system" for m in self.controller.conversation.messages):
             await self._render_history()
         for notice in self.startup_notices:
-            self.query_one("#chat-log", VerticalScroll).mount(NoticeLine(notice))
+            self._post_line(NoticeLine(notice))
         # On a resumed session this reconnects the pending-changes summary.
         await self.refresh_diff_summary()
 
@@ -190,10 +190,9 @@ class AgentApp(App[None]):
     def _handle_slash_command(self, text: str) -> None:
         parts = text[1:].split(maxsplit=1)
         cmd = parts[0] if parts else ""
-        chat = self.query_one("#chat-log", VerticalScroll)
         if cmd == "tools":
             names = ", ".join(t["function"]["name"] for t in self.tool_registry.schema())
-            chat.mount(ErrorLine(f"tools: {names}"))
+            self._post_line(ErrorLine(f"tools: {names}"))
         elif cmd == "sessions":
             self.push_screen(ResumeScreen(), self._on_session_selected)
         elif cmd == "new":
@@ -207,12 +206,12 @@ class AgentApp(App[None]):
             self._show_diff_command(arg)
         elif cmd == "model":
             if self.config_path is None:
-                chat.mount(ErrorLine("/model unavailable: no config path known"))
+                self._post_line(ErrorLine("/model unavailable: no config path known"))
                 return
             try:
                 self._profiles_cache = load_all_profiles(self.config_path)
             except ConfigError as exc:
-                chat.mount(ErrorLine(f"/model failed: {exc}"))
+                self._post_line(ErrorLine(f"/model failed: {exc}"))
                 return
             self.push_screen(
                 PickerScreen(
@@ -248,7 +247,7 @@ class AgentApp(App[None]):
                     self._on_theme_selected,
                 )
         else:
-            chat.mount(ErrorLine(f"unknown command: /{cmd}"))
+            self._post_line(ErrorLine(f"unknown command: /{cmd}"))
 
     # ------------------------------------------------------------------
     # Git worktree state (diff summary + accept/reject)
@@ -261,7 +260,7 @@ class AgentApp(App[None]):
             info = self.git_info
             if info is None:
                 return None
-            return check_blocked_git(command, info.branch, info.worktree)
+            return check_blocked_git(command, info.branch, info.agent_workspace)
 
         return guard
 
@@ -273,7 +272,7 @@ class AgentApp(App[None]):
             await widget.clear()
             return
         try:
-            stat = await diff_stat(info.worktree, info.base_ref)
+            stat = await diff_stat(info.worktree, info.base_ref, info.subtree)
         except GitWorktreeError:
             await widget.clear()  # worktree vanished / git broken: stay quiet
             return
@@ -292,12 +291,14 @@ class AgentApp(App[None]):
             return
         try:
             if event.key is None:
-                text = await full_diff(info.worktree, info.base_ref)
+                text = await git_diff(info.worktree, info.base_ref, subtree=info.subtree)
             else:
-                text = await file_diff(info.worktree, info.base_ref, event.key)
+                text = await git_diff(
+                    info.worktree, info.base_ref, event.key, subtree=info.subtree
+                )
         except GitWorktreeError as exc:
             widget.hide_diff()
-            self.query_one("#chat-log", VerticalScroll).mount(ErrorLine(f"diff failed: {exc}"))
+            self._post_line(ErrorLine(f"diff failed: {exc}"))
             return
         widget.show_diff(event.key, text)
 
@@ -306,10 +307,9 @@ class AgentApp(App[None]):
         """Slash /diff: toggle the pending-changes panel — the first /diff
         expands the per-file list, /diff again hides it entirely. With an
         argument, /diff <path> shows that one file's unified diff."""
-        chat = self.query_one("#chat-log", VerticalScroll)
         info = self.git_info
         if info is None:
-            chat.mount(ErrorLine(
+            self._post_line(ErrorLine(
                 "/diff: no pending-changes tracking for this session — the workspace "
                 "could not be isolated with git (auto-init disabled via --no-init-repo, "
                 "or repo setup failed), so the agent edits it directly"
@@ -324,19 +324,19 @@ class AgentApp(App[None]):
                 return
             await self.refresh_diff_summary()
             if not widget.has_class("visible"):
-                chat.mount(NoticeLine("no pending changes to diff"))
+                self._post_line(NoticeLine("no pending changes to diff"))
                 return
             widget.add_class("expanded")
             return
 
         try:
-            text = await file_diff(info.worktree, info.base_ref, arg)
+            text = await git_diff(info.worktree, info.base_ref, arg, subtree=info.subtree)
         except GitWorktreeError as exc:
             widget.hide_diff()
-            chat.mount(ErrorLine(f"/diff failed: {exc}"))
+            self._post_line(ErrorLine(f"/diff failed: {exc}"))
             return
         if not text.strip():
-            chat.mount(NoticeLine(f"no pending changes for {arg}"))
+            self._post_line(NoticeLine(f"no pending changes for {arg}"))
             return
         # Rebuild the row list first (a previous /diff toggle may have cleared
         # it) so the active-row highlight has something to attach to.
@@ -344,19 +344,24 @@ class AgentApp(App[None]):
         widget.show_diff(arg, text)
 
     async def _rebind_worktree(self, info: GitInfo, chat: VerticalScroll) -> None:
-        """Point the sandbox + tools at a (possibly resumed) worktree."""
+        """Point the sandbox + tools at a (possibly resumed) worktree.
+
+        ``chat`` is kept for signature symmetry with the other worktree
+        helpers; failures are posted through _post_line."""
         if self.sandbox_session is not None:
             await self.sandbox_session.close()
             self.sandbox_session = None
         sandbox: SandboxConfig | None = None
         try:
-            sandbox = SandboxConfig(workspace=info.worktree, git_dir=info.git_common_dir)
+            sandbox = SandboxConfig(
+                workspace=info.worktree, subtree=info.subtree, git_dir=info.git_common_dir
+            )
         except SandboxUnavailable as exc:
-            chat.mount(ErrorLine(f"filesystem tools unavailable: {exc}"))
+            self._post_line(ErrorLine(f"filesystem tools unavailable: {exc}"))
         self.sandbox = sandbox
         self.sandbox_session = SandboxSession(sandbox) if sandbox is not None else None
         self.git_info = info
-        self.workspace = info.worktree
+        self.workspace = info.agent_workspace
         self.tool_registry = build_registry(
             sandbox, self.sandbox_session, mode=self.mode,
             ask_callback=self._ask_user, compact_callback=self._compact_conversation,
@@ -383,61 +388,74 @@ class AgentApp(App[None]):
                 git=self.git_info.to_block() if self.git_info else None,
             )
 
-    @work(group="git-action", exclusive=True)
-    async def _start_accept(self) -> None:
-        """Merge agent/<id> into the user's branch in their real checkout."""
+    def _git_action_preflight(self, label: str) -> tuple[GitInfo, VerticalScroll] | None:
+        """Shared /accept //reject guards; mounts an error line if blocked."""
         chat = self.query_one("#chat-log", VerticalScroll)
         info = self.git_info
         if info is None:
-            chat.mount(ErrorLine("/accept: this session has no git worktree (the workspace isn't a git repo, or the changes were already resolved)"))
-            return
+            self._post_line(ErrorLine(
+                f"/{label}: this session has no git worktree (the workspace isn't "
+                "a git repo, or the changes were already resolved)"
+            ))
+            return None
         if self._turn_busy:
-            chat.mount(ErrorLine("/accept: wait for the current turn to finish first"))
+            self._post_line(ErrorLine(f"/{label}: wait for the current turn to finish first"))
+            return None
+        return info, chat
+
+    async def _finish_git_action(self, message: str) -> None:
+        """Post-resolution cleanup shared by accept and reject."""
+        self._disable_fs_tools()
+        self._persist_git_state()
+        await self.refresh_diff_summary()
+        self._post_line(NoticeLine(message))
+        self._post_line(NoticeLine(
+            "filesystem tools disabled — /new starts a fresh session with a new worktree"
+        ))
+
+    @work(group="git-action", exclusive=True)
+    async def _start_accept(self) -> None:
+        """Merge agent/<id> into the user's branch in their real checkout."""
+        preflight = self._git_action_preflight("accept")
+        if preflight is None:
             return
-        chat.mount(NoticeLine(f"accepting: committing worktree changes and merging {info.branch}…"))
+        info, _chat = preflight
+        self._post_line(NoticeLine(f"accepting: committing worktree changes and merging {info.branch}…"))
         try:
             await commit_worktree_changes(info)
             result = await merge_branch(info.original_workspace, info.branch)
         except GitWorktreeError as exc:
-            chat.mount(ErrorLine(f"/accept failed: {exc}"))
+            self._post_line(ErrorLine(f"/accept failed: {exc}"))
             return
         if result.outcome is MergeOutcome.IN_PROGRESS:
-            chat.mount(ErrorLine(
+            self._post_line(ErrorLine(
                 f"/accept: a merge is already unresolved in {info.original_workspace}. "
                 "Finish it there with normal git tooling, commit, then run /accept again."
             ))
             return
         if result.outcome is MergeOutcome.CONFLICT:
-            chat.mount(ErrorLine(
+            self._post_line(ErrorLine(
                 f"/accept: merge conflicts in {info.original_workspace} — your branch moved on "
                 "since the session started. Resolve them there with normal git tooling and "
                 "commit the merge; the worktree was left in place so you can retry /accept."
             ))
             return
         if result.outcome is MergeOutcome.ERROR:
-            chat.mount(ErrorLine(f"/accept failed: {result.detail}"))
+            self._post_line(ErrorLine(f"/accept failed: {result.detail}"))
             return
         await remove_worktree(info.original_workspace, info.worktree)
-        self._disable_fs_tools()
-        self._persist_git_state()
-        await self.refresh_diff_summary()
-        chat.mount(NoticeLine(
+        await self._finish_git_action(
             f"accepted: changes merged into your working directory; worktree removed. "
             f"Branch {info.branch} kept as history (delete with: git branch -D {info.branch})."
-        ))
-        chat.mount(NoticeLine("filesystem tools disabled — /new starts a fresh session with a new worktree"))
+        )
 
     @work(group="git-action", exclusive=True)
     async def _start_reject(self) -> None:
         """Discard everything: force-remove the worktree, delete the branch."""
-        chat = self.query_one("#chat-log", VerticalScroll)
-        info = self.git_info
-        if info is None:
-            chat.mount(ErrorLine("/reject: this session has no git worktree"))
+        preflight = self._git_action_preflight("reject")
+        if preflight is None:
             return
-        if self._turn_busy:
-            chat.mount(ErrorLine("/reject: wait for the current turn to finish first"))
-            return
+        info, _chat = preflight
         confirmed = await self.push_screen(ConfirmScreen(
             title="Reject agent changes?",
             detail=(
@@ -453,13 +471,11 @@ class AgentApp(App[None]):
             await remove_worktree(info.original_workspace, info.worktree, force=True)
             await delete_branch(info.original_workspace, info.branch)
         except GitWorktreeError as exc:
-            chat.mount(ErrorLine(f"/reject failed: {exc}"))
+            self._post_line(ErrorLine(f"/reject failed: {exc}"))
             return
-        self._disable_fs_tools()
-        self._persist_git_state()
-        await self.refresh_diff_summary()
-        chat.mount(NoticeLine("rejected: worktree and branch removed; your working directory was never modified"))
-        chat.mount(NoticeLine("filesystem tools disabled — /new starts a fresh session with a new worktree"))
+        await self._finish_git_action(
+            "rejected: worktree and branch removed; your working directory was never modified"
+        )
 
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
@@ -467,9 +483,8 @@ class AgentApp(App[None]):
 
     def _handle_theme_command(self, arg: str) -> None:
         """Apply an explicitly named theme, or report the available ones."""
-        chat = self.query_one("#chat-log", VerticalScroll)
         if arg not in theme.THEMES:
-            chat.mount(ErrorLine(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}"))
+            self._post_line(ErrorLine(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}"))
             return
         self._apply_theme(arg)
 
@@ -564,9 +579,9 @@ class AgentApp(App[None]):
                     )
         await self._render_history()
         for note in notes:
-            chat.mount(NoticeLine(note))
+            self._post_line(NoticeLine(note))
         for error in errors:
-            chat.mount(ErrorLine(error))
+            self._post_line(ErrorLine(error))
         await self.refresh_diff_summary()
 
     def _on_model_selected(self, name: str | None) -> None:
@@ -578,8 +593,7 @@ class AgentApp(App[None]):
         try:
             api_key = resolve_api_key(profile)
         except ConfigError as exc:
-            chat = self.query_one("#chat-log", VerticalScroll)
-            chat.mount(ErrorLine(f"could not switch model: {exc}"))
+            self._post_line(ErrorLine(f"could not switch model: {exc}"))
             return
         # Swap the provider underneath the existing controller: client,
         # conversation, and tools all carry over.
@@ -638,7 +652,14 @@ class AgentApp(App[None]):
 
     def on_chat_input_slash_query(self, event: ChatInput.SlashQuery) -> None:
         q = event.query.lower()
-        matches = [(name, f"/{name}  {desc}") for name, desc in SLASH_COMMANDS if name.startswith(q)]
+        # Table-style rows: commands padded to a shared column, descriptions
+        # dimmed — same layout language as the session list.
+        width = max(len(name) for name, _ in SLASH_COMMANDS)
+        matches = [
+            (name, f"/{name:<{width}}  [dim]{desc}[/]")
+            for name, desc in SLASH_COMMANDS
+            if name.startswith(q)
+        ]
         # Exact match first (stable sort keeps declaration order otherwise), so
         # typing "/mode" highlights /mode rather than /model.
         matches.sort(key=lambda m: m[0] != q)
@@ -715,6 +736,17 @@ class AgentApp(App[None]):
     def _hide_popup(self) -> None:
         self.query_one("#suggestion-popup", SuggestionPopup).remove_class("visible")
 
+    def _post_line(self, widget: Static) -> None:
+        """Mount a notice/error line into the chat log, keeping it in view
+        when the log is already at the bottom — otherwise it lands below the
+        fold, and a stale scroll position also stops the next turn from
+        auto-following (see _at_bottom)."""
+        chat = self.query_one("#chat-log", VerticalScroll)
+        follow = self._at_bottom(chat)
+        chat.mount(widget)
+        if follow:
+            chat.call_after_refresh(chat.scroll_end, animate=False)
+
     def _submit(self, text: str) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
         follow = self._at_bottom(chat)
@@ -752,6 +784,16 @@ class AgentApp(App[None]):
             chat_input.popup_active = None
             self._cancel_at_search()
             self._hide_popup()
+            return
+        diff_summary = self.query_one("#diff-summary", DiffSummary)
+        if diff_summary.diff_shown:
+            # First esc: minimize the open diff, keeping the file list up and
+            # its last-viewed row highlighted for arrow-key navigation.
+            diff_summary.minimize_diff()
+            return
+        if self.focused is diff_summary and diff_summary.has_class("expanded"):
+            # Second esc: close the file list too; only the summary remains.
+            diff_summary.collapse()
             return
         if self._turn_busy and self._worker is not None:
             self._worker.cancel()
@@ -867,7 +909,7 @@ class AgentApp(App[None]):
                 if not round_has_tools:
                     if not had_stream_error:
                         worked = _format_duration(time.monotonic() - turn_start)
-                        await chat.mount(NoticeLine(f"worked for {worked}"))
+                        self._post_line(NoticeLine(f"Worked for {worked}"))
                     break
 
                 # Execute the calls this round requested, in stream order.
@@ -894,7 +936,7 @@ class AgentApp(App[None]):
             for block in tool_blocks.values():
                 if block.status is ToolCallStatus.MAKING_CALL:
                     block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
-            await chat.mount(ErrorLine("interrupted"))
+            self._post_line(ErrorLine("interrupted"))
         finally:
             self._turn_busy = False
             self._worker = None

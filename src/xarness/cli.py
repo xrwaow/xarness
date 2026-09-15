@@ -200,10 +200,11 @@ def _run_chat(args: argparse.Namespace) -> None:
     sandbox: SandboxConfig | None = None
     session: SandboxSession | None = None
     if fs_tools_enabled:
-        effective_workspace = git_info.worktree if git_info is not None else workspace
+        effective_workspace = git_info.agent_workspace if git_info is not None else workspace
         try:
             sandbox = SandboxConfig(
-                workspace=effective_workspace,
+                workspace=git_info.worktree if git_info is not None else workspace,
+                subtree=git_info.subtree if git_info is not None else "",
                 external_refs=refs,
                 git_dir=git_info.git_common_dir if git_info is not None else None,
             )
