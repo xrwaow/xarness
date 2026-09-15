@@ -1,11 +1,10 @@
 """Tool registry and the built-in tools.
 
-test_tool has no filesystem or process access. read_file/edit_file/run_bash
-execute inside a bwrap sandbox (see sandbox.py) scoped to one workspace
-directory, with no network access — run_bash uses a persistent SandboxSession
-so shell state survives across calls within one chat. web_search is the one
-tool that runs outside the sandbox, since it's the only one that needs a
-real network path.
+read_file/write_file/edit_file/run_bash execute inside a bwrap sandbox (see
+sandbox.py) scoped to one workspace directory, with no network access —
+run_bash uses a persistent SandboxSession so shell state survives across
+calls within one chat. web_search is the one tool that runs outside the
+sandbox, since it's the only one that needs a real network path.
 """
 
 from __future__ import annotations
@@ -82,18 +81,6 @@ class ToolRegistry:
             return ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
 
 
-async def _test_tool_handler(args: dict[str, Any]) -> ToolResult:
-    return ToolResult(ok=True, output="success!")
-
-
-test_tool = Tool(
-    name="test_tool",
-    description="A no-op test tool that always succeeds, for wiring verification.",
-    parameters_schema={"type": "object", "properties": {}},
-    handler=_test_tool_handler,
-)
-
-
 async def _web_search_handler(args: dict[str, Any]) -> ToolResult:
     """Runs OUTSIDE the sandbox — the only tool with real network access."""
     import httpx
@@ -137,12 +124,59 @@ web_search_tool = Tool(
 )
 
 
+# Files larger than this return a structural outline instead of contents
+# (unless the call passes explicit line numbers).
+OUTLINE_THRESHOLD = 500
+# Upper bound on lines returned by one ranged read.
+MAX_READ_LINES = 2000
+
+
+def _python_outline(source: str) -> str | None:
+    """One line per class/def with its 1-based line range, methods indented.
+
+    Returns None for non-Python (or symbol-less) files, so the caller can
+    fall back to a plain truncated preview.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    lines: list[str] = []
+
+    def walk(node: ast.AST, depth: int) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                lines.append(f"{' ' * depth}class {child.name} [L{child.lineno}-{child.end_lineno}]")
+                walk(child, depth + 1)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                keyword = "async def" if isinstance(child, ast.AsyncFunctionDef) else "def"
+                lines.append(
+                    f"{' ' * depth}{keyword} {child.name} [L{child.lineno}-{child.end_lineno}]"
+                )
+                walk(child, depth + 1)
+
+    walk(tree, 0)
+    return "\n".join(lines) if lines else None
+
+
 def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     async def _read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
         error = sandbox.validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
+
+        try:
+            start = int(args["start_line"]) if args.get("start_line") is not None else 1
+            end = int(args["end_line"]) if args.get("end_line") is not None else None
+        except (TypeError, ValueError):
+            return ToolResult(
+                ok=False, error="start_line/end_line must be integers", parse_error=True
+            )
+        if start < 1:
+            return ToolResult(ok=False, error="start_line is 1-based", parse_error=True)
 
         count_result = await run_in_sandbox(sandbox, ["wc", "-l", path])
         if count_result.exit_code != 0:
@@ -152,15 +186,22 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         except (IndexError, ValueError):
             return ToolResult(ok=False, error=f"could not count lines in {path}")
 
-        if "offset" in args or "limit" in args:
-            start = int(args.get("offset") or 1)
-            count = int(args.get("limit") or 2000)
-        elif total_lines > 500:
-            start, count = 1, 200
+        if args.get("start_line") is None and args.get("end_line") is None:
+            if total_lines <= OUTLINE_THRESHOLD:
+                start, end = 1, max(total_lines, 1)
+            else:
+                return await _outline_result(sandbox, path, total_lines)
         else:
-            start, count = 1, total_lines or 1
+            end = total_lines if end is None else min(end, total_lines)
+            if end < start:
+                return ToolResult(
+                    ok=False,
+                    error=f"end_line ({end}) is before start_line ({start})",
+                    parse_error=True,
+                )
+            if end - start + 1 > MAX_READ_LINES:
+                end = start + MAX_READ_LINES - 1
 
-        end = start + count - 1
         result = await run_in_sandbox(sandbox, ["sed", "-n", f"{start},{end}p", path])
         if result.exit_code != 0:
             return ToolResult(ok=False, error=result.stderr.strip() or "read failed")
@@ -168,33 +209,67 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         output = result.stdout
         if end < total_lines:
             output += (
-                f"\n[showing lines {start}-{end} of {total_lines}; "
-                "pass offset/limit for more]"
+                f"\n[showing lines {start}-{end} of {total_lines}; pass "
+                "start_line/end_line for more]"
             )
         return ToolResult(ok=True, output=output)
+
+    async def _outline_result(sandbox: SandboxConfig, path: str, total_lines: int) -> ToolResult:
+        cat_result = await run_in_sandbox(sandbox, ["cat", path])
+        if cat_result.exit_code != 0:
+            return ToolResult(ok=False, error=cat_result.stderr.strip() or "read failed")
+        outline = _python_outline(cat_result.stdout)
+        if outline is None:
+            # Not a Python file (or no defs/classes): fall back to a preview
+            # chunk, pointing at start_line/end_line for the rest.
+            end = min(200, total_lines)
+            preview = "\n".join(cat_result.stdout.splitlines()[:end]) + "\n"
+            return ToolResult(ok=True, output=(
+                f"[showing lines 1-{end} of {total_lines}; this file is too large "
+                "to read all at once and has no outline — pass start_line/end_line "
+                "to read specific sections]\n"
+                f"{preview}"
+            ))
+        abs_path = sandbox.workspace / path
+        return ToolResult(ok=True, output=(
+            "File outline retrieved. This file is too large to read all at once, so "
+            "the outline below shows the file's structure with line numbers.\n"
+            "\n"
+            "IMPORTANT: Do NOT retry this call without line numbers - you will get "
+            "the same outline.\n"
+            "Instead, use the line numbers below to read specific sections by calling "
+            "this tool again with start_line and end_line parameters.\n"
+            "\n"
+            f"# File outline for {abs_path}\n"
+            "\n"
+            f"{outline}\n"
+            "\n"
+            "NEXT STEPS: To read a specific symbol's implementation, call read_file "
+            "with the same path plus start_line and end_line from the outline above.\n"
+            "For example, to read a function shown as [L100-150], use start_line: 100 "
+            "and end_line: 150."
+        ))
 
     return Tool(
         name="read_file",
         description=(
             "Read a file's contents. Paths are relative to the workspace root, "
-            "or '.refs/<alias>' for externally referenced files. Large files "
-            "(over 500 lines) return only the first 200 lines by default; pass "
-            "offset/limit to read further chunks."
+            "or '.refs/<alias>' for externally referenced files. Files over "
+            f"{OUTLINE_THRESHOLD} lines return a structural outline with line "
+            "numbers instead of contents; read specific sections of those by "
+            "passing start_line and end_line (1-based, inclusive)."
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "offset": {
+                "start_line": {
                     "type": "integer",
                     "description": "1-based line to start reading from (default 1)",
                 },
-                "limit": {
+                "end_line": {
                     "type": "integer",
-                    "description": (
-                        "maximum lines to return (default 200 on large files, "
-                        "2000 otherwise)"
-                    ),
+                    "description": "1-based last line to read (default: end of file)",
                 },
             },
             "required": ["path"],
@@ -203,10 +278,48 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     )
 
 
+def _make_write_tool(sandbox: SandboxConfig) -> Tool:
+    async def _write_file(args: dict[str, Any]) -> ToolResult:
+        path = args.get("path", "")
+        content = args.get("content", "")
+        error = sandbox.validate_relpath(path)
+        if error:
+            return ToolResult(ok=False, error=error, parse_error=True)
+        if path.startswith((".refs/", "./.refs/")):
+            return ToolResult(ok=False, error="'.refs/' is read-only")
+
+        exists = await run_in_sandbox(sandbox, ["test", "-e", path])
+        created = exists.exit_code != 0
+        write_result = await run_in_sandbox(
+            sandbox, ["tee", path], input_bytes=content.encode()
+        )
+        if write_result.exit_code != 0:
+            return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+        verb = "created" if created else "overwrote"
+        return ToolResult(ok=True, output=f"{verb} {path} ({len(content)} bytes)")
+
+    return Tool(
+        name="write_file",
+        description=(
+            "Create a new file or overwrite an existing one with completely new "
+            "contents. Prefer edit_file for changing part of an existing file. "
+            "Cannot write under '.refs/', which is read-only."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string", "description": "the full new file contents"},
+            },
+            "required": ["path", "content"],
+        },
+        handler=_write_file,
+    )
+
+
 def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
     async def _edit_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        mode = args.get("mode", "")
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
         error = sandbox.validate_relpath(path)
@@ -214,80 +327,56 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error=error, parse_error=True)
         if path.startswith((".refs/", "./.refs/")):
             return ToolResult(ok=False, error="'.refs/' is read-only")
-
-        if mode == "create":
-            exists = await run_in_sandbox(sandbox, ["test", "-e", path])
-            if exists.exit_code == 0:
-                return ToolResult(
-                    ok=False,
-                    error=f"{path} already exists; use mode='replace' to modify it",
-                )
-            write_result = await run_in_sandbox(
-                sandbox, ["tee", path], input_bytes=new_string.encode()
+        if not old_string:
+            return ToolResult(
+                ok=False,
+                error="'old_string' is required (use write_file to replace a whole file)",
+                parse_error=True,
             )
-            if write_result.exit_code != 0:
-                return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
-            return ToolResult(ok=True, output=f"created {path} ({len(new_string)} bytes)")
 
-        if mode == "replace":
-            if not old_string:
-                return ToolResult(
-                    ok=False,
-                    error="'old_string' is required when mode='replace'",
-                    parse_error=True,
-                )
+        read_result = await run_in_sandbox(sandbox, ["cat", path])
+        if read_result.exit_code != 0:
+            return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
 
-            read_result = await run_in_sandbox(sandbox, ["cat", path])
-            if read_result.exit_code != 0:
-                return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
-
-            current = read_result.stdout
-            occurrences = current.count(old_string)
-            if occurrences == 0:
-                return ToolResult(ok=False, error="old_string not found in file")
-            if occurrences > 1:
-                return ToolResult(
-                    ok=False,
-                    error=f"old_string is not unique ({occurrences} matches); "
-                    "include more surrounding context to disambiguate",
-                )
-
-            updated = current.replace(old_string, new_string, 1)
-            write_result = await run_in_sandbox(
-                sandbox, ["tee", path], input_bytes=updated.encode()
+        current = read_result.stdout
+        occurrences = current.count(old_string)
+        if occurrences == 0:
+            return ToolResult(ok=False, error="old_string not found in file")
+        if occurrences > 1:
+            return ToolResult(
+                ok=False,
+                error=f"old_string is not unique ({occurrences} matches); "
+                "include more surrounding context to disambiguate",
             )
-            if write_result.exit_code != 0:
-                return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
-            return ToolResult(ok=True, output=f"applied edit to {path}")
 
-        return ToolResult(
-            ok=False,
-            error="'mode' must be 'replace' or 'create'",
-            parse_error=True,
+        updated = current.replace(old_string, new_string, 1)
+        write_result = await run_in_sandbox(
+            sandbox, ["tee", path], input_bytes=updated.encode()
         )
+        if write_result.exit_code != 0:
+            return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+        return ToolResult(ok=True, output=f"applied edit to {path}")
 
     return Tool(
         name="edit_file",
         description=(
-            "Create a new file or edit an existing one. With mode='create', "
-            "write new_string to a path that must not already exist. With "
-            "mode='replace', replace one exact, unique occurrence of "
-            "old_string with new_string — include enough surrounding context "
-            "(a few lines) to disambiguate if the snippet could appear more "
-            "than once. Cannot write under '.refs/', which is read-only."
+            "Edit an existing file by replacing one exact, unique occurrence of "
+            "old_string with new_string — include enough surrounding context (a "
+            "few lines) to disambiguate if the snippet could appear more than "
+            "once. Use write_file to create a file or replace its whole contents. "
+            "Cannot write under '.refs/', which is read-only."
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "mode": {"type": "string", "enum": ["replace", "create"]},
                 "old_string": {
                     "type": "string",
-                    "description": "required when mode='replace'",
+                    "description": "the exact text to replace (must match once)",
                 },
-                "new_string": {"type": "string"},
+                "new_string": {"type": "string", "description": "the replacement text"},
             },
-            "required": ["path", "mode", "new_string"],
+            "required": ["path", "old_string", "new_string"],
         },
         handler=_edit_file,
     )
@@ -402,8 +491,8 @@ def build_registry(
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
-    plan mode exposes read_file (plus the always-on test_tool/web_search);
-    write mode additionally exposes edit_file and run_bash. ``ask_callback``
+    plan mode exposes read_file (plus the always-on web_search); write mode
+    additionally exposes write_file, edit_file, and run_bash. ``ask_callback``
     enables the ask tool (prompts the user in the TUI); ``compact_callback``
     enables the compact tool (summarizes + truncates the conversation).
     ``git_guard`` optionally vetoes run_bash commands that would interfere
@@ -411,7 +500,6 @@ def build_registry(
     ``allow_subagent`` is reserved for subagent registration in a later phase.
     """
     registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
-    registry.register(test_tool)
     registry.register(web_search_tool)
     if ask_callback is not None:
         registry.register(_make_ask_tool(ask_callback))
@@ -420,6 +508,7 @@ def build_registry(
     if sandbox is not None:
         registry.register(_make_read_tool(sandbox))  # read_file always available
         if mode == "write":
+            registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
             if session is not None:
                 registry.register(_make_run_bash_tool(session, git_guard))  # run_bash

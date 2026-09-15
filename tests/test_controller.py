@@ -127,10 +127,10 @@ def test_multi_turn_history_accumulates() -> None:
 def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
     client = FakeClient(
         [
-            ToolCallStarted("call_1", "test_tool"),
+            ToolCallStarted("call_1", "fake_tool"),
             ToolCallArgumentsDelta("call_1", '{"a"'),
             ToolCallArgumentsDelta("call_1", ": 1}"),
-            ToolCallArgumentsDone("call_1", "test_tool", '{"a": 1}'),
+            ToolCallArgumentsDone("call_1", "fake_tool", '{"a": 1}'),
             TurnComplete(has_tool_calls=True),
         ]
     )
@@ -145,7 +145,7 @@ def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
         {
             "id": "call_1",
             "type": "function",
-            "function": {"name": "test_tool", "arguments": '{"a": 1}'},
+            "function": {"name": "fake_tool", "arguments": '{"a": 1}'},
         }
     ]
 
@@ -153,8 +153,8 @@ def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
 def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> None:
     client = FakeClient(
         [
-            ToolCallStarted("call_1", "test_tool"),
-            ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+            ToolCallStarted("call_1", "fake_tool"),
+            ToolCallArgumentsDone("call_1", "fake_tool", "{}"),
             TurnComplete(has_tool_calls=True),
         ]
     )
@@ -177,7 +177,7 @@ def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> Non
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "test_tool", "arguments": "{}"},
+                    "function": {"name": "fake_tool", "arguments": "{}"},
                 }
             ],
         },
@@ -240,8 +240,8 @@ def test_compact_preserves_trailing_tool_call_round() -> None:
     asyncio.run(collect(controller, "first question"))
 
     client.script = [
-        ToolCallStarted("call_1", "test_tool"),
-        ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+        ToolCallStarted("call_1", "fake_tool"),
+        ToolCallArgumentsDone("call_1", "fake_tool", "{}"),
         TurnComplete(has_tool_calls=True),
     ]
     asyncio.run(collect(controller, "use the tool"))

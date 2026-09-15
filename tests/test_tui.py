@@ -18,8 +18,10 @@ from xarness.events import (
     TurnComplete,
     Usage,
 )
+from xarness.tools import Tool, ToolRegistry, ToolResult, build_registry
 from xarness.tui.app import AgentApp
 from xarness.tui.widgets import (
+    AskBar,
     ChatInput,
     ErrorLine,
     NoticeLine,
@@ -62,10 +64,34 @@ class FakeClient:
             yield event
 
 
+def make_registry(
+    ask_callback=None, compact_callback=None
+) -> ToolRegistry:
+    """Registry for TUI tests: web_search/ask/compact plus a deterministic
+    stub tool ("noop") the scripted tool-call rounds can invoke."""
+    registry = build_registry(
+        None, None, ask_callback=ask_callback, compact_callback=compact_callback
+    )
+
+    async def _noop(args: dict[str, Any]) -> ToolResult:
+        return ToolResult(ok=True, output="ok")
+
+    registry.register(Tool(name="noop", description="", parameters_schema={}, handler=_noop))
+    return registry
+
+
 def make_app(script: list[Any], delay: float = 0.01) -> tuple[AgentApp, FakeClient]:
     client = FakeClient(script, delay)
     controller = ChatController(PROFILE, "test-key", client=client)
-    return AgentApp(PROFILE, "test-key", controller=controller), client
+    app = AgentApp(PROFILE, "test-key", controller=controller)
+    # Swap in a registry with a deterministic stub tool: the default one has
+    # no sandbox tools here, and web_search would hit the network.
+    registry = make_registry(
+        ask_callback=app._ask_user, compact_callback=app._compact_conversation
+    )
+    app.tool_registry = registry
+    app.controller.tools = registry
+    return app, client
 
 
 async def wait_until_idle(app: AgentApp, timeout: float = 5.0) -> None:
@@ -74,6 +100,14 @@ async def wait_until_idle(app: AgentApp, timeout: float = 5.0) -> None:
         if not app._turn_busy:
             return
     raise AssertionError("turn did not finish in time")
+
+
+async def wait_for(predicate, timeout: float = 5.0) -> None:
+    for _ in range(int(timeout / 0.05)):
+        await asyncio.sleep(0.05)
+        if predicate():
+            return
+    raise AssertionError("condition not met in time")
 
 
 class TestChatLoop(unittest.IsolatedAsyncioTestCase):
@@ -204,12 +238,12 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.total_out, 7)
 
     async def test_tool_call_round_trip(self) -> None:
-        """A tool-call round executes test_tool and streams a follow-up round."""
+        """A tool-call round executes the stub tool and streams a follow-up round."""
         app, client = make_app(
             [
-                ToolCallStarted("call_1", "test_tool"),
+                ToolCallStarted("call_1", "noop"),
                 ToolCallArgumentsDelta("call_1", "{}"),
-                ToolCallArgumentsDone("call_1", "test_tool", "{}"),
+                ToolCallArgumentsDone("call_1", "noop", "{}"),
                 TurnComplete(has_tool_calls=True),
             ]
         )
@@ -222,10 +256,10 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
 
             # One tool call block, settled green with the tool's output.
             block = app.query_one(ToolCallBlock)
-            self.assertEqual(block.tool_name, "test_tool")
+            self.assertEqual(block.tool_name, "noop")
             self.assertEqual(block.status, ToolCallStatus.CALL_SUCCEEDED)
             self.assertEqual(block.accumulated_arguments, "{}")
-            self.assertEqual(block._output_text, "success!")
+            self.assertEqual(block._output_text, "ok")
 
             # Conversation: system, user, assistant tool-call turn, tool result,
             # final answer.
@@ -235,7 +269,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             )
             tool_msg = app.controller.conversation.messages[3]
             self.assertEqual(tool_msg.tool_call_id, "call_1")
-            self.assertEqual(tool_msg.content, "success!")
+            self.assertEqual(tool_msg.content, "ok")
             self.assertEqual(app.controller.conversation.messages[4].content, "tool says hi")
 
     async def test_parallel_tool_calls_show_single_writing_indicator(self) -> None:
@@ -243,11 +277,11 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         Blocks appear (and the indicator leaves) once args are done."""
         app, client = make_app(
             [
-                ToolCallStarted("call_1", "test_tool"),
-                ToolCallStarted("call_2", "web_search"),
+                ToolCallStarted("call_1", "noop"),
+                ToolCallStarted("call_2", "noop"),
                 ToolCallArgumentsDelta("call_1", "{}"),
-                ToolCallArgumentsDone("call_1", "test_tool", "{}"),
-                ToolCallArgumentsDone("call_2", "web_search", '"x"'),
+                ToolCallArgumentsDone("call_1", "noop", "{}"),
+                ToolCallArgumentsDone("call_2", "noop", '"x"'),
                 TurnComplete(has_tool_calls=True),
             ],
             delay=0.3,
@@ -275,7 +309,8 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(ToolCallBlock)), 2)
 
     async def test_ask_tool_returns_user_answers(self) -> None:
-        """The ask tool surfaces AskScreen; answers become the tool result."""
+        """The ask tool shows questions one at a time in the AskBar; answers
+        typed into the normal chat input become the tool result."""
         app, client = make_app(
             [
                 ToolCallStarted("call_1", "ask"),
@@ -292,15 +327,20 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.press("a", "s", "k", "enter")
 
-            from xarness.tui.ask_screen import AskScreen
-            for _ in range(100):
-                await asyncio.sleep(0.05)
-                if isinstance(app.screen, AskScreen):
-                    break
-            self.assertIsInstance(app.screen, AskScreen)
+            ask_bar = app.query_one("#ask-bar", AskBar)
+            await wait_for(lambda: ask_bar.has_class("visible"))
+            # First question only, shown above the input.
+            self.assertIn("Question 1/2", str(ask_bar.content))
+            self.assertIn("Which db?", str(ask_bar.content))
+            self.assertNotIn("Confirm?", str(ask_bar.content))
+            self.assertTrue(app.query_one(ChatInput).has_focus)
 
-            # Answer both questions; Enter on the last one submits.
-            await pilot.press("p", "g", "enter", "y", "e", "s", "enter")
+            # Answer it; the second question appears in the same bar.
+            await pilot.press("p", "g", "enter")
+            await wait_for(lambda: "Confirm?" in str(ask_bar.content))
+            self.assertIn("Question 2/2", str(ask_bar.content))
+
+            await pilot.press("y", "e", "s", "enter")
             await wait_until_idle(app)
 
             tool_msg = app.controller.conversation.messages[3]
@@ -308,6 +348,38 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertIn("A: pg", tool_msg.content)
             self.assertIn("A: yes", tool_msg.content)
             self.assertEqual(app.controller.conversation.messages[4].content, "got it")
+
+            # The bar hides and the placeholder is restored once done.
+            await wait_for(lambda: not ask_bar.has_class("visible"))
+            self.assertNotIn("answer", str(app.query_one(ChatInput).placeholder).lower())
+
+    async def test_ask_tool_escape_skips_questions(self) -> None:
+        """Esc while a question is pending skips it; the turn keeps running."""
+        app, client = make_app(
+            [
+                ToolCallStarted("call_1", "ask"),
+                ToolCallArgumentsDone(
+                    "call_1", "ask", '{"questions": ["Which db?"]}'
+                ),
+                TurnComplete(has_tool_calls=True),
+            ],
+            delay=0.05,
+        )
+        client.next_scripts = [
+            [ContentDelta("moving on"), TurnComplete(usage=Usage(5, 2))]
+        ]
+        async with app.run_test() as pilot:
+            await pilot.press("a", "s", "k", "enter")
+            ask_bar = app.query_one("#ask-bar", AskBar)
+            await wait_for(lambda: ask_bar.has_class("visible"))
+
+            await pilot.press("escape")
+            await wait_until_idle(app)
+
+            tool_msg = app.controller.conversation.messages[3]
+            self.assertIn("skipped", tool_msg.content)
+            self.assertEqual(app.controller.conversation.messages[4].content, "moving on")
+            self.assertFalse(ask_bar.has_class("visible"))
 
     async def test_slash_theme_opens_picker_and_switches(self) -> None:
         from xarness import theme

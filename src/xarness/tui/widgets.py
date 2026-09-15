@@ -17,6 +17,7 @@ from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static, TextArea
@@ -459,7 +460,10 @@ class ToolCallBlock(Vertical):
     def _refresh_dot(self) -> None:
         if self.is_mounted:
             color = theme.PALETTE[self._STATUS_COLOR_KEY[self._status]]
-            self.query_one(".toolcall-dot", Static).update(Text("•", style=color))
+            try:
+                self.query_one(".toolcall-dot", Static).update(Text("•", style=color))
+            except NoMatches:
+                pass  # DOM pruned during app shutdown
 
     def _refresh_body(self) -> None:
         if not self.is_mounted:
@@ -467,10 +471,16 @@ class ToolCallBlock(Vertical):
         body = self.accumulated_arguments
         if self._output_text:
             body = f"{body}\n{self._output_text}" if body else self._output_text
-        self.query_one(".toolcall-body", Static).update(body)
+        try:
+            self.query_one(".toolcall-body", Static).update(body)
+        except NoMatches:
+            pass  # DOM pruned during app shutdown
 
     def _swap_to_static_summary(self) -> None:
-        summary_row = self.query_one(".toolcall-summary", Horizontal)
+        try:
+            summary_row = self.query_one(".toolcall-summary", Horizontal)
+        except NoMatches:
+            return  # DOM pruned during app shutdown
         shimmer = summary_row.query(".toolcall-shimmer")
         if shimmer:
             shimmer.remove()
@@ -893,6 +903,22 @@ class NoticeLine(Static):
 
     def __init__(self, message: str) -> None:
         super().__init__(Text(message), classes="msg notice")
+
+
+class AskBar(Static):
+    """The ask tool's current question, shown above the input while pending.
+
+    Hidden until a question is active; the user answers through the normal
+    chat input. Content wraps to the terminal width (unlike the old modal's
+    auto-width labels, which clipped long questions).
+    """
+
+    def show_question(self, text: str) -> None:
+        self.update(Text(text))
+        self.add_class("visible")
+
+    def hide(self) -> None:
+        self.remove_class("visible")
 
 
 class StatusBar(Static):

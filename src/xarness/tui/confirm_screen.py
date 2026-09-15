@@ -1,5 +1,5 @@
-"""Typed-confirmation modal for destructive actions (matches AskScreen's
-flat-surface modal style; no buttons exist elsewhere in this TUI, so the
+"""Typed-confirmation modal for destructive actions (a flat-surface modal
+like the other screens; no buttons exist elsewhere in this TUI, so the
 confirmation affordance is the same Input the rest of the modals use)."""
 
 from __future__ import annotations

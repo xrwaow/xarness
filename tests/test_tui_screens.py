@@ -120,7 +120,7 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "test_tool", "arguments": '{"x": 1}'},
+                        "function": {"name": "noop", "arguments": '{"x": 1}'},
                     }
                 ],
             )
@@ -146,7 +146,7 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
 
             # Tool call replays settled green with the tool-role output.
             block = app.query_one(ToolCallBlock)
-            self.assertEqual(block.tool_name, "test_tool")
+            self.assertEqual(block.tool_name, "noop")
             self.assertEqual(block.accumulated_arguments, '{"x": 1}')
             self.assertEqual(block.status, ToolCallStatus.CALL_SUCCEEDED)
             self.assertEqual(block._output_text, "success!")
@@ -197,7 +197,7 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
                     {
                         "id": "call_9",
                         "type": "function",
-                        "function": {"name": "test_tool", "arguments": "{}"},
+                        "function": {"name": "noop", "arguments": "{}"},
                     }
                 ],
             )

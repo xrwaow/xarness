@@ -17,6 +17,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
@@ -38,15 +39,20 @@ from ..gitwork import (
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from ..sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
 from ..tools import ToolRegistry, build_registry
-from .ask_screen import AskScreen
 from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
-    AssistantMessage, ChatInput, DiffSummary, ErrorLine, NoticeLine, PendingIndicator,
-    ShimmerText, StatusBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
-    ToolWritingIndicator, UserMessage, _format_duration,
+    AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, NoticeLine,
+    PendingIndicator, ShimmerText, StatusBar, SuggestionPopup, ThinkingBlock,
+    ToolCallBlock, ToolWritingIndicator, UserMessage, _format_duration,
 )
+
+
+INPUT_PLACEHOLDER = (
+    "Send a message…  (Enter: send · Shift+Enter: newline · Ctrl+T: thoughts)"
+)
+ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 
 
 SLASH_COMMANDS = [
@@ -114,6 +120,7 @@ class AgentApp(App[None]):
         self.last_in = 0
         self._turn_busy = False
         self._queued: list[str] = []
+        self._ask_future: asyncio.Future[str | None] | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
         self._at_search_timer = None
@@ -143,10 +150,11 @@ class AgentApp(App[None]):
         yield VerticalScroll(id="chat-log")
         with Container(id="input-wrap"):
             yield DiffSummary(id="diff-summary")
+            yield AskBar(id="ask-bar")
             yield SuggestionPopup(id="suggestion-popup")
             yield ChatInput(
                 id="chat-input",
-                placeholder="Send a message…  (Enter: send · Shift+Enter: newline · Ctrl+T: thoughts)",
+                placeholder=INPUT_PLACEHOLDER,
             )
         yield StatusBar(id="status-bar")
 
@@ -181,6 +189,11 @@ class AgentApp(App[None]):
     # Submission / turn lifecycle
 
     def on_chat_input_chat_submitted(self, event: ChatInput.ChatSubmitted) -> None:
+        # While the ask tool waits for an answer, every submission is the
+        # answer — never a chat message or slash command.
+        if self._ask_future is not None and not self._ask_future.done():
+            self._ask_future.set_result(event.text)
+            return
         text = event.text.strip()
         if text.startswith("/"):
             self._handle_slash_command(text)
@@ -266,7 +279,10 @@ class AgentApp(App[None]):
 
     async def refresh_diff_summary(self) -> None:
         """Recompute the pending-changes bar (hidden when empty or gitless)."""
-        widget = self.query_one("#diff-summary", DiffSummary)
+        try:
+            widget = self.query_one("#diff-summary", DiffSummary)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
         info = self.git_info
         if info is None:
             await widget.clear()
@@ -741,7 +757,10 @@ class AgentApp(App[None]):
         when the log is already at the bottom — otherwise it lands below the
         fold, and a stale scroll position also stops the next turn from
         auto-following (see _at_bottom)."""
-        chat = self.query_one("#chat-log", VerticalScroll)
+        try:
+            chat = self.query_one("#chat-log", VerticalScroll)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
         follow = self._at_bottom(chat)
         chat.mount(widget)
         if follow:
@@ -785,6 +804,11 @@ class AgentApp(App[None]):
             self._cancel_at_search()
             self._hide_popup()
             return
+        if self._ask_future is not None and not self._ask_future.done():
+            # Esc while a question is pending: skip the questions, keep the
+            # turn running (the ask tool reports the skip to the model).
+            self._ask_future.set_result(None)
+            return
         diff_summary = self.query_one("#diff-summary", DiffSummary)
         if diff_summary.diff_shown:
             # First esc: minimize the open diff, keeping the file list up and
@@ -799,12 +823,32 @@ class AgentApp(App[None]):
             self._worker.cancel()
 
     async def _ask_user(self, questions: list[str]) -> list[str] | None:
-        """Callback for the ask tool: surface the questions, await the answers.
+        """Callback for the ask tool: show the questions one at a time in the
+        AskBar above the input; the user answers through the normal chat
+        input (Enter submits, Esc skips all questions).
 
-        Runs inside the turn worker, so wait_for_dismiss is allowed; it makes
-        the awaited result the screen's dismiss value (the answers).
+        Runs inside the turn worker, awaiting a future that the input
+        handler resolves — same event loop, so the await is safe.
         """
-        return await self.push_screen(AskScreen(questions), wait_for_dismiss=True)
+        ask_bar = self.query_one("#ask-bar", AskBar)
+        chat_input = self.query_one("#chat-input", ChatInput)
+        answers: list[str] = []
+        try:
+            for index, question in enumerate(questions):
+                ask_bar.show_question(f"Question {index + 1}/{len(questions)}: {question}")
+                chat_input.placeholder = ASK_PLACEHOLDER
+                chat_input.focus()
+                future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+                self._ask_future = future
+                answer = await future
+                if answer is None:  # esc: skip the remaining questions
+                    return None
+                answers.append(answer)
+            return answers
+        finally:
+            self._ask_future = None
+            ask_bar.hide()
+            chat_input.placeholder = INPUT_PLACEHOLDER
 
     async def _compact_conversation(self) -> str:
         """Callback for the compact tool: summarize + truncate the history."""

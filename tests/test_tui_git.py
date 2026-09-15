@@ -23,7 +23,7 @@ from xarness.events import ContentDelta, ToolCallArgumentsDone, ToolCallStarted,
 from xarness.tui.app import AgentApp
 from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.widgets import DiffSummary, ErrorLine, NoticeLine
-from test_tui import PROFILE
+from test_tui import PROFILE, make_registry
 
 
 class FakeClient:
@@ -91,8 +91,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         from xarness.controller import ChatController
         controller = ChatController(PROFILE, "k", client=client)
         app = AgentApp(
-            PROFILE, "k", controller=controller, workspace=info.worktree,
-            session_name="testsess", git_info=info,
+            PROFILE, "k", controller=controller, tool_registry=make_registry(),
+            workspace=info.worktree, session_name="testsess", git_info=info,
         )
         return app, info
 
@@ -122,8 +122,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
     async def test_diff_summary_appears_after_tool_turn(self):
         script = [
-            ToolCallStarted("c1", "test_tool"),
-            ToolCallArgumentsDone("c1", "test_tool", "{}"),
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
             TurnComplete(has_tool_calls=True),
         ]
         app, info = await self.make_git_app(script)
@@ -133,8 +133,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         client.next_scripts = [
             [ContentDelta("done"), TurnComplete(usage=None)],
             [
-                ToolCallStarted("c2", "test_tool"),
-                ToolCallArgumentsDone("c2", "test_tool", "{}"),
+                ToolCallStarted("c2", "noop"),
+                ToolCallArgumentsDone("c2", "noop", "{}"),
                 TurnComplete(has_tool_calls=True),
             ],
             [ContentDelta("done"), TurnComplete(usage=None)],
@@ -173,8 +173,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
     async def test_diff_content_renders_requested_diff(self):
         script = [
-            ToolCallStarted("c1", "test_tool"),
-            ToolCallArgumentsDone("c1", "test_tool", "{}"),
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
             TurnComplete(has_tool_calls=True),
         ]
         app, info = await self.make_git_app(script)

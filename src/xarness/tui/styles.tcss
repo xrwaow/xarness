@@ -311,6 +311,21 @@ DiffSummary:hover #diff-summary-row,
     text-style: underline;
 }
 
+AskBar {
+    display: none;
+    width: 1fr;
+    height: auto;
+    background: $c-surface;
+    color: $c-text;
+    padding: 1 1;
+}
+
+AskBar.visible {
+    display: block;
+    /* Separator between the question and the answer input below. */
+    border-bottom: solid $c-border;
+}
+
 #diff-body {
     display: none;
     height: auto;
@@ -487,34 +502,4 @@ ResumeScreen, PickerScreen {
 #picker-list > ListItem.-highlight {
     background: $c-border;
     color: $c-text;
-}
-
-#ask-modal {
-    width: 64;
-    height: auto;
-    background: $c-surface;
-    padding: 1 2;
-}
-
-.ask-question {
-    color: $c-text;
-    margin-bottom: 1;
-}
-
-#ask-modal > Input {
-    border: none;
-    border-bottom: solid $c-border;
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-    margin-bottom: 1;
-}
-
-#ask-modal > Input:focus {
-    border: none;
-    border-bottom: solid $c-highlight;
-}
-
-.ask-hint {
-    color: $c-muted;
 }
