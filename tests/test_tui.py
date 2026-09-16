@@ -410,6 +410,114 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(errors)
             self.assertIn("unknown theme", str(errors.last().content))
 
+    async def test_slash_mode_updates_system_message_and_tools(self) -> None:
+        """A mid-session /mode rewrites the system message in place so it
+        always matches the active mode's tool set."""
+        from xarness.prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
+
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            self.assertEqual(
+                app.controller.conversation.messages[0].content,
+                system_prompt_for(GENERAL_SYSTEM_PROMPT, "write"),
+            )
+
+            app._handle_slash_command("/mode")
+            await pilot.pause()
+
+            self.assertEqual(app.mode, "plan")
+            self.assertEqual(
+                app.controller.conversation.messages[0].content,
+                system_prompt_for(GENERAL_SYSTEM_PROMPT, "plan"),
+            )
+            self.assertIn("PLAN mode", app.controller.conversation.messages[0].content)
+            # The controller streams with the new mode's registry.
+            self.assertIs(app.controller.tools, app.tool_registry)
+            self.assertEqual(
+                {t["function"]["name"] for t in app.controller.tools.schema()},
+                {t["function"]["name"] for t in app.tool_registry.schema()},
+            )
+
+            # And back again.
+            app._handle_slash_command("/mode")
+            await pilot.pause()
+            self.assertIn("WRITE mode", app.controller.conversation.messages[0].content)
+
+    async def test_slash_undo_restores_input_and_history(self) -> None:
+        app, _client = make_app([ContentDelta("answer"), TurnComplete(usage=Usage(10, 4))])
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+            self.assertEqual(app.total_in, 10)
+
+            app._handle_slash_command("/undo")
+            await wait_for(lambda: app.query_one(ChatInput).text == "hi")
+
+            # Conversation back to just the system message; usage rolled back.
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+            self.assertEqual((app.total_in, app.total_out, app.last_in), (0, 0, 0))
+            # The user message is back in the input box (focused), not sent.
+            chat_input = app.query_one(ChatInput)
+            self.assertEqual(chat_input.text, "hi")
+            self.assertTrue(chat_input.has_focus)
+            self.assertFalse(app._turn_busy)
+
+    async def test_slash_retry_resends_the_same_message(self) -> None:
+        app, client = make_app([ContentDelta("bad answer"), TurnComplete(usage=Usage(10, 4))])
+        client.next_scripts = [
+            [ContentDelta("better answer"), TurnComplete(usage=Usage(8, 3))]
+        ]
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+
+            app._handle_slash_command("/retry")
+            await wait_until_idle(app)
+
+            # The old turn was replaced by a fresh one with the same text.
+            self.assertEqual(
+                [m.content for m in app.controller.conversation.messages][1:],
+                ["hi", "better answer"],
+            )
+            self.assertEqual(len(app.query(UserMessage)), 1)
+            # Only the surviving turn's usage counts.
+            self.assertEqual((app.total_in, app.total_out), (8, 3))
+
+    async def test_slash_undo_without_a_turn_is_a_noop(self) -> None:
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/undo")
+            await pilot.pause()
+            app._handle_slash_command("/retry")
+            await pilot.pause()
+
+            notices = [str(n.content) for n in app.query(NoticeLine)]
+            self.assertTrue(any("nothing to undo" in n for n in notices))
+            self.assertTrue(any("nothing to retry" in n for n in notices))
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+
+    async def test_compact_tool_reports_token_counts(self) -> None:
+        app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+
+            client.script = [
+                ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))
+            ]
+            result = await app._compact_conversation()
+
+            # Before/after on one line, then the summary itself.
+            first_line, _, rest = result.partition("\n")
+            self.assertEqual(first_line, "compacted: 40 → 7 tokens (freed 33)")
+            self.assertIn("summary text", rest)
+            # The summarization round's spend is in the session totals.
+            self.assertEqual((app.total_in, app.total_out), (105, 47))
+
 
 if __name__ == "__main__":
     unittest.main()

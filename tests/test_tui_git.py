@@ -23,6 +23,7 @@ from xarness.events import ContentDelta, ToolCallArgumentsDone, ToolCallStarted,
 from xarness.tui.app import AgentApp
 from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.widgets import DiffSummary, ErrorLine, NoticeLine
+from xarness.tui.widgets import ChatInput, UserMessage
 from test_tui import PROFILE, make_registry
 
 
@@ -427,6 +428,118 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.git_info.worktree.exists())
             await self.wait_until(
                 lambda: any("recreated" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+    # ------------------------------------------------------------------
+    # /undo + /retry
+
+    async def test_undo_reverts_file_edits_and_restores_input(self):
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script)
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            # What the turn's tools did: edit a tracked file, create a new one.
+            (info.worktree / "app.py").write_text("agent edit\n")
+            (info.worktree / "created.txt").write_text("new\n")
+
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+
+            # File state restored to the turn's checkpoint.
+            self.assertEqual(
+                (info.worktree / "app.py").read_text(), "line1\nline2\n"
+            )
+            self.assertFalse((info.worktree / "created.txt").exists())
+            # Conversation back to just the system message; input holds the text.
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+            self.assertTrue(app.query_one(ChatInput).has_focus)
+            self.assertFalse(app._turn_busy)
+            await self.wait_until(
+                lambda: any("undone" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+    async def test_retry_reverts_file_edits_and_resends(self):
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script)
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            (info.worktree / "app.py").write_text("agent edit\n")
+            (info.worktree / "created.txt").write_text("new\n")
+            client.next_scripts.append(
+                [ContentDelta("second answer"), TurnComplete(usage=None)]
+            )
+
+            app._handle_slash_command("/retry")
+            await self.wait_until(lambda: not app._turn_busy)
+            await self.wait_until(
+                lambda: any(
+                    m.role == "assistant" and m.content == "second answer"
+                    for m in app.controller.conversation.messages
+                )
+            )
+
+            # File edits from the retried turn are gone.
+            self.assertEqual(
+                (info.worktree / "app.py").read_text(), "line1\nline2\n"
+            )
+            self.assertFalse((info.worktree / "created.txt").exists())
+            # Same user message, fresh response.
+            self.assertEqual(
+                [m.content for m in app.controller.conversation.messages][1:],
+                ["hi", "second answer"],
+            )
+            self.assertEqual(len(app.query(UserMessage)), 1)
+
+    async def test_untracked_file_added_mid_session_becomes_visible(self):
+        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            self.assertFalse((info.worktree / "midway.txt").exists())
+
+            # The user drops a new untracked file into their real workspace.
+            (self.repo / "midway.txt").write_text("user file\n")
+            await pilot.press("a", "g", "a", "i", "n", "enter")
+            await self.wait_until(lambda: not app._turn_busy)
+
+            # Synced into the worktree at the start of the next turn.
+            self.assertEqual((info.worktree / "midway.txt").read_text(), "user file\n")
+            self.assertIn("midway.txt", info.copied_untracked)
+
+    async def test_undo_without_git_rolls_back_messages_only(self):
+        """No git isolation: messages and usage still roll back, and the user
+        is told file edits could not be reverted."""
+        app, _ = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app.git_info = None
+        app.controller.git_info = None
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await self.wait_until(lambda: not app._turn_busy)
+
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+            await self.wait_until(
+                lambda: any(
+                    "could not be reverted" in str(n.content)
+                    for n in app.query(NoticeLine)
+                )
             )
 
 

@@ -21,6 +21,8 @@ GENERAL_SYSTEM_PROMPT = (
     "- read_file returns a structural outline for large files; read specific "
     "sections of those with start_line/end_line instead of guessing at "
     "contents.\n"
+    "- Explore with ls and glob, and search contents with grep, instead of "
+    "guessing paths or reaching for run_bash.\n"
     "- Create new files with write_file; prefer edit_file with a small, unique "
     "old_string over rewriting whole files.\n"
     "- run_bash has no network access; use web_search for anything that needs "

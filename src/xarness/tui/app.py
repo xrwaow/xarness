@@ -28,7 +28,7 @@ from ..conversation import Conversation, Message
 from ..controller import ChatController
 from ..events import (
     ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDone,
-    ToolCallStarted, ToolCallStatus, TurnComplete,
+    ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
 )
 from ..file_search import search_files
 from ..gitwork import (
@@ -65,6 +65,14 @@ SLASH_COMMANDS = [
     ("diff", "show pending changes (optionally: /diff <path>)"),
     ("accept", "merge the agent's worktree changes into your branch"),
     ("reject", "discard the agent's worktree changes (asks confirmation)"),
+    ("undo", (
+        "drop the last turn: revert its file edits, put your message back "
+        "in the input (run_bash side effects are not undone)"
+    )),
+    ("retry", (
+        "revert the last turn's file edits and resend your message "
+        "(run_bash side effects are not undone)"
+    )),
 ]
 
 
@@ -104,11 +112,12 @@ class AgentApp(App[None]):
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-            git_guard=self._make_git_guard(),
+            git_guard=self._make_git_guard(), git_info=git_info,
         )
         self.controller = controller or ChatController(
             profile, api_key, tool_registry=self.tool_registry
         )
+        self.controller.git_info = git_info
         self.workspace = workspace
         self.session_name = session_name
         self.config_path = config_path
@@ -240,11 +249,15 @@ class AgentApp(App[None]):
             self.tool_registry = build_registry(
                 self.sandbox, self.sandbox_session, mode=new_mode,
                 ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-                git_guard=self._make_git_guard(),
+                git_guard=self._make_git_guard(), git_info=self.git_info,
             )
             self.controller.tools = self.tool_registry  # rewire to the new registry
             self.ensure_system_message()
             self._refresh_status()
+        elif cmd == "undo":
+            self._run_undo(resend=False)
+        elif cmd == "retry":
+            self._run_undo(resend=True)
         elif cmd == "theme":
             arg = parts[1].strip() if len(parts) > 1 else ""
             if arg:
@@ -261,6 +274,55 @@ class AgentApp(App[None]):
                 )
         else:
             self._post_line(ErrorLine(f"unknown command: /{cmd}"))
+
+    # ------------------------------------------------------------------
+    # /undo + /retry
+
+    def _sync_totals_from_controller(self) -> None:
+        """Mirror the controller's cumulative usage into the status bar."""
+        self.total_in = self.controller.usage_total.input_tokens
+        self.total_out = self.controller.usage_total.output_tokens
+        last = next(
+            (m.usage for m in reversed(self.controller.conversation.messages) if m.usage), None
+        )
+        self.last_in = last.input_tokens if last else 0
+
+    @work(group="undo", exclusive=True)
+    async def _run_undo(self, resend: bool) -> None:
+        """Shared body of /undo (drop the last turn, put its user message
+        back in the input) and /retry (drop it and resend it).
+
+        Only file edits are reverted — the worktree is reset to the turn's
+        checkpoint. Anything run_bash did beyond the worktree (installs,
+        background jobs, network calls) is not undone."""
+        label = "retry" if resend else "undo"
+        if self._turn_busy:
+            self._post_line(ErrorLine(f"/{label}: wait for the current turn to finish first"))
+            return
+        plan = self.controller.rollback_plan()
+        if plan is None:
+            self._post_line(NoticeLine(f"nothing to {label}"))
+            return
+        sha = self.controller.apply_rollback(plan)
+        reverted = await self.controller.revert_worktree(sha)
+        await self._render_history()
+        self._sync_totals_from_controller()
+        self._refresh_status()
+        await self.refresh_diff_summary()
+        if reverted:
+            note = "file edits reverted"
+        elif self.git_info is None:
+            note = "no git isolation for this session — file edits could not be reverted"
+        else:
+            note = "file edits could not be reverted (no checkpoint or git failed)"
+        if resend:
+            self._post_line(NoticeLine(f"retrying: last turn rolled back ({note})"))
+            self._submit(plan.user_text)
+        else:
+            chat_input = self.query_one("#chat-input", ChatInput)
+            chat_input.load_text(plan.user_text)
+            chat_input.focus()
+            self._post_line(NoticeLine(f"undone: last turn removed ({note})"))
 
     # ------------------------------------------------------------------
     # Git worktree state (diff summary + accept/reject)
@@ -377,17 +439,19 @@ class AgentApp(App[None]):
         self.sandbox = sandbox
         self.sandbox_session = SandboxSession(sandbox) if sandbox is not None else None
         self.git_info = info
+        self.controller.git_info = info
         self.workspace = info.agent_workspace
         self.tool_registry = build_registry(
             sandbox, self.sandbox_session, mode=self.mode,
             ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-            git_guard=self._make_git_guard(),
+            git_guard=self._make_git_guard(), git_info=info,
         )
         self.controller.tools = self.tool_registry
 
     def _disable_fs_tools(self) -> None:
         """After accept/reject the worktree is gone; nothing sane to edit."""
         self.git_info = None
+        self.controller.git_info = None
         self.sandbox = None
         self.sandbox_session = None
         self.tool_registry = build_registry(
@@ -532,6 +596,8 @@ class AgentApp(App[None]):
     def _start_new_session(self) -> None:
         """Slash /new: fresh conversation, fresh session file (unless disabled)."""
         self.controller.conversation = Conversation()
+        self.controller.usage_total = Usage(input_tokens=0, output_tokens=0)
+        self.controller.last_compaction = None
         if self.session_name is not None:
             from ..session_store import new_session_name
             self.session_name = new_session_name()
@@ -551,6 +617,8 @@ class AgentApp(App[None]):
         self.controller.conversation = load_session(name)
         self.session_name = name
         self.ensure_system_message()
+        # Per-message usage is persisted: restore the status-bar totals.
+        self._sync_totals_from_controller()
         # Notices mount after _render_history (which clears the chat log).
         notes: list[str] = []
         errors: list[str] = []
@@ -852,7 +920,18 @@ class AgentApp(App[None]):
 
     async def _compact_conversation(self) -> str:
         """Callback for the compact tool: summarize + truncate the history."""
-        return await self.controller.compact()
+        summary = await self.controller.compact()
+        # The summarization round's own spend just entered the controller's
+        # cumulative total; mirror it now rather than waiting for the next
+        # round's TurnComplete.
+        self._sync_totals_from_controller()
+        self._refresh_status()
+        counts = self.controller.last_compaction
+        if counts is not None:
+            before, after = counts
+            freed = max(0, before - after)
+            return f"compacted: {before:,} → {after:,} tokens (freed {freed:,})\n{summary}"
+        return summary
 
     @work(group="turn")
     async def _run_turn(self, text: str) -> None:
@@ -1010,9 +1089,11 @@ class AgentApp(App[None]):
             thinking.finish(event.reasoning_seconds)
 
         if event.usage is not None:
-            self.total_in += event.usage.input_tokens
-            self.total_out += event.usage.output_tokens
             self.last_in = event.usage.input_tokens
+        # The controller folds every round's usage (including compaction's
+        # own summarization round) into its cumulative total; mirror it.
+        self.total_in = self.controller.usage_total.input_tokens
+        self.total_out = self.controller.usage_total.output_tokens
         self._refresh_status()
 
         if self.session_name:

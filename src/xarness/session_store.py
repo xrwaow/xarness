@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .conversation import Conversation, Message
+from .events import Usage
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
 
@@ -20,6 +21,13 @@ def session_path(name: str) -> Path:
 def new_session_name() -> str:
     """Timestamped unique name for a freshly started session."""
     return f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+
+def _message_from(raw: dict) -> Message:
+    usage = raw.get("usage")
+    if isinstance(usage, dict):
+        raw["usage"] = Usage(**usage)
+    return Message(**raw)
 
 
 def save_session(
@@ -37,6 +45,9 @@ def save_session(
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "messages": [asdict(m) for m in conversation.messages],
     }
+    if conversation.undo_snapshot:
+        # /undo //retry need the pre-turn conversation even after a resume.
+        data["undo_snapshot"] = [asdict(m) for m in conversation.undo_snapshot]
     if git is not None:
         data["git"] = git
     session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -46,7 +57,10 @@ def load_session(name: str) -> Conversation:
     data = json.loads(session_path(name).read_text(encoding="utf-8"))
     conversation = Conversation()
     for raw in data["messages"]:
-        conversation.add(Message(**raw))
+        conversation.add(_message_from(raw))
+    snapshot = data.get("undo_snapshot")
+    if isinstance(snapshot, list):
+        conversation.undo_snapshot = [_message_from(raw) for raw in snapshot]
     return conversation
 
 

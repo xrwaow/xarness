@@ -6,6 +6,7 @@ from typing import Any
 
 from xarness.config import CotStrength, ProviderProfile
 from xarness.controller import ChatController
+from xarness.conversation import Message
 from xarness.events import (
     ContentDelta,
     ProcessingStarted,
@@ -268,6 +269,151 @@ def test_compact_without_history_is_a_noop() -> None:
 
     assert summary == "nothing to compact yet"
     assert controller.conversation.messages == []
+
+
+# ---------------------------------------------------------------------------
+# usage accounting (per-message + cumulative)
+
+
+def test_usage_attaches_to_messages_and_totals() -> None:
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first"))
+
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    asyncio.run(collect(controller, "second"))
+
+    messages = controller.conversation.messages
+    assert messages[1].usage == Usage(5, 3)
+    assert messages[3].usage == Usage(9, 4)
+    # Usage is local-only: never sent over the wire.
+    assert all("usage" not in m for m in client.received_wire[-1])
+    assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
+
+
+def test_send_snapshots_conversation_for_undo() -> None:
+    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "hello"))
+
+    # Snapshot taken when the turn began: just the user message.
+    assert [m.role for m in controller.conversation.undo_snapshot] == ["user"]
+    assert controller.conversation.undo_snapshot[0].content == "hello"
+    assert controller.conversation.messages[0].checkpoint_sha is None  # no git
+
+
+def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first question"))
+
+    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
+    summary = asyncio.run(controller.compact())
+
+    assert summary == "summary text"
+    before, after = controller.last_compaction
+    assert before == 40 and after == 7
+    # The summarization round's own spend is part of the session total.
+    assert controller.usage_total == Usage(input_tokens=105, output_tokens=47)
+    # The summary message carries the summarizer's usage (for /undo).
+    assert controller.conversation.messages[1].usage == Usage(100, 7)
+
+
+def test_compact_then_undo_restores_messages_and_usage() -> None:
+    """Undoing a turn that compacted mid-flight restores the pre-compact
+    message list AND un-does the summarizer's usage adjustment."""
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first"))
+
+    # Turn 2, round 1: the model calls compact.
+    client.script = [
+        ToolCallStarted("call_1", "compact"),
+        ToolCallArgumentsDone("call_1", "compact", "{}"),
+        TurnComplete(usage=Usage(4, 1), has_tool_calls=True),
+    ]
+    asyncio.run(collect(controller, "second"))
+    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
+    asyncio.run(controller.compact())
+    controller.record_tool_result("call_1", ToolResult(ok=True, output="compacted"))
+    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
+    asyncio.run(_drain(controller.continue_after_tools()))
+
+    assert controller.usage_total == Usage(input_tokens=115, output_tokens=13)
+    assert [m.role for m in controller.conversation.messages] == [
+        "user", "user", "assistant", "tool", "assistant",
+    ]
+
+    plan = controller.rollback_plan()
+    assert plan is not None and plan.user_text == "second"
+    controller.apply_rollback(plan)
+
+    # Pre-compact history restored (the turn's own user message removed).
+    assert [m.role for m in controller.conversation.messages] == ["user", "assistant"]
+    assert controller.conversation.messages[1].content == "one"
+    # Usage back to exactly the pre-turn total: the compacted rounds', the
+    # summarizer's, and the final round's spend all subtracted.
+    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+    assert controller.conversation.undo_snapshot is None
+
+    # A further /undo falls back to the previous turn (resumed-session
+    # semantics): it rolls back to an empty conversation.
+    plan2 = controller.rollback_plan()
+    assert plan2 is not None and plan2.user_text == "first"
+    controller.apply_rollback(plan2)
+    assert controller.conversation.messages == []
+    assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
+    assert controller.rollback_plan() is None
+
+
+def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:
+    """Both /undo and /retry truncate to before the turn's user message;
+    /retry re-sends the text (with a fresh checkpoint) via send()."""
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first"))
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    asyncio.run(collect(controller, "second"))
+
+    plan = controller.rollback_plan()
+    assert plan is not None
+    assert plan.user_text == "second"
+    assert [m.content for m in plan.keep] == ["first", "one"]
+    assert [m.content for m in plan.dropped] == ["second", "two"]
+
+    controller.apply_rollback(plan)
+    assert [m.content for m in controller.conversation.messages] == [
+        "first", "one",
+    ]
+    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+
+
+def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
+    """Resumed sessions have no snapshot: fall back to the last user message
+    (its persisted checkpoint sha is used for the worktree revert)."""
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    controller.conversation.add(Message(role="user", content="old"))
+    controller.conversation.add(Message(role="assistant", content="a", usage=Usage(5, 3)))
+    controller.conversation.add(
+        Message(role="user", content="last", checkpoint_sha="abc123")
+    )
+    controller.conversation.add(Message(role="assistant", content="b", usage=Usage(9, 4)))
+    controller.usage_total = Usage(input_tokens=14, output_tokens=7)
+
+    plan = controller.rollback_plan()
+    assert plan is not None
+    assert plan.user_text == "last"
+    assert plan.checkpoint_sha == "abc123"
+    controller.apply_rollback(plan)
+    assert [m.content for m in controller.conversation.messages] == ["old", "a"]
+    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+
+
+def test_rollback_is_a_noop_without_a_finished_turn() -> None:
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    assert controller.rollback_plan() is None  # empty conversation
+    asyncio.run(collect(controller, "only a user message"))
+    assert controller.rollback_plan() is None  # no response yet
 
 
 async def _drain(stream: AsyncIterator[Any]) -> list[Any]:

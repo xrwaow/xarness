@@ -77,6 +77,13 @@ class GitInfo:
     # the agent can see them. Tracked separately so accept can avoid committing
     # the ones the agent never touched (they stay untracked in the user's repo).
     copied_untracked: list[str] = field(default_factory=list)
+    # rel path -> the original's mtime_ns when it was last copied (copy2 makes
+    # the worktree copy's mtime match, so a diverging mtime on either side
+    # tells a user edit from an agent edit during sync_untracked_files).
+    copied_untracked_state: dict[str, int] = field(default_factory=dict)
+    # Whether untracked files are copied into the worktree at all
+    # (--no-copy-untracked sets this False; sync then does nothing too).
+    copy_untracked: bool = True
 
     @property
     def agent_workspace(self) -> Path:
@@ -102,6 +109,10 @@ class GitInfo:
             git_common_dir=Path(block["git_common_dir"]),
             subtree=block.get("subtree", ""),
             copied_untracked=list(block.get("copied_untracked", [])),
+            copied_untracked_state={
+                k: int(v) for k, v in (block.get("copied_untracked_state") or {}).items()
+            },
+            copy_untracked=bool(block.get("copy_untracked", True)),
         )
 
 
@@ -266,12 +277,16 @@ def _untracked_from_status(status_z: str) -> list[str]:
 
 
 async def copy_untracked_files(
-    original: Path, worktree: Path, subtree: str = ""
+    original: Path,
+    worktree: Path,
+    subtree: str = "",
+    state: dict[str, int] | None = None,
 ) -> list[str]:
     """Copy the user's untracked files (and only those — never a blanket
     directory copy, which would drag in gitignored secrets/huge files) into
     the fresh worktree. With ``subtree`` (repo-root relative), only files
-    under it are copied. Returns the relative paths copied."""
+    under it are copied. Returns the relative paths copied. When ``state``
+    is given, records each file's copy-time mtime for later re-syncs."""
     rc, out, _ = await _run_git(["status", "--porcelain", "-uall", "-z"], cwd=original)
     if rc != 0:
         return []
@@ -286,8 +301,79 @@ async def copy_untracked_files(
         dest = worktree / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
+        if state is not None:
+            state[rel] = src.stat().st_mtime_ns
         copied.append(rel)
     return copied
+
+
+async def sync_untracked_files(info: GitInfo) -> list[str]:
+    """Re-sync the worktree with untracked files the user added (or changed)
+    in their checkout since the worktree was created. Runs at the start of
+    each turn so files created mid-session are visible to the agent.
+
+    New paths are always copied. Already-copied paths are refreshed only when
+    the user's copy changed AND the worktree copy still has the mtime it got
+    at copy time (copy2 preserves mtimes) — i.e. the agent never touched it;
+    a diverging worktree mtime means the agent edited it and must not be
+    clobbered. Returns the newly synced paths."""
+    if not info.copy_untracked:
+        return []
+    rc, out, _ = await _run_git(
+        ["status", "--porcelain", "-uall", "-z"], cwd=info.original_workspace
+    )
+    if rc != 0:
+        return []
+    prefix = f"{info.subtree}/" if info.subtree else ""
+    known = set(info.copied_untracked)
+    state = info.copied_untracked_state
+    newly: list[str] = []
+    for rel in _untracked_from_status(out):
+        if info.subtree and not rel.startswith(prefix):
+            continue
+        src = info.original_workspace / rel
+        if not src.is_file():
+            continue
+        dest = info.worktree / rel
+        src_mtime = src.stat().st_mtime_ns
+        if rel in known:
+            recorded = state.get(rel)
+            if recorded is not None:
+                if src_mtime == recorded:
+                    continue  # user's copy unchanged since the last sync
+                try:
+                    if dest.stat().st_mtime_ns != recorded:
+                        continue  # agent edited its copy — don't clobber
+                except OSError:
+                    continue  # gone from the worktree (agent deleted it?)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        state[rel] = src_mtime
+        if rel not in known:
+            info.copied_untracked.append(rel)
+            newly.append(rel)
+    return newly
+
+
+async def sync_gitignore(info: GitInfo) -> bool:
+    """Copy the original workspace's live .gitignore over the worktree's copy
+    when they differ, so ignore-aware exploration (ls/glob/grep) reflects
+    uncommitted user edits — the worktree only has the committed snapshot,
+    and nothing else re-syncs this file mid-session. Same staleness class as
+    sync_untracked_files, but for the one file that changes how the agent
+    sees *every* other file. Returns True when a copy was made."""
+    src = info.original_workspace / info.subtree / ".gitignore"
+    dst = info.worktree / info.subtree / ".gitignore"
+    if not src.is_file():
+        return False
+    try:
+        if dst.is_file() and dst.read_bytes() == src.read_bytes():
+            return False
+    except OSError:
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
 
 
 async def _free_branch_name(root: Path, base: str) -> str:
@@ -349,10 +435,11 @@ async def create_worktree(
         original_workspace=repo.root,
         git_common_dir=repo.git_common_dir,
         subtree=subtree,
+        copy_untracked=copy_untracked,
     )
     if copy_untracked:
         info.copied_untracked = await copy_untracked_files(
-            repo.root, worktree_path, subtree=subtree
+            repo.root, worktree_path, subtree=subtree, state=info.copied_untracked_state
         )
     return info
 
@@ -449,7 +536,8 @@ async def recreate_worktree(info: GitInfo) -> GitInfo:
             f"could not recreate worktree: {err.strip() or out.strip()}"
         )
     info.copied_untracked = await copy_untracked_files(
-        info.original_workspace, info.worktree, subtree=info.subtree
+        info.original_workspace, info.worktree, subtree=info.subtree,
+        state=info.copied_untracked_state,
     )
     if info.subtree:
         (info.worktree / info.subtree).mkdir(parents=True, exist_ok=True)
@@ -540,6 +628,94 @@ async def git_diff(
 # accept / reject (Part 4)
 
 
+async def _stage_worktree_changes(info: GitInfo) -> bool:
+    """Stage all worktree changes onto the index, keeping untouched
+    copied-untracked files out of it (byte-identical check). True if anything
+    is staged. Shared by commit_worktree_changes and checkpoint."""
+    await _run_git(["add", "-A"], cwd=info.worktree)
+    for rel in info.copied_untracked:
+        wt_file = info.worktree / rel
+        orig = info.original_workspace / rel
+        if wt_file.is_file() and orig.is_file():
+            try:
+                if wt_file.read_bytes() == orig.read_bytes():
+                    await _run_git(["restore", "--staged", "--", rel], cwd=info.worktree)
+            except OSError:
+                pass
+    rc, _, _ = await _run_git(["diff", "--cached", "--quiet"], cwd=info.worktree)
+    return rc != 0
+
+
+async def _head_sha(worktree: Path) -> str:
+    rc, sha, _ = await _run_git(["rev-parse", "HEAD"], cwd=worktree)
+    if rc != 0:
+        raise GitWorktreeError("could not read the worktree's HEAD")
+    return sha.strip()
+
+
+async def checkpoint(info: GitInfo) -> str:
+    """Snapshot the worktree's current state onto the agent branch, so a turn
+    can be rolled back with revert_to_checkpoint.
+
+    Commits everything staged (same staging rules as /accept) when the
+    worktree is dirty; when it is already clean, records the current HEAD
+    instead of making an empty commit. Returns the sha to reset to."""
+    rc, out, err = await _run_git(
+        ["status", "--porcelain", "-uall", "-z"], cwd=info.worktree
+    )
+    if rc != 0:
+        raise GitWorktreeError(f"could not read worktree status: {err.strip()}")
+    if out.replace("\0", "").strip() and await _stage_worktree_changes(info):
+        rc, _, err = await _run_git(
+            [*await _commit_identity(info.worktree), "commit", "-q",
+             "-m", f"xarness: checkpoint (session {info.session_id})"],
+            cwd=info.worktree,
+        )
+        if rc != 0:
+            raise GitWorktreeError(f"could not create checkpoint: {err.strip()}")
+    return await _head_sha(info.worktree)
+
+
+async def revert_to_checkpoint(info: GitInfo, sha: str) -> None:
+    """Hard-reset the worktree to a checkpoint sha, discarding every file
+    change made since it: staged, unstaged, and newly created files (the
+    pre-reset ``add -A`` puts new paths in the index so reset removes them).
+
+    Untracked files copied from the user's checkout need special care: they
+    are not in the checkpoint commit, so the reset would delete them even
+    when the agent never touched them. After the reset, any of them that the
+    sha's tree doesn't track are restored byte-for-byte from the user's
+    workspace — their exact pre-turn state.
+
+    Only reverts files — anything run_bash did outside the worktree
+    (installs, background jobs, network calls) is not undone."""
+    rc, tree, _ = await _run_git(
+        ["ls-tree", "-r", "--name-only", sha], cwd=info.worktree
+    )
+    tracked = set(tree.splitlines()) if rc == 0 else set()
+    await _run_git(["add", "-A"], cwd=info.worktree)
+    rc, _, err = await _run_git(["reset", "--hard", sha], cwd=info.worktree)
+    if rc != 0:
+        raise GitWorktreeError(
+            f"could not revert to checkpoint {sha[:8]}: {err.strip()}"
+        )
+    for rel in info.copied_untracked:
+        if rel in tracked:
+            continue  # committed earlier: reset already restored that version
+        src = info.original_workspace / rel
+        dest = info.worktree / rel
+        if not src.is_file():
+            continue
+        if dest.is_file():
+            try:
+                if dest.read_bytes() == src.read_bytes():
+                    continue  # survived the reset untouched
+            except OSError:
+                pass
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+
+
 async def commit_worktree_changes(info: GitInfo) -> str:
     """Commit all worktree changes onto the agent branch so a merge can
     carry them. Returns "clean", "nothing-staged", or "committed".
@@ -553,18 +729,7 @@ async def commit_worktree_changes(info: GitInfo) -> str:
         raise GitWorktreeError(f"could not read worktree status: {err.strip()}")
     if not out.replace("\0", "").strip():
         return "clean"
-    await _run_git(["add", "-A"], cwd=info.worktree)
-    for rel in info.copied_untracked:
-        wt_file = info.worktree / rel
-        orig = info.original_workspace / rel
-        if wt_file.is_file() and orig.is_file():
-            try:
-                if wt_file.read_bytes() == orig.read_bytes():
-                    await _run_git(["restore", "--staged", "--", rel], cwd=info.worktree)
-            except OSError:
-                pass
-    rc, _, _ = await _run_git(["diff", "--cached", "--quiet"], cwd=info.worktree)
-    if rc == 0:
+    if not await _stage_worktree_changes(info):
         return "nothing-staged"
     rc, out, err = await _run_git(
         [*await _commit_identity(info.worktree), "commit", "-q",

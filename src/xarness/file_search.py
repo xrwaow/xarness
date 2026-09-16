@@ -10,7 +10,8 @@ import asyncio
 import os
 from pathlib import Path
 
-_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".cache"}
+from .ignore import DEFAULT_IGNORE_DIRS
+
 _MAX_SCAN = 20_000
 _MAX_RESULTS = 50
 
@@ -19,7 +20,7 @@ def _walk_bounded(root: Path) -> list[str]:
     results: list[str] = []
     scanned = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root)
             results.append(rel)

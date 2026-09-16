@@ -3,14 +3,16 @@
 Roles are modeled faithfully to the OpenAI wire format — including the
 reserved ``tool`` role and tool-call fields — so a future tool-calling layer
 can append tool-call/tool-result messages here without touching UI code.
-Reasoning text is stored locally per assistant message but is never sent back
-over the wire.
+Reasoning text and token usage are stored locally per assistant message but
+are never sent back over the wire.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from .events import Usage
 
 
 @dataclass(slots=True)
@@ -23,6 +25,12 @@ class Message:
     reasoning: str | None = None
     # Local-only: seconds spent in the reasoning channel (None if unknown).
     reasoning_seconds: float | None = None
+    # Local-only: token usage reported for the round that produced this
+    # message (assistant messages only; never sent over the wire).
+    usage: Usage | None = None
+    # Local-only: git checkpoint sha taken when this user message was sent —
+    # the state /undo //retry restore the worktree to.
+    checkpoint_sha: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -47,6 +55,10 @@ class Conversation:
     """Ordered message history; the single source of truth for the chat."""
 
     messages: list[Message] = field(default_factory=list)
+    # Local-only: the message list as it stood when the current turn's user
+    # message was sent (set by the controller, used by /undo and /retry to
+    # roll the conversation back — including across a mid-turn compaction).
+    undo_snapshot: list[Message] | None = None
 
     def add(self, message: Message) -> Message:
         self.messages.append(message)

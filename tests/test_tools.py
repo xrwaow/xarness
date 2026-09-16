@@ -96,12 +96,15 @@ def test_handler_exception_is_contained() -> None:
 
 def test_plan_registry_is_read_only(tmp_path) -> None:
     names = {t["function"]["name"] for t in _registry_for(tmp_path, mode="plan").schema()}
-    assert names == {"web_search", "read_file"}
+    assert names == {"web_search", "read_file", "ls", "glob", "grep"}
 
 
 def test_write_registry_exposes_write_tools(tmp_path) -> None:
     names = {t["function"]["name"] for t in _registry_for(tmp_path, mode="write").schema()}
-    assert names == {"web_search", "read_file", "write_file", "edit_file"}
+    assert names == {
+        "web_search", "read_file", "ls", "glob", "grep",
+        "write_file", "edit_file",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +201,41 @@ def test_read_rejects_inverted_range(tmp_path) -> None:
     ))
     assert not result.ok
     assert result.parse_error is True
+
+
+# ---------------------------------------------------------------------------
+# line counting (no trailing newline)
+
+
+def test_read_counts_lines_without_trailing_newline(tmp_path) -> None:
+    """wc -l counts newlines; a 3-line file without one must still report 3."""
+    (tmp_path / "a.txt").write_text("one\ntwo\nthree")
+    result = asyncio.run(
+        _registry_for(tmp_path).call("read_file", '{"path": "a.txt"}')
+    )
+    assert result.ok
+    # Full read: no truncation annotation, and the last line is included.
+    assert result.output == "one\ntwo\nthree"
+
+    ranged = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", '{"path": "a.txt", "start_line": 2, "end_line": 2}'
+    ))
+    assert ranged.ok
+    assert "[showing lines 2-2 of 3" in ranged.output
+
+
+def test_read_outline_threshold_ignores_missing_trailing_newline(tmp_path) -> None:
+    """A 501-line Python file with no trailing newline must cross the outline
+    threshold (wc -l would count 500 and read it whole instead)."""
+    lines = ["import os", *(["# filler"] * 498), "def top():", "    pass"]
+    assert len(lines) == 501
+    (tmp_path / "big.py").write_text("\n".join(lines))
+    result = asyncio.run(
+        _registry_for(tmp_path).call("read_file", '{"path": "big.py"}')
+    )
+    assert result.ok
+    assert result.output.startswith("File outline retrieved.")
+    assert "def top [L500-501]" in result.output
 
 
 # ---------------------------------------------------------------------------

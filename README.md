@@ -51,7 +51,9 @@ yet), xarness runs `git init` itself and snapshots your current files as a
 baseline commit — your files are never modified by this. Opt out with
 `--no-init-repo` (the agent then edits the directory directly, and diff
 tracking is unavailable). Untracked files are copied into the worktree so the
-agent can see them; skip that with `--no-copy-untracked`.
+agent can see them — and re-synced at the start of every turn, so files you
+add to your workspace mid-session become visible to the agent on its next
+round; skip that with `--no-copy-untracked`.
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
@@ -66,11 +68,34 @@ harness-managed worktree/branch lifecycle.
 | `/diff <path>` | Show one file's unified diff |
 | `/accept` | Merge the agent's branch into your branch (`--no-ff`), remove the worktree |
 | `/reject` | Discard everything (asks you to confirm) |
+| `/undo` | Drop the last turn: revert its file edits, put your message back in the input |
+| `/retry` | Revert the last turn's file edits and resend your message |
 
 `/accept` conflicts (your branch moved on since the session started) are
 reported, never auto-resolved — the worktree stays so you can retry after
 fixing things manually. Quitting without accepting or rejecting keeps the
 worktree; resuming the session reconnects to it.
+
+### Undo and retry
+
+Each turn starts with a git checkpoint: the worktree's current state is
+committed to the agent branch (or, when it is already clean, its HEAD is
+recorded). `/undo` and `/retry` reset the worktree to that checkpoint,
+removing every file change the turn made — edits, deletions, and newly
+created files.
+
+**Only file edits are reverted.** Non-file side effects of `run_bash` —
+package installs, background jobs, network calls, anything outside the
+worktree — are *not* undone. `/undo` puts the removed message back into the
+input box; `/retry` resends it immediately. Both also roll back the turn's
+token usage from the session totals, and work across a mid-turn `/compact`
+(the pre-compaction history is restored). Without git isolation (no repo,
+`--no-init-repo`, or setup failure) they still remove the messages and fix
+the token counts, but tell you the file edits could not be reverted.
+
+Because turns are checkpointed, `/accept` merges the branch's per-turn
+checkpoint commits plus a final commit instead of one big diff — the history
+reads as a per-turn log of the session.
 
 ## Sessions
 
@@ -143,6 +168,8 @@ xarness chat --workspace ./some-project    # sandbox root (default: cwd)
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
+| `/undo` | Drop the last turn (file edits reverted, message back in the input) |
+| `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Git-backed change tracking" above |
 
 ## Keys
@@ -170,7 +197,9 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 - **Token counts**: taken from the API's `usage` field when provided
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
   approximate local estimate is shown. The status bar keeps running session
-  totals and context headroom against `max_context`.
+  totals and context headroom against `max_context`. Compaction's own
+  summarization round is included in the totals, and the `compact` tool
+  reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
 
 ## Layout of the code
 

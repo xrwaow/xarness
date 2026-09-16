@@ -6,6 +6,7 @@ monkeypatches gitwork.WORKTREES_DIR so nothing touches ~/.local/share.
 """
 
 import asyncio
+import os
 import shutil
 import subprocess
 import tempfile
@@ -14,9 +15,10 @@ from pathlib import Path
 
 from xarness import gitwork
 from xarness.gitwork import (
-    MergeOutcome, check_blocked_git, commit_worktree_changes, create_worktree,
-    delete_branch, detect_repo, diff_stat, git_diff, merge_branch,
-    recreate_worktree, remove_worktree, stage_untracked, worktree_is_valid,
+    MergeOutcome, check_blocked_git, checkpoint, commit_worktree_changes,
+    create_worktree, delete_branch, detect_repo, diff_stat, git_diff,
+    merge_branch, recreate_worktree, remove_worktree, revert_to_checkpoint,
+    stage_untracked, worktree_is_valid,
 )
 
 
@@ -230,6 +232,148 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert await worktree_is_valid(fresh)
         assert fresh.worktree == info.worktree
         assert fresh.branch == info.branch
+
+    async def test_sync_untracked_picks_up_new_and_changed_files(self):
+        """Files the user adds (or edits) after worktree creation appear in
+        the worktree on the next sync; agent-edited copies are not clobbered."""
+        repo = self.make_repo()
+        (repo / "notes.md").write_text("v1\n")
+        info = await create_worktree(await detect_repo(repo), "sess1")
+        assert (info.worktree / "notes.md").read_text() == "v1\n"
+
+        # Distinct mtimes keep the user-edit vs agent-edit detection
+        # deterministic on filesystems with coarse timestamps.
+        def touch(path: Path, mtime: int) -> None:
+            os.utime(path, (mtime, mtime))
+
+        # User adds a brand-new untracked file mid-session and edits an
+        # already-copied one.
+        (repo / "later.txt").write_text("added later\n")
+        (repo / "notes.md").write_text("v2\n")
+        touch(repo / "notes.md", 2_000_000_000)
+        newly = await gitwork.sync_untracked_files(info)
+        assert newly == ["later.txt"]
+        assert (info.worktree / "later.txt").read_text() == "added later\n"
+        assert (info.worktree / "notes.md").read_text() == "v2\n"
+        assert "later.txt" in info.copied_untracked
+
+        # The agent edits its copy after the user's change: sync must not
+        # clobber the agent's newer edit.
+        (info.worktree / "notes.md").write_text("agent edit\n")
+        touch(info.worktree / "notes.md", 3_000_000_000)
+        (repo / "notes.md").write_text("v3\n")
+        touch(repo / "notes.md", 2_500_000_000)
+        newly = await gitwork.sync_untracked_files(info)
+        assert newly == []
+        assert (info.worktree / "notes.md").read_text() == "agent edit\n"
+
+    async def test_checkpoint_and_revert_restore_worktree_state(self):
+        """checkpoint() snapshots the worktree; revert_to_checkpoint discards
+        everything a turn did after it — edits, staged edits, new files."""
+        repo = self.make_repo()
+        info = await create_worktree(await detect_repo(repo), "sess1")
+        base_head = _git(info.worktree, "rev-parse", "HEAD").strip()
+
+        # Turn starts: a previous-turn leftover is uncommitted; checkpoint
+        # commits it.
+        (info.worktree / "app.py").write_text("prior work\n")
+        sha = await checkpoint(info)
+        assert sha != base_head
+        assert _git(info.worktree, "status", "--porcelain") == ""
+
+        # The turn edits a tracked file, stages it, and creates a new file.
+        (info.worktree / "app.py").write_text("turn edits\n")
+        (info.worktree / "created.py").write_text("new file\n")
+        _git(info.worktree, "add", "-A")
+        assert await git_diff(info.worktree, info.base_ref)  # changes visible
+
+        await revert_to_checkpoint(info, sha)
+        assert (info.worktree / "app.py").read_text() == "prior work\n"
+        assert not (info.worktree / "created.py").exists()
+        assert _git(info.worktree, "status", "--porcelain") == ""
+        # Prior turns' checkpointed work is preserved.
+        stat = await diff_stat(info.worktree, info.base_ref)
+        assert [(f.path, f.additions, f.deletions) for f in stat.files] == [
+            ("app.py", 1, 2)
+        ]
+
+    async def test_revert_keeps_user_untracked_files_intact(self):
+        """Copied untracked files are not part of the checkpoint commit: the
+        revert must not delete untouched ones, and must restore the ones the
+        turn modified or deleted to their pre-turn (original) content."""
+        repo = self.make_repo()
+        (repo / "untouched.txt").write_text("user file\n")
+        (repo / "touched.txt").write_text("user file 2\n")
+        (repo / "doomed.txt").write_text("user file 3\n")
+        info = await create_worktree(await detect_repo(repo), "sess1")
+        sha = await checkpoint(info)  # clean worktree: records HEAD
+
+        # The turn modifies one copied file and deletes another.
+        (info.worktree / "touched.txt").write_text("agent rewrite\n")
+        (info.worktree / "doomed.txt").unlink()
+
+        await revert_to_checkpoint(info, sha)
+
+        assert (info.worktree / "untouched.txt").read_text() == "user file\n"
+        assert (info.worktree / "touched.txt").read_text() == "user file 2\n"
+        assert (info.worktree / "doomed.txt").read_text() == "user file 3\n"
+        # Back to the pre-turn state: the user's files untracked, nothing else.
+        assert sorted(
+            _git(info.worktree, "status", "--porcelain").splitlines()
+        ) == ["?? doomed.txt", "?? touched.txt", "?? untouched.txt"]
+
+    async def test_revert_preserves_previously_committed_copied_file(self):
+        """A copied untracked file the agent modified in an EARLIER turn (so a
+        checkpoint committed it) keeps its committed version across a later
+        revert — the user's original must not clobber accepted work."""
+        repo = self.make_repo()
+        (repo / "scratch.txt").write_text("v0\n")
+        info = await create_worktree(await detect_repo(repo), "sess1")
+
+        # Turn 1 modifies the copied file; turn 2's checkpoint commits it.
+        (info.worktree / "scratch.txt").write_text("agent v1\n")
+        sha2 = await checkpoint(info)
+        assert _git(info.worktree, "status", "--porcelain") == ""
+
+        # Turn 3 modifies it again; undoing turn 3 restores the committed v1.
+        (info.worktree / "scratch.txt").write_text("agent v2\n")
+        await revert_to_checkpoint(info, sha2)
+        assert (info.worktree / "scratch.txt").read_text() == "agent v1\n"
+
+    async def test_checkpoint_clean_worktree_records_head(self):
+        repo = self.make_repo()
+        info = await create_worktree(await detect_repo(repo), "sess1")
+        head = _git(info.worktree, "rev-parse", "HEAD").strip()
+        count = _git(info.worktree, "rev-list", "--count", "HEAD").strip()
+
+        sha = await checkpoint(info)
+
+        assert sha == head  # no empty commit
+        assert _git(info.worktree, "rev-list", "--count", "HEAD").strip() == count
+        # Reverting to it is still a valid no-op-ish rollback.
+        (info.worktree / "app.py").write_text("scratch\n")
+        await revert_to_checkpoint(info, sha)
+        assert (info.worktree / "app.py").read_text() == "line1\nline2\n"
+
+    async def test_commit_worktree_changes_after_checkpoint(self):
+        """With every turn checkpointed, /accept's commit paths still behave:
+        clean worktree → "clean"; untouched copied untracked stay untracked."""
+        repo = self.make_repo()
+        (repo / "scratch.txt").write_text("untracked\n")
+        info = await create_worktree(await detect_repo(repo), "sess1")
+
+        # Turn 1: agent modifies a tracked file; checkpointed at turn 2 start.
+        (info.worktree / "app.py").write_text("line1\nedited\n")
+        await checkpoint(info)  # commits the edit
+        # Turn 2: clean worktree.
+        await checkpoint(info)
+        # The untouched copied-untracked file keeps status "dirty" but stages
+        # nothing — /accept proceeds and merges the checkpoint commits.
+        assert await commit_worktree_changes(info) == "nothing-staged"
+
+        # The copied untracked file was never touched: not committed.
+        commits = _git(info.worktree, "log", "--name-only", "--format=%h").splitlines()
+        assert "scratch.txt" not in commits
 
     # ------------------------------------------------------------------
     # diff computation

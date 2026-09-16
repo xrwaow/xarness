@@ -45,6 +45,13 @@ class SandboxSubtreeTest(unittest.TestCase):
         assert config.validate_relpath("../etc") is not None
         assert config.validate_relpath("/etc") is not None
 
+        # Read mode: the whole workspace is bound read-only, so paths outside
+        # the subtree are readable — only traversal/absolute paths are wrong.
+        assert config.validate_relpath("app.py", mode="read") is None
+        assert config.validate_relpath("f/notes.txt", mode="read") is None
+        assert config.validate_relpath("../etc", mode="read") is not None
+        assert config.validate_relpath("/etc", mode="read") is not None
+
     def test_missing_subtree_dir_is_unavailable(self):
         with self.assertRaises(SandboxUnavailable):
             SandboxConfig(workspace=self.workspace, subtree="nope")

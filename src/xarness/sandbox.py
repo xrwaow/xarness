@@ -15,6 +15,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 
 class SandboxUnavailable(Exception):
@@ -69,17 +70,23 @@ class SandboxConfig:
         base = f"/workspace/{self.subtree}" if self.subtree else "/workspace"
         return f"{base}/.refs/{alias}"
 
-    def validate_relpath(self, path: str) -> str | None:
+    def validate_relpath(self, path: str, mode: Literal["read", "write"] = "write") -> str | None:
         """Defense-in-depth path check; bwrap's mount namespace is the real
         enforcement — this just gives a clean error instead of a bwrap
-        failure. With a subtree, tool paths must stay inside it (the
-        read-only .refs/ binds live at the subtree root)."""
+        failure.
+
+        mode="read" only enforces workspace containment: with a subtree, the
+        whole workspace is bound read-only (build_argv), so anything under
+        /workspace is readable even though it's outside the session's
+        read-write subtree. mode="write" additionally requires the path to
+        stay inside the subtree (the read-only .refs/ binds live at the
+        subtree root)."""
         p = Path(path)
         if p.is_absolute():
             return f"path must be relative to the workspace, got absolute path '{path}'"
         if ".." in p.parts:
             return f"path must not contain '..', got '{path}'"
-        if self.subtree:
+        if mode == "write" and self.subtree:
             norm = path[2:] if path.startswith("./") else path
             if not norm.startswith(".refs/"):
                 inside = norm == self.subtree or norm.startswith(self.subtree + "/")

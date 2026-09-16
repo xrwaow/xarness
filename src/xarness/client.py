@@ -7,6 +7,7 @@ consumes wire-format message dicts and yields typed stream events from
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -28,6 +29,12 @@ from .events import (
 )
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=30.0, pool=15.0)
+
+# Transient connection failures are retried before any tokens have arrived —
+# a single connection blip shouldn't kill the whole turn. Server responses
+# (4xx/5xx) and mid-stream drops after tokens started are never retried.
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF = 0.3
 
 # cot_strength -> the reasoning-effort-style parameter this provider expects.
 # Kept isolated so per-provider adjustments never touch the rest of the code.
@@ -99,9 +106,15 @@ class _ToolCallAccumulator:
 class ChatClient:
     """Streams chat completions from an OpenAI-compatible endpoint."""
 
-    def __init__(self, profile: ProviderProfile, api_key: str | None) -> None:
+    def __init__(
+        self,
+        profile: ProviderProfile,
+        api_key: str | None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._profile = profile
         self._api_key = api_key
+        self._transport = transport  # injectable for tests
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Repoint this client at a new provider profile mid-session."""
@@ -147,42 +160,53 @@ class ChatClient:
 
         usage: Usage | None = None
         tool_calls = _ToolCallAccumulator()
-        try:
-            async with (
-                httpx.AsyncClient(timeout=_TIMEOUT) as client,
-                client.stream(
-                    "POST", url, json=self.build_payload(wire_messages, tools), headers=headers
-                ) as response,
-            ):
-                if response.status_code != 200:
-                    detail = (await response.aread()).decode(errors="replace").strip()
-                    yield StreamError(f"HTTP {response.status_code} from {url}: {detail[:500]}")
-                    return
-
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue  # SSE comments / event:/retry: lines
-                    data = line[len("data:") :].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if isinstance(chunk.get("error"), dict):
-                        message = chunk["error"].get("message") or str(chunk["error"])
-                        yield StreamError(f"stream error from {url}: {message}")
+        received_any = False
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            try:
+                async with (
+                    httpx.AsyncClient(timeout=_TIMEOUT, transport=self._transport) as client,
+                    client.stream(
+                        "POST", url, json=self.build_payload(wire_messages, tools), headers=headers
+                    ) as response,
+                ):
+                    if response.status_code != 200:
+                        detail = (await response.aread()).decode(errors="replace").strip()
+                        yield StreamError(f"HTTP {response.status_code} from {url}: {detail[:500]}")
                         return
 
-                    reported = _usage_from_chunk(chunk)
-                    if reported is not None:
-                        usage = reported
-                    for event in _delta_events(chunk, tool_calls):
-                        yield event
-        except httpx.HTTPError as exc:
-            yield StreamError(f"request to {url} failed: {exc}")
-            return
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue  # SSE comments / event:/retry: lines
+                        data = line[len("data:") :].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if isinstance(chunk.get("error"), dict):
+                            message = chunk["error"].get("message") or str(chunk["error"])
+                            yield StreamError(f"stream error from {url}: {message}")
+                            return
+
+                        reported = _usage_from_chunk(chunk)
+                        if reported is not None:
+                            usage = reported
+                        events = _delta_events(chunk, tool_calls)
+                        if events:
+                            received_any = True
+                        for event in events:
+                            yield event
+            except httpx.TransportError as exc:
+                # Connection-level failure. Retry only while nothing has been
+                # streamed yet — a partial answer can never be replayed.
+                if received_any or attempt == _RETRY_ATTEMPTS:
+                    yield StreamError(f"request to {url} failed: {exc}")
+                    return
+                await asyncio.sleep(_RETRY_BACKOFF * attempt)
+            else:
+                break
 
         for event in tool_calls.finish():
             yield event
