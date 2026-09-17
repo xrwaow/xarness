@@ -9,6 +9,7 @@ the sandbox, since it's the only one that needs a real network path.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -353,66 +354,180 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
     )
 
 
+# Upper bound on the diff lines echoed back by edit_file.
+_MAX_EDIT_DIFF_LINES = 400
+
+
+def _collect_edits(
+    args: dict[str, Any],
+) -> tuple[list[tuple[str, str]], ToolResult | None]:
+    """Normalize the two accepted argument shapes into ``(old, new)`` pairs.
+
+    Preferred is an ``edits`` array (every change to the file in one call);
+    a bare top-level ``old_string``/``new_string`` pair is still accepted so
+    older transcripts and habits keep working.
+    """
+    raw = args.get("edits")
+    if raw is None:
+        old = args.get("old_string", "")
+        if not old:
+            return [], ToolResult(
+                ok=False,
+                error="provide 'edits' (a list of {old_string, new_string}) or a "
+                "single 'old_string'/'new_string' pair",
+                parse_error=True,
+            )
+        return [(old, args.get("new_string", ""))], None
+    if not isinstance(raw, list) or not raw:
+        return [], ToolResult(
+            ok=False, error="'edits' must be a non-empty list", parse_error=True
+        )
+    edits: list[tuple[str, str]] = []
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            return [], ToolResult(
+                ok=False, error=f"edit {index} must be an object", parse_error=True
+            )
+        old, new = item.get("old_string", ""), item.get("new_string", "")
+        if not isinstance(old, str) or not isinstance(new, str) or not old:
+            return [], ToolResult(
+                ok=False,
+                error=f"edit {index} needs a non-empty 'old_string' and a 'new_string'",
+                parse_error=True,
+            )
+        edits.append((old, new))
+    return edits, None
+
+
+def _apply_edits(current: str, edits: list[tuple[str, str]]) -> tuple[str, str | None]:
+    """Apply every edit in order; return ``(new_text, error)``.
+
+    All-or-nothing: the first edit that does not match exactly once aborts
+    the whole call, so a partially edited file is never written.
+    """
+    updated = current
+    for index, (old, new) in enumerate(edits, 1):
+        where = f"edit {index}" if len(edits) > 1 else "old_string"
+        occurrences = updated.count(old)
+        if occurrences == 0:
+            return updated, f"{where}: old_string not found in file"
+        if occurrences > 1:
+            return updated, (
+                f"{where}: old_string is not unique ({occurrences} matches); "
+                "include more surrounding context to disambiguate"
+            )
+        updated = updated.replace(old, new, 1)
+    return updated, None
+
+
+def _format_edit_diff(path: str, before: str, after: str) -> str:
+    """Git-style unified diff of one edit call's changes.
+
+    Returned as the tool's output so both the model (to verify what it
+    actually changed) and the TUI (expanding the tool block) can see the
+    changed lines rather than just an "applied" acknowledgement.
+    """
+    lines = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+            lineterm="",
+        )
+    )
+    if not lines:
+        return "(no textual change)"
+    if len(lines) > _MAX_EDIT_DIFF_LINES:
+        lines = lines[:_MAX_EDIT_DIFF_LINES] + [
+            f"[... diff truncated at {_MAX_EDIT_DIFF_LINES} lines]"
+        ]
+    return f"diff --git a/{path} b/{path}\n" + "\n".join(lines)
+
+
 def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
     async def _edit_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        old_string = args.get("old_string", "")
-        new_string = args.get("new_string", "")
         error = sandbox.validate_relpath(path)
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
         if path.startswith((".refs/", "./.refs/")):
             return ToolResult(ok=False, error="'.refs/' is read-only")
-        if not old_string:
-            return ToolResult(
-                ok=False,
-                error="'old_string' is required (use write_file to replace a whole file)",
-                parse_error=True,
-            )
+
+        edits, parse_error = _collect_edits(args)
+        if parse_error is not None:
+            return parse_error
 
         read_result = await run_in_sandbox(sandbox, ["cat", _sandbox_path(path)])
         if read_result.exit_code != 0:
             return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
 
         current = read_result.stdout
-        occurrences = current.count(old_string)
-        if occurrences == 0:
-            return ToolResult(ok=False, error="old_string not found in file")
-        if occurrences > 1:
-            return ToolResult(
-                ok=False,
-                error=f"old_string is not unique ({occurrences} matches); "
-                "include more surrounding context to disambiguate",
-            )
+        updated, failure = _apply_edits(current, edits)
+        if failure is not None:
+            return ToolResult(ok=False, error=failure)
 
-        updated = current.replace(old_string, new_string, 1)
         write_result = await run_in_sandbox(
             sandbox, ["tee", _sandbox_path(path)], input_bytes=updated.encode()
         )
         if write_result.exit_code != 0:
             return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
-        return ToolResult(ok=True, output=f"applied edit to {path}")
+        plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
+        return ToolResult(
+            ok=True,
+            output=f"applied {plural} to {path}\n{_format_edit_diff(path, current, updated)}",
+        )
 
     return Tool(
         name="edit_file",
         description=(
-            "Edit an existing file by replacing one exact, unique occurrence of "
-            "old_string with new_string — include enough surrounding context (a "
-            "few lines) to disambiguate if the snippet could appear more than "
-            "once. Use write_file to create a file or replace its whole contents. "
-            "Cannot write under '.refs/', which is read-only."
+            "Edit an existing file by replacing exact, unique strings with new "
+            "text. Pass 'edits': a list of {old_string, new_string} replacements, "
+            "applied in order — batch every change you want to make to the same "
+            "file into one call rather than calling this tool repeatedly. Each "
+            "old_string must match the file exactly and uniquely; include enough "
+            "surrounding context (a few lines) to disambiguate if the snippet "
+            "could appear more than once. Edits are all-or-nothing: if any one "
+            "fails to match, nothing is written. The result includes a diff of "
+            "what changed. Use write_file to create a file or replace its whole "
+            "contents. Cannot write under '.refs/', which is read-only."
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "description": (
+                        "replacements to apply, in order (prefer this over the "
+                        "single-edit old_string/new_string pair)"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": "the exact text to replace (must match once)",
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "the replacement text",
+                            },
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
                 "old_string": {
                     "type": "string",
-                    "description": "the exact text to replace (must match once)",
+                    "description": "single-edit form: the exact text to replace (must match once)",
                 },
-                "new_string": {"type": "string", "description": "the replacement text"},
+                "new_string": {
+                    "type": "string",
+                    "description": "single-edit form: the replacement text",
+                },
             },
-            "required": ["path", "old_string", "new_string"],
+            "required": ["path"],
         },
         handler=_edit_file,
     )

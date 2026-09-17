@@ -1,6 +1,7 @@
 """Tests for the tool registry: dispatch, failure containment, schema."""
 
 import asyncio
+import json
 import shutil
 
 import pytest
@@ -272,6 +273,92 @@ def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     ))
     assert result.ok
     assert (tmp_path / "f.txt").read_text() == "alpha\nBETA\nalpha\n"
+    # The result carries the changed code, not just an acknowledgement.
+    assert result.output.startswith("applied edit to f.txt")
+    assert "-beta" in result.output
+    assert "+BETA" in result.output
+
+
+def test_edit_file_applies_multiple_edits_in_one_call(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\nbeta\ngamma\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({"path": "f.txt", "edits": [
+            {"old_string": "alpha", "new_string": "ALPHA"},
+            {"old_string": "gamma", "new_string": "GAMMA"},
+        ]}),
+    ))
+    assert result.ok
+    assert (tmp_path / "f.txt").read_text() == "ALPHA\nbeta\nGAMMA\n"
+    assert result.output.startswith("applied 2 edits to f.txt")
+    assert "diff --git a/f.txt b/f.txt" in result.output
+    for line in ("-alpha", "+ALPHA", "-gamma", "+GAMMA"):
+        assert line in result.output
+
+
+def test_edit_file_edits_apply_in_order(tmp_path) -> None:
+    """A later edit matches against the text the earlier one produced."""
+    (tmp_path / "f.txt").write_text("one\ntwo\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({"path": "f.txt", "edits": [
+            {"old_string": "one", "new_string": "uno"},
+            {"old_string": "uno", "new_string": "UNO"},
+        ]}),
+    ))
+    assert result.ok
+    assert (tmp_path / "f.txt").read_text() == "UNO\ntwo\n"
+
+
+def test_edit_file_edits_are_all_or_nothing(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\nbeta\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({"path": "f.txt", "edits": [
+            {"old_string": "alpha", "new_string": "ALPHA"},
+            {"old_string": "missing", "new_string": "X"},
+        ]}),
+    ))
+    assert not result.ok
+    assert "edit 2" in result.error
+    assert "not found" in result.error
+    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\n"
+
+
+def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\nbeta\nalpha\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({"path": "f.txt", "edits": [
+            {"old_string": "beta", "new_string": "BETA"},
+            {"old_string": "alpha", "new_string": "ALPHA"},
+        ]}),
+    ))
+    assert not result.ok
+    assert "edit 2" in result.error
+    assert "not unique" in result.error
+    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\nalpha\n"
+
+
+def test_edit_file_rejects_empty_edits_list(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file", '{"path": "f.txt", "edits": []}'
+    ))
+    assert not result.ok
+    assert result.parse_error is True
+    assert "non-empty list" in result.error
+
+
+def test_edit_file_rejects_malformed_edit_item(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file", '{"path": "f.txt", "edits": [{"new_string": "x"}]}'
+    ))
+    assert not result.ok
+    assert result.parse_error is True
+    assert "edit 1" in result.error
+    assert (tmp_path / "f.txt").read_text() == "alpha\n"
 
 
 def test_edit_file_rejects_ambiguous_match(tmp_path) -> None:

@@ -285,9 +285,9 @@ class ThinkingBlock(Vertical):
     streaming — to reveal or hide the live reasoning text. Shows "Thinking"
     (shimmering) while active, "Thought for Xs" (plain) once done.
 
-    Auto-scrolls the chat log to follow new reasoning text, but only while
-    expanded AND still actively thinking — never after it's settled, so
-    re-expanding a finished thought later doesn't yank the viewport.
+    Following new reasoning text is left to the chat log's anchor: while it is
+    armed the growing text keeps the log pinned to the end, and once the user
+    scrolls up the log stays where they put it.
     """
 
     def __init__(self) -> None:
@@ -316,8 +316,6 @@ class ThinkingBlock(Vertical):
     def append_reasoning(self, text: str) -> None:
         self._reasoning += text
         self._refresh_text()
-        if self.has_class("expanded") and not self._done:
-            self._follow_scroll()
 
     def finish(self, duration: float | None, estimate_if_unknown: bool = True) -> None:
         """Collapse to a static summary. First call wins.
@@ -351,16 +349,10 @@ class ThinkingBlock(Vertical):
             self.remove_class("expanded")
         else:
             self.add_class("expanded")
-            if not self._done:
-                self._follow_scroll()
 
     def on_click(self, event: events.Click) -> None:
         self.toggle()
         event.stop()
-
-    def _follow_scroll(self) -> None:
-        if self.is_mounted and self.parent is not None:
-            self.parent.scroll_end(animate=False)
 
     def _refresh_text(self) -> None:
         if self.is_mounted:
@@ -472,9 +464,21 @@ class ToolCallBlock(Vertical):
         if self._output_text:
             body = f"{body}\n{self._output_text}" if body else self._output_text
         try:
-            self.query_one(".toolcall-body", Static).update(body)
+            static = self.query_one(".toolcall-body", Static)
         except NoMatches:
-            pass  # DOM pruned during app shutdown
+            return  # DOM pruned during app shutdown
+        split = _split_tool_diff(body)
+        if split is None:
+            static.update(body)
+            return
+        # Unified diffs (edit_file's result, `git diff` from run_bash) render
+        # with the theme's diff colors; anything before them stays plain.
+        prose, diff = split
+        rendered = Text(prose.rstrip("\n"))
+        if rendered:
+            rendered.append("\n")
+        rendered.append_text(_render_diff(diff))
+        static.update(rendered)
 
     def _swap_to_static_summary(self) -> None:
         try:
@@ -489,6 +493,16 @@ class ToolCallBlock(Vertical):
 
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_DIFF_GIT_RE = re.compile(r"^diff --git ", re.MULTILINE)
+
+
+def _split_tool_diff(text: str) -> tuple[str, str] | None:
+    """Split tool output into ``(prose, unified diff)`` at its first
+    ``diff --git`` line; ``None`` when the output isn't a diff."""
+    match = _DIFF_GIT_RE.search(text)
+    if match is None:
+        return None
+    return text[: match.start()], text[match.start() :]
 
 
 def _render_diff(text: str) -> Text:

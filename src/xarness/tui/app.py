@@ -170,6 +170,12 @@ class AgentApp(App[None]):
     async def on_mount(self) -> None:
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_status()
+        # Follow new output only while the user is parked at the bottom.
+        # Textual's anchor does exactly that: the log stays pinned to the end as
+        # content streams, the anchor is released the moment the user scrolls up
+        # (so nothing yanks the viewport back), and it re-arms once they scroll
+        # down to the bottom again.
+        self.query_one("#chat-log", VerticalScroll).anchor()
         # A conversation loaded before mount (e.g. `--session <name>` resume
         # in cli.py) has never been rendered — replay it into the chat log.
         if any(m.role != "system" for m in self.controller.conversation.messages):
@@ -607,6 +613,8 @@ class AgentApp(App[None]):
         self._queued.clear()
         chat = self.query_one("#chat-log", VerticalScroll)
         chat.remove_children()
+        # Fresh, empty log: follow it again from the top of the new session.
+        chat.anchor()
         self._refresh_status()
 
     async def _on_session_selected(self, name: str | None) -> None:
@@ -821,29 +829,24 @@ class AgentApp(App[None]):
         self.query_one("#suggestion-popup", SuggestionPopup).remove_class("visible")
 
     def _post_line(self, widget: Static) -> None:
-        """Mount a notice/error line into the chat log, keeping it in view
-        when the log is already at the bottom — otherwise it lands below the
-        fold, and a stale scroll position also stops the next turn from
-        auto-following (see _at_bottom)."""
+        """Mount a notice/error line into the chat log.
+
+        Whether it lands in view is the chat log's business: it is anchored,
+        so it follows the new line only if the user is already at the bottom.
+        """
         try:
             chat = self.query_one("#chat-log", VerticalScroll)
         except NoMatches:
             return  # app shutting down; DOM already pruned
-        follow = self._at_bottom(chat)
         chat.mount(widget)
-        if follow:
-            chat.call_after_refresh(chat.scroll_end, animate=False)
 
     def _submit(self, text: str) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
-        follow = self._at_bottom(chat)
         user_message = UserMessage(text)
         if self._turn_busy:
             user_message.mark_queued()
             self._queued.append(text)
         chat.mount(user_message)
-        if follow:
-            chat.scroll_end(animate=False)
         if not self._turn_busy:
             self._worker = self._run_turn(text)
 
@@ -969,8 +972,6 @@ class AgentApp(App[None]):
                 round_has_tools = False
 
                 async for event in stream:
-                    follow = self._at_bottom(chat)
-
                     if isinstance(event, ReasoningDelta):
                         if thinking is None:
                             await self._dismiss_indicator(indicator)
@@ -1019,9 +1020,6 @@ class AgentApp(App[None]):
                             indicator_live = False
                         await chat.mount(ErrorLine(event.message))
                         had_stream_error = True
-
-                    if follow:
-                        chat.scroll_end(animate=False)
 
                 if writing is not None:
                     await self._dismiss_indicator(writing)
@@ -1106,9 +1104,3 @@ class AgentApp(App[None]):
     def action_toggle_thoughts(self) -> None:
         if self._last_thinking is not None:
             self._last_thinking.toggle()
-
-    # ------------------------------------------------------------------
-    # Scrolling
-
-    def _at_bottom(self, chat: VerticalScroll) -> bool:
-        return chat.scroll_y >= chat.max_scroll_y - 2

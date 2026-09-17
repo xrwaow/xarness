@@ -5,6 +5,10 @@ import unittest
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
+from rich.text import Text
+from textual.containers import VerticalScroll
+from textual.widgets import Static
+
 from xarness.config import CotStrength, ProviderProfile
 from xarness.controller import ChatController
 from xarness.events import (
@@ -272,6 +276,43 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tool_msg.content, "ok")
             self.assertEqual(app.controller.conversation.messages[4].content, "tool says hi")
 
+    async def test_tool_output_containing_a_diff_is_rendered_as_one(self) -> None:
+        """An edit's diff shows up in the expanded tool block, with the theme's
+        diff styling rather than as an undifferentiated blob of text."""
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            block = ToolCallBlock("call_1", "edit_file")
+            await app.query_one("#chat-log", VerticalScroll).mount(block)
+            block.append_arguments('{"path": "f.py"}')
+            block.set_result(
+                ToolCallStatus.CALL_SUCCEEDED,
+                output=(
+                    "applied edit to f.py\n"
+                    "diff --git a/f.py b/f.py\n"
+                    "--- a/f.py\n"
+                    "+++ b/f.py\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    " def a():\n"
+                    "-    old_line()\n"
+                    "+    new_line()\n"
+                ),
+            )
+            await pilot.pause()
+
+            body = block.query_one(".toolcall-body", Static).content
+            self.assertIsInstance(body, Text)
+            self.assertIn('{"path": "f.py"}', body.plain)
+            self.assertIn("applied edit to f.py", body.plain)
+            # The diff is rendered (file header + hunk, changed lines included),
+            # not dumped as raw `diff --git`/`---`/`+++` text.
+            self.assertIn("── f.py", body.plain)
+            self.assertIn("@@ -1,2 +1,2 @@", body.plain)
+            self.assertIn("old_line()", body.plain)
+            self.assertIn("new_line()", body.plain)
+            self.assertNotIn("diff --git", body.plain)
+            # Not plain text: the +/- lines carry the theme's diff styling.
+            self.assertTrue(body.spans)
+
     async def test_parallel_tool_calls_show_single_writing_indicator(self) -> None:
         """While args stream: one 'Writing tools' shimmer, no per-call blocks.
         Blocks appear (and the indicator leaves) once args are done."""
@@ -517,6 +558,75 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertIn("summary text", rest)
             # The summarization round's spend is in the session totals.
             self.assertEqual((app.total_in, app.total_out), (105, 47))
+
+
+class TestChatScroll(unittest.IsolatedAsyncioTestCase):
+    """The chat log follows the stream, but only while the user is at the
+    bottom — scrolling up mid-turn must not be undone."""
+
+    @staticmethod
+    def _wheel_up(chat, times: int = 1) -> None:
+        # What Textual's MouseScrollUp handler does; used directly because the
+        # test drives the scroll position rather than the terminal's mouse.
+        for _ in range(times):
+            chat._scroll_up_for_pointer(animate=False)
+
+    @staticmethod
+    def _wheel_down(chat, times: int = 1) -> None:
+        for _ in range(times):
+            chat._scroll_down_for_pointer(animate=False)
+
+    def _long_script(self) -> list[Any]:
+        script: list[Any] = [ContentDelta(f"line {i}\n\n") for i in range(300)]
+        script.append(TurnComplete(usage=Usage(10, 10)))
+        return script
+
+    async def test_stream_follows_while_at_the_bottom(self) -> None:
+        app, _client = make_app(self._long_script(), delay=0.005)
+        async with app.run_test(size=(80, 24)):
+            chat = app.query_one("#chat-log", VerticalScroll)
+            app._submit("hi")
+            await wait_for(lambda: chat.max_scroll_y > 20)
+            self.assertTrue(chat.is_anchored)
+            self.assertEqual(chat.scroll_y, chat.max_scroll_y)
+            await wait_until_idle(app)
+
+    async def test_scrolling_up_mid_turn_is_not_yanked_back(self) -> None:
+        app, _client = make_app(self._long_script(), delay=0.005)
+        async with app.run_test(size=(80, 24)):
+            chat = app.query_one("#chat-log", VerticalScroll)
+            app._submit("hi")
+            await wait_for(lambda: chat.max_scroll_y > 20)
+
+            self._wheel_up(chat, times=5)
+            parked = chat.scroll_y
+            grown_from = chat.max_scroll_y
+
+            # Still streaming: the log grew, but the viewport stays put.
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                self.assertEqual(chat.scroll_y, parked)
+            self.assertGreater(chat.max_scroll_y, grown_from)
+            self.assertTrue(chat._anchor_released)
+            await wait_until_idle(app)
+
+    async def test_scrolling_back_to_the_bottom_resumes_following(self) -> None:
+        app, _client = make_app(self._long_script(), delay=0.005)
+        async with app.run_test(size=(80, 24)):
+            chat = app.query_one("#chat-log", VerticalScroll)
+            app._submit("hi")
+            await wait_for(lambda: chat.max_scroll_y > 20)
+
+            self._wheel_up(chat, times=5)
+            self.assertTrue(chat._anchor_released)
+
+            self._wheel_down(chat, times=int(chat.max_scroll_y) + 5)
+            self.assertFalse(chat._anchor_released)
+            # Following again: the viewport tracks the growing log.
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                self.assertEqual(chat.scroll_y, chat.max_scroll_y)
+            await wait_until_idle(app)
 
 
 if __name__ == "__main__":

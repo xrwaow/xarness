@@ -14,7 +14,7 @@ When a filesystem sandbox is available, the model gets:
 | --- | --- | --- |
 | `read_file` | plan + write | Read a file (large files return a structural outline; read sections with `start_line`/`end_line`) |
 | `write_file` | write | Create or overwrite a file |
-| `edit_file` | write | Replace a small, unique string in a file |
+| `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
 | `run_bash` | write | Run a shell command in a persistent sandboxed shell (cwd, env vars, and background jobs survive across calls) |
 | `web_search` | always | Search the web via the Brave Search API (needs `BRAVE_API_KEY` set) — runs in the harness process, never inside the sandbox |
 | `ask` | always | Ask you a clarifying question in the TUI |
@@ -194,6 +194,10 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 - **Thoughts**: after a turn with reasoning, a collapsed `▸ Thought for Xs`
   indicator stays in the scrollback; `Ctrl+T` or a click expands it inline.
   Reasoning text is kept in the conversation history regardless of visibility.
+- **Scrolling**: the log follows new output only while you are at the bottom.
+  Scroll up mid-answer and it stays where you put it (nothing yanks it back
+  down); scroll back to the bottom and it resumes following. Expanding a tool
+  call whose output is a diff renders it with the theme's diff colors.
 - **Token counts**: taken from the API's `usage` field when provided
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
   approximate local estimate is shown. The status bar keeps running session
