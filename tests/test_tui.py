@@ -241,6 +241,99 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.total_in, 40)
             self.assertEqual(app.total_out, 7)
 
+    async def test_queued_message_steers_next_round(self) -> None:
+        """A message typed mid-turn is injected at the round boundary —
+        after the tool answers, before the next LLM call — so the very
+        next round already sees it, and its (queued) marker clears."""
+
+        class GatedClient:
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+                self._calls = 0
+                self.round_user_texts: list[list[str]] = []
+
+            async def stream(self, wire_messages, tools=None):
+                self._calls += 1
+                self.round_user_texts.append(
+                    [m["content"] for m in wire_messages if m.get("role") == "user"]
+                )
+                yield ProcessingStarted()
+                if self._calls == 1:
+                    yield ToolCallStarted("call_1", "noop")
+                    yield ToolCallArgumentsDelta("call_1", "{}")
+                    yield ToolCallArgumentsDone("call_1", "noop", "{}")
+                    yield TurnComplete(has_tool_calls=True)
+                    # Hold the turn open so the steer message lands mid-round.
+                    await self.gate.wait()
+                else:
+                    yield ContentDelta("steered reply")
+                    yield TurnComplete(usage=Usage(20, 4))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
+        async with app.run_test() as pilot:
+            await pilot.press("a", "enter")
+            await wait_for(lambda: app._turn_busy)
+
+            # Queue while the tool round is in flight.
+            await pilot.press("b", "enter")
+            self.assertEqual(app._queued, ["b"])
+            notices = [str(n.content) for n in app.query(NoticeLine)]
+            self.assertTrue(any("press enter to send now" in n for n in notices))
+
+            client.gate.set()
+            await wait_until_idle(app)
+
+            # The queued message was delivered into the same turn, right
+            # after the tool result, before the follow-up round.
+            roles = [m.role for m in app.controller.conversation.messages]
+            self.assertEqual(roles, ["user", "assistant", "tool", "user", "assistant"])
+            self.assertEqual(app.controller.conversation.messages[3].content, "b")
+            self.assertEqual(client.round_user_texts[1], ["a", "b"])
+            self.assertEqual(app._queued, [])
+            self.assertEqual(app.query(UserMessage)[1]._suffix, "")
+
+    async def test_enter_on_empty_input_sends_queued_message_now(self) -> None:
+        """Enter with an empty input while a message is queued interrupts the
+        running turn and sends the queued message immediately."""
+
+        class GatedClient:
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+                self._calls = 0
+
+            async def stream(self, wire_messages, tools=None):
+                self._calls += 1
+                yield ProcessingStarted()
+                if self._calls == 1:
+                    yield ContentDelta("first reply")
+                    await self.gate.wait()
+                    yield TurnComplete(usage=Usage(10, 2))
+                else:
+                    yield ContentDelta("second reply")
+                    yield TurnComplete(usage=Usage(20, 4))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
+        async with app.run_test() as pilot:
+            await pilot.press("a", "enter")
+            await wait_for(lambda: app._turn_busy)
+
+            await pilot.press("b", "enter")
+            self.assertEqual(app._queued, ["b"])
+
+            # Empty input + Enter: send now, don't wait for the turn to end.
+            await pilot.press("enter")
+            await wait_until_idle(app)
+
+            self.assertEqual(app._queued, [])
+            self.assertEqual(len(app.query(UserMessage)), 2)
+            self.assertEqual(app.controller.conversation.messages[-1].content, "second reply")
+            notices = [str(n.content) for n in app.query(ErrorLine)]
+            self.assertTrue(any("interrupted" in n for n in notices))
+
     async def test_tool_call_round_trip(self) -> None:
         """A tool-call round executes the stub tool and streams a follow-up round."""
         app, client = make_app(

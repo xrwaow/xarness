@@ -226,6 +226,11 @@ class UserMessage(Vertical):
         self._suffix = "   (queued)"
         self.apply_palette()
 
+    def mark_sent(self) -> None:
+        """The queued message reached the model; drop the queued marker."""
+        self._suffix = ""
+        self.apply_palette()
+
 
 class AssistantMessage(Vertical):
     """Streams the answer, settling each closed code fence as it completes.
@@ -1273,6 +1278,9 @@ class ChatInput(TextArea):
             return
         text = self.text.strip()
         if not text:
+            # Empty Enter is still an event: the app uses it to "send now"
+            # a message that is queued behind a running turn.
+            self.post_message(self.ChatSubmitted(""))
             return
         self.load_text("")
         self.post_message(self.ChatSubmitted(text))

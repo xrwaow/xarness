@@ -124,6 +124,17 @@ class ChatController:
             )
         )
 
+    def inject_user_message(self, text: str) -> None:
+        """Add a user message mid-turn (steering).
+
+        Called at a round boundary — after tool results are recorded, before
+        the next round streams — so a message typed while the agent works is
+        seen by the very next model call instead of waiting for the turn to
+        end. No checkpoint of its own: it belongs to the turn that is already
+        running, whose snapshot /undo restores anyway.
+        """
+        self.conversation.add(Message(role="user", content=text))
+
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Point the session at a new provider profile.
 

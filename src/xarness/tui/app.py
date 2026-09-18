@@ -129,6 +129,7 @@ class AgentApp(App[None]):
         self.last_in = 0
         self._turn_busy = False
         self._queued: list[str] = []
+        self._queued_widgets: list[UserMessage] = []
         self._ask_future: asyncio.Future[str | None] | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
@@ -205,11 +206,17 @@ class AgentApp(App[None]):
 
     def on_chat_input_chat_submitted(self, event: ChatInput.ChatSubmitted) -> None:
         # While the ask tool waits for an answer, every submission is the
-        # answer — never a chat message or slash command.
+        # answer — never a chat message or slash command. Empty text is
+        # ignored so the "send now" Enter can't submit a blank answer.
         if self._ask_future is not None and not self._ask_future.done():
-            self._ask_future.set_result(event.text)
+            if event.text.strip():
+                self._ask_future.set_result(event.text)
             return
         text = event.text.strip()
+        if not text:
+            # Empty input + Enter while messages are queued: send now.
+            self._flush_queued_now()
+            return
         if text.startswith("/"):
             self._handle_slash_command(text)
             return
@@ -611,6 +618,7 @@ class AgentApp(App[None]):
         self.total_in = self.total_out = self.last_in = 0
         self._last_thinking = None
         self._queued.clear()
+        self._queued_widgets.clear()
         chat = self.query_one("#chat-log", VerticalScroll)
         chat.remove_children()
         # Fresh, empty log: follow it again from the top of the new session.
@@ -847,9 +855,23 @@ class AgentApp(App[None]):
         if self._turn_busy:
             user_message.mark_queued()
             self._queued.append(text)
+            self._queued_widgets.append(user_message)
         chat.mount(user_message)
-        if not self._turn_busy:
+        if self._turn_busy:
+            if len(self._queued) == 1:
+                self._post_line(NoticeLine("press enter to send now"))
+        else:
             self._worker = self._run_turn(text)
+
+    def _flush_queued_now(self) -> None:
+        """Enter on an empty input while messages are queued: send now.
+
+        Interrupts the running turn; the worker's cleanup pops the oldest
+        queued message and starts it as a turn immediately, instead of
+        waiting for the next round boundary.
+        """
+        if self._turn_busy and self._queued and self._worker is not None:
+            self._worker.cancel()
 
     def action_copy_or_quit(self) -> None:
         """ctrl+c: copy the active selection if there is one, quit otherwise."""
@@ -1049,6 +1071,18 @@ class AgentApp(App[None]):
                     )
                     self.controller.record_tool_result(call_id, result)
 
+                # Steer: anything typed while this round was streaming is
+                # injected here — after the tool answers, before the next
+                # LLM call — so the model sees it right away instead of the
+                # queued message waiting for the whole turn to end.
+                if self._queued:
+                    for queued_text in self._queued:
+                        self.controller.inject_user_message(queued_text)
+                    for widget in self._queued_widgets:
+                        widget.mark_sent()
+                    self._queued_widgets.clear()
+                    self._queued.clear()
+
                 stream = self.controller.continue_after_tools()
         except asyncio.CancelledError:
             if writing is not None and writing.is_mounted:
@@ -1069,6 +1103,7 @@ class AgentApp(App[None]):
             if turn_had_tools and self.git_info is not None:
                 await self.refresh_diff_summary()
             if self._queued:
+                self._queued_widgets.pop(0).mark_sent()
                 self._worker = self._run_turn(self._queued.pop(0))
 
     async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
