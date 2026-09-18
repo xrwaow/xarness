@@ -288,7 +288,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail("write_file", '{"path": "new.py"}'), " new.py")
         self.assertEqual(detail("edit_file", '{"path": "f.py", "edits": []}'), " f.py")
         self.assertEqual(
-            detail("run_bash", '{"command": "git status\nls"}'), " git status"
+            detail("run_bash", '{"command": "git status\\nls"}'), " git status"
         )
         self.assertEqual(detail("ls", '{}'), " .")
         self.assertEqual(detail("ls", '{"path": "src"}'), " src")
@@ -298,9 +298,8 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(detail("glob", '{"glob": "**/*.py", "path": "src"}'), " **/*.py, src")
         self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
-        self.assertEqual(
-            detail("ask", '{"questions": ["Which one?", "Why?"]}'), " Which one? (+1 more)"
-        )
+        # ask renders as a plain "Ran ask" — no argument summary.
+        self.assertIsNone(detail("ask", '{"questions": ["Which one?", "Why?"]}'))
         self.assertEqual(
             detail("compact", "", "compacted: 12,000 → 3,400 tokens (freed 8,600)\nsummary"),
             " 12,000 → 3,400 tokens (freed 8,600)",
@@ -310,8 +309,9 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(detail("unknown_tool", "{}"))
 
     async def test_tool_output_containing_a_diff_is_rendered_as_one(self) -> None:
-        """An edit's diff shows up in the expanded tool block, with the theme's
-        diff styling rather than as an undifferentiated blob of text."""
+        """An edit's diff shows up in the expanded tool block — just the diff,
+        with the theme's diff styling; the raw old/new arguments and the
+        'applied' prose are not shown."""
         app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
         async with app.run_test() as pilot:
             block = ToolCallBlock("call_1", "edit_file")
@@ -334,8 +334,8 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
 
             body = block.query_one(".toolcall-body", Static).content
             self.assertIsInstance(body, Text)
-            self.assertIn('{"path": "f.py"}', body.plain)
-            self.assertIn("applied edit to f.py", body.plain)
+            self.assertNotIn('{"path": "f.py"}', body.plain)
+            self.assertNotIn("applied edit to f.py", body.plain)
             # The diff is rendered (file header + hunk, changed lines included),
             # not dumped as raw `diff --git`/`---`/`+++` text.
             self.assertIn("── f.py", body.plain)

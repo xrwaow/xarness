@@ -115,7 +115,14 @@ class ChatController:
     def record_tool_result(self, call_id: str, result: ToolResult) -> None:
         """Append a ``tool`` role message with the outcome of one call."""
         content = result.output if result.ok else f"error: {result.error}"
-        self.conversation.add(Message(role="tool", tool_call_id=call_id, content=content))
+        self.conversation.add(
+            Message(
+                role="tool",
+                tool_call_id=call_id,
+                content=content,
+                header=result.header or None,
+            )
+        )
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Point the session at a new provider profile.

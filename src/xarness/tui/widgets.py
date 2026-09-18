@@ -396,6 +396,30 @@ def _json_tool_args(args_text: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _header_detail_text(tool_name: str, header: str) -> Text | None:
+    """The stored header summary, laid out after the verb + tool name.
+
+    edit_file's ``+N -M path`` counts and run_bash's command go on their own
+    line (``Ran edit_file\n+3 -1 src/app.py``); everything else appends
+    dimmed after a space. run_bash's command is truncated for the header —
+    the full command shows in the expanded body.
+    """
+    if not header:
+        return None
+    muted = theme.PALETTE["muted"]
+    if tool_name == "edit_file":
+        detail = Text("\n", style=muted)
+        detail.append(header, style=muted)
+        return detail
+    if tool_name == "run_bash":
+        detail = Text("\n", style=muted)
+        detail.append(_shorten(header, 80), style=muted)
+        return detail
+    detail = Text(" ")
+    detail.append(header, style=muted)
+    return detail
+
+
 def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Text | None:
     """The dimmed detail that follows the verb in the settled header, e.g.
     ``Ran read_file [dimmed]src/app.py``. Returns None (plain verb + name)
@@ -461,20 +485,6 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
         detail = Text(" ")
         detail.append(_shorten(query), style=muted)
         return detail
-    if tool_name == "ask":
-        raw = args.get("questions")
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            return None
-        questions = [q for q in raw if isinstance(q, str) and q.strip()]
-        if not questions:
-            return None
-        detail = Text(" ")
-        detail.append(_shorten(questions[0]), style=muted)
-        if len(questions) > 1:
-            detail.append(f" (+{len(questions) - 1} more)", style=muted)
-        return detail
     if tool_name == "compact":
         # The compact tool's result line carries the token counts
         # ("compacted: N → M tokens (freed K)\n...") — surface them so the
@@ -489,6 +499,9 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
         detail.append(f"{before} → {after} tokens (freed {freed})", style=muted)
         return detail
     return None
+
+
+_EXPAND_PLAIN_TOOLS = frozenset({"run_bash", "glob", "grep", "ls"})
 
 
 class ToolCallBlock(Vertical):
@@ -519,6 +532,7 @@ class ToolCallBlock(Vertical):
         # DOMNode already exposes a read-only `name`; the tool's name lives here.
         self.tool_name = name
         self.accumulated_arguments = ""
+        self._header = ""
         self._status = ToolCallStatus.MAKING_CALL
         self._output_text = ""
 
@@ -538,19 +552,32 @@ class ToolCallBlock(Vertical):
         self.accumulated_arguments += text
         self._refresh_body()
 
-    def set_result(self, status: ToolCallStatus, output: str = "", error: str = "") -> None:
-        """Move to a terminal state; output and error are mutually exclusive."""
+    def set_result(
+        self,
+        status: ToolCallStatus,
+        output: str = "",
+        error: str = "",
+        header: str = "",
+    ) -> None:
+        """Move to a terminal state; output and error are mutually exclusive.
+
+        ``header`` is the tool-computed summary line persisted with the
+        conversation; when absent (older sessions), the header falls back to
+        a best-effort reconstruction from the call's arguments.
+        """
         self._status = status
         self._output_text = output or error
+        self._header = header
         self._refresh_dot()
         self._refresh_body()
-        self._swap_to_static_summary()
+        self._render_summary()
 
     def toggle(self) -> None:
         if self.has_class("expanded"):
             self.remove_class("expanded")
         else:
             self.add_class("expanded")
+        self._render_summary()
 
     def on_click(self, event: events.Click) -> None:
         self.toggle()
@@ -571,13 +598,28 @@ class ToolCallBlock(Vertical):
     def _refresh_body(self) -> None:
         if not self.is_mounted:
             return
-        body = self.accumulated_arguments
-        if self._output_text:
-            body = f"{body}\n{self._output_text}" if body else self._output_text
         try:
             static = self.query_one(".toolcall-body", Static)
         except NoMatches:
             return  # DOM pruned during app shutdown
+        if self.tool_name == "edit_file":
+            # The raw old_string/new_string arguments add nothing on expand —
+            # show just the diff (or the error text when the edit failed).
+            split = _split_tool_diff(self._output_text)
+            if split is not None:
+                static.update(_render_diff(split[1]))
+                return
+            static.update(self._output_text)
+            return
+        args = self.accumulated_arguments
+        if self.tool_name == "run_bash":
+            # Show the command itself, not its JSON wrapper.
+            command = self._bash_command()
+            if command:
+                args = command
+        body = args
+        if self._output_text:
+            body = f"{body}\n{self._output_text}" if body else self._output_text
         split = _split_tool_diff(body)
         if split is None:
             static.update(body)
@@ -591,7 +633,19 @@ class ToolCallBlock(Vertical):
         rendered.append_text(_render_diff(diff))
         static.update(rendered)
 
-    def _swap_to_static_summary(self) -> None:
+    def _bash_command(self) -> str:
+        """The called command: parsed from the arguments, falling back to the
+        stored header (which is the command) for resumed sessions."""
+        command = _json_tool_args(self.accumulated_arguments).get("command")
+        if isinstance(command, str) and command:
+            return command
+        return self._header
+
+    def _render_summary(self) -> None:
+        """(Re)build the settled summary row. Called on set_result and on
+        toggle — when expanded, the argument-summary tools (run_bash, glob,
+        grep, ls) drop the header detail since the full arguments/commands
+        are shown in the body."""
         try:
             summary_row = self.query_one(".toolcall-summary", Horizontal)
         except NoMatches:
@@ -599,15 +653,20 @@ class ToolCallBlock(Vertical):
         shimmer = summary_row.query(".toolcall-shimmer")
         if shimmer:
             shimmer.remove()
+        for old in summary_row.query(".toolcall-summary-text"):
+            old.remove()
         verb = self._STATUS_VERB[self._status]
         # Verb + tool name inherit the stylesheet's muted color; the detail
         # suffix (path, command, token counts, …) bakes the palette's muted
         # style in so it reads dimmer next to it.
-        summary = Text(f"{verb} {self.tool_name}", markup=False)
-        if self._status is ToolCallStatus.CALL_SUCCEEDED:
-            detail = _tool_header_detail(
-                self.tool_name, self.accumulated_arguments, self._output_text
-            )
+        summary = Text(f"{verb} {self.tool_name}")
+        hide_detail = self.has_class("expanded") and self.tool_name in _EXPAND_PLAIN_TOOLS
+        if self._status is ToolCallStatus.CALL_SUCCEEDED and not hide_detail:
+            detail = _header_detail_text(self.tool_name, self._header)
+            if detail is None:
+                detail = _tool_header_detail(
+                    self.tool_name, self.accumulated_arguments, self._output_text
+                )
             if detail is not None:
                 summary.append_text(detail)
         summary_row.mount(Static(summary, classes="toolcall-summary-text", markup=False))

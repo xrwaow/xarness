@@ -739,6 +739,7 @@ class AgentApp(App[None]):
                             status,
                             output="" if is_error else result.content,
                             error=result.content[len("error: "):] if is_error else "",
+                            header=result.header or "",
                         )
         chat.scroll_end(animate=False)
 
@@ -1043,7 +1044,9 @@ class AgentApp(App[None]):
                         status = ToolCallStatus.CALL_SUCCEEDED
                     else:
                         status = ToolCallStatus.CALL_FAILED
-                    block.set_result(status, output=result.output, error=result.error)
+                    block.set_result(
+                        status, output=result.output, error=result.error, header=result.header
+                    )
                     self.controller.record_tool_result(call_id, result)
 
                 stream = self.controller.continue_after_tools()

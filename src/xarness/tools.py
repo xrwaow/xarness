@@ -13,6 +13,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 from collections.abc import Awaitable, Callable
@@ -30,6 +31,10 @@ class ToolResult:
     output: str = ""
     error: str = ""
     parse_error: bool = False
+    # One-line summary for the TUI's settled tool-call header (the dimmed
+    # detail after "Ran <tool>"). Computed by the tool itself so it can be
+    # persisted with the conversation and replayed on /resume.
+    header: str = ""
 
 
 @dataclass(slots=True)
@@ -248,7 +253,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
                 f"\n[showing lines {start}-{end} of {total_lines}; pass "
                 "start_line/end_line for more]"
             )
-        return ToolResult(ok=True, output=output)
+        return ToolResult(ok=True, output=output, header=path)
 
     async def _outline_result(sandbox: SandboxConfig, path: str, total_lines: int) -> ToolResult:
         cat_result = await run_in_sandbox(sandbox, ["cat", _sandbox_path(path)])
@@ -283,8 +288,9 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             "NEXT STEPS: To read a specific symbol's implementation, call read_file "
             "with the same path plus start_line and end_line from the outline above.\n"
             "For example, to read a function shown as [L100-150], use start_line: 100 "
-            "and end_line: 150."
-        ))
+            "and end_line: 150."),
+            header=path,
+        )
 
     return Tool(
         name="read_file",
@@ -333,7 +339,7 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         if write_result.exit_code != 0:
             return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
         verb = "created" if created else "overwrote"
-        return ToolResult(ok=True, output=f"{verb} {path} ({len(content)} bytes)")
+        return ToolResult(ok=True, output=f"{verb} {path} ({len(content)} bytes)", header=path)
 
     return Tool(
         name="write_file",
@@ -474,9 +480,19 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         if write_result.exit_code != 0:
             return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
         plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
+        diff = _format_edit_diff(path, current, updated)
+        adds = sum(
+            1 for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        dels = sum(
+            1 for line in diff.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
         return ToolResult(
             ok=True,
-            output=f"applied {plural} to {path}\n{_format_edit_diff(path, current, updated)}",
+            output=f"applied {plural} to {path}\n{diff}",
+            header=f"+{adds} -{dels} {path}",
         )
 
     return Tool(
@@ -544,14 +560,15 @@ def _make_run_bash_tool(
         if git_guard is not None:
             block_reason = git_guard(command)
             if block_reason:
-                return ToolResult(ok=False, error=block_reason)
+                return ToolResult(ok=False, error=block_reason, header=command)
         result = await session.run(command)
         if result.timed_out:
-            return ToolResult(ok=False, error="command timed out (shell restarted)")
+            return ToolResult(ok=False, error="command timed out (shell restarted)", header=command)
         return ToolResult(
             ok=result.exit_code == 0,
             output=result.stdout,
             error="" if result.exit_code == 0 else f"exit code {result.exit_code}",
+            header=command,
         )
 
     return Tool(
@@ -617,7 +634,17 @@ def _make_compact_tool(compact_callback: Callable[[], Awaitable[str]]) -> Tool:
         # The callback (controller.compact via the app) returns the summary
         # prefixed with the before/after token counts on the first line.
         summary = await compact_callback()
-        return ToolResult(ok=True, output=summary)
+        # The summary's first line carries the token counts
+        # ("compacted: N → M tokens (freed K)\n...") — lift them into the
+        # header so the tool-call header alone shows what compaction bought.
+        match = re.search(
+            r"compacted: ([\d,]+) → ([\d,]+) tokens \(freed ([\d,]+)\)", summary
+        )
+        header = ""
+        if match:
+            before, after, freed = match.groups()
+            header = f"{before} → {after} tokens (freed {freed})"
+        return ToolResult(ok=True, output=summary, header=header)
 
     return Tool(
         name="compact",
@@ -693,7 +720,7 @@ def _make_ls_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         if not kept:
             return ToolResult(ok=True, output="(nothing left after ignore filtering)")
         kept.sort(key=lambda e: (not e.endswith("/"), e.rstrip("/")))
-        return ToolResult(ok=True, output="\n".join(kept))
+        return ToolResult(ok=True, output="\n".join(kept), header=path)
 
     return Tool(
         name="ls",
@@ -776,10 +803,10 @@ def _make_glob_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         if len(matches) > cap:
             output = "\n".join(matches[:cap])
             output += f"\n[showing {cap} of {len(matches)} matches — narrow the glob or 'path']"
-            return ToolResult(ok=True, output=output)
+            return ToolResult(ok=True, output=output, header=_search_header(pattern, path))
         if not matches:
-            return ToolResult(ok=True, output="(no matches)")
-        return ToolResult(ok=True, output="\n".join(matches))
+            return ToolResult(ok=True, output="(no matches)", header=_search_header(pattern, path))
+        return ToolResult(ok=True, output="\n".join(matches), header=_search_header(pattern, path))
 
     return Tool(
         name="glob",
@@ -824,6 +851,12 @@ def _plain_grep_argv(regex: str, include: str, path: str) -> list[str]:
         script += f" --include={shlex.quote(include)}"
     script += f" -- {shlex.quote(regex)} {shlex.quote(path)}"
     return ["sh", "-c", script]
+
+
+def _search_header(query: str, path: str) -> str:
+    """Shared header shape for grep/glob: ``query, scope`` (scope dropped
+    when it's the workspace root)."""
+    return query if path in (".", "") else f"{query}, {path}"
 
 
 def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
@@ -924,7 +957,11 @@ def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
             )
         if notes:
             output += "\n[" + "; ".join(notes) + "]"
-        return ToolResult(ok=True, output=output)
+        return ToolResult(
+            ok=True,
+            output=output,
+            header=_search_header(regex, include or path),
+        )
 
     return Tool(
         name="grep",

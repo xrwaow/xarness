@@ -34,6 +34,10 @@ class Message:
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    # Local-only: the tool call's one-line header summary (tool-role messages
+    # only) — computed by the tool, persisted so /resume renders the same
+    # headers. Never sent over the wire.
+    header: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}
