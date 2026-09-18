@@ -35,20 +35,20 @@ class SandboxSubtreeTest(unittest.TestCase):
         assert argv[argv.index("--chdir") + 1] == "/workspace/f"
         assert config.ref_path("docs") == "/workspace/f/.refs/docs"
 
-        # Tool paths: inside the subtree allowed, outside rejected, the
-        # read-only .refs/ binds allowed, traversal always rejected.
-        assert config.validate_relpath("f/notes.txt") is None
-        assert config.validate_relpath("./f/notes.txt") is None
-        assert config.validate_relpath("f") is None
-        assert config.validate_relpath("app.py") is not None
+        # Tool paths anchor at the subtree: the agent's workspace IS the
+        # --workspace dir, so any non-escaping relative path is valid and
+        # maps inside the read-write subtree. Traversal and absolute paths
+        # are always rejected.
+        assert config.tool_root == "/workspace/f"
+        assert config.tool_path("notes.txt") == "/workspace/f/notes.txt"
+        assert config.tool_path("./notes.txt") == "/workspace/f/notes.txt"
+        assert config.tool_path(".") == "/workspace/f/."
+        assert config.validate_relpath("notes.txt") is None
+        assert config.validate_relpath("./notes.txt") is None
+        assert config.validate_relpath("sub/dir/x.py") is None
         assert config.validate_relpath(".refs/docs") is None
         assert config.validate_relpath("../etc") is not None
         assert config.validate_relpath("/etc") is not None
-
-        # Read mode: the whole workspace is bound read-only, so paths outside
-        # the subtree are readable — only traversal/absolute paths are wrong.
-        assert config.validate_relpath("app.py", mode="read") is None
-        assert config.validate_relpath("f/notes.txt", mode="read") is None
         assert config.validate_relpath("../etc", mode="read") is not None
         assert config.validate_relpath("/etc", mode="read") is not None
 
@@ -64,6 +64,8 @@ class SandboxSubtreeTest(unittest.TestCase):
         assert argv[bind + 1:bind + 3] == [str(self.workspace), "/workspace"]
         assert argv[argv.index("--chdir") + 1] == "/workspace"
         assert config.ref_path("docs") == "/workspace/.refs/docs"
+        assert config.tool_root == "/workspace"
+        assert config.tool_path("app.py") == "/workspace/app.py"
         assert config.validate_relpath("app.py") is None
 
 

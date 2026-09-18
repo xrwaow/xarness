@@ -36,9 +36,8 @@ def save_session(
     conversation: Conversation,
     git: dict | None = None,
 ) -> None:
-    """Persist a session. ``git`` is the harness-managed worktree block
-    (see gitwork.GitInfo.to_block); passing None drops any existing block —
-    which is exactly what accept/reject want after resolving a session."""
+    """Persist a session. ``git`` is the change-tracking block
+    (see gitwork.GitInfo.to_block); passing None drops any existing block."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "profile": profile_name,
@@ -65,7 +64,7 @@ def load_session(name: str) -> Conversation:
 
 
 def load_git_block(name: str) -> dict | None:
-    """The persisted worktree block for a session, or None."""
+    """The persisted change-tracking block for a session, or None."""
     path = session_path(name)
     if not path.exists():
         return None

@@ -59,13 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
         "without setup; your files are never modified by this).",
     )
     chat.add_argument(
-        "--no-copy-untracked",
-        action="store_true",
-        help="Don't copy the workspace's untracked files into the agent worktree "
-        "(default copies them so the agent can see files you haven't committed yet; "
-        "they are excluded from /accept's commit unless the agent modified them).",
-    )
-    chat.add_argument(
         "--no-session", action="store_true",
         help="Don't save this conversation as a resumable session.",
     )
@@ -112,65 +105,49 @@ def _parse_refs(raw_refs: list[str]) -> dict[str, Path]:
 
 def _prepare_git(
     args: argparse.Namespace, workspace: Path, session_name: str | None
-) -> tuple[GitInfo | None, list[str], bool]:
-    """Set up worktree isolation before the TUI boots.
+) -> tuple[GitInfo | None, list[str]]:
+    """Set up change tracking before the TUI boots.
 
-    Returns (git_info, startup notices, fs_tools_ok). fs_tools_ok is False in
-    the one unsafe case: a resumed session whose worktree is gone AND cannot
-    be recreated — the sandbox then stays off rather than falling back to the
-    user's real directory.
+    The agent always edits the workspace directly; git tracking (baseline
+    tree snapshot) is what makes /diff and /undo work. Returns (git_info,
+    startup notices); git_info is None when the workspace can't be tracked.
     """
     from . import gitwork, session_store
 
-    async def _setup() -> tuple[GitInfo | None, list[str], bool]:
+    async def _setup() -> tuple[GitInfo | None, list[str]]:
         notices: list[str] = []
 
-        # Resume: reconnect to the persisted worktree if there is one.
+        # Resume: reconnect to the persisted tracking state if there is one.
         if args.session and session_store.session_path(args.session).exists():
             block = session_store.load_git_block(args.session)
             if block is not None:
-                info = gitwork.GitInfo.from_block(block)
-                if await gitwork.worktree_is_valid(info):
-                    return info, notices, True
                 try:
-                    fresh = await gitwork.recreate_worktree(info)
-                except gitwork.GitWorktreeError as exc:
+                    return gitwork.GitInfo.from_block(block), notices
+                except (KeyError, TypeError, ValueError):
+                    # Session predates direct-write tracking (old worktree
+                    # block). Set up tracking now — the session shouldn't be
+                    # penalized forever for when it was first created.
                     notices.append(
-                        f"error: this session's agent worktree is gone and could not be "
-                        f"recreated ({exc}); filesystem tools are disabled so the agent "
-                        "cannot touch your real directory — start a new session to edit files"
+                        "note: this session used the old worktree isolation; "
+                        "switched to direct edits with fresh change tracking"
                     )
-                    return None, notices, False
-                notices.append(
-                    f"note: previous worktree for this session was removed externally; "
-                    f"recreated a fresh one from branch {fresh.branch} — uncommitted agent "
-                    "changes from before are gone"
-                )
-                return fresh, notices, True
-            # Session predates git tracking (no git block). Set up isolation
-            # now if possible — the session shouldn't be penalized forever for
-            # when it was first created.
-            return await _fresh_isolation(notices)
+        return await _fresh_tracking(notices)
 
-        # Fresh session: isolate if the workspace can be (repos get a
-        # worktree; non-repos get an auto-initialized one unless declined).
-        return await _fresh_isolation(notices)
-
-    async def _fresh_isolation(notices: list[str]) -> tuple[GitInfo | None, list[str], bool]:
+    async def _fresh_tracking(notices: list[str]) -> tuple[GitInfo | None, list[str]]:
         try:
-            info, notes = await gitwork.setup_isolation(
+            info, notes = await gitwork.setup_tracking(
                 workspace,
                 session_name or session_store.new_session_name(),
-                copy_untracked=not args.no_copy_untracked,
                 allow_init=not args.no_init_repo,
             )
         except gitwork.GitWorktreeError as exc:
             notices.append(
-                f"warning: git worktree isolation unavailable ({exc}); "
-                f"the agent will edit {workspace} directly"
+                f"warning: git change tracking unavailable ({exc}); the agent "
+                f"still edits {workspace} directly, but /diff and /undo cannot "
+                "revert file changes"
             )
-            return None, notices, True
-        return info, notices + notes, True
+            return None, notices
+        return info, notices + notes
 
     return asyncio.run(_setup())
 
@@ -195,7 +172,7 @@ def _run_chat(args: argparse.Namespace) -> None:
     git_info: GitInfo | None = None
     git_notices: list[str] = []
     if fs_tools_enabled:
-        git_info, git_notices, fs_tools_enabled = _prepare_git(args, workspace, session_name)
+        git_info, git_notices = _prepare_git(args, workspace, session_name)
 
     sandbox: SandboxConfig | None = None
     session: SandboxSession | None = None
@@ -203,10 +180,10 @@ def _run_chat(args: argparse.Namespace) -> None:
         effective_workspace = git_info.agent_workspace if git_info is not None else workspace
         try:
             sandbox = SandboxConfig(
-                workspace=git_info.worktree if git_info is not None else workspace,
+                workspace=git_info.workspace if git_info is not None else workspace,
                 subtree=git_info.subtree if git_info is not None else "",
                 external_refs=refs,
-                git_dir=git_info.git_common_dir if git_info is not None else None,
+                git_dir=git_info.git_dir if git_info is not None else None,
             )
             session = SandboxSession(sandbox)
         except SandboxUnavailable as exc:

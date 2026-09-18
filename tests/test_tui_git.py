@@ -1,8 +1,9 @@
 """TUI integration tests for git-based change tracking: the diff summary
-widget, /accept, /reject, and worktree resume reconnection.
+widget, /undo //retry file reverts, and resume reconnection.
 
-Uses a real temp git repo; session storage and worktree locations are
-redirected to temp dirs so nothing touches the user's home.
+Uses a real temp git repo; session storage is redirected to a temp dir so
+nothing touches the user's home. The agent edits the repo directly — there
+is no worktree.
 """
 
 import asyncio
@@ -15,13 +16,12 @@ from typing import Any
 from unittest import mock
 
 from textual.widgets import Static
-from xarness import gitwork, session_store
+from xarness import session_store
 from xarness.conversation import Conversation
 from xarness.controller import ChatController
-from xarness.gitwork import GitInfo, create_worktree, detect_repo, remove_worktree
+from xarness.gitwork import GitInfo, diff_stat, setup_tracking
 from xarness.events import ContentDelta, ToolCallArgumentsDone, ToolCallStarted, TurnComplete
 from xarness.tui.app import AgentApp
-from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.widgets import DiffSummary, ErrorLine, NoticeLine
 from xarness.tui.widgets import ChatInput, UserMessage
 from test_tui import PROFILE, make_registry
@@ -65,13 +65,12 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(tempfile.mkdtemp(dir=self._tmp.name))
 
-        # Redirect all persistent state into the temp dir.
-        for target, value in (
-            (gitwork, "WORKTREES_DIR"), (session_store, "SESSIONS_DIR"),
-        ):
-            patcher = mock.patch.object(target, value, self.base / value.lower())
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        # Redirect persistent session storage into the temp dir.
+        patcher = mock.patch.object(
+            session_store, "SESSIONS_DIR", self.base / "sessions"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         # A repo with one commit.
         self.repo = self.base / "repo"
@@ -84,16 +83,14 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         _git(self.repo, "commit", "-qm", "init")
 
     async def make_git_app(self, script: list[Any]) -> tuple[AgentApp, GitInfo]:
-        """App bound to a fresh worktree of the test repo."""
-        repo_info = await detect_repo(self.repo)
-        assert repo_info is not None
-        info = await create_worktree(repo_info, "testsess")
+        """App bound to the test repo with direct-write change tracking."""
+        info, _ = await setup_tracking(self.repo, "testsess")
+        assert info is not None
         client = FakeClient(script)
-        from xarness.controller import ChatController
         controller = ChatController(PROFILE, "k", client=client)
         app = AgentApp(
             PROFILE, "k", controller=controller, tool_registry=make_registry(),
-            workspace=info.worktree, session_name="testsess", git_info=info,
+            workspace=info.agent_workspace, session_name="testsess", git_info=info,
         )
         return app, info
 
@@ -150,9 +147,9 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             await self.wait_until(lambda: not app._turn_busy)
             self.assertFalse(summary.has_class("visible"))
 
-            # The agent edits a file in the worktree; next tool turn the
+            # The agent edits a file in the workspace; next tool turn the
             # summary must appear with correct counts.
-            (info.worktree / "app.py").write_text("line1\nline2\nline3\nline4\n")
+            (info.workspace / "app.py").write_text("line1\nline2\nline3\nline4\n")
             await pilot.press("a", "g", "a", "i", "n", "enter")
             await self.wait_until(lambda: not app._turn_busy)
 
@@ -179,7 +176,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             TurnComplete(has_tool_calls=True),
         ]
         app, info = await self.make_git_app(script)
-        (info.worktree / "app.py").write_text("edited\n")
+        (info.workspace / "app.py").write_text("edited\n")
         async with app.run_test() as pilot:
             await pilot.press("g", "o", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -200,8 +197,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
     async def test_slash_diff_toggles_panel_and_per_file_diff(self):
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.worktree / "app.py").write_text("agent edit\n")
-        (info.worktree / "new.py").write_text("brand new\n")
+        (info.workspace / "app.py").write_text("agent edit\n")
+        (info.workspace / "new.py").write_text("brand new\n")
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -236,8 +233,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         focus moves to the list); arrows + enter navigate/open from there;
         esc #2 collapses the list back to the bare summary line."""
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.worktree / "app.py").write_text("agent edit\n")
-        (info.worktree / "new.py").write_text("brand new\n")
+        (info.workspace / "app.py").write_text("agent edit\n")
+        (info.workspace / "new.py").write_text("brand new\n")
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -281,7 +278,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             await self.wait_until(lambda: app.focused is app.query_one("#chat-input"))
 
     async def test_slash_diff_without_changes_or_git(self):
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app, _info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -293,105 +290,119 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(app.query_one("#diff-summary", DiffSummary).has_class("expanded"))
 
-        # No worktree at all: an error line.
+        # No tracking at all: an error line.
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
-        from xarness.controller import ChatController
         bare = AgentApp(
             PROFILE, "k", controller=ChatController(PROFILE, "k", client=client),
         )
         async with bare.run_test() as pilot:
             bare._handle_slash_command("/diff")
             await self.wait_until(
-                lambda: any("no pending-changes tracking" in str(e.content) for e in bare.query(ErrorLine))
+                lambda: any("no change tracking" in str(e.content) for e in bare.query(ErrorLine))
             )
 
-    # ------------------------------------------------------------------
-    # accept / reject
-
-    async def test_reject_removes_worktree_after_confirmation(self):
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.worktree / "app.py").write_text("agent edit\n")
+    async def test_accept_locks_in_changes_and_resets_diff(self):
+        """/accept makes the current state the new baseline: /diff empties,
+        and /undo of a pre-accept turn can no longer revert its file edits.
+        Work continues from the accepted state."""
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script)
+        client = app.controller._client
+        client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=None)],
+            [ContentDelta("done"), TurnComplete(usage=None)],
+        ]
         async with app.run_test() as pilot:
-            await pilot.press("h", "i", "enter")
-            await self.wait_until(lambda: not app._turn_busy)
-
-            app._handle_slash_command("/reject")
-            # Confirmation modal appears; wrong word does nothing.
-            await self.wait_until(lambda: isinstance(app.screen, ConfirmScreen))
-            await pilot.press("n", "o", "enter")
-            await self.wait_until(lambda: not isinstance(app.screen, ConfirmScreen))
-            self.assertTrue(info.worktree.exists())  # not confirmed: no-op
-
-            # Type the confirm word: worktree and branch are destroyed.
-            app._handle_slash_command("/reject")
-            await self.wait_until(lambda: isinstance(app.screen, ConfirmScreen))
-            await pilot.press("r", "e", "j", "e", "c", "t", "enter")
-            await self.wait_until(lambda: app.git_info is None)
-
-            self.assertFalse(info.worktree.exists())
-            self.assertNotIn("agent/testsess", _git(self.repo, "branch"))
-            # No agent/* branch of any kind survives a confirmed reject.
-            self.assertFalse(any(
-                b.strip().lstrip("* ").startswith("agent/")
-                for b in _git(self.repo, "branch").splitlines()
-            ))
-            # User's directory untouched.
-            self.assertEqual((self.repo / "app.py").read_text(), "line1\nline2\n")
-            # Session JSON no longer carries a git block.
-            self.assertIsNone(session_store.load_git_block("testsess"))
-
-    async def test_accept_merges_and_cleans_up(self):
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.worktree / "app.py").write_text("agent edit\n")
-        async with app.run_test() as pilot:
-            await pilot.press("h", "i", "enter")
-            await self.wait_until(lambda: not app._turn_busy)
+            await self.run_simple_turn(app, pilot)
+            # Feature one: the agent edits app.py and creates a file.
+            (info.workspace / "app.py").write_text("feature one\n")
+            (info.workspace / "feature.py").write_text("new\n")
 
             app._handle_slash_command("/accept")
             await self.wait_until(
-                lambda: any("accepted" in str(n.content) for n in app.query(NoticeLine))
+                lambda: any("accepted: 2 file(s)" in str(n.content) for n in app.query(NoticeLine))
             )
 
-            # Changes landed as a merge commit in the user's directory.
-            self.assertEqual((self.repo / "app.py").read_text(), "agent edit\n")
-            self.assertIn("Merge branch", _git(self.repo, "log", "-1", "--format=%s"))
-            self.assertFalse(info.worktree.exists())
-            self.assertIsNone(app.git_info)
-            self.assertIsNone(session_store.load_git_block("testsess"))
+            # /diff is reset: nothing pending vs the new baseline.
+            summary = app.query_one("#diff-summary", DiffSummary)
+            self.assertFalse(summary.has_class("visible"))
 
-    async def test_accept_conflict_reports_and_preserves_worktree(self):
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.worktree / "app.py").write_text("agent edit\n")
-        async with app.run_test() as pilot:
-            await pilot.press("h", "i", "enter")
+            # /undo of the (pre-accept) turn rolls back the conversation but
+            # must NOT revert the accepted file changes.
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+            self.assertEqual((info.workspace / "app.py").read_text(), "feature one\n")
+            self.assertTrue((info.workspace / "feature.py").exists())
+
+            # Continue with feature two; only it shows as pending now —
+            # the accepted feature is off /diff's radar entirely.
+            (info.workspace / "second.py").write_text("feature two\n")
+            await pilot.press("m", "o", "r", "e", "enter")
             await self.wait_until(lambda: not app._turn_busy)
+            stat = await diff_stat(info)
+            self.assertEqual({f.path for f in stat.files}, {"second.py"})
 
-            # The user's directory moves on with a conflicting change.
-            (self.repo / "app.py").write_text("user conflicting edit\n")
-            _git(self.repo, "commit", "-aqm", "user change")
+            # The accepted tree is persisted for resume.
+            block = session_store.load_git_block("testsess")
+            self.assertEqual(block["baseline_tree"], info.baseline_tree)
 
-            app._handle_slash_command("/accept")
+    async def test_reject_discards_everything_since_last_accept(self):
+        """/reject restores the workspace to the accepted baseline, wiping all
+        un-accepted changes (agent's and user's) while keeping the session."""
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script)
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            (info.workspace / "app.py").write_text("un-accepted edit\n")
+            (info.workspace / "created.txt").write_text("new\n")
+
+            app._handle_slash_command("/reject")
             await self.wait_until(
-                lambda: any("conflict" in str(e.content) for e in app.query(ErrorLine))
+                lambda: any("rejected: 2 file(s)" in str(n.content) for n in app.query(NoticeLine))
             )
 
-            # Conflict reported, worktree kept so the user can retry after
-            # manually reconciling; git state still persisted.
-            self.assertTrue(info.worktree.exists())
-            self.assertIsNotNone(app.git_info)
-            notices = [str(n.content) for n in app.query(NoticeLine)]
-            self.assertFalse(any("accepted" in n for n in notices))
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            self.assertFalse((info.workspace / "created.txt").exists())
+            summary = app.query_one("#diff-summary", DiffSummary)
+            self.assertFalse(summary.has_class("visible"))
+
+            # A following /undo doesn't resurrect the rejected changes.
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+
+    async def test_accept_reject_without_tracking_error(self):
+        app, _info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app.git_info = None
+        app.controller.git_info = None
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/accept")
+            app._handle_slash_command("/reject")
+            await self.wait_until(lambda: len(app.query(ErrorLine)) >= 2)
+            errors = [str(e.content) for e in app.query(ErrorLine)]
+            self.assertTrue(any("/accept: no change tracking" in e for e in errors))
+            self.assertTrue(any("/reject: no change tracking" in e for e in errors))
 
     # ------------------------------------------------------------------
     # resume reconnection
 
-    async def test_resume_reconnects_valid_worktree(self):
-        info = await create_worktree(await detect_repo(self.repo), "testsess")
-        (info.worktree / "app.py").write_text("pending agent edit\n")
+    async def test_resume_reconnects_tracking(self):
+        info, _ = await setup_tracking(self.repo, "testsess")
+        assert info is not None
+        (self.repo / "app.py").write_text("pending agent edit\n")
         session_store.save_session("testsess", "m", Conversation(), git=info.to_block())
 
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
-        from xarness.controller import ChatController
         app = AgentApp(
             PROFILE, "k", controller=ChatController(PROFILE, "k", client=client),
             session_name="testsess",
@@ -402,32 +413,40 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self.wait_until(lambda: app.git_info is not None)
 
-            self.assertEqual(app.git_info.worktree, info.worktree)
-            self.assertEqual(app.sandbox.workspace, info.worktree)
+            self.assertEqual(app.git_info.workspace, info.workspace)
+            self.assertEqual(app.git_info.baseline_tree, info.baseline_tree)
             summary = app.query_one("#diff-summary", DiffSummary)
             self.assertTrue(summary.has_class("visible"))
             text = str(app.query_one("#diff-summary-text").content)
             self.assertIn("Edited 1 file", text)
 
-    async def test_resume_recreates_removed_worktree(self):
-        info = await create_worktree(await detect_repo(self.repo), "testsess")
-        session_store.save_session("testsess", "m", Conversation(), git=info.to_block())
-        # Externally removed (git worktree prune + folder deletion).
-        await remove_worktree(self.repo, info.worktree, force=True)
+    async def test_resume_with_legacy_worktree_block_sets_up_fresh_tracking(self):
+        """A session persisted by the old worktree-based build resumes with
+        fresh direct-write tracking instead of failing."""
+        legacy_block = {
+            "session_id": "testsess",
+            "base_ref": "abc",
+            "branch": "agent/testsess",
+            "worktree": str(self.base / "gone-worktree"),
+            "original_workspace": str(self.repo),
+            "git_common_dir": str(self.repo / ".git"),
+        }
+        session_store.save_session("testsess", "m", Conversation(), git=legacy_block)
 
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
         app = AgentApp(
             PROFILE, "k", controller=ChatController(PROFILE, "k", client=client),
-            session_name="testsess",
+            workspace=self.repo, session_name="testsess",
         )
         async with app.run_test() as pilot:
             await app._on_session_selected("testsess")
             await pilot.pause()
             await self.wait_until(lambda: app.git_info is not None)
 
-            self.assertTrue(app.git_info.worktree.exists())
+            self.assertEqual(app.git_info.workspace, self.repo.resolve())
+            self.assertTrue(app.git_info.baseline_tree)
             await self.wait_until(
-                lambda: any("recreated" in str(n.content) for n in app.query(NoticeLine))
+                lambda: any("old worktree" in str(n.content) for n in app.query(NoticeLine))
             )
 
     # ------------------------------------------------------------------
@@ -445,17 +464,17 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
             # What the turn's tools did: edit a tracked file, create a new one.
-            (info.worktree / "app.py").write_text("agent edit\n")
-            (info.worktree / "created.txt").write_text("new\n")
+            (info.workspace / "app.py").write_text("agent edit\n")
+            (info.workspace / "created.txt").write_text("new\n")
 
             app._handle_slash_command("/undo")
             await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
 
             # File state restored to the turn's checkpoint.
             self.assertEqual(
-                (info.worktree / "app.py").read_text(), "line1\nline2\n"
+                (info.workspace / "app.py").read_text(), "line1\nline2\n"
             )
-            self.assertFalse((info.worktree / "created.txt").exists())
+            self.assertFalse((info.workspace / "created.txt").exists())
             # Conversation back to just the system message; input holds the text.
             self.assertEqual(
                 [m.role for m in app.controller.conversation.messages], ["system"]
@@ -477,8 +496,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
-            (info.worktree / "app.py").write_text("agent edit\n")
-            (info.worktree / "created.txt").write_text("new\n")
+            (info.workspace / "app.py").write_text("agent edit\n")
+            (info.workspace / "created.txt").write_text("new\n")
             client.next_scripts.append(
                 [ContentDelta("second answer"), TurnComplete(usage=None)]
             )
@@ -494,9 +513,9 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
             # File edits from the retried turn are gone.
             self.assertEqual(
-                (info.worktree / "app.py").read_text(), "line1\nline2\n"
+                (info.workspace / "app.py").read_text(), "line1\nline2\n"
             )
-            self.assertFalse((info.worktree / "created.txt").exists())
+            self.assertFalse((info.workspace / "created.txt").exists())
             # Same user message, fresh response.
             self.assertEqual(
                 [m.content for m in app.controller.conversation.messages][1:],
@@ -504,23 +523,19 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(app.query(UserMessage)), 1)
 
-    async def test_untracked_file_added_mid_session_becomes_visible(self):
+    async def test_user_files_are_visible_to_the_agent_immediately(self):
+        """Direct-write mode: files the user adds mid-session are in the
+        agent's workspace already — no sync step needed."""
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
-            self.assertFalse((info.worktree / "midway.txt").exists())
-
-            # The user drops a new untracked file into their real workspace.
             (self.repo / "midway.txt").write_text("user file\n")
-            await pilot.press("a", "g", "a", "i", "n", "enter")
-            await self.wait_until(lambda: not app._turn_busy)
-
-            # Synced into the worktree at the start of the next turn.
-            self.assertEqual((info.worktree / "midway.txt").read_text(), "user file\n")
-            self.assertIn("midway.txt", info.copied_untracked)
+            self.assertEqual(
+                (info.workspace / "midway.txt").read_text(), "user file\n"
+            )
 
     async def test_undo_without_git_rolls_back_messages_only(self):
-        """No git isolation: messages and usage still roll back, and the user
+        """No git tracking: messages and usage still roll back, and the user
         is told file edits could not be reverted."""
         app, _ = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         app.git_info = None
@@ -543,5 +558,5 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             )
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -2,8 +2,7 @@
 read/write scoping split in validate_relpath.
 
 Uses a real temp git repo and real bwrap (git and bwrap are hard
-dependencies of the feature); gitwork.WORKTREES_DIR is monkeypatched so
-worktree-isolation tests never touch ~/.local/share.
+dependencies of the feature).
 """
 
 import asyncio
@@ -13,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from xarness import gitwork
-from xarness.gitwork import setup_isolation
+from xarness.gitwork import setup_tracking
 from xarness.sandbox import SandboxConfig
 from xarness.tools import build_registry
 
@@ -62,12 +60,11 @@ def _registry_for(
     subtree: str = "",
     git_dir: Path | None = None,
     mode: str = "write",
-    git_info=None,
 ):
     if shutil.which("bwrap") is None:
         pytest.skip("bwrap not available")
     sandbox = SandboxConfig(workspace=workspace, subtree=subtree, git_dir=git_dir)
-    return build_registry(sandbox, None, mode=mode, git_info=git_info)
+    return build_registry(sandbox, None, mode=mode)
 
 
 def _call(registry, name: str, args: str):
@@ -169,64 +166,47 @@ def test_grep_no_matches_is_ok_not_error(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# subtree scoping: reads outside the subtree work, writes don't (fix 0)
+# subtree scoping: the agent's workspace IS the --workspace dir
 
 
-def _scoped_registry(tmp_path, monkeypatch):
+def _scoped_registry(tmp_path):
     repo = _make_repo(tmp_path)
-    monkeypatch.setattr(gitwork, "WORKTREES_DIR", tmp_path / "worktrees")
-    info, _ = asyncio.run(setup_isolation(repo / "pkg", "sess-scoped"))
+    info, _ = asyncio.run(setup_tracking(repo / "pkg", "sess-scoped"))
     return repo, _registry_for(
-        info.worktree, subtree=info.subtree, git_dir=info.git_common_dir,
-        git_info=info,
+        info.workspace, subtree=info.subtree, git_dir=info.git_dir,
     )
 
 
-def test_scoped_session_reads_outside_subtree(tmp_path, monkeypatch) -> None:
-    repo, registry = _scoped_registry(tmp_path, monkeypatch)
-    # app.py sits outside the session's pkg/ subtree — readable now.
-    read = _call(registry, "read_file", '{"path": "app.py"}')
-    assert read.ok
-    assert read.output == "print('hi')\n"
-    # ...but still not writable.
-    write = _call(registry, "write_file", '{"path": "app.py", "content": "nope"}')
-    assert not write.ok
-    assert "scoped" in write.error
-
-
-def test_scoped_session_explore_tools_outside_subtree(tmp_path, monkeypatch) -> None:
-    _repo, registry = _scoped_registry(tmp_path, monkeypatch)
-    ls = _call(registry, "ls", "{}")  # workspace root, outside the subtree
+def test_scoped_session_tools_root_at_the_workspace(tmp_path) -> None:
+    """With --workspace inside a bigger repo, tool paths are relative to that
+    directory: ls lists its entries, and writes land inside it on the host."""
+    repo, registry = _scoped_registry(tmp_path)
+    # ls lists the workspace dir's own entries, not the repo root's.
+    ls = _call(registry, "ls", "{}")
     assert ls.ok
-    assert "pkg/" in ls.output.splitlines()
-    glob = _call(registry, "glob", '{"glob": "**/controller.py"}')
+    assert "controller.py" in ls.output.splitlines()
+    assert "app.py" not in ls.output.splitlines()  # repo root, outside
+
+    # Reads and writes are workspace-relative.
+    read = _call(registry, "read_file", '{"path": "util.py"}')
+    assert read.ok
+    assert read.output == "x = 1\n"
+
+    write = _call(registry, "write_file", '{"path": "new.py", "content": "ok = 1\\n"}')
+    assert write.ok
+    assert (repo / "pkg" / "new.py").read_text() == "ok = 1\n"
+    # Nothing leaked outside the workspace dir.
+    assert not (repo / "new.py").exists()
+
+
+def test_scoped_session_explore_tools(tmp_path) -> None:
+    _repo, registry = _scoped_registry(tmp_path)
+    glob = _call(registry, "glob", '{"glob": "**/*.py"}')
     assert glob.ok
-    assert glob.output.splitlines() == ["pkg/controller.py"]
+    assert sorted(glob.output.splitlines()) == ["controller.py", "util.py"]
     grep = _call(registry, "grep", '{"regex": "class Controller"}')
     assert grep.ok
-    assert "pkg/controller.py:1:class Controller:" in grep.output
-
-
-# ---------------------------------------------------------------------------
-# live .gitignore re-sync from the original workspace
-
-
-def test_gitignore_edit_in_original_workspace_picked_up(tmp_path, monkeypatch) -> None:
-    repo = _make_repo(tmp_path)
-    monkeypatch.setattr(gitwork, "WORKTREES_DIR", tmp_path / "worktrees")
-    info, _ = asyncio.run(setup_isolation(repo, "sess-gi"))
-    registry = _registry_for(
-        info.worktree, git_dir=info.git_common_dir, git_info=info,
-    )
-    before = _call(registry, "ls", "{}")
-    assert "app.py" in before.output.splitlines()
-
-    # The user edits .gitignore in their real checkout mid-session —
-    # uncommitted, so the worktree's copy is stale until the next call.
-    (repo / ".gitignore").write_text("secret.txt\nignored_dir/\napp.py\n")
-    after = _call(registry, "ls", "{}")
-    assert after.ok
-    assert "app.py" not in after.output.splitlines()
+    assert "controller.py:1:class Controller:" in grep.output
 
 
 # ---------------------------------------------------------------------------

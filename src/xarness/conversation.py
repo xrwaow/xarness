@@ -28,8 +28,8 @@ class Message:
     # Local-only: token usage reported for the round that produced this
     # message (assistant messages only; never sent over the wire).
     usage: Usage | None = None
-    # Local-only: git checkpoint sha taken when this user message was sent —
-    # the state /undo //retry restore the worktree to.
+    # Local-only: git checkpoint tree sha taken when this user message was
+    # sent — the state /undo //retry restore the workspace to.
     checkpoint_sha: str | None = None
     name: str | None = None
     tool_call_id: str | None = None

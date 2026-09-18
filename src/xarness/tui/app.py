@@ -32,14 +32,12 @@ from ..events import (
 )
 from ..file_search import search_files
 from ..gitwork import (
-    GitInfo, GitWorktreeError, MergeOutcome, check_blocked_git, commit_worktree_changes,
-    delete_branch, diff_stat, git_diff, merge_branch, recreate_worktree,
-    remove_worktree, worktree_is_valid,
+    GitInfo, GitWorktreeError, accept_changes, check_blocked_git, diff_stat,
+    git_diff, revert_to_tree, setup_tracking,
 )
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
-from ..sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
+from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
-from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -63,8 +61,8 @@ SLASH_COMMANDS = [
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
     ("diff", "show pending changes (optionally: /diff <path>)"),
-    ("accept", "merge the agent's worktree changes into your branch"),
-    ("reject", "discard the agent's worktree changes (asks confirmation)"),
+    ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
+    ("reject", "discard all changes made since the last /accept"),
     ("undo", (
         "drop the last turn: revert its file edits, put your message back "
         "in the input (run_bash side effects are not undone)"
@@ -112,7 +110,7 @@ class AgentApp(App[None]):
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-            git_guard=self._make_git_guard(), git_info=git_info,
+            git_guard=self._make_git_guard(),
         )
         self.controller = controller or ChatController(
             profile, api_key, tool_registry=self.tool_registry
@@ -233,9 +231,11 @@ class AgentApp(App[None]):
         elif cmd == "new":
             self._start_new_session()
         elif cmd == "accept":
-            self._start_accept()
+            if self._git_action_preflight("accept") is not None:
+                self._start_accept()
         elif cmd == "reject":
-            self._start_reject()
+            if self._git_action_preflight("reject") is not None:
+                self._start_reject()
         elif cmd == "diff":
             arg = parts[1].strip() if len(parts) > 1 else ""
             self._show_diff_command(arg)
@@ -262,7 +262,7 @@ class AgentApp(App[None]):
             self.tool_registry = build_registry(
                 self.sandbox, self.sandbox_session, mode=new_mode,
                 ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-                git_guard=self._make_git_guard(), git_info=self.git_info,
+                git_guard=self._make_git_guard(),
             )
             self.controller.tools = self.tool_registry  # rewire to the new registry
             self.ensure_system_message()
@@ -305,9 +305,9 @@ class AgentApp(App[None]):
         """Shared body of /undo (drop the last turn, put its user message
         back in the input) and /retry (drop it and resend it).
 
-        Only file edits are reverted — the worktree is reset to the turn's
-        checkpoint. Anything run_bash did beyond the worktree (installs,
-        background jobs, network calls) is not undone."""
+        Only file edits are reverted — the workspace is restored to the
+        turn's checkpoint snapshot. Anything run_bash did beyond the files
+        (installs, background jobs, network calls) is not undone."""
         label = "retry" if resend else "undo"
         if self._turn_busy:
             self._post_line(ErrorLine(f"/{label}: wait for the current turn to finish first"))
@@ -317,7 +317,7 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"nothing to {label}"))
             return
         sha = self.controller.apply_rollback(plan)
-        reverted = await self.controller.revert_worktree(sha)
+        reverted = await self.controller.revert_changes(sha)
         await self._render_history()
         self._sync_totals_from_controller()
         self._refresh_status()
@@ -325,7 +325,7 @@ class AgentApp(App[None]):
         if reverted:
             note = "file edits reverted"
         elif self.git_info is None:
-            note = "no git isolation for this session — file edits could not be reverted"
+            note = "no git tracking for this session — file edits could not be reverted"
         else:
             note = "file edits could not be reverted (no checkpoint or git failed)"
         if resend:
@@ -338,7 +338,7 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"undone: last turn removed ({note})"))
 
     # ------------------------------------------------------------------
-    # Git worktree state (diff summary + accept/reject)
+    # Git change tracking (diff summary + accept/reject)
 
     def _make_git_guard(self) -> Callable[[str], str | None]:
         """run_bash veto closure; reads self.git_info at call time so /resume
@@ -348,7 +348,7 @@ class AgentApp(App[None]):
             info = self.git_info
             if info is None:
                 return None
-            return check_blocked_git(command, info.branch, info.agent_workspace)
+            return check_blocked_git(command, None, info.workspace)
 
         return guard
 
@@ -363,9 +363,9 @@ class AgentApp(App[None]):
             await widget.clear()
             return
         try:
-            stat = await diff_stat(info.worktree, info.base_ref, info.subtree)
+            stat = await diff_stat(info)
         except GitWorktreeError:
-            await widget.clear()  # worktree vanished / git broken: stay quiet
+            await widget.clear()  # tracking broken (e.g. repo gone): stay quiet
             return
         if not stat.files:
             await widget.clear()
@@ -382,11 +382,9 @@ class AgentApp(App[None]):
             return
         try:
             if event.key is None:
-                text = await git_diff(info.worktree, info.base_ref, subtree=info.subtree)
+                text = await git_diff(info)
             else:
-                text = await git_diff(
-                    info.worktree, info.base_ref, event.key, subtree=info.subtree
-                )
+                text = await git_diff(info, event.key)
         except GitWorktreeError as exc:
             widget.hide_diff()
             self._post_line(ErrorLine(f"diff failed: {exc}"))
@@ -401,9 +399,9 @@ class AgentApp(App[None]):
         info = self.git_info
         if info is None:
             self._post_line(ErrorLine(
-                "/diff: no pending-changes tracking for this session — the workspace "
-                "could not be isolated with git (auto-init disabled via --no-init-repo, "
-                "or repo setup failed), so the agent edits it directly"
+                "/diff: no change tracking for this session — the workspace "
+                "could not be tracked with git (auto-init disabled via --no-init-repo, "
+                "or repo setup failed), so the agent's edits cannot be diffed"
             ))
             return
         widget = self.query_one("#diff-summary", DiffSummary)
@@ -421,7 +419,7 @@ class AgentApp(App[None]):
             return
 
         try:
-            text = await git_diff(info.worktree, info.base_ref, arg, subtree=info.subtree)
+            text = await git_diff(info, arg)
         except GitWorktreeError as exc:
             widget.hide_diff()
             self._post_line(ErrorLine(f"/diff failed: {exc}"))
@@ -434,44 +432,13 @@ class AgentApp(App[None]):
         await self.refresh_diff_summary()
         widget.show_diff(arg, text)
 
-    async def _rebind_worktree(self, info: GitInfo, chat: VerticalScroll) -> None:
-        """Point the sandbox + tools at a (possibly resumed) worktree.
+    def _rebind_tracking(self, info: GitInfo) -> None:
+        """Attach (possibly resumed) change-tracking state to this session.
 
-        ``chat`` is kept for signature symmetry with the other worktree
-        helpers; failures are posted through _post_line."""
-        if self.sandbox_session is not None:
-            await self.sandbox_session.close()
-            self.sandbox_session = None
-        sandbox: SandboxConfig | None = None
-        try:
-            sandbox = SandboxConfig(
-                workspace=info.worktree, subtree=info.subtree, git_dir=info.git_common_dir
-            )
-        except SandboxUnavailable as exc:
-            self._post_line(ErrorLine(f"filesystem tools unavailable: {exc}"))
-        self.sandbox = sandbox
-        self.sandbox_session = SandboxSession(sandbox) if sandbox is not None else None
+        The sandbox already points at the user's real workspace — only the
+        git_info wiring (checkpoints, diff summary, git guard) changes."""
         self.git_info = info
         self.controller.git_info = info
-        self.workspace = info.agent_workspace
-        self.tool_registry = build_registry(
-            sandbox, self.sandbox_session, mode=self.mode,
-            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-            git_guard=self._make_git_guard(), git_info=info,
-        )
-        self.controller.tools = self.tool_registry
-
-    def _disable_fs_tools(self) -> None:
-        """After accept/reject the worktree is gone; nothing sane to edit."""
-        self.git_info = None
-        self.controller.git_info = None
-        self.sandbox = None
-        self.sandbox_session = None
-        self.tool_registry = build_registry(
-            None, None, mode=self.mode,
-            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-        )
-        self.controller.tools = self.tool_registry
 
     def _persist_git_state(self) -> None:
         if self.session_name:
@@ -481,94 +448,87 @@ class AgentApp(App[None]):
                 git=self.git_info.to_block() if self.git_info else None,
             )
 
-    def _git_action_preflight(self, label: str) -> tuple[GitInfo, VerticalScroll] | None:
+    def _rewrite_checkpoints(self, sha: str) -> None:
+        """Point every turn's checkpoint at ``sha`` (the accepted tree), so
+        /undo //retry can no longer revert file state past an accept."""
+        for message in self.controller.conversation.messages:
+            if message.role == "user" and message.checkpoint_sha is not None:
+                message.checkpoint_sha = sha
+        if self.controller.conversation.undo_snapshot:
+            for message in self.controller.conversation.undo_snapshot:
+                if message.role == "user" and message.checkpoint_sha is not None:
+                    message.checkpoint_sha = sha
+
+    def _git_action_preflight(self, label: str) -> GitInfo | None:
         """Shared /accept //reject guards; mounts an error line if blocked."""
-        chat = self.query_one("#chat-log", VerticalScroll)
         info = self.git_info
         if info is None:
             self._post_line(ErrorLine(
-                f"/{label}: this session has no git worktree (the workspace isn't "
-                "a git repo, or the changes were already resolved)"
+                f"/{label}: no change tracking for this session (the workspace "
+                "isn't a git repo, or tracking setup failed)"
             ))
             return None
         if self._turn_busy:
             self._post_line(ErrorLine(f"/{label}: wait for the current turn to finish first"))
             return None
-        return info, chat
-
-    async def _finish_git_action(self, message: str) -> None:
-        """Post-resolution cleanup shared by accept and reject."""
-        self._disable_fs_tools()
-        self._persist_git_state()
-        await self.refresh_diff_summary()
-        self._post_line(NoticeLine(message))
-        self._post_line(NoticeLine(
-            "filesystem tools disabled — /new starts a fresh session with a new worktree"
-        ))
+        return info
 
     @work(group="git-action", exclusive=True)
     async def _start_accept(self) -> None:
-        """Merge agent/<id> into the user's branch in their real checkout."""
-        preflight = self._git_action_preflight("accept")
-        if preflight is None:
+        """Lock in the changes made so far: they become the new baseline —
+        off /diff's radar and out of /undo's reach. Work continues from
+        here, change-per-feature. (Guarding happens synchronously in the
+        slash-command handler; the worker assumes it passed.)"""
+        info = self.git_info
+        if info is None:
             return
-        info, _chat = preflight
-        self._post_line(NoticeLine(f"accepting: committing worktree changes and merging {info.branch}…"))
         try:
-            await commit_worktree_changes(info)
-            result = await merge_branch(info.original_workspace, info.branch)
+            stat = await diff_stat(info)
+        except GitWorktreeError:
+            stat = None
+        try:
+            sha = await accept_changes(info)
         except GitWorktreeError as exc:
             self._post_line(ErrorLine(f"/accept failed: {exc}"))
             return
-        if result.outcome is MergeOutcome.IN_PROGRESS:
-            self._post_line(ErrorLine(
-                f"/accept: a merge is already unresolved in {info.original_workspace}. "
-                "Finish it there with normal git tooling, commit, then run /accept again."
+        self._rewrite_checkpoints(sha)
+        self._persist_git_state()
+        await self.refresh_diff_summary()
+        if stat is None or not stat.files:
+            self._post_line(NoticeLine(
+                "accepted: no pending changes — baseline reset; /diff and /undo "
+                "now measure from here"
             ))
-            return
-        if result.outcome is MergeOutcome.CONFLICT:
-            self._post_line(ErrorLine(
-                f"/accept: merge conflicts in {info.original_workspace} — your branch moved on "
-                "since the session started. Resolve them there with normal git tooling and "
-                "commit the merge; the worktree was left in place so you can retry /accept."
+        else:
+            self._post_line(NoticeLine(
+                f"accepted: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
+                "locked in; /diff is reset and /undo can no longer revert them"
             ))
-            return
-        if result.outcome is MergeOutcome.ERROR:
-            self._post_line(ErrorLine(f"/accept failed: {result.detail}"))
-            return
-        await remove_worktree(info.original_workspace, info.worktree)
-        await self._finish_git_action(
-            f"accepted: changes merged into your working directory; worktree removed. "
-            f"Branch {info.branch} kept as history (delete with: git branch -D {info.branch})."
-        )
 
     @work(group="git-action", exclusive=True)
     async def _start_reject(self) -> None:
-        """Discard everything: force-remove the worktree, delete the branch."""
-        preflight = self._git_action_preflight("reject")
-        if preflight is None:
-            return
-        info, _chat = preflight
-        confirmed = await self.push_screen(ConfirmScreen(
-            title="Reject agent changes?",
-            detail=(
-                f"Permanently discards the session worktree ({info.worktree}) and deletes "
-                f"branch {info.branch}. This cannot be undone. Your own working directory "
-                "is never touched by this session, so it is unaffected."
-            ),
-            confirm_word="reject",
-        ), wait_for_dismiss=True)
-        if not confirmed:
+        """Discard every change made since the last /accept: the workspace is
+        restored to the accepted baseline. The conversation keeps going (the
+        agent sees the reverted files on its next turn)."""
+        info = self.git_info
+        if info is None:
             return
         try:
-            await remove_worktree(info.original_workspace, info.worktree, force=True)
-            await delete_branch(info.original_workspace, info.branch)
+            stat = await diff_stat(info)
+            await revert_to_tree(info, info.baseline_tree)
         except GitWorktreeError as exc:
             self._post_line(ErrorLine(f"/reject failed: {exc}"))
             return
-        await self._finish_git_action(
-            "rejected: worktree and branch removed; your working directory was never modified"
-        )
+        self._rewrite_checkpoints(info.baseline_tree)
+        self._persist_git_state()
+        await self.refresh_diff_summary()
+        if not stat.files:
+            self._post_line(NoticeLine("rejected: nothing to discard"))
+        else:
+            self._post_line(NoticeLine(
+                f"rejected: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
+                "since the last accept were reverted"
+            ))
 
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
@@ -640,49 +600,51 @@ class AgentApp(App[None]):
         errors: list[str] = []
         block = load_git_block(name)
         if block is not None:
-            info = GitInfo.from_block(block)
-            if await worktree_is_valid(info):
-                await self._rebind_worktree(info, chat)
-                notes.append(f"reconnected to agent worktree {info.worktree} (branch {info.branch})")
-            else:
-                # Never fall back to editing the user's real directory silently —
-                # recreate the worktree, or say loudly what happened.
-                try:
-                    fresh = await recreate_worktree(info)
-                except GitWorktreeError as exc:
-                    errors.append(
-                        f"this session's agent worktree is gone and could not be recreated ({exc}); "
-                        "filesystem tools stay on the previous workspace — use /new for a clean start"
-                    )
-                else:
-                    await self._rebind_worktree(fresh, chat)
-                    notes.append(
-                        f"previous worktree for this session was removed externally; recreated a fresh "
-                        f"one from branch {fresh.branch} — uncommitted agent changes from before are gone"
-                    )
-        elif self.sandbox is not None:
-            # Session predates git tracking. Set up isolation now if possible
-            # (same policy as cli.py — including auto-init on a bare directory).
-            from .. import gitwork
             try:
-                info, notes = await gitwork.setup_isolation(
-                    self.workspace or Path.cwd(), name
+                info = GitInfo.from_block(block)
+            except (KeyError, TypeError, ValueError):
+                info = None
+            if info is not None:
+                self._rebind_tracking(info)
+                notes.append(
+                    f"reconnected to change tracking for {info.agent_workspace} "
+                    "(direct edits; /diff shows pending changes, /undo reverts the last turn)"
                 )
-            except GitWorktreeError as exc:
-                errors.append(f"git worktree isolation unavailable: {exc}")
             else:
-                if info is not None:
-                    await self._rebind_worktree(info, chat)
-                    notes.append(
-                        f"agent edits go to worktree {info.worktree} (branch {info.branch}); "
-                        "/diff shows pending changes, /accept merges, /reject discards"
-                    )
+                # Session predates direct-write tracking (old worktree block).
+                notes.append(
+                    "note: this session used the old worktree isolation; "
+                    "switched to direct edits with fresh change tracking"
+                )
+                await self._setup_tracking_for_resume(name, notes, errors)
+        elif self.sandbox is not None:
+            # Session predates git tracking. Set up tracking now if possible
+            # (same policy as cli.py — including auto-init on a bare directory).
+            await self._setup_tracking_for_resume(name, notes, errors)
         await self._render_history()
         for note in notes:
             self._post_line(NoticeLine(note))
         for error in errors:
             self._post_line(ErrorLine(error))
         await self.refresh_diff_summary()
+
+    async def _setup_tracking_for_resume(
+        self, name: str, notes: list[str], errors: list[str]
+    ) -> None:
+        """Set up fresh change tracking for a resumed session that has none
+        (legacy worktree block or pre-tracking session). The sandbox already
+        points at the real workspace."""
+        from .. import gitwork
+        try:
+            info, setup_notes = await gitwork.setup_tracking(
+                self.workspace or Path.cwd(), name
+            )
+        except GitWorktreeError as exc:
+            errors.append(f"git change tracking unavailable: {exc}")
+            return
+        if info is not None:
+            self._rebind_tracking(info)
+            notes.extend(setup_notes)
 
     def _on_model_selected(self, name: str | None) -> None:
         if not name:

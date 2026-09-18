@@ -39,63 +39,63 @@ Expose external files read-only to the agent with `--ref ALIAS=PATH`
 (repeatable); they appear under `.refs/ALIAS` in the workspace and are
 read-only by convention.
 
-## Git-backed change tracking
+## Change tracking and undo
 
-Every session runs in an isolated `git worktree` — a second working directory
-linked to your repository, checked out on its own branch (`agent/<session>`).
-The agent's file edits and shell commands land there; your checkout, its
-uncommitted changes, and its branch are never touched.
+The agent edits your files directly — there is no separate worktree and no
+accept/reject step. Instead, every session snapshots your workspace state
+into a git tree object at startup (via a throwaway index: your index, HEAD,
+and refs are never touched), and every turn takes another snapshot.
 
 No setup is required: if the workspace isn't a git repo (or has no commits
-yet), xarness runs `git init` itself and snapshots your current files as a
-baseline commit — your files are never modified by this. Opt out with
-`--no-init-repo` (the agent then edits the directory directly, and diff
-tracking is unavailable). Untracked files are copied into the worktree so the
-agent can see them — and re-synced at the start of every turn, so files you
-add to your workspace mid-session become visible to the agent on its next
-round; skip that with `--no-copy-untracked`.
+yet), xarness runs `git init` itself so tracking works. Your files are never
+modified by this, and no commits are ever created — snapshots are plain tree
+objects. Opt out with `--no-init-repo` (the agent still edits the directory
+directly; there is just no /diff or /undo for file changes).
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
 (`name  dir/  +N -M`), and click a row to read that file's unified diff.
 
-`run_bash` also vetoes git commands that would interfere with the
-harness-managed worktree/branch lifecycle.
-
 | Command | Action |
 | --- | --- |
 | `/diff` | Show the pending-changes panel; `/diff` again hides it |
 | `/diff <path>` | Show one file's unified diff |
-| `/accept` | Merge the agent's branch into your branch (`--no-ff`), remove the worktree |
-| `/reject` | Discard everything (asks you to confirm) |
+| `/accept` | Lock in the changes made so far: `/diff` resets, `/undo` can no longer revert past this point |
+| `/reject` | Discard all changes made since the last `/accept` |
 | `/undo` | Drop the last turn: revert its file edits, put your message back in the input |
 | `/retry` | Revert the last turn's file edits and resend your message |
 
-`/accept` conflicts (your branch moved on since the session started) are
-reported, never auto-resolved — the worktree stays so you can retry after
-fixing things manually. Quitting without accepting or rejecting keeps the
-worktree; resuming the session reconnects to it.
+`/accept` is how you follow change-per-feature: let the agent build one
+feature, `/accept` it, move on to the next. Everything before the last
+accept is out of `/diff`'s and `/undo`'s reach — use git itself (a repo you
+control) for history beyond that. `/reject` restores the workspace to the
+last accepted snapshot, discarding everything since — including changes you
+made yourself — while keeping the conversation going so the agent sees the
+reverted files on its next turn.
+
+If your `--workspace` is a subdirectory of a bigger repo, the session is
+scoped to that subdirectory: the agent's tools (ls/glob/grep, read/edit, and
+the shell's start directory) are rooted at *your* directory — not the repo
+root — tool writes land only inside it, and diffs/reverts cover only it.
+The rest of the repo stays mounted read-only for context (and reachable via
+`run_bash`), but it is not the agent's workspace.
 
 ### Undo and retry
 
-Each turn starts with a git checkpoint: the worktree's current state is
-committed to the agent branch (or, when it is already clean, its HEAD is
-recorded). `/undo` and `/retry` reset the worktree to that checkpoint,
-removing every file change the turn made — edits, deletions, and newly
-created files.
+Each turn starts with a checkpoint: a git tree snapshot of the workspace's
+current state (tracked changes, uncommitted changes, and untracked files —
+gitignored files are excluded, matching classic git semantics). `/undo` and
+`/retry` restore the workspace to that snapshot, removing every file change
+the turn made — edits, deletions, and newly created files.
 
 **Only file edits are reverted.** Non-file side effects of `run_bash` —
 package installs, background jobs, network calls, anything outside the
-worktree — are *not* undone. `/undo` puts the removed message back into the
+workspace — are *not* undone. `/undo` puts the removed message back into the
 input box; `/retry` resends it immediately. Both also roll back the turn's
 token usage from the session totals, and work across a mid-turn `/compact`
-(the pre-compaction history is restored). Without git isolation (no repo,
+(the pre-compaction history is restored). Without git tracking (no repo,
 `--no-init-repo`, or setup failure) they still remove the messages and fix
 the token counts, but tell you the file edits could not be reverted.
-
-Because turns are checkpointed, `/accept` merges the branch's per-turn
-checkpoint commits plus a final commit instead of one big diff — the history
-reads as a per-turn log of the session.
 
 ## Sessions
 
@@ -109,10 +109,9 @@ xarness sessions list
 xarness sessions delete my-session
 ```
 
-Resuming reconnects to the session's worktree; if the worktree was removed
-externally, xarness recreates a fresh one from the session's branch (uncommitted
-agent changes from before are gone) — or, if it can't, disables filesystem
-tools rather than letting the agent touch your real directory.
+Resuming reconnects to the session's change tracking (the persisted baseline
+snapshot); sessions created by older builds with worktree isolation resume
+with fresh tracking instead.
 
 ## Install
 
@@ -170,7 +169,7 @@ xarness chat --workspace ./some-project    # sandbox root (default: cwd)
 | `/new` | Start a new chat |
 | `/undo` | Drop the last turn (file edits reverted, message back in the input) |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
-| `/diff`, `/accept`, `/reject` | See "Git-backed change tracking" above |
+| `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |
 
 ## Keys
 
@@ -209,7 +208,7 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 
 ```
 src/xarness/
-  cli.py          argument parsing, boots the TUI, worktree setup
+  cli.py          argument parsing, boots the TUI, change-tracking setup
   config.py       pydantic config models, YAML loading, profile selection
   client.py       async httpx SSE client, reasoning-effort mapping
   events.py       typed stream events (the client/UI contract)
@@ -220,7 +219,7 @@ src/xarness/
   sandbox.py      bubblewrap sandbox: one-shot file tools + persistent shell
   session_store.py  save/load conversations as JSON, keyed by session name
   file_search.py  bounded filename search backing @-mention autocomplete
-  gitwork.py      worktree lifecycle, diff computation, accept/reject, git filter
+  gitwork.py      tree-snapshot checkpoints, diff computation, git filter
   theme.py        the color palettes
   tui/            Textual app, widgets, screens (picker/resume/confirm), stylesheet
 ```

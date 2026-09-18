@@ -1,13 +1,10 @@
-"""Tests for gitwork: worktree lifecycle, diff computation, merge/reject,
-and the run_bash git-command filter.
+"""Tests for gitwork: direct-write change tracking (tree snapshots,
+checkpoints, revert, diff) and the run_bash git-command filter.
 
-Uses a real temp git repo (git is a hard dependency of the feature anyway);
-monkeypatches gitwork.WORKTREES_DIR so nothing touches ~/.local/share.
+Uses a real temp git repo (git is a hard dependency of the feature anyway).
 """
 
 import asyncio
-import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -15,10 +12,8 @@ from pathlib import Path
 
 from xarness import gitwork
 from xarness.gitwork import (
-    MergeOutcome, check_blocked_git, checkpoint, commit_worktree_changes,
-    create_worktree, delete_branch, detect_repo, diff_stat, git_diff,
-    merge_branch, recreate_worktree, remove_worktree, revert_to_checkpoint,
-    stage_untracked, worktree_is_valid,
+    GitInfo, accept_changes, check_blocked_git, checkpoint, detect_repo,
+    diff_stat, git_diff, revert_to_tree, setup_tracking, snapshot_tree,
 )
 
 
@@ -36,9 +31,6 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
-        self._orig_dir = gitwork.WORKTREES_DIR
-        gitwork.WORKTREES_DIR = self.base / "worktrees"
-        self.addCleanup(setattr, gitwork, "WORKTREES_DIR", self._orig_dir)
 
     def make_repo(self) -> Path:
         repo = self.base / "repo"
@@ -54,583 +46,314 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         return repo
 
     # ------------------------------------------------------------------
-    # detection + worktree creation
+    # detection + setup
 
     async def test_detect_repo_reads_head(self):
         assert await detect_repo(self.base) is None  # plain directory
         repo = self.make_repo()
         info = await detect_repo(repo)
         assert info is not None
-        assert info.root == repo
+        assert info.root == repo.resolve()
         assert info.head_branch == "main"
-        sha = _git(repo, "rev-parse", "HEAD").strip()
-        assert info.base_ref == sha
-        assert info.git_common_dir == repo / ".git"
+        assert info.base_ref is not None
 
     async def test_detect_repo_unborn_head_has_no_base_ref(self):
-        repo = self.base / "empty"
+        repo = self.base / "unborn"
         repo.mkdir()
         _git(repo, "init", "-q", "-b", "main", ".")
         info = await detect_repo(repo)
         assert info is not None
-        assert info.root == repo
         assert info.base_ref is None
 
-    async def test_setup_isolation_auto_initializes_non_repo(self):
+    async def test_setup_tracking_auto_initializes_non_repo(self):
         """No git init from the user: the harness sets everything up itself."""
         workspace = self.base / "plain"
         workspace.mkdir()
         (workspace / "notes.txt").write_text("user's file\n")
 
-        info, notes = await gitwork.setup_isolation(workspace, "sess1")
+        info, notes = await setup_tracking(workspace, "sess1")
 
         assert info is not None
-        assert info.worktree.is_dir()
-        # The user's file was snapshotted as the baseline and is intact.
+        assert info.workspace == workspace.resolve()
+        # The user's file is untouched, and the repo is harness-managed.
         assert (workspace / "notes.txt").read_text() == "user's file\n"
-        assert (info.worktree / "notes.txt").read_text() == "user's file\n"
         assert any("initialized" in n for n in notes)
-        # The repo is marked as harness-managed.
-        managed = _git(workspace, "config", "xarness.managed").strip()
-        assert managed == "true"
+        out = _git(workspace, "config", "xarness.managed")
+        assert out.strip() == "true"
 
-        # Agent edit shows up in the diff against the baseline...
-        (info.worktree / "notes.txt").write_text("user's file\nagent edit\n")
-        stat = await diff_stat(info.worktree, info.base_ref)
-        assert stat.additions == 1
+    async def test_setup_tracking_snapshots_uncommitted_state(self):
+        """The baseline tree captures uncommitted + untracked files, so /diff
+        starts empty even in a dirty repo."""
+        repo = self.make_repo()
+        (repo / "app.py").write_text("line1\nedited\n")  # uncommitted
+        (repo / "draft.txt").write_text("untracked\n")
 
-        # ...and accept lands it in the user's (auto-initialized) repo.
-        assert await commit_worktree_changes(info) == "committed"
-        result = await merge_branch(workspace, info.branch)
-        assert result.outcome is MergeOutcome.MERGED
-        assert (workspace / "notes.txt").read_text() == "user's file\nagent edit\n"
-
-    async def test_setup_isolation_baselines_unborn_user_repo(self):
-        """User ran `git init` themselves but has no commits: their repo is
-        used as-is (plus a baseline snapshot), never replaced."""
-        workspace = self.base / "unborn"
-        workspace.mkdir()
-        _git(workspace, "init", "-q", "-b", "main", ".")
-        (workspace / "file.py").write_text("x = 1\n")
-
-        info, notes = await gitwork.setup_isolation(workspace, "sess1")
+        info, _ = await setup_tracking(repo, "sess1")
 
         assert info is not None
-        assert any("no commits" in n for n in notes)
-        assert await detect_repo(workspace) is not None
-        # One commit (the baseline), authored into THEIR repo — files intact.
-        assert len(_git(workspace, "log", "--oneline").splitlines()) == 1
-        assert (workspace / "file.py").read_text() == "x = 1\n"
+        stat = await diff_stat(info)
+        assert stat.files == []
 
-    async def test_setup_isolation_respects_allow_init_false(self):
+    async def test_setup_tracking_respects_allow_init_false(self):
         workspace = self.base / "plain"
         workspace.mkdir()
-        info, notes = await gitwork.setup_isolation(workspace, "sess1", allow_init=False)
+        info, _ = await setup_tracking(workspace, "sess1", allow_init=False)
         assert info is None
         assert not (workspace / ".git").exists()
 
-    async def test_setup_isolation_scopes_to_workspace_subdir(self):
+    async def test_setup_tracking_scopes_to_workspace_subdir(self):
         """--workspace pointing at a subdirectory of a bigger repo: the
-        session is scoped to that subtree — untracked copy, diff, and agent
-        workspace cover only it, never the rest of the repo."""
+        session is scoped to that subtree — snapshots, diffs, and reverts
+        only ever touch it."""
         repo = self.make_repo()
         (repo / "f").mkdir()
         (repo / "f" / "notes.txt").write_text("tracked\n")
         _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "add f")
-        (repo / "f" / "draft.txt").write_text("untracked\n")  # under f
+        _git(repo, "commit", "-qm", "f")
         (repo / "stray.txt").write_text("untracked\n")  # outside f
 
-        info, notes = await gitwork.setup_isolation(repo / "f", "sess1")
+        info, notes = await setup_tracking(repo / "f", "sess1")
 
         assert info is not None
         assert info.subtree == "f"
-        assert info.agent_workspace == info.worktree / "f"
-        # The subtree exists in the worktree even though git doesn't check
-        # out untracked directories.
-        assert info.agent_workspace.is_dir()
+        assert info.agent_workspace == repo / "f"
         assert any("scoped to f/" in n for n in notes)
-        # Only the subtree's untracked file was copied.
-        assert (info.worktree / "f" / "draft.txt").read_text() == "untracked\n"
-        assert not (info.worktree / "stray.txt").exists()
-        assert info.copied_untracked == ["f/draft.txt"]
 
-        # Diff covers the subtree only, with subtree-relative paths — even
-        # when the rest of the worktree somehow changes too. The copied
-        # untracked draft shows up as a new file (intent-to-add), same as in
-        # the whole-repo case.
-        (info.worktree / "f" / "notes.txt").write_text("tracked\nagent edit\n")
-        (info.worktree / "app.py").write_text("outside the subtree\n")
-        stat = await diff_stat(info.worktree, info.base_ref, info.subtree)
+        # Edits outside the subtree don't show in the diff; edits inside do,
+        # with subtree-relative paths. A file created inside the subtree
+        # after setup shows up as new.
+        (repo / "f" / "draft.txt").write_text("untracked\n")
+        (repo / "f" / "notes.txt").write_text("tracked\nagent edit\n")
+        (repo / "app.py").write_text("outside the subtree\n")
+        stat = await diff_stat(info)
         by_path = {f.path: f for f in stat.files}
         assert set(by_path) == {"notes.txt", "draft.txt"}
         assert by_path["notes.txt"].additions == 1
-        assert by_path["notes.txt"].is_new is False
-        assert by_path["draft.txt"].is_new is True
-        full = await git_diff(info.worktree, info.base_ref, subtree=info.subtree)
-        assert "diff --git a/notes.txt" in full
-        assert "app.py" not in full
-        single = await git_diff(
-            info.worktree, info.base_ref, "notes.txt", subtree=info.subtree
-        )
-        assert "diff --git a/notes.txt" in single
+        assert by_path["draft.txt"].is_new
 
-        # A recreated worktree keeps the subtree present and scoped.
-        fresh = await recreate_worktree(info)
-        assert fresh.subtree == "f"
-        assert (fresh.worktree / "f").is_dir()
-
-    async def test_create_worktree_isolates_user_state(self):
-        repo = self.make_repo()
-        # User has uncommitted changes BEFORE the session starts.
-        (repo / "app.py").write_text("user edit\n")
-        (repo / "scratch.txt").write_text("untracked\n")
-        before_status = _git(repo, "status", "--porcelain")
-
-        info = await create_worktree(await detect_repo(repo), "sess1")
-
-        # Worktree exists outside the repo, on its own branch at base_ref.
-        assert info.worktree.is_dir()
-        assert info.worktree.parent == gitwork.WORKTREES_DIR
-        assert info.branch == "agent/sess1"
-        assert (info.worktree / "app.py").read_text() == "line1\nline2\n"
-        assert _git(info.worktree, "rev-parse", "--abbrev-ref", "HEAD").strip() == "agent/sess1"
-
-        # The user's directory is byte-for-byte untouched.
-        assert _git(repo, "status", "--porcelain") == before_status
-        assert (repo / "app.py").read_text() == "user edit\n"
-        assert (repo / "scratch.txt").read_text() == "untracked\n"
-        assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
-
-    async def test_create_worktree_copies_untracked_files(self):
-        repo = self.make_repo()
-        (repo / "uncommitted.cfg").write_text("key=value\n")
-        (repo / "sub").mkdir()
-        (repo / "sub" / "nested.txt").write_text("nested\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        assert (info.worktree / "uncommitted.cfg").read_text() == "key=value\n"
-        assert (info.worktree / "sub" / "nested.txt").read_text() == "nested\n"
-        assert "uncommitted.cfg" in info.copied_untracked
-
-        # copy_untracked=False skips them entirely.
-        info = await create_worktree(await detect_repo(repo), "sess2", copy_untracked=False)
-        assert not (info.worktree / "uncommitted.cfg").exists()
-        assert info.copied_untracked == []
-
-    async def test_worktree_is_valid_and_recreate(self):
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        assert await worktree_is_valid(info)
-        # Nothing changed yet: nothing to commit.
-        assert await commit_worktree_changes(info) == "clean"
-
-        # Simulate external removal (git worktree prune + delete the folder).
-        await remove_worktree(repo, info.worktree, force=True)
-        assert not await worktree_is_valid(info)
-
-        fresh = await recreate_worktree(info)
-        assert await worktree_is_valid(fresh)
-        assert fresh.worktree == info.worktree
-        assert fresh.branch == info.branch
-
-    async def test_sync_untracked_picks_up_new_and_changed_files(self):
-        """Files the user adds (or edits) after worktree creation appear in
-        the worktree on the next sync; agent-edited copies are not clobbered."""
-        repo = self.make_repo()
-        (repo / "notes.md").write_text("v1\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        assert (info.worktree / "notes.md").read_text() == "v1\n"
-
-        # Distinct mtimes keep the user-edit vs agent-edit detection
-        # deterministic on filesystems with coarse timestamps.
-        def touch(path: Path, mtime: int) -> None:
-            os.utime(path, (mtime, mtime))
-
-        # User adds a brand-new untracked file mid-session and edits an
-        # already-copied one.
-        (repo / "later.txt").write_text("added later\n")
-        (repo / "notes.md").write_text("v2\n")
-        touch(repo / "notes.md", 2_000_000_000)
-        newly = await gitwork.sync_untracked_files(info)
-        assert newly == ["later.txt"]
-        assert (info.worktree / "later.txt").read_text() == "added later\n"
-        assert (info.worktree / "notes.md").read_text() == "v2\n"
-        assert "later.txt" in info.copied_untracked
-
-        # The agent edits its copy after the user's change: sync must not
-        # clobber the agent's newer edit.
-        (info.worktree / "notes.md").write_text("agent edit\n")
-        touch(info.worktree / "notes.md", 3_000_000_000)
-        (repo / "notes.md").write_text("v3\n")
-        touch(repo / "notes.md", 2_500_000_000)
-        newly = await gitwork.sync_untracked_files(info)
-        assert newly == []
-        assert (info.worktree / "notes.md").read_text() == "agent edit\n"
-
-    async def test_checkpoint_and_revert_restore_worktree_state(self):
-        """checkpoint() snapshots the worktree; revert_to_checkpoint discards
-        everything a turn did after it — edits, staged edits, new files."""
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        base_head = _git(info.worktree, "rev-parse", "HEAD").strip()
-
-        # Turn starts: a previous-turn leftover is uncommitted; checkpoint
-        # commits it.
-        (info.worktree / "app.py").write_text("prior work\n")
+        # Revert restores the subtree (and only it).
         sha = await checkpoint(info)
-        assert sha != base_head
-        assert _git(info.worktree, "status", "--porcelain") == ""
-
-        # The turn edits a tracked file, stages it, and creates a new file.
-        (info.worktree / "app.py").write_text("turn edits\n")
-        (info.worktree / "created.py").write_text("new file\n")
-        _git(info.worktree, "add", "-A")
-        assert await git_diff(info.worktree, info.base_ref)  # changes visible
-
-        await revert_to_checkpoint(info, sha)
-        assert (info.worktree / "app.py").read_text() == "prior work\n"
-        assert not (info.worktree / "created.py").exists()
-        assert _git(info.worktree, "status", "--porcelain") == ""
-        # Prior turns' checkpointed work is preserved.
-        stat = await diff_stat(info.worktree, info.base_ref)
-        assert [(f.path, f.additions, f.deletions) for f in stat.files] == [
-            ("app.py", 1, 2)
-        ]
-
-    async def test_revert_keeps_user_untracked_files_intact(self):
-        """Copied untracked files are not part of the checkpoint commit: the
-        revert must not delete untouched ones, and must restore the ones the
-        turn modified or deleted to their pre-turn (original) content."""
-        repo = self.make_repo()
-        (repo / "untouched.txt").write_text("user file\n")
-        (repo / "touched.txt").write_text("user file 2\n")
-        (repo / "doomed.txt").write_text("user file 3\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        sha = await checkpoint(info)  # clean worktree: records HEAD
-
-        # The turn modifies one copied file and deletes another.
-        (info.worktree / "touched.txt").write_text("agent rewrite\n")
-        (info.worktree / "doomed.txt").unlink()
-
-        await revert_to_checkpoint(info, sha)
-
-        assert (info.worktree / "untouched.txt").read_text() == "user file\n"
-        assert (info.worktree / "touched.txt").read_text() == "user file 2\n"
-        assert (info.worktree / "doomed.txt").read_text() == "user file 3\n"
-        # Back to the pre-turn state: the user's files untracked, nothing else.
-        assert sorted(
-            _git(info.worktree, "status", "--porcelain").splitlines()
-        ) == ["?? doomed.txt", "?? touched.txt", "?? untouched.txt"]
-
-    async def test_revert_preserves_previously_committed_copied_file(self):
-        """A copied untracked file the agent modified in an EARLIER turn (so a
-        checkpoint committed it) keeps its committed version across a later
-        revert — the user's original must not clobber accepted work."""
-        repo = self.make_repo()
-        (repo / "scratch.txt").write_text("v0\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-
-        # Turn 1 modifies the copied file; turn 2's checkpoint commits it.
-        (info.worktree / "scratch.txt").write_text("agent v1\n")
-        sha2 = await checkpoint(info)
-        assert _git(info.worktree, "status", "--porcelain") == ""
-
-        # Turn 3 modifies it again; undoing turn 3 restores the committed v1.
-        (info.worktree / "scratch.txt").write_text("agent v2\n")
-        await revert_to_checkpoint(info, sha2)
-        assert (info.worktree / "scratch.txt").read_text() == "agent v1\n"
-
-    async def test_checkpoint_clean_worktree_records_head(self):
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        head = _git(info.worktree, "rev-parse", "HEAD").strip()
-        count = _git(info.worktree, "rev-list", "--count", "HEAD").strip()
-
-        sha = await checkpoint(info)
-
-        assert sha == head  # no empty commit
-        assert _git(info.worktree, "rev-list", "--count", "HEAD").strip() == count
-        # Reverting to it is still a valid no-op-ish rollback.
-        (info.worktree / "app.py").write_text("scratch\n")
-        await revert_to_checkpoint(info, sha)
-        assert (info.worktree / "app.py").read_text() == "line1\nline2\n"
-
-    async def test_commit_worktree_changes_after_checkpoint(self):
-        """With every turn checkpointed, /accept's commit paths still behave:
-        clean worktree → "clean"; untouched copied untracked stay untracked."""
-        repo = self.make_repo()
-        (repo / "scratch.txt").write_text("untracked\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-
-        # Turn 1: agent modifies a tracked file; checkpointed at turn 2 start.
-        (info.worktree / "app.py").write_text("line1\nedited\n")
-        await checkpoint(info)  # commits the edit
-        # Turn 2: clean worktree.
-        await checkpoint(info)
-        # The untouched copied-untracked file keeps status "dirty" but stages
-        # nothing — /accept proceeds and merges the checkpoint commits.
-        assert await commit_worktree_changes(info) == "nothing-staged"
-
-        # The copied untracked file was never touched: not committed.
-        commits = _git(info.worktree, "log", "--name-only", "--format=%h").splitlines()
-        assert "scratch.txt" not in commits
+        (repo / "f" / "extra.txt").write_text("created\n")
+        (repo / "f" / "notes.txt").unlink()
+        await revert_to_tree(info, sha)
+        assert (repo / "f" / "notes.txt").read_text() == "tracked\nagent edit\n"
+        assert not (repo / "f" / "extra.txt").exists()
+        assert (repo / "app.py").read_text() == "outside the subtree\n"
 
     # ------------------------------------------------------------------
-    # diff computation
+    # snapshots never touch the user's index / HEAD
+
+    async def test_snapshot_leaves_index_and_head_alone(self):
+        repo = self.make_repo()
+        (repo / "app.py").write_text("line1\nstaged\n")
+        _git(repo, "add", "app.py")  # user staged something
+        head_before = _git(repo, "rev-parse", "HEAD").strip()
+
+        sha = await snapshot_tree(repo)
+
+        assert sha
+        assert _git(repo, "rev-parse", "HEAD").strip() == head_before
+        status = _git(repo, "status", "--porcelain")
+        assert "M  app.py" in status  # still staged, index untouched
+
+    async def test_snapshot_captures_untracked_not_ignored(self):
+        repo = self.make_repo()
+        (repo / ".gitignore").write_text("ignored*\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "gitignore")
+        (repo / "ignored.bin").write_text("x\n")
+        (repo / "kept.txt").write_text("y\n")
+
+        sha = await snapshot_tree(repo)
+        names = _git(repo, "ls-tree", "-r", "--name-only", sha).splitlines()
+        assert "kept.txt" in names
+        assert "ignored.bin" not in names
+
+    # ------------------------------------------------------------------
+    # checkpoint + revert
+
+    async def test_checkpoint_and_revert_restore_workspace_state(self):
+        """Edits, deletions, and creations since the checkpoint are all
+        undone by revert_to_tree."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        sha = await checkpoint(info)
+
+        # Agent turn: modify, delete, create.
+        (repo / "app.py").write_text("line1\nagent edit\n")
+        (repo / "pkg" / "mod.py").unlink()
+        (repo / "new_file.py").write_text("created\n")
+
+        await revert_to_tree(info, sha)
+
+        assert (repo / "app.py").read_text() == "line1\nline2\n"
+        assert (repo / "pkg" / "mod.py").read_text() == "a = 1\n"
+        assert not (repo / "new_file.py").exists()
+        # Nothing staged, HEAD unmoved.
+        assert _git(repo, "status", "--porcelain").strip() == ""
+
+    async def test_revert_restores_untracked_baseline_files(self):
+        """Files untracked at checkpoint time are restored too — the snapshot
+        tree holds their content, not just tracked files'."""
+        repo = self.make_repo()
+        (repo / "draft.txt").write_text("untracked\n")
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        sha = await checkpoint(info)
+
+        (repo / "draft.txt").unlink()
+        await revert_to_tree(info, sha)
+
+        assert (repo / "draft.txt").read_text() == "untracked\n"
+        # Still untracked — the user's index was never involved.
+        assert "??" in _git(repo, "status", "--porcelain")
+
+    async def test_revert_keeps_ignored_files(self):
+        repo = self.make_repo()
+        (repo / ".gitignore").write_text("ignored*\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "gitignore")
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        sha = await checkpoint(info)
+
+        (repo / "ignored.dir").mkdir()
+        (repo / "ignored.dir" / "artifact.bin").write_text("x\n")
+        await revert_to_tree(info, sha)
+
+        assert (repo / "ignored.dir" / "artifact.bin").exists()
+
+    async def test_revert_to_missing_tree_fails_loudly(self):
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        with self.assertRaises(gitwork.GitWorktreeError):
+            await revert_to_tree(info, "0" * 40)
+
+    # ------------------------------------------------------------------
+    # diff
 
     async def test_diff_stat_tracks_edits_and_new_files(self):
         repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        wt = info.worktree
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
 
-        # Nothing changed yet.
-        stat = await diff_stat(wt, info.base_ref)
-        assert stat.files == []
+        (repo / "app.py").write_text("line1\nline2\nline3\n")
+        (repo / "added.txt").write_text("new\n")
+        (repo / "pkg" / "mod.py").unlink()
 
-        # Edit a tracked file (+1 -1) and create a new one (+2 -0).
-        (wt / "app.py").write_text("line1\nchanged\n")
-        (wt / "new.py").write_text("x = 1\ny = 2\n")
-
-        stat = await diff_stat(wt, info.base_ref)
+        stat = await diff_stat(info)
         by_path = {f.path: f for f in stat.files}
+        assert set(by_path) == {"app.py", "added.txt", "pkg/mod.py"}
         assert by_path["app.py"].additions == 1
-        assert by_path["app.py"].deletions == 1
-        assert by_path["new.py"].additions == 2
-        assert by_path["new.py"].deletions == 0
-        assert by_path["new.py"].is_new is True
-        assert by_path["app.py"].is_new is False
-        assert stat.additions == 3
-        assert stat.deletions == 1
+        assert by_path["added.txt"].is_new
+        assert by_path["pkg/mod.py"].deletions == 1
+        assert stat.additions == 2 and stat.deletions == 1
 
     async def test_full_and_file_diff(self):
         repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("edited\n")
-        (info.worktree / "other.py").write_text("new\n")
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "app.py").write_text("line1\nagent\n")
 
-        full = await git_diff(info.worktree, info.base_ref)
-        assert "diff --git a/app.py" in full
-        assert "diff --git a/other.py" in full
-
-        single = await git_diff(info.worktree, info.base_ref, "app.py")
-        assert "diff --git a/app.py" in single
-        assert "other.py" not in single
+        full = await git_diff(info)
+        assert "app.py" in full and "agent" in full
+        one = await git_diff(info, "app.py")
+        assert "app.py" in one
+        other = await git_diff(info, "pkg/mod.py")
+        assert other.strip() == ""
 
     async def test_diff_detects_renames(self):
-        """-M is passed explicitly: a moved file shows up as a rename (one
-        numstat entry for the new path, "rename from/to" in the full diff),
-        not a full delete+add pair, regardless of diff.renames config."""
         repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        wt = info.worktree
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "app.py").rename(repo / "renamed.py")
 
-        # Pure move (100% similarity) + move-and-edit (2 of 3 lines kept).
-        (wt / "moved.py").write_text((wt / "pkg" / "mod.py").read_text())
-        (wt / "pkg" / "mod.py").unlink()
-        (wt / "app_renamed.py").write_text("line1\nline2\nline3\n")
-        (wt / "app.py").unlink()
+        stat = await diff_stat(info)
+        assert {f.path for f in stat.files} == {"renamed.py"}
 
-        stat = await diff_stat(wt, info.base_ref)
-        paths = {f.path for f in stat.files}
-        assert "pkg/mod.py" not in paths
-        assert "app.py" not in paths
-        assert "moved.py" in paths
-        assert "app_renamed.py" in paths
-        by_path = {f.path: f for f in stat.files}
-        # Rename-with-edit: numstat counts only the edit's lines.
-        assert by_path["app_renamed.py"].additions == 1
-        assert by_path["app_renamed.py"].deletions == 0
+    # ------------------------------------------------------------------
+    # accept (re-baselining)
 
-        full = await git_diff(wt, info.base_ref)
-        assert "rename from pkg/mod.py" in full
-        assert "rename to moved.py" in full
-
-    async def test_stage_untracked_is_idempotent(self):
-        """Re-staging between edits never corrupts the diff: it must always
-        reflect current worktree content, and extra calls are no-ops."""
+    async def test_accept_changes_rebaselines(self):
         repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        wt = info.worktree
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "app.py").write_text("feature\n")
+        assert (await diff_stat(info)).files
 
-        (wt / "new.py").write_text("v1\n")
-        await stage_untracked(wt)
-        (wt / "new.py").write_text("v2 edited\n")
-        await stage_untracked(wt)
-        await stage_untracked(wt)
-        (wt / "app.py").write_text("edited\n")
+        sha = await accept_changes(info)
 
-        stat = await diff_stat(wt, info.base_ref)
+        assert info.baseline_tree == sha
+        assert (await diff_stat(info)).files == []  # /diff resets
+
+        # Later work measures against the new baseline only.
+        (repo / "app.py").write_text("feature\nmore\n")
+        (repo / "second.py").write_text("two\n")
+        stat = await diff_stat(info)
         by_path = {f.path: f for f in stat.files}
-        assert by_path["new.py"].additions == 1
-        assert by_path["new.py"].deletions == 0
-        assert by_path["new.py"].is_new is True
-        assert by_path["app.py"].additions == 1
-        assert by_path["app.py"].deletions == 2
+        assert set(by_path) == {"app.py", "second.py"}
         assert stat.additions == 2
-        assert stat.deletions == 2
-
-        # A second diff_stat (which re-stages) reports the same thing.
-        again = await diff_stat(wt, info.base_ref)
-        assert again.additions == stat.additions
-        assert again.deletions == stat.deletions
 
     # ------------------------------------------------------------------
-    # accept / reject
+    # session-block round trip
 
-    async def test_accept_merges_into_user_branch_no_ff(self):
+    async def test_git_info_block_round_trip(self):
         repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("agent edit\n")
-        assert await commit_worktree_changes(info) == "committed"
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        block = info.to_block()
+        assert all(isinstance(v, (str, int)) for v in block.values())
+        restored = GitInfo.from_block(block)
+        assert restored == info
 
-        result = await merge_branch(repo, info.branch)
-        assert result.outcome is MergeOutcome.MERGED
-        assert (repo / "app.py").read_text() == "agent edit\n"
-        # --no-ff: a distinct merge commit, not a fast-forward.
-        assert len(_git(repo, "log", "--oneline").splitlines()) == 3
-        assert "Merge branch" in _git(repo, "log", "-1", "--format=%s")
-
-    async def test_create_worktree_after_accept_picks_free_branch(self):
-        """Resuming a session whose changes were accepted: accept dropped the
-        git block but kept the branch, so a fresh worktree for the same
-        session id must derive a new branch instead of failing on -b."""
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("agent edit\n")
-        assert await commit_worktree_changes(info) == "committed"
-        assert (await merge_branch(repo, info.branch)).outcome is MergeOutcome.MERGED
-
-        # The resume path (cli._fresh_isolation / app._on_session_selected)
-        # calls setup_isolation → create_worktree with the same session id.
-        fresh = await create_worktree(await detect_repo(repo), "sess1")
-        assert fresh.branch == "agent/sess1-2"
-        assert fresh.worktree.is_dir()
-        # Worktree is based on the user's current HEAD, i.e. includes the
-        # previously accepted change.
-        assert (fresh.worktree / "app.py").read_text() == "agent edit\n"
-        assert "agent/sess1\n" in _git(repo, "branch")  # kept history intact
-
-    async def test_accept_reports_conflict_and_keeps_worktree(self):
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("agent edit\n")
-        assert await commit_worktree_changes(info) == "committed"
-
-        # The user's directory moves on with a conflicting change.
-        (repo / "app.py").write_text("user conflicting edit\n")
-        _git(repo, "commit", "-aqm", "user change")
-
-        result = await merge_branch(repo, info.branch)
-        assert result.outcome is MergeOutcome.CONFLICT
-        # The merge is left in place for manual resolution...
-        assert (repo / ".git" / "MERGE_HEAD").exists()
-        # ...and the worktree is NOT deleted, so the user can retry.
-        assert await worktree_is_valid(info)
-
-    async def test_accept_in_progress_merge_is_reported(self):
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("agent edit\n")
-        await commit_worktree_changes(info)
-
-        # Simulate an unresolved merge sitting in the user's repo: a
-        # conflicting merge that was never resolved or aborted.
-        (repo / "app.py").write_text("user conflicting edit\n")
-        _git(repo, "commit", "-aqm", "user change")
-        _git(repo, "merge", "--no-commit", info.branch, check=False)
-
-        result = await merge_branch(repo, info.branch)
-        assert result.outcome is MergeOutcome.IN_PROGRESS
-
-    async def test_commit_skips_untouched_copied_untracked(self):
-        repo = self.make_repo()
-        (repo / "notes.txt").write_text("user notes\n")
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        # Agent edits a tracked file but leaves the copied untracked file alone.
-        (info.worktree / "app.py").write_text("agent edit\n")
-
-        assert await commit_worktree_changes(info) == "committed"
-        # The agent's edit is committed...
-        names = _git(info.worktree, "show", "--name-only", "--format=").split()
-        assert "app.py" in names
-        # ...but the untouched copied file is not.
-        assert "notes.txt" not in names
-
-        # A clean worktree (nothing to commit) is reported as such.
-        info = await create_worktree(await detect_repo(repo), "sess2")
-        assert await commit_worktree_changes(info) == "nothing-staged"
-
-    async def test_reject_removes_worktree_and_branch(self):
-        repo = self.make_repo()
-        info = await create_worktree(await detect_repo(repo), "sess1")
-        (info.worktree / "app.py").write_text("agent edit\n")  # uncommitted
-
-        await remove_worktree(repo, info.worktree, force=True)
-        await delete_branch(repo, info.branch)
-
-        assert not info.worktree.exists()
-        # No agent/* branch of any kind survives a reject.
-        branches = [b.strip().lstrip("* ") for b in _git(repo, "branch").splitlines()]
-        assert not any(b.startswith("agent/") for b in branches)
-        assert "agent/sess1" not in _git(repo, "worktree", "list")
-        # User's directory completely unaffected.
-        assert (repo / "app.py").read_text() == "line1\nline2\n"
-        assert _git(repo, "status", "--porcelain") == ""
+    async def test_from_block_rejects_legacy_worktree_block(self):
+        with self.assertRaises(KeyError):
+            GitInfo.from_block({
+                "session_id": "old",
+                "base_ref": "abc",
+                "branch": "agent/old",
+                "worktree": "/tmp/wt",
+                "original_workspace": "/tmp/ws",
+                "git_common_dir": "/tmp/ws/.git",
+            })
 
     # ------------------------------------------------------------------
-    # shell-command filter (Part 2)
+    # run_bash git-command filter (unchanged behavior)
 
-    def guard(self, command, branch="agent/sess1", root=None):
-        return check_blocked_git(command, branch, root)
+    def guard(self, cmd: str) -> str | None:
+        return check_blocked_git(cmd, "main", self.base)
 
     def test_blocks_branch_switching(self):
-        assert self.guard("git checkout main")
-        assert self.guard("git checkout other-branch")
-        assert self.guard("git checkout -b new-branch")
-        assert self.guard("git switch main")
-        assert self.guard("git switch -c feature")
+        assert self.guard("git checkout other-branch") is not None
+        assert self.guard("git switch main") is not None
+        assert self.guard("git checkout -b new") is not None
 
     def test_allows_file_restore_and_readonly_git(self):
-        assert self.guard("git checkout -- some/file.py") is None
-        # A bare word that names an existing path is a file restore, not a
-        # ref switch — don't block it even though it looks like a branch name.
-        existing = self.base / "some-branch-looking-file"
-        existing.write_text("x")
-        assert self.guard("git checkout some-branch-looking-file", root=self.base) is None
-        assert self.guard("git checkout agent/sess1") is None  # own branch
+        (self.base / "file.txt").write_text("x\n")
+        assert self.guard("git checkout -- file.txt") is None
+        assert self.guard("git checkout file.txt") is None
         assert self.guard("git status") is None
-        assert self.guard("git diff") is None
+        assert self.guard("git diff HEAD") is None
         assert self.guard("git log --oneline") is None
-        assert self.guard("git add -A && git commit -m x") is None
-        assert self.guard("git show HEAD") is None
-        assert self.guard("git blame app.py") is None
-        # A file literally named checkout.txt must not trip the filter.
-        assert self.guard("cat checkout.txt") is None
-        assert self.guard("git log -- checkout.txt") is None
+        assert self.guard("git add -A && git commit -m msg") is None
 
     def test_blocks_worktree_and_destructive_ops(self):
-        assert self.guard("git worktree add /tmp/x main")
-        assert self.guard("git worktree remove /tmp/x")
-        assert self.guard("git worktree prune")
-        assert self.guard("git branch -d agent/sess1")
-        assert self.guard("git branch -D agent/sess1")
-        assert self.guard("git branch --delete agent/sess1")
-        assert self.guard("git reset --hard HEAD~1")
-        assert self.guard("git rebase main")
+        assert self.guard("git worktree add ../wt") is not None
+        assert self.guard("git branch -D agent/x") is not None
+        assert self.guard("git reset --hard") is not None
+        assert self.guard("git rebase main") is not None
 
     def test_blocks_through_shell_operators_and_env_prefixes(self):
-        assert self.guard("git status && git checkout main")
-        assert self.guard("echo hi; git worktree prune")
-        assert self.guard("GIT_DIR=/tmp git checkout main || true")
-        assert self.guard("sh -c 'git checkout main'")
-        assert self.guard("sudo git rebase main")
+        assert self.guard("echo hi && git reset --hard") is not None
+        assert self.guard("FOO=1 git reset --hard") is not None
+        assert self.guard("sh -c 'git reset --hard'") is not None
 
     def test_filter_blocks_even_without_branch_info(self):
-        # check_blocked_git itself still blocks identity changes when the
-        # branch name is unknown; the app-level guard is what short-circuits
-        # to None when the session has no worktree at all.
-        assert check_blocked_git("git checkout main", None, None) is not None
+        assert check_blocked_git("git reset --hard", None, None) is not None
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

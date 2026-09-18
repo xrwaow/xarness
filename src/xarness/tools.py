@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import difflib
 import json
-import logging
 import os
 import re
 import shlex
@@ -20,7 +19,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .gitwork import GitInfo, GitWorktreeError, sync_gitignore
 from .ignore import DEFAULT_IGNORE_DIRS, glob_to_regex, is_ignored
 from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
 
@@ -147,28 +145,6 @@ _MAX_GREP_MATCHES = 200
 _MAX_GREP_PER_FILE = 20
 
 
-def _sandbox_path(path: str) -> str:
-    """Anchor a validated workspace-relative path at the sandbox mount point.
-
-    Commands must not rely on the process cwd: with a subtree session bwrap
-    chdirs into the subtree, while tool paths are workspace-root-relative
-    (see validate_relpath)."""
-    return f"/workspace/{path}"
-
-
-async def _sync_gitignore_best_effort(git_info: GitInfo | None) -> None:
-    """Pull the original workspace's live .gitignore into the worktree before
-    ignore-aware exploration, so uncommitted user edits are respected. Best
-    effort: no git isolation (or a failed copy) just means the worktree's
-    committed copy is used as-is."""
-    if git_info is None:
-        return
-    try:
-        await sync_gitignore(git_info)
-    except (GitWorktreeError, OSError) as exc:
-        logging.getLogger(__name__).debug("gitignore re-sync skipped: %s", exc)
-
-
 def _python_outline(source: str) -> str | None:
     """One line per class/def with its 1-based line range, methods indented.
 
@@ -216,7 +192,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         if start < 1:
             return ToolResult(ok=False, error="start_line is 1-based", parse_error=True)
 
-        target = _sandbox_path(path)
+        target = sandbox.tool_path(path)
         # awk's NR counts lines regardless of a trailing newline (wc -l counts
         # newlines, undercounting files that don't end with one).
         count_result = await run_in_sandbox(sandbox, ["awk", "END{print NR}", target])
@@ -256,7 +232,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         return ToolResult(ok=True, output=output, header=path)
 
     async def _outline_result(sandbox: SandboxConfig, path: str, total_lines: int) -> ToolResult:
-        cat_result = await run_in_sandbox(sandbox, ["cat", _sandbox_path(path)])
+        cat_result = await run_in_sandbox(sandbox, ["cat", sandbox.tool_path(path)])
         if cat_result.exit_code != 0:
             return ToolResult(ok=False, error=cat_result.stderr.strip() or "read failed")
         outline = _python_outline(cat_result.stdout)
@@ -330,7 +306,7 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         if path.startswith((".refs/", "./.refs/")):
             return ToolResult(ok=False, error="'.refs/' is read-only")
 
-        target = _sandbox_path(path)
+        target = sandbox.tool_path(path)
         exists = await run_in_sandbox(sandbox, ["test", "-e", target])
         created = exists.exit_code != 0
         write_result = await run_in_sandbox(
@@ -465,7 +441,7 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         if parse_error is not None:
             return parse_error
 
-        read_result = await run_in_sandbox(sandbox, ["cat", _sandbox_path(path)])
+        read_result = await run_in_sandbox(sandbox, ["cat", sandbox.tool_path(path)])
         if read_result.exit_code != 0:
             return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
 
@@ -475,7 +451,7 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error=failure)
 
         write_result = await run_in_sandbox(
-            sandbox, ["tee", _sandbox_path(path)], input_bytes=updated.encode()
+            sandbox, ["tee", sandbox.tool_path(path)], input_bytes=updated.encode()
         )
         if write_result.exit_code != 0:
             return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
@@ -576,9 +552,9 @@ def _make_run_bash_tool(
         description=(
             "Run a shell command inside the sandboxed workspace. No network access. "
             "The shell persists across calls within this chat — cwd and exported "
-            "variables carry over. Branch/worktree git operations (checkout <ref>, "
-            "switch, worktree, branch -d/-D, reset --hard, rebase) are managed by "
-            "the harness and rejected; status/diff/log/show/blame/add/commit work."
+            "variables carry over. Branch/ref git operations (checkout <ref>, "
+            "switch, worktree, branch -d/-D, reset --hard, rebase) are rejected; "
+            "status/diff/log/show/blame/add/commit work."
         ),
         parameters_schema={
             "type": "object",
@@ -674,7 +650,7 @@ async def _git_ignored_set(sandbox: SandboxConfig, rel_paths: list[str]) -> set[
         return set()
     res = await run_in_sandbox(
         sandbox,
-        ["git", "-C", "/workspace", "check-ignore", "--stdin", "--no-index"],
+        ["git", "-C", sandbox.tool_root, "check-ignore", "--stdin", "--no-index"],
         input_bytes=("\n".join(rel_paths) + "\n").encode(),
     )
     if res.exit_code not in (0, 1):
@@ -682,7 +658,7 @@ async def _git_ignored_set(sandbox: SandboxConfig, rel_paths: list[str]) -> set[
     return {line for line in res.stdout.splitlines() if line}
 
 
-def _make_ls_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
+def _make_ls_tool(sandbox: SandboxConfig) -> Tool:
     async def _ls(args: dict[str, Any]) -> ToolResult:
         path = args.get("path") or "."
         if not isinstance(path, str):
@@ -690,9 +666,7 @@ def _make_ls_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         error = sandbox.validate_relpath(path, mode="read")
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
-        await _sync_gitignore_best_effort(git_info)
-
-        target = _sandbox_path(path)
+        target = sandbox.tool_path(path)
         is_dir = await run_in_sandbox(sandbox, ["test", "-d", target])
         if is_dir.exit_code != 0:
             exists = await run_in_sandbox(sandbox, ["test", "-e", target])
@@ -741,11 +715,11 @@ def _make_ls_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
 
 
 async def _list_files_respecting_gitignore(sandbox: SandboxConfig, base: str) -> list[str]:
-    """Files under ``base`` (workspace-root-relative, "" = root) as
-    workspace-root-relative posix paths, honoring the repo's ignore rules
+    """Files under ``base`` (agent-workspace-relative, "" = root) as
+    agent-workspace-relative posix paths, honoring the repo's ignore rules
     (layer a) via git. Falls back to ``find`` when the workspace isn't a git
     repo; default-ignored dirs are pruned either way by the caller (layer b)."""
-    argv = ["git", "-C", "/workspace", "ls-files", "--cached", "--others",
+    argv = ["git", "-C", sandbox.tool_root, "ls-files", "--cached", "--others",
             "--exclude-standard", "--"]
     if base:
         argv.append(base)
@@ -753,7 +727,7 @@ async def _list_files_respecting_gitignore(sandbox: SandboxConfig, base: str) ->
     if res.exit_code == 0:
         return [line for line in res.stdout.splitlines() if line]
 
-    target = _sandbox_path(base)
+    target = sandbox.tool_path(base or ".")
     prune: list[str] = ["("]
     for i, name in enumerate(sorted(DEFAULT_IGNORE_DIRS)):
         if i:
@@ -763,11 +737,11 @@ async def _list_files_respecting_gitignore(sandbox: SandboxConfig, base: str) ->
     res = await run_in_sandbox(sandbox, ["find", target, *prune])
     if res.exit_code != 0:
         raise RuntimeError(res.stderr.strip() or f"could not list files under {base or '.'}")
-    prefix = "/workspace/"
+    prefix = sandbox.tool_root + "/"
     return [line[len(prefix):] for line in res.stdout.splitlines() if line.startswith(prefix)]
 
 
-def _make_glob_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
+def _make_glob_tool(sandbox: SandboxConfig) -> Tool:
     async def _glob(args: dict[str, Any]) -> ToolResult:
         pattern = args.get("glob", "")
         if not pattern:
@@ -778,11 +752,9 @@ def _make_glob_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         error = sandbox.validate_relpath(path, mode="read")
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
-        await _sync_gitignore_best_effort(git_info)
-
         base = "" if path in (".", "") else path.strip("/")
         if base:
-            is_dir = await run_in_sandbox(sandbox, ["test", "-d", _sandbox_path(base)])
+            is_dir = await run_in_sandbox(sandbox, ["test", "-d", sandbox.tool_path(base)])
             if is_dir.exit_code != 0:
                 return ToolResult(ok=False, error=f"path is not a directory: {path}", parse_error=True)
 
@@ -828,25 +800,25 @@ def _make_glob_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
     )
 
 
-def _rg_argv(regex: str, include: str, path: str) -> list[str]:
-    script = "cd /workspace && exec rg -n --no-heading --color=never"
+def _rg_argv(regex: str, include: str, path: str, root: str) -> list[str]:
+    script = f"cd {root} && exec rg -n --no-heading --color=never"
     if include:
         script += f" -g {shlex.quote(include)}"
     script += f" -- {shlex.quote(regex)} {shlex.quote(path)}"
     return ["sh", "-c", script]
 
 
-def _git_grep_argv(regex: str, include: str, path: str) -> list[str]:
+def _git_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
     if include:
         spec = include if path in (".", "") else f":(glob){path}/**/{include}"
     else:
         spec = path
-    return ["git", "-C", "/workspace", "grep", "-n", "--untracked",
+    return ["git", "-C", root, "grep", "-n", "--untracked",
             "--exclude-standard", "-E", "-e", regex, "--", spec]
 
 
-def _plain_grep_argv(regex: str, include: str, path: str) -> list[str]:
-    script = "cd /workspace && exec grep -rnE --color=never"
+def _plain_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
+    script = f"cd {root} && exec grep -rnE --color=never"
     if include:
         script += f" --include={shlex.quote(include)}"
     script += f" -- {shlex.quote(regex)} {shlex.quote(path)}"
@@ -859,7 +831,7 @@ def _search_header(query: str, path: str) -> str:
     return query if path in (".", "") else f"{query}, {path}"
 
 
-def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
+def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
     async def _grep(args: dict[str, Any]) -> ToolResult:
         regex = args.get("regex", "")
         if not regex:
@@ -873,10 +845,8 @@ def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         error = sandbox.validate_relpath(path, mode="read")
         if error:
             return ToolResult(ok=False, error=error, parse_error=True)
-        await _sync_gitignore_best_effort(git_info)
-
         if path not in (".", ""):
-            exists = await run_in_sandbox(sandbox, ["test", "-e", _sandbox_path(path)])
+            exists = await run_in_sandbox(sandbox, ["test", "-e", sandbox.tool_path(path)])
             if exists.exit_code != 0:
                 return ToolResult(ok=False, error=f"path does not exist: {path}", parse_error=True)
 
@@ -884,9 +854,10 @@ def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
         # always exists in this harness. Exit 127 means the binary wasn't
         # actually reachable inside the sandbox — try the next backend.
         backends = []
+        root = sandbox.tool_root
         if shutil.which("rg") is not None:
-            backends.append(_rg_argv(regex, include, path))
-        backends.append(_git_grep_argv(regex, include, path))
+            backends.append(_rg_argv(regex, include, path, root))
+        backends.append(_git_grep_argv(regex, include, path, root))
         res = await run_in_sandbox(sandbox, backends[0])
         for argv in backends[1:]:
             if res.exit_code != 127:
@@ -907,7 +878,7 @@ def _make_grep_tool(sandbox: SandboxConfig, git_info: GitInfo | None) -> Tool:
                     # No repo to lean on (isolation disabled): plain grep,
                     # with only the default-ignore filtering on top.
                     res = await run_in_sandbox(
-                        sandbox, _plain_grep_argv(regex, include, path)
+                        sandbox, _plain_grep_argv(regex, include, path, root)
                     )
                 if res.exit_code not in (0, 1):
                     return ToolResult(
@@ -997,7 +968,6 @@ def build_registry(
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
     compact_callback: Callable[[], Awaitable[str]] | None = None,
     git_guard: Callable[[str], str | None] | None = None,
-    git_info: GitInfo | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
@@ -1006,10 +976,8 @@ def build_registry(
     run_bash. ``ask_callback`` enables the ask tool (prompts the user in the
     TUI); ``compact_callback`` enables the compact tool (summarizes +
     truncates the conversation). ``git_guard`` optionally vetoes run_bash
-    commands that would interfere with harness-managed worktree/branch
-    lifecycle (see gitwork.py). ``git_info`` (when the session is git-
-    isolated) lets the exploration tools re-sync the original workspace's
-    live .gitignore before filtering. ``allow_subagent`` is reserved for
+    commands that would rewrite the user's branch/refs (see gitwork.py).
+    ``allow_subagent`` is reserved for
     subagent registration in a later phase.
     """
     registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
@@ -1020,9 +988,9 @@ def build_registry(
         registry.register(_make_compact_tool(compact_callback))
     if sandbox is not None:
         registry.register(_make_read_tool(sandbox))  # read_file always available
-        registry.register(_make_ls_tool(sandbox, git_info))
-        registry.register(_make_glob_tool(sandbox, git_info))
-        registry.register(_make_grep_tool(sandbox, git_info))
+        registry.register(_make_ls_tool(sandbox))
+        registry.register(_make_glob_tool(sandbox))
+        registry.register(_make_grep_tool(sandbox))
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file

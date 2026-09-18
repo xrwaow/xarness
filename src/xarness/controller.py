@@ -12,10 +12,9 @@ calls :meth:`record_tool_result` for each, then calls
 internally; the UI stays in control of pacing tool execution and rendering
 between rounds.
 
-``send()`` also takes a per-turn checkpoint: untracked files are re-synced
-from the user's workspace, a git checkpoint of the worktree is recorded on
-the user message, and the conversation is snapshotted — the machinery behind
-/undo and /retry.
+``send()`` also takes a per-turn checkpoint: a git tree snapshot of the
+workspace is recorded on the user message, and the conversation is
+snapshotted — the machinery behind /undo and /retry.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ from .events import (
 )
 from .gitwork import GitInfo, GitWorktreeError
 from .gitwork import checkpoint as git_checkpoint
-from .gitwork import revert_to_checkpoint, sync_untracked_files
+from .gitwork import revert_to_tree
 from .tools import ToolRegistry, ToolResult
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
@@ -83,8 +82,8 @@ class ChatController:
         self.conversation = Conversation()
         self._client = client or ChatClient(profile, api_key)
         self.tools = tool_registry
-        # Set by the app when the session has a git-isolated worktree; drives
-        # per-turn untracked re-sync and checkpoints.
+        # Set by the app when the session has git change tracking; drives
+        # per-turn checkpoints.
         self.git_info: GitInfo | None = None
         # Cumulative session spend (input + output), folded together from
         # every round's usage — including compaction's own summarization
@@ -96,7 +95,6 @@ class ChatController:
 
     async def send(self, user_text: str) -> AsyncIterator[StreamEvent]:
         """Send a user message, streaming the first round."""
-        await self._sync_untracked()
         self.conversation.add(
             Message(role="user", content=user_text, checkpoint_sha=await self._take_checkpoint())
         )
@@ -148,23 +146,11 @@ class ChatController:
             switch(profile, api_key)
 
     # ------------------------------------------------------------------
-    # per-turn git checkpoint + untracked re-sync
-
-    async def _sync_untracked(self) -> None:
-        """Copy untracked files the user added to their workspace since the
-        worktree was created, so the agent sees them this turn. Best-effort."""
-        info = self.git_info
-        if info is None:
-            return
-        try:
-            await sync_untracked_files(info)
-        except (GitWorktreeError, OSError):
-            pass  # never block a turn on housekeeping
+    # per-turn git checkpoint
 
     async def _take_checkpoint(self) -> str | None:
-        """Commit the worktree's current state onto the agent branch and
-        return the sha (or the current HEAD when already clean). None when
-        there is no git isolation or the checkpoint failed."""
+        """Snapshot the workspace's current state as a tree and return the
+        sha. None when there is no git tracking or the checkpoint failed."""
         info = self.git_info
         if info is None:
             return None
@@ -216,7 +202,7 @@ class ChatController:
     def apply_rollback(self, plan: RollbackPlan) -> str | None:
         """Truncate the conversation, subtract the dropped turns' usage from
         the running totals, and clear the snapshot. Returns the checkpoint
-        sha so the caller can revert the worktree."""
+        sha so the caller can revert the file edits."""
         self.conversation.messages = list(plan.keep)
         self.conversation.undo_snapshot = None
         for message in plan.dropped:
@@ -230,15 +216,15 @@ class ChatController:
         self.last_compaction = None
         return plan.checkpoint_sha
 
-    async def revert_worktree(self, sha: str | None) -> bool:
-        """Restore the worktree to a checkpoint sha. False when there is no
-        git isolation / no sha / the revert failed — the caller should tell
+    async def revert_changes(self, sha: str | None) -> bool:
+        """Restore the workspace to a checkpoint tree. False when there is no
+        git tracking / no sha / the revert failed — the caller should tell
         the user file edits could not be reverted."""
         info = self.git_info
         if info is None or sha is None:
             return False
         try:
-            await revert_to_checkpoint(info, sha)
+            await revert_to_tree(info, sha)
         except (GitWorktreeError, OSError):
             return False
         return True

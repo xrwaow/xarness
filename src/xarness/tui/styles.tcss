@@ -232,6 +232,15 @@ MarkdownBullet {
     color: $c-text !important;
 }
 
+/* Textual styles inline code from its own theme's dark/light variant; we
+   never register a Textual theme, so the dark variant (yellow on white)
+   always wins. Pin it to the palette instead. !important beats the
+   higher-specificity `MarkdownBlock:dark >` built-in rule. */
+MarkdownBlock > .code_inline {
+    background: $c-surface !important;
+    color: $c-accent2 !important;
+}
+
 /* Text selection uses the theme's highlight color instead of Textual's blue. */
 Screen > .screen--selection {
     background: $c-highlight;

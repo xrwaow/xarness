@@ -35,13 +35,10 @@ class SandboxConfig:
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
     timeout_seconds: float = 60.0
-    # Host path of the repo's shared git dir (e.g. <repo>/.git). Bound into
-    # the sandbox at its real path so git works inside a linked worktree:
-    # the worktree's `.git` file points here, and its index lives under
-    # <git-dir>/worktrees/<name>/. Read-write because git add/commit must
-    # update worktree state and the shared object store. The user's actual
-    # checkout is never bound — only the object store/refs this worktree
-    # already shares by design.
+    # Host path of the repo's .git dir. Bound into the sandbox at its real
+    # path so git works inside the sandbox: the agent's shell git commands
+    # (status/diff/add/commit) need it. Read-write because git add/commit
+    # must update the index and object store.
     git_dir: Path | None = None
 
     def __post_init__(self) -> None:
@@ -67,34 +64,37 @@ class SandboxConfig:
             self.git_dir = self.git_dir.resolve()
 
     def ref_path(self, alias: str) -> str:
-        base = f"/workspace/{self.subtree}" if self.subtree else "/workspace"
-        return f"{base}/.refs/{alias}"
+        return f"{self.tool_root}/.refs/{alias}"
+
+    @property
+    def tool_root(self) -> str:
+        """Sandbox path the agent's workspace is anchored at: the scoped
+        subtree when one is set (the --workspace dir inside a bigger repo),
+        else the whole mounted workspace."""
+        return f"/workspace/{self.subtree}" if self.subtree else "/workspace"
+
+    def tool_path(self, path: str) -> str:
+        """Anchor a validated agent-workspace-relative path at its sandbox
+        mount point. Commands must not rely on the process cwd: with a
+        subtree session bwrap chdirs into the subtree, and tool paths are
+        relative to it (see validate_relpath)."""
+        norm = "." if path in ("", ".") else (path[2:] if path.startswith("./") else path)
+        return f"{self.tool_root}/{norm}"
 
     def validate_relpath(self, path: str, mode: Literal["read", "write"] = "write") -> str | None:
         """Defense-in-depth path check; bwrap's mount namespace is the real
         enforcement — this just gives a clean error instead of a bwrap
         failure.
 
-        mode="read" only enforces workspace containment: with a subtree, the
-        whole workspace is bound read-only (build_argv), so anything under
-        /workspace is readable even though it's outside the session's
-        read-write subtree. mode="write" additionally requires the path to
-        stay inside the subtree (the read-only .refs/ binds live at the
-        subtree root)."""
+        Paths are relative to the agent's workspace (the scoped subtree when
+        one is set, else the whole mounted workspace — see tool_path).
+        Absolute paths and traversal are rejected in every mode, so a path
+        can never point outside the workspace's mount."""
         p = Path(path)
         if p.is_absolute():
             return f"path must be relative to the workspace, got absolute path '{path}'"
         if ".." in p.parts:
             return f"path must not contain '..', got '{path}'"
-        if mode == "write" and self.subtree:
-            norm = path[2:] if path.startswith("./") else path
-            if not norm.startswith(".refs/"):
-                inside = norm == self.subtree or norm.startswith(self.subtree + "/")
-                if not inside:
-                    return (
-                        f"this session is scoped to '{self.subtree}/' — paths outside "
-                        f"it (like '{path}') are read-only"
-                    )
         return None
 
     def _system_ro_binds(self) -> list[str]:
@@ -134,8 +134,8 @@ class SandboxConfig:
         else:
             argv += ["--bind", str(self.workspace), "/workspace"]
         if self.git_dir is not None:
-            # Same path as on the host: the worktree's .git file references it
-            # absolutely, so git inside the sandbox resolves it unchanged.
+            # Same path as on the host, so git inside the sandbox resolves
+            # it unchanged.
             argv += ["--bind", str(self.git_dir), str(self.git_dir)]
         for alias, host_path in self.external_refs.items():
             argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
