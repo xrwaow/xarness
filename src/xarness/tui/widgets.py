@@ -13,12 +13,14 @@ import re
 import time
 from typing import ClassVar, cast
 
+from rich.console import Group, RenderableType
 from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.highlight import highlight
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static, TextArea
@@ -589,8 +591,12 @@ class ToolCallBlock(Vertical):
         event.stop()
 
     def recolor(self) -> None:
-        """Re-apply the status-dot color with the current palette (/theme)."""
+        """Re-render with the current palette (/theme).
+
+        The status dot and any expanded body (diffs, code blocks) bake
+        palette colors into rich styles, so both need a re-render."""
         self._refresh_dot()
+        self._refresh_body()
 
     def _refresh_dot(self) -> None:
         if self.is_mounted:
@@ -616,6 +622,30 @@ class ToolCallBlock(Vertical):
                 return
             static.update(self._output_text)
             return
+        args = _json_tool_args(self.accumulated_arguments)
+        path = args.get("path")
+        if self.tool_name == "read_file" and isinstance(path, str) and path:
+            # Show the read content as a syntax-highlighted code block; on
+            # failure (or while arguments stream in) stay plain.
+            if self._status is ToolCallStatus.CALL_SUCCEEDED:
+                static.update(_render_read_file(path, self._output_text))
+                return
+        if self.tool_name == "write_file":
+            # Show the written content as a syntax-highlighted code block
+            # rather than the raw JSON arguments. While the arguments are
+            # still streaming in (no complete JSON yet), fall through to the
+            # plain rendering below.
+            content = args.get("content")
+            if isinstance(path, str) and path and isinstance(content, str):
+                # textual.highlight.highlight: the same highlighting the
+                # assistant message's markdown code fences use, so tool code
+                # blocks and LLM code blocks match. Language is guessed from
+                # the path. The path itself is already in the summary row.
+                parts: list[RenderableType] = [highlight(content, path=path)]
+                if self._output_text:
+                    parts.append(Text(self._output_text))
+                static.update(Group(*parts))
+                return
         args = self.accumulated_arguments
         if self.tool_name == "run_bash":
             # Show the command itself, not its JSON wrapper.
@@ -679,6 +709,25 @@ class ToolCallBlock(Vertical):
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git ", re.MULTILINE)
+
+
+_SHOWING_LINES_RE = re.compile(
+    r"^\[showing lines \d+-\d+ of \d+;[^\]]*\]", re.MULTILINE
+)
+
+
+def _render_read_file(path: str, output: str) -> RenderableType:
+    """read_file result as a syntax-highlighted code block (the path lives
+    in the summary row). The bracketed ``[showing lines …]`` truncation
+    notes are lifted out so they don't get lexed as code; large-file
+    outlines stay plain prose."""
+    if "# File outline for" in output:
+        return Text(output.rstrip("\n"))
+    notes = _SHOWING_LINES_RE.findall(output)
+    if notes:
+        output = _SHOWING_LINES_RE.sub("", output).strip("\n")
+        return Group(highlight(output, path=path), Text("\n".join(notes)))
+    return highlight(output, path=path)
 
 
 def _split_tool_diff(text: str) -> tuple[str, str] | None:

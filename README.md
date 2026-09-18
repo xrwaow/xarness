@@ -179,6 +179,7 @@ xarness chat --workspace ./some-project    # sandbox root (default: cwd)
 | `Shift+Enter` (or `Alt+Enter`) | Newline in the input |
 | `Ctrl+T` | Expand/collapse the most recent "Thought for Xs" block (clicking it works too) |
 | `Ctrl+C` | Copy the current selection, or quit if nothing is selected |
+| `Ctrl+Shift+C` | Copy the current selection (never quits) |
 | `Escape` | Interrupt the agent mid-turn |
 
 Note: `Shift+Enter` is only distinguishable from `Enter` on terminals with
@@ -195,8 +196,9 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   Reasoning text is kept in the conversation history regardless of visibility.
 - **Scrolling**: the log follows new output only while you are at the bottom.
   Scroll up mid-answer and it stays where you put it (nothing yanks it back
-  down); scroll back to the bottom and it resumes following. Expanding a tool
-  call whose output is a diff renders it with the theme's diff colors.
+  scroll back to the bottom and it resumes following. Expanding a tool call
+  whose output is a diff renders it with the theme's diff colors; expanding
+  `write_file` shows the written content as a syntax-highlighted code block.
 - **Token counts**: taken from the API's `usage` field when provided
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
   approximate local estimate is shown. The status bar keeps running session

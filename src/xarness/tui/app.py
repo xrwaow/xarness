@@ -81,6 +81,7 @@ class AgentApp(App[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+t", "toggle_thoughts", "Thoughts", priority=True),
         Binding("ctrl+c", "copy_or_quit", "Copy / Quit", priority=True),
+        Binding("ctrl+shift+c", "copy_selection", "Copy", priority=True),
         Binding("escape", "interrupt", "Interrupt", priority=True),
     ]
 
@@ -557,8 +558,6 @@ class AgentApp(App[None]):
             shimmer.set_colors(*colors)
         for message in self.query(UserMessage):
             message.apply_palette()
-        for block in self.query(ToolCallBlock):
-            block.recolor()
         for thinking in self.query(ThinkingBlock):
             thinking.recolor()
         for block in self.query(ToolCallBlock):
@@ -835,17 +834,26 @@ class AgentApp(App[None]):
         if self._turn_busy and self._queued and self._worker is not None:
             self._worker.cancel()
 
-    def action_copy_or_quit(self) -> None:
-        """ctrl+c: copy the active selection if there is one, quit otherwise."""
+    def _copy_selection(self) -> bool:
+        """Copy the active selection (TextArea or screen); True if copied."""
         focused = self.focused
         if isinstance(focused, TextArea) and focused.selected_text:
             self.copy_to_clipboard(focused.selected_text)
-            return
+            return True
         selected = self.screen.get_selected_text()
         if selected:
             self.copy_to_clipboard(selected)
-            return
-        self.exit()
+            return True
+        return False
+
+    def action_copy_or_quit(self) -> None:
+        """ctrl+c: copy the active selection if there is one, quit otherwise."""
+        if not self._copy_selection():
+            self.exit()
+
+    def action_copy_selection(self) -> None:
+        """ctrl+shift+c: copy the active selection, if any (never quits)."""
+        self._copy_selection()
 
     def action_interrupt(self) -> None:
         # The priority escape binding shadows the modals' own cancel bindings,
