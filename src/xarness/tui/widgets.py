@@ -600,7 +600,10 @@ class ToolCallBlock(Vertical):
         if shimmer:
             shimmer.remove()
         verb = self._STATUS_VERB[self._status]
-        summary = Text(f"{verb} {self.tool_name}", style=theme.PALETTE["text"], markup=False)
+        # Verb + tool name inherit the stylesheet's muted color; the detail
+        # suffix (path, command, token counts, …) bakes the palette's muted
+        # style in so it reads dimmer next to it.
+        summary = Text(f"{verb} {self.tool_name}", markup=False)
         if self._status is ToolCallStatus.CALL_SUCCEEDED:
             detail = _tool_header_detail(
                 self.tool_name, self.accumulated_arguments, self._output_text
