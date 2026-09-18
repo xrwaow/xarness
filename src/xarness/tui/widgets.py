@@ -8,6 +8,7 @@ events and hold no conversation state of their own (the reasoning text inside
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import ClassVar, cast
@@ -380,6 +381,116 @@ class ThinkingBlock(Vertical):
         elapsed_static.update(Text(self.summary_text, style=f"italic {theme.PALETTE['muted']}"))
 
 
+def _shorten(text: str, limit: int = 60) -> str:
+    """Collapse whitespace and truncate long text for a one-line header."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _json_tool_args(args_text: str) -> dict:
+    """Best-effort parse of a tool call's streamed arguments JSON."""
+    try:
+        parsed = json.loads(args_text)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Text | None:
+    """The dimmed detail that follows the verb in the settled header, e.g.
+    ``Ran read_file [dimmed]src/app.py``. Returns None (plain verb + name)
+    for tools without a useful summary or unparseable arguments.
+
+    Kept best-effort and defensive: model-supplied arguments are not trusted
+    and a malformed call must never break rendering.
+    """
+    muted = theme.PALETTE["muted"]
+    args = _json_tool_args(args_text)
+
+    def as_str(value: object) -> str:
+        return value if isinstance(value, str) else ""
+
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = as_str(args.get("path"))
+        if not path:
+            return None
+        detail = Text(" ")
+        detail.append(_shorten(path), style=muted)
+        return detail
+    if tool_name == "run_bash":
+        command = as_str(args.get("command"))
+        if not command:
+            return None
+        first = command.splitlines()[0]
+        detail = Text(" ")
+        detail.append(_shorten(first, 80), style=muted)
+        return detail
+    if tool_name == "ls":
+        path = as_str(args.get("path")) or "."
+        detail = Text(" ")
+        detail.append(_shorten(path), style=muted)
+        return detail
+    if tool_name == "grep":
+        regex = as_str(args.get("regex"))
+        if not regex:
+            return None
+        parts = [f"{_shorten(regex, 40)}"]
+        include = as_str(args.get("include_pattern"))
+        path = as_str(args.get("path"))
+        scope = include or path
+        if scope and scope != ".":
+            parts.append(_shorten(scope))
+        detail = Text(" ")
+        detail.append(", ".join(parts), style=muted)
+        return detail
+    if tool_name == "glob":
+        pattern = as_str(args.get("glob"))
+        if not pattern:
+            return None
+        path = as_str(args.get("path"))
+        parts = [_shorten(pattern, 40)]
+        if path and path != ".":
+            parts.append(_shorten(path))
+        detail = Text(" ")
+        detail.append(", ".join(parts), style=muted)
+        return detail
+    if tool_name == "web_search":
+        query = as_str(args.get("query"))
+        if not query:
+            return None
+        detail = Text(" ")
+        detail.append(_shorten(query), style=muted)
+        return detail
+    if tool_name == "ask":
+        raw = args.get("questions")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list) or not raw:
+            return None
+        questions = [q for q in raw if isinstance(q, str) and q.strip()]
+        if not questions:
+            return None
+        detail = Text(" ")
+        detail.append(_shorten(questions[0]), style=muted)
+        if len(questions) > 1:
+            detail.append(f" (+{len(questions) - 1} more)", style=muted)
+        return detail
+    if tool_name == "compact":
+        # The compact tool's result line carries the token counts
+        # ("compacted: N → M tokens (freed K)\n...") — surface them so the
+        # header alone shows what the compaction bought.
+        match = re.search(
+            r"compacted: ([\d,]+) → ([\d,]+) tokens \(freed ([\d,]+)\)", output_text
+        )
+        if match is None:
+            return None
+        before, after, freed = match.groups()
+        detail = Text(" ")
+        detail.append(f"{before} → {after} tokens (freed {freed})", style=muted)
+        return detail
+    return None
+
+
 class ToolCallBlock(Vertical):
     """One tool call: colored status dot + name, expandable to see args/output.
 
@@ -489,7 +600,17 @@ class ToolCallBlock(Vertical):
         if shimmer:
             shimmer.remove()
         verb = self._STATUS_VERB[self._status]
-        summary_row.mount(Static(f"{verb} {self.tool_name}", classes="toolcall-summary-text", markup=False))
+        # Verb + tool name inherit the stylesheet's muted color; the detail
+        # suffix (path, command, token counts, …) bakes the palette's muted
+        # style in so it reads dimmer next to it.
+        summary = Text(f"{verb} {self.tool_name}", markup=False)
+        if self._status is ToolCallStatus.CALL_SUCCEEDED:
+            detail = _tool_header_detail(
+                self.tool_name, self.accumulated_arguments, self._output_text
+            )
+            if detail is not None:
+                summary.append_text(detail)
+        summary_row.mount(Static(summary, classes="toolcall-summary-text", markup=False))
 
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")

@@ -276,6 +276,39 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tool_msg.content, "ok")
             self.assertEqual(app.controller.conversation.messages[4].content, "tool says hi")
 
+    async def test_tool_call_header_detail(self) -> None:
+        """Settled headers carry a dimmed argument summary per tool."""
+        from xarness.tui.widgets import _tool_header_detail
+
+        def detail(name, args, out=""):
+            t = _tool_header_detail(name, args, out)
+            return None if t is None else t.plain
+
+        self.assertEqual(detail("read_file", '{"path": "src/app.py"}'), " src/app.py")
+        self.assertEqual(detail("write_file", '{"path": "new.py"}'), " new.py")
+        self.assertEqual(detail("edit_file", '{"path": "f.py", "edits": []}'), " f.py")
+        self.assertEqual(
+            detail("run_bash", '{"command": "git status\nls"}'), " git status"
+        )
+        self.assertEqual(detail("ls", '{}'), " .")
+        self.assertEqual(detail("ls", '{"path": "src"}'), " src")
+        self.assertEqual(
+            detail("grep", '{"regex": "foo", "include_pattern": "**/*.py"}'),
+            " foo, **/*.py",
+        )
+        self.assertEqual(detail("glob", '{"glob": "**/*.py", "path": "src"}'), " **/*.py, src")
+        self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
+        self.assertEqual(
+            detail("ask", '{"questions": ["Which one?", "Why?"]}'), " Which one? (+1 more)"
+        )
+        self.assertEqual(
+            detail("compact", "", "compacted: 12,000 → 3,400 tokens (freed 8,600)\nsummary"),
+            " 12,000 → 3,400 tokens (freed 8,600)",
+        )
+        # Malformed / missing args fall back to the plain header.
+        self.assertIsNone(detail("read_file", "not json"))
+        self.assertIsNone(detail("unknown_tool", "{}"))
+
     async def test_tool_output_containing_a_diff_is_rendered_as_one(self) -> None:
         """An edit's diff shows up in the expanded tool block, with the theme's
         diff styling rather than as an undifferentiated blob of text."""
