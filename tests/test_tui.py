@@ -441,6 +441,101 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             # Not plain text: the +/- lines carry the theme's diff styling.
             self.assertTrue(body.spans)
 
+    async def test_read_file_highlight_matches_message_fences(self) -> None:
+        """The read_file body uses the exact same highlight function as the
+        assistant message's markdown fences — including the ANSI-mode branch,
+        where the palette theme would quantize to unreadable 16-color output."""
+        from unittest.mock import PropertyMock, patch
+
+        from textual.app import active_app
+
+        from xarness.tui.widgets import PaletteFence, highlight_code
+
+        code = 'def foo():\n    return "bar"\n'
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test():
+            # Same output as the fence path, non-ANSI…
+            self.assertEqual(
+                highlight_code(code, path="f.py"),
+                PaletteFence.highlight(code, language="", path="f.py"),
+            )
+            # …and in ANSI mode the fence's ANSI theme is used, not the
+            # palette-driven CodeHighlightTheme.
+            token = active_app.set(app)
+            try:
+                with patch.object(
+                    type(app), "native_ansi_color", new_callable=PropertyMock, return_value=True
+                ):
+                    self.assertEqual(
+                        highlight_code(code, path="f.py"),
+                        PaletteFence.highlight(
+                            code, language="", ansi=True, dark=True, path="f.py"
+                        ),
+                    )
+            finally:
+                active_app.reset(token)
+
+    async def test_tool_code_blocks_render_readable_on_dark_background(self) -> None:
+        """Truncated read_file (with a `[showing lines …]` note) and write_file
+        bodies must be a single Content, not a rich Group. A Group renders
+        through Rich without the widget's background, so the Content's
+        `$text` (auto) styles resolve to black and unstyled tokens
+        (punctuation, operators) come out black-on-dark — unlike the identical
+        LLM-message fences."""
+        from textual.content import Content
+
+        from xarness import theme
+
+        previous = theme.CURRENT_THEME
+        theme.set_theme("carbonfox")
+        self.addCleanup(theme.set_theme, previous)
+
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test(size=(120, 60)) as pilot:
+            log = app.query_one("#chat-log", VerticalScroll)
+
+            read = ToolCallBlock("c1", "read_file")
+            await log.mount(read)
+            read.append_arguments('{"path": "f.py", "start_line": 1, "end_line": 2}')
+            read.set_result(
+                ToolCallStatus.CALL_SUCCEEDED,
+                output=(
+                    "def foo(a, b):\n    return a + b\n"
+                    "\n[showing lines 1-2 of 900; pass start_line/end_line for more]"
+                ),
+            )
+            read.toggle()
+
+            write = ToolCallBlock("c2", "write_file")
+            await log.mount(write)
+            write.append_arguments('{"path": "g.py", "content": "def foo():\\n    return 1\\n"}')
+            write.set_result(ToolCallStatus.CALL_SUCCEEDED, output="applied write to g.py")
+            write.toggle()
+            await pilot.pause()
+            await pilot.pause()
+
+            for block in (read, write):
+                body = block.query_one(".toolcall-body", Static).content
+                self.assertIsInstance(body, Content)
+
+            # Every code/note row renders light text on the dark background
+            # (the left border marker is a dim border color by design).
+            for strip in app.screen._compositor.render_strips():
+                row = "".join(segment.text for segment in strip)
+                if not any(marker in row for marker in ("def foo(a, b)", "def foo():", "applied write")):
+                    continue
+                for segment in strip:
+                    if not segment.text.strip() or segment.text.strip() == "│":
+                        continue
+                    style = segment.style
+                    if style is None or style.color is None or style.bgcolor is None:
+                        continue
+                    self.assertGreater(
+                        sum(style.color.get_truecolor()),
+                        200,
+                        f"dark tool text {segment.text!r} on {style.bgcolor}",
+                    )
+
     async def test_parallel_tool_calls_show_single_writing_indicator(self) -> None:
         """While args stream: one 'Writing tools' shimmer, no per-call blocks.
         Blocks appear (and the indicator leaves) once args are done."""

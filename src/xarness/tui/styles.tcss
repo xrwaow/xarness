@@ -219,12 +219,12 @@ GeneratingBar.active {
 
 ChatInput {
     height: auto;
-    min-height: 2;
+    min-height: 3;
     max-height: 8;
     border: none;
     background: $c-surface;
     color: $c-text;
-    padding: 0 1 1 1;
+    padding: 1 1 1 1;
 }
 
 MarkdownFence {

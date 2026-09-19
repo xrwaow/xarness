@@ -14,7 +14,7 @@ import re
 import time
 from typing import ClassVar, cast
 
-from rich.console import Group, RenderableType
+from rich.console import RenderableType
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -99,13 +99,38 @@ class PaletteFence(MarkdownFence):
     """
 
     @classmethod
-    def highlight(cls, code: str, language: str, ansi: bool = False, dark: bool = False) -> Content:
+    def highlight(
+        cls, code: str, language: str, ansi: bool = False, dark: bool = False,
+        path: str | None = None,
+    ) -> Content:
         from textual.highlight import ANSIDarkHighlightTheme, ANSILightHighlightTheme
 
         if ansi:
             ansi_theme = ANSIDarkHighlightTheme if dark else ANSILightHighlightTheme
-            return highlight(code, language=language or None, theme=ansi_theme)
-        return highlight(code, language=language or None, theme=theme.CodeHighlightTheme)
+            return highlight(code, language=language or None, path=path, theme=ansi_theme)
+        return highlight(code, language=language or None, path=path, theme=theme.CodeHighlightTheme)
+
+
+def highlight_code(code: str, path: str | None = None) -> Content:
+    """Highlight a code block the same way assistant-message fences do.
+
+    Tool-call bodies (read_file/write_file) must match the LLM message
+    fences exactly, including the ANSI-mode branch: on terminals without
+    truecolor, the palette-driven CodeHighlightTheme quantizes its hex
+    colors down to the 16-color ANSI palette and tokens collapse to
+    black-on-dark. Reading the flags off the active app keeps the two
+    paths in lockstep.
+    """
+    from textual.app import active_app
+
+    app = active_app.get()
+    return PaletteFence.highlight(
+        code,
+        language="",
+        ansi=app.native_ansi_color,
+        dark=app.current_theme.dark,
+        path=path,
+    )
 
 
 class InlineMarkdown(Markdown):
@@ -668,14 +693,21 @@ class ToolCallBlock(Vertical):
             # plain rendering below.
             content = args.get("content")
             if isinstance(path, str) and path and isinstance(content, str):
-                # textual.highlight.highlight: the same highlighting the
-                # assistant message's markdown code fences use, so tool code
-                # blocks and LLM code blocks match. Language is guessed from
-                # the path. The path itself is already in the summary row.
-                parts: list[RenderableType] = [highlight(content, path=path, theme=theme.CodeHighlightTheme)]
+                # highlight_code: the same highlighting the assistant
+                # message's markdown code fences use, so tool code blocks
+                # and LLM code blocks match. Language is guessed from the
+                # path. The path itself is already in the summary row.
+                #
+                # Keep this one Content rather than a rich Group: a Group
+                # renders through Rich, where the widget's background is
+                # missing when the Content's `$text` (auto) styles resolve,
+                # so unstyled tokens (punctuation, operators) come out black
+                # on a dark background. A bare Content renders as a Visual
+                # with the widget's style as the base, matching the fences.
+                body = highlight_code(content, path=path)
                 if self._output_text:
-                    parts.append(Text(self._output_text))
-                static.update(Group(*parts))
+                    body = body + Content("\n" + self._output_text)
+                static.update(body)
                 return
         args = self.accumulated_arguments
         if self.tool_name == "run_bash":
@@ -757,8 +789,10 @@ def _render_read_file(path: str, output: str) -> RenderableType:
     notes = _SHOWING_LINES_RE.findall(output)
     if notes:
         output = _SHOWING_LINES_RE.sub("", output).strip("\n")
-        return Group(highlight(output, path=path, theme=theme.CodeHighlightTheme), Text("\n".join(notes)))
-    return highlight(output, path=path, theme=theme.CodeHighlightTheme)
+        # One Content, not a rich Group — see the write_file branch in
+        # _refresh_body for why a Group turns unstyled tokens black.
+        return highlight_code(output, path=path) + Content("\n" + "\n".join(notes))
+    return highlight_code(output, path=path)
 
 
 def _split_tool_diff(text: str) -> tuple[str, str] | None:
@@ -1277,7 +1311,7 @@ class StatusBar(Static):
         line = Text()
         line.append(shown_name, style=f"bold {palette['status']}")
         line.append(f" · effort {effort}", style=palette["muted"])
-        line.append(f" · {mode}", style=palette["accent2"] if mode == "write" else palette["muted"])
+        line.append(f" · {mode}", style=palette["accent2"] if mode == "write" else palette["text"])
         line.append("  │  ", style=palette["border"])
         line.append("in ", style=palette["muted"])
         line.append(_fmt_tokens(total_in), style=palette["text"])
