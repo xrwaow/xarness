@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from .client import ChatClient
 from .config import ProviderProfile
-from .conversation import Conversation, Message
+from .conversation import SUMMARY_PREFIX, Conversation, Message
 from .events import (
     ContentDelta,
     ReasoningDelta,
@@ -48,6 +48,32 @@ from .tools import ToolRegistry, ToolResult
 _CHARS_PER_TOKEN = 4
 
 
+def _is_summary(message: Message) -> bool:
+    """True for the summary user message a compaction leaves behind."""
+    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
+
+
+def _last_user_turn_index(messages: list[Message]) -> int | None:
+    """Index of the last real user turn (summary placeholders don't count)
+    that has a response after it, or None."""
+    index = max(
+        (i for i, m in enumerate(messages) if m.role == "user" and not _is_summary(m)
+         and i < len(messages) - 1),
+        default=None,
+    )
+    return index
+
+
+def _summary_index(messages: list[Message]) -> int | None:
+    """Index of the first compaction summary in the list, or None."""
+    return next((i for i, m in enumerate(messages) if _is_summary(m)), None)
+
+
+def _message_key(message: Message) -> tuple:
+    """Value key for message identity across a save/load roundtrip."""
+    return (message.role, message.content, message.tool_call_id)
+
+
 class StreamClient(Protocol):
     """Anything that can stream a round; ChatClient is the real implementation."""
 
@@ -66,6 +92,14 @@ class RollbackPlan:
     checkpoint_sha: str | None  # git state to restore; None = cannot revert
     keep: list[Message]  # what the conversation becomes
     dropped: list[Message]  # messages whose usage must be subtracted
+    # True when the restore point is before the most recent compaction, so
+    # apply_rollback must drop the compact snapshot (the summary it covers
+    # is no longer part of the history).
+    clears_compaction: bool = False
+    # True for a compaction-only undo: the pre-compaction history is
+    # restored verbatim, the turn stays intact, no files are reverted, and
+    # the input box is not touched.
+    compaction_only: bool = False
 
 
 class ChatController:
@@ -89,6 +123,14 @@ class ChatController:
         # every round's usage — including compaction's own summarization
         # round. /undo subtracts the usage of the messages it drops.
         self.usage_total = Usage(input_tokens=0, output_tokens=0)
+        # Set by compact() when it summarizes away the compact tool call
+        # itself: the next record_tool_result call is that call's own result
+        # and must not be appended (the history ends on the summary).
+        self._drop_next_tool_result = False
+        # Usage folded into the totals for messages that compaction later
+        # removed during the current turn. /undo must subtract it too, since
+        # the message objects that carry it no longer exist.
+        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
         # (before, after) token counts of the most recent compaction, for the
         # compact tool's result line.
         self.last_compaction: tuple[int, int] | None = None
@@ -102,6 +144,8 @@ class ChatController:
         # turn began (user message included). Restoring it rolls back the
         # whole turn — even one that compacted the history mid-flight.
         self.conversation.undo_snapshot = list(self.conversation.messages)
+        self._drop_next_tool_result = False
+        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
         async for event in self._stream_round():
             yield event
 
@@ -112,6 +156,11 @@ class ChatController:
 
     def record_tool_result(self, call_id: str, result: ToolResult) -> None:
         """Append a ``tool`` role message with the outcome of one call."""
+        if self._drop_next_tool_result:
+            # compact() summarized away its own tool call; recording its
+            # result would leave an orphaned tool message on the wire.
+            self._drop_next_tool_result = False
+            return
         content = result.output if result.ok else f"error: {result.error}"
         self.conversation.add(
             Message(
@@ -166,15 +215,39 @@ class ChatController:
         """Plan the rollback of the last user turn, or None if there is
         nothing to undo (no user message, or no response to it yet).
 
-        With a snapshot (the normal case) the conversation is restored to
-        exactly what it was when the turn began — which also un-does a
-        mid-turn compaction. Without one (resumed session) it falls back to
-        truncating at the last user message. Either way the turn's user
-        message is dropped: /undo stops there, /retry re-sends its text
-        (which takes a fresh checkpoint).
+        If the most recent thing that happened is a compaction (a summary in
+        the history, no real user turn after it), /undo //retry undo the
+        compaction itself first: the full pre-compaction history is
+        restored, the turn that triggered it stays intact, and no files are
+        touched. The next /undo then removes that turn normally.
+
+        Otherwise, with a turn snapshot (the normal case) the conversation
+        is restored to exactly what it was when the turn began. Without one
+        (resumed session) it falls back to truncating at the last user
+        message. Either way the turn's user message is dropped: /undo stops
+        there, /retry re-sends its text (which takes a fresh checkpoint).
         """
         messages = self.conversation.messages
         snapshot = self.conversation.undo_snapshot
+        compact_snapshot = self.conversation.compact_snapshot
+        summary_idx = _summary_index(messages)
+        last_real = _last_user_turn_index(messages)
+        if (
+            compact_snapshot is not None and summary_idx is not None
+            and (last_real is None or last_real < summary_idx)
+        ):
+            # Undo the compaction: restore the pre-compaction history
+            # verbatim. The summary and everything after it leave the
+            # history (their usage is subtracted); the compaction turn's own
+            # messages come back — matched by value, since after a save/load
+            # the snapshot and the message list are distinct objects.
+            keep = list(compact_snapshot)
+            kept_values = {_message_key(m) for m in keep}
+            dropped = [m for m in messages if _message_key(m) not in kept_values]
+            return RollbackPlan(
+                user_text="", checkpoint_sha=None, keep=keep, dropped=dropped,
+                clears_compaction=True, compaction_only=True,
+            )
         if snapshot and snapshot[-1].role == "user":
             snapshot_ids = {id(m) for m in snapshot}
             if not any(id(m) not in snapshot_ids for m in messages):
@@ -184,19 +257,31 @@ class ChatController:
             sha = snapshot[-1].checkpoint_sha
             kept_ids = {id(m) for m in keep}
             dropped = [m for m in messages if id(m) not in kept_ids]
+            # If the restore point is before the compaction (the undone turn
+            # is the one that compacted), the summary is gone from the
+            # history — the compact snapshot is no longer reachable.
+            clears = not any(_is_summary(m) for m in keep)
         else:
-            index = max(
-                (i for i, m in enumerate(messages) if m.role == "user" and i < len(messages) - 1),
-                default=None,
-            )
+            index = last_real
             if index is None:
                 return None
-            keep = messages[:index]
+            keep = list(messages[:index])
             user_text = messages[index].content
             sha = messages[index].checkpoint_sha
-            dropped = messages[index:]
+            dropped = list(messages[index:])
+            clears = False
         return RollbackPlan(
-            user_text=user_text, checkpoint_sha=sha, keep=keep, dropped=dropped
+            user_text=user_text, checkpoint_sha=sha, keep=keep, dropped=dropped,
+            clears_compaction=clears,
+        )
+
+    def _subtract_usage(self, usage: Usage) -> None:
+        """Remove one round's spend from the cumulative total (floored at 0)."""
+        self.usage_total.input_tokens = max(
+            0, self.usage_total.input_tokens - usage.input_tokens
+        )
+        self.usage_total.output_tokens = max(
+            0, self.usage_total.output_tokens - usage.output_tokens
         )
 
     def apply_rollback(self, plan: RollbackPlan) -> str | None:
@@ -207,13 +292,21 @@ class ChatController:
         self.conversation.undo_snapshot = None
         for message in plan.dropped:
             if message.usage is not None:
-                self.usage_total.input_tokens = max(
-                    0, self.usage_total.input_tokens - message.usage.input_tokens
-                )
-                self.usage_total.output_tokens = max(
-                    0, self.usage_total.output_tokens - message.usage.output_tokens
-                )
+                self._subtract_usage(message.usage)
+        # Usage of messages compaction destroyed (their objects are gone, so
+        # the loop above can't see them). A compaction undo restores those
+        # very objects — their spend stays folded until the turn itself is
+        # undone later.
+        if not plan.compaction_only:
+            self._subtract_usage(self._absorbed_usage)
+        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
         self.last_compaction = None
+        if plan.clears_compaction:
+            # The restore point is before the compaction: its summary is no
+            # longer in the history, so the pre-compaction snapshot (which
+            # would only offer a stale second undo of the same turn) is
+            # dropped too.
+            self.conversation.compact_snapshot = None
         return plan.checkpoint_sha
 
     async def revert_changes(self, sha: str | None) -> bool:
@@ -235,35 +328,57 @@ class ChatController:
     async def compact(self) -> str:
         """Summarize the conversation and replace older messages with it.
 
-        Keeps the system prompt and the trailing assistant tool-call message
-        (the tool result that follows a mid-turn compaction must pair with
-        it on the wire); everything in between becomes a single summary user
-        message. Returns the summary text; the before/after token counts are
+        Keeps the system prompt; everything after it becomes a single summary
+        user message. When compaction is requested mid-turn, the compact tool
+        call itself is summarized away too and its result is never recorded —
+        the model never sees the compaction mechanics, the history just ends
+        on the summary. (If the same round requested other tools as well,
+        the assistant message is kept so those results stay paired on the
+        wire.) Returns the summary text; the before/after token counts are
         left in :attr:`last_compaction` for the compact tool's result line.
         """
         messages = self.conversation.messages
-        keep_from = len(messages)
-        if messages and messages[-1].role == "assistant" and messages[-1].tool_calls:
-            keep_from -= 1  # preserve the round that requested this compaction
+        # Mid-turn compaction: if the trailing assistant round requested only
+        # this compact call, summarize it away and suppress its tool result.
+        # With other pending calls in the same round, keep the message so
+        # their results stay paired on the wire.
+        last = messages[-1] if messages else None
+        pending_calls = last is not None and last.role == "assistant" and bool(last.tool_calls)
+        drop_call_round = pending_calls and len(last.tool_calls) == 1
+        keep_from = len(messages) - (1 if pending_calls and not drop_call_round else 0)
         compactable = messages[1:keep_from]
-        if len(messages) < 2 or not compactable:
+        if not compactable:
             self.last_compaction = None
             return "nothing to compact yet"
+        self._drop_next_tool_result = drop_call_round
 
         before_tokens = sum(self._message_tokens(m) for m in compactable)
         transcript = "\n\n".join(self._render_for_summary(m) for m in compactable)
         summary, usage = await self._summarize(transcript)
         summary_message = Message(
             role="user",
-            content=f"[earlier conversation, summarized]\n\n{summary}",
+            content=f"{SUMMARY_PREFIX}\n\n{summary}",
             usage=usage,
         )
         # The summarization round's own spend is part of the session total.
         if usage is not None:
             self._fold_usage(usage)
+        # Snapshot for /undo: the full pre-compaction history. Taken here (not
+        # on entry) so an empty compaction never clobbers an older snapshot.
+        self.conversation.compact_snapshot = list(messages)
         self.conversation.messages = [messages[0], summary_message, *messages[keep_from:]]
-        after_tokens = self._message_tokens(summary_message)
-        self.last_compaction = (before_tokens, after_tokens)
+        self.last_compaction = (before_tokens, self._message_tokens(summary_message))
+        # Usage of removed messages that belongs to the current turn (not in
+        # the undo snapshot): /undo must subtract it even though the message
+        # objects are gone. Pre-turn usage stays folded, matching rollback
+        # semantics; send() resets the tracker each turn.
+        snapshot = self.conversation.undo_snapshot
+        if snapshot:
+            snapshot_ids = {id(m) for m in snapshot}
+            for removed in messages[1:keep_from]:
+                if removed.usage is not None and id(removed) not in snapshot_ids:
+                    self._absorbed_usage.input_tokens += removed.usage.input_tokens
+                    self._absorbed_usage.output_tokens += removed.usage.output_tokens
         return summary
 
     @staticmethod

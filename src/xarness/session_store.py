@@ -49,6 +49,9 @@ def save_session(
     if conversation.undo_snapshot:
         # /undo //retry need the pre-turn conversation even after a resume.
         data["undo_snapshot"] = [asdict(m) for m in conversation.undo_snapshot]
+    if conversation.compact_snapshot:
+        # /undo needs the pre-compaction history to undo across a compaction.
+        data["compact_snapshot"] = [asdict(m) for m in conversation.compact_snapshot]
     if git is not None:
         data["git"] = git
     session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -61,7 +64,19 @@ def load_session(name: str) -> Conversation:
         conversation.add(_message_from(raw))
     snapshot = data.get("undo_snapshot")
     if isinstance(snapshot, list):
-        conversation.undo_snapshot = [_message_from(raw) for raw in snapshot]
+        loaded = [_message_from(raw) for raw in snapshot]
+        # rollback_plan matches messages by identity. On disk the snapshot is
+        # a value-prefix of the message list (the conversation as it stood
+        # when the turn began); re-tie it to the loaded message objects so
+        # the identity checks keep working after a resume.
+        if len(loaded) <= len(conversation.messages) and all(
+            a == b for a, b in zip(loaded, conversation.messages)
+        ):
+            loaded = conversation.messages[: len(loaded)]
+        conversation.undo_snapshot = loaded
+    compact = data.get("compact_snapshot")
+    if isinstance(compact, list):
+        conversation.compact_snapshot = [_message_from(raw) for raw in compact]
     return conversation
 
 

@@ -9,6 +9,7 @@ events and hold no conversation state of their own (the reasoning text inside
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from typing import ClassVar, cast
@@ -19,11 +20,13 @@ from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.css.query import NoMatches
 from textual.highlight import highlight
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static, TextArea
+from textual.widgets.markdown import MarkdownFence
 from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
 
@@ -86,6 +89,25 @@ def _lerp_hex(c1: str, c2: str, t: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+class PaletteFence(MarkdownFence):
+    """MarkdownFence that highlights with the xarness palette.
+
+    Textual's fence uses its own dark-only code theme, which renders
+    unreadable colors on light backgrounds. In ANSI mode the terminal's own
+    palette is still used; otherwise the palette-driven CodeHighlightTheme
+    applies (and follows live /theme switches).
+    """
+
+    @classmethod
+    def highlight(cls, code: str, language: str, ansi: bool = False, dark: bool = False) -> Content:
+        from textual.highlight import ANSIDarkHighlightTheme, ANSILightHighlightTheme
+
+        if ansi:
+            ansi_theme = ANSIDarkHighlightTheme if dark else ANSILightHighlightTheme
+            return highlight(code, language=language or None, theme=ansi_theme)
+        return highlight(code, language=language or None, theme=theme.CodeHighlightTheme)
+
+
 class InlineMarkdown(Markdown):
     """Markdown that sizes to its content instead of claiming free space.
 
@@ -95,6 +117,12 @@ class InlineMarkdown(Markdown):
     actually hit turned out to be ThinkingBlock, not this — a long enough
     assistant response could still exercise this path.
     """
+
+    BLOCKS = {
+        **Markdown.BLOCKS,
+        "fence": PaletteFence,
+        "code_block": PaletteFence,
+    }
 
     def on_mount(self) -> None:
         self.styles.height = "auto"
@@ -289,9 +317,10 @@ class AssistantMessage(Vertical):
 class ThinkingBlock(Vertical):
     """Reasoning channel for a turn.
 
-    Collapsed by default. Clickable at any time — including while still
-    streaming — to reveal or hide the live reasoning text. Shows "Thinking"
-    (shimmering) while active, "Thought for Xs" (plain) once done.
+    Expanded while streaming so the live reasoning is visible; collapsed
+    once finished. Clickable at any time — including while still streaming —
+    to hide or reveal the reasoning text. Shows "Thinking" (shimmering) while
+    active, "Thought for Xs" (plain) once done.
 
     Following new reasoning text is left to the chat log's anchor: while it is
     armed the growing text keeps the log pinned to the end, and once the user
@@ -299,7 +328,7 @@ class ThinkingBlock(Vertical):
     """
 
     def __init__(self) -> None:
-        super().__init__(classes="msg thinking")  # no "expanded" — starts collapsed
+        super().__init__(classes="msg thinking expanded")  # open while streaming
         self._reasoning = ""
         self._duration: float | None = None
         self._done = False
@@ -341,6 +370,7 @@ class ThinkingBlock(Vertical):
             self._duration = time.monotonic() - self._start
         else:
             self._duration = None
+        self.remove_class("expanded")  # shrink once finished
         self._swap_to_static_summary()
 
     def finish_unknown(self) -> None:
@@ -350,6 +380,7 @@ class ThinkingBlock(Vertical):
             return
         self._done = True
         self._duration = None
+        self.remove_class("expanded")
         self._swap_to_static_summary()
 
     def toggle(self) -> None:
@@ -641,7 +672,7 @@ class ToolCallBlock(Vertical):
                 # assistant message's markdown code fences use, so tool code
                 # blocks and LLM code blocks match. Language is guessed from
                 # the path. The path itself is already in the summary row.
-                parts: list[RenderableType] = [highlight(content, path=path)]
+                parts: list[RenderableType] = [highlight(content, path=path, theme=theme.CodeHighlightTheme)]
                 if self._output_text:
                     parts.append(Text(self._output_text))
                 static.update(Group(*parts))
@@ -726,8 +757,8 @@ def _render_read_file(path: str, output: str) -> RenderableType:
     notes = _SHOWING_LINES_RE.findall(output)
     if notes:
         output = _SHOWING_LINES_RE.sub("", output).strip("\n")
-        return Group(highlight(output, path=path), Text("\n".join(notes)))
-    return highlight(output, path=path)
+        return Group(highlight(output, path=path, theme=theme.CodeHighlightTheme), Text("\n".join(notes)))
+    return highlight(output, path=path, theme=theme.CodeHighlightTheme)
 
 
 def _split_tool_diff(text: str) -> tuple[str, str] | None:
@@ -1097,6 +1128,48 @@ class DiffSummary(Vertical):
             return
         if self._active_key is not _NO_DIFF:
             self.query_one("#diff-text", Static).update(_render_diff(self._active_text))
+
+
+class GeneratingBar(Static):
+    """Random-walk brightness bar shown above the input while generating.
+
+    Each column drifts up or down a brightness ladder one step per tick, so
+    the bar breathes organically instead of cycling like a spinner. Every
+    cell is the same bottom-anchored half-block glyph with the brightness
+    in its *foreground* color: shade glyphs (░▒▓█) are ambiguous-width and
+    render double in some terminals, and background-colored spaces get
+    glyph-ized back into shades by Textual's driver. Toggled with the
+    ``active`` class by ``_run_turn``.
+    """
+
+    GLYPH = "▄"
+    WIDTH = 8
+    LEVELS = 8
+    TICK = 0.16
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(markup=False, **kwargs)
+        self._cols: list[int] = []
+
+    def _level_color(self, level: int) -> str:
+        """Foreground color for a brightness level (0 = dim, max = accent)."""
+        t = level / (self.LEVELS - 1) if self.LEVELS > 1 else 1.0
+        return _lerp_hex(theme.PALETTE["bg"], theme.PALETTE["accent"], t)
+
+    def on_mount(self) -> None:
+        self._cols = [random.randrange(self.LEVELS) for _ in range(self.WIDTH)]
+        self.set_interval(self.TICK, self._tick)
+
+    def _tick(self) -> None:
+        if not self.is_mounted:
+            return
+        top = self.LEVELS - 1
+        for i in range(self.WIDTH):
+            self._cols[i] = max(0, min(top, self._cols[i] + random.choice((-1, 0, 1))))
+        line = Text("  ")
+        for level in self._cols:
+            line.append(self.GLYPH, style=self._level_color(level))
+        self.update(line)
 
 
 class PendingIndicator(Horizontal):

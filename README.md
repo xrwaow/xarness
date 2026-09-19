@@ -167,7 +167,9 @@ xarness chat --workspace ./some-project    # sandbox root (default: cwd)
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
-| `/undo` | Drop the last turn (file edits reverted, message back in the input) |
+| `/compact` | Summarize and truncate the conversation now, freeing context window. While the agent is working it's steered instead: it runs at the next round boundary, before any queued messages are injected |
+| `/auto_compact` | Toggle automatic compaction when the context window is 90% full (checked after each turn) |
+| `/undo` | Drop the last turn (file edits reverted, message back in the input). If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |
 

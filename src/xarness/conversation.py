@@ -14,6 +14,10 @@ from typing import Any
 
 from .events import Usage
 
+# Prefix of the summary user message compaction leaves behind. Identifying
+# it by content (not identity) keeps working across a session save/load.
+SUMMARY_PREFIX = "[earlier conversation, summarized]"
+
 
 @dataclass(slots=True)
 class Message:
@@ -63,6 +67,11 @@ class Conversation:
     # message was sent (set by the controller, used by /undo and /retry to
     # roll the conversation back — including across a mid-turn compaction).
     undo_snapshot: list[Message] | None = None
+    # Local-only: the full message list as it stood just before the most
+    # recent compaction. Lets /undo restore pre-compaction history even
+    # after later turns have replaced the undo snapshot. Only the most
+    # recent compaction is recoverable.
+    compact_snapshot: list[Message] | None = None
 
     def add(self, message: Message) -> Message:
         self.messages.append(message)

@@ -1,3 +1,8 @@
+/* Hide every scrollbar app-wide; wheel/key scrolling still works. */
+Widget {
+    scrollbar-size: 0 0;
+}
+
 Screen {
     layout: vertical;
     background: $c-bg;
@@ -183,19 +188,43 @@ StatusBar {
     padding: 0;
 }
 
+GeneratingBar {
+    display: none;
+    width: auto;
+    height: 1;
+    color: $c-accent;
+}
+
+GeneratingBar.active {
+    display: block;
+}
+
 #input-wrap {
     height: auto;
     padding: 0;
 }
 
+#input-row {
+    height: auto;
+    align-vertical: middle;
+}
+
+#input-prompt {
+    width: 1;
+    height: 100%;
+    background: $c-surface;
+    color: $c-muted;
+    content-align: left middle;
+}
+
 ChatInput {
     height: auto;
-    min-height: 3;
+    min-height: 2;
     max-height: 8;
     border: none;
     background: $c-surface;
     color: $c-text;
-    padding: 0;
+    padding: 0 1 1 1;
 }
 
 MarkdownFence {
@@ -288,8 +317,7 @@ DiffSummary {
 
 DiffSummary.visible {
     display: block;
-    /* Separator between the diff panel and the chat input below. */
-    border-bottom: solid $c-border;
+    background: $c-bg;
 }
 
 #diff-summary-row {
@@ -435,7 +463,6 @@ DiffSummary.expanded #diff-body {
 
 #confirm-modal > Input {
     border: none;
-    border-bottom: solid $c-border;
     background: $c-surface;
     color: $c-text;
     padding: 0 1;
@@ -444,7 +471,6 @@ DiffSummary.expanded #diff-body {
 
 #confirm-modal > Input:focus {
     border: none;
-    border-bottom: solid $c-highlight;
 }
 
 ResumeScreen, PickerScreen {
@@ -456,7 +482,6 @@ ResumeScreen, PickerScreen {
     height: auto;
     max-height: 20;
     background: $c-surface;
-    border: round $c-border;
     padding: 1 2;
 }
 
@@ -467,8 +492,8 @@ ResumeScreen, PickerScreen {
 }
 
 #resume-search {
+    height: 1;
     border: none;
-    border-bottom: solid $c-border;
     background: $c-surface;
     color: $c-text;
     padding: 0 1;
@@ -479,9 +504,12 @@ ResumeScreen, PickerScreen {
     color: $c-muted;
 }
 
-#resume-search:focus {
-    border: none;
-    border-bottom: solid $c-highlight;
+/* Textual's Input tints the background 5% $foreground while focused, which
+   renders as a darker box inside the surface modal; kill it (search +
+   confirm inputs are focused essentially all the time). */
+#resume-search:focus,
+#confirm-modal > Input:focus {
+    background-tint: transparent;
 }
 
 #resume-list {

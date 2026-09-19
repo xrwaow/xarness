@@ -8,6 +8,9 @@ is sufficient — no threading a theme object through every widget.
 
 from __future__ import annotations
 
+from pygments.token import Token
+from textual.highlight import HighlightTheme, TokenType
+
 # Semantic keys every theme must define:
 #   bg, surface, border, text, muted, user, reasoning, accent, accent2, status,
 #   error, success, warning, highlight, cursor,
@@ -61,9 +64,32 @@ THEMES: dict[str, dict[str, str]] = {
         "diff_hunk": "#7c4dff",
         "diff_meta": "#a0a1a7",
     },
+    "carbonfox": {
+        "bg": "#161616",              # background (IBM Carbon gray-90)
+        "surface": "#232323",         # elevated surface
+        "border": "#353535",          # border.variant
+        "text": "#f2f4f8",            # text
+        "muted": "#7a7d82",           # comment (bg blended toward fg)
+        "user": "#25be6a",            # terminal.ansi.green / success
+        "reasoning": "#7a7d82",       # comment
+        "accent": "#be95ff",          # terminal.ansi.magenta / keyword
+        "accent2": "#3ddbd9",         # terminal.ansi.orange slot (teal)
+        "status": "#78a9ff",          # terminal.ansi.blue
+        "error": "#ee5396",           # terminal.ansi.red
+        "success": "#25be6a",         # green status dot / tool call succeeded
+        "warning": "#ff7eb6",         # pink status dot / call in flight
+        "highlight": "#f2f4f8",       # generic UI emphasis (hover, focus)
+        "cursor": "#be95ff",          # input caret block
+        "diff_add": "#42be65",        # added line text
+        "diff_add_bg": "#1c2b21",     # added line background tint
+        "diff_del": "#ee5396",        # removed line text
+        "diff_del_bg": "#2e1c26",     # removed line background tint
+        "diff_hunk": "#78a9ff",       # @@ hunk headers
+        "diff_meta": "#7a7d82",       # line-number gutter / metadata
+    },
 }
 
-DEFAULT_THEME = "ayu-darker"
+DEFAULT_THEME = "carbonfox"
 
 PALETTE: dict[str, str] = {}
 CSS_VARIABLES: dict[str, str] = {}
@@ -104,3 +130,47 @@ def set_theme(name: str) -> None:
 
 
 set_theme(DEFAULT_THEME)
+
+
+class CodeHighlightTheme(HighlightTheme):
+    """Syntax colors for code blocks, driven by the active xarness palette.
+
+    Textual's built-in HighlightTheme styles code with its own theme's
+    variables ($text-warning etc.), which always resolve to the dark
+    "textual-dark" palette here — unreadable on light backgrounds. These
+    styles use our $c-* variables instead, resolved at render time against
+    the app's CSS variables, so code follows the active palette and live
+    /theme switches.
+    """
+
+    STYLES: dict[TokenType, str] = {
+        Token.Comment: "italic $c-muted",
+        Token.Error: "$c-error",
+        Token.Generic.Error: "$c-error",
+        Token.Generic.Heading: "underline $c-status",
+        Token.Generic.Subheading: "$c-status",
+        Token.Keyword: "$c-accent",
+        Token.Keyword.Constant: "bold $c-accent2",
+        Token.Keyword.Namespace: "$c-accent",
+        Token.Keyword.Type: "bold $c-accent2",
+        Token.Literal.Number: "$c-accent2",
+        Token.Number: "$c-accent2",
+        Token.Operator: "$c-text",
+        Token.Operator.Word: "bold $c-accent",
+        Token.String: "$c-success",
+        Token.Literal.String: "$c-success",
+        Token.Literal.String.Backtick: "$c-muted",
+        Token.Literal.String.Doc: "italic $c-success 80%",
+        Token.Name: "$c-text",
+        Token.Name.Attribute: "$c-accent2",
+        Token.Name.Builtin: "$c-accent",
+        Token.Name.Builtin.Pseudo: "italic $c-accent",
+        Token.Name.Class: "bold $c-accent2",
+        Token.Name.Constant: "$c-error",
+        Token.Name.Decorator: "bold $c-status",
+        Token.Name.Function: "$c-status",
+        Token.Name.Function.Magic: "$c-status",
+        Token.Name.Tag: "bold $c-accent",
+        Token.Name.Variable: "$c-text",
+        Token.Whitespace: "",
+    }
