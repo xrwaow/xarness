@@ -198,6 +198,7 @@ class AgentApp(App[None]):
             total_out=self.total_out,
             context_used=context_used,
             max_context=self.profile.max_context,
+            workspace=str(self.workspace) if self.workspace else None,
         )
 
     # ------------------------------------------------------------------
@@ -447,6 +448,7 @@ class AgentApp(App[None]):
             save_session(
                 self.session_name, self.profile.model_id, self.controller.conversation,
                 git=self.git_info.to_block() if self.git_info else None,
+                workspace=str(self.workspace) if self.workspace else None,
             )
 
     def _rewrite_checkpoints(self, sha: str) -> None:
@@ -1107,6 +1109,7 @@ class AgentApp(App[None]):
             save_session(
                 self.session_name, self.profile.model_id, self.controller.conversation,
                 git=self.git_info.to_block() if self.git_info else None,
+                workspace=str(self.workspace) if self.workspace else None,
             )
 
     def action_toggle_thoughts(self) -> None:

@@ -288,8 +288,10 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             # The queued message was delivered into the same turn, right
             # after the tool result, before the follow-up round.
             roles = [m.role for m in app.controller.conversation.messages]
-            self.assertEqual(roles, ["user", "assistant", "tool", "user", "assistant"])
-            self.assertEqual(app.controller.conversation.messages[3].content, "b")
+            self.assertEqual(
+                roles, ["system", "user", "assistant", "tool", "user", "assistant"]
+            )
+            self.assertEqual(app.controller.conversation.messages[4].content, "b")
             self.assertEqual(client.round_user_texts[1], ["a", "b"])
             self.assertEqual(app._queued, [])
             self.assertEqual(app.query(UserMessage)[1]._suffix, "")

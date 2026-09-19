@@ -35,12 +35,14 @@ def save_session(
     profile_name: str,
     conversation: Conversation,
     git: dict | None = None,
+    workspace: str | None = None,
 ) -> None:
     """Persist a session. ``git`` is the change-tracking block
     (see gitwork.GitInfo.to_block); passing None drops any existing block."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "profile": profile_name,
+        "workspace": workspace,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "messages": [asdict(m) for m in conversation.messages],
     }
@@ -84,7 +86,11 @@ def list_sessions() -> list[str]:
 
 def session_meta(name: str) -> dict:
     data = json.loads(session_path(name).read_text(encoding="utf-8"))
-    return {"updated_at": data.get("updated_at"), "message_count": len(data.get("messages", []))}
+    return {
+        "updated_at": data.get("updated_at"),
+        "message_count": len(data.get("messages", [])),
+        "workspace": data.get("workspace"),
+    }
 
 
 def delete_session(name: str) -> bool:

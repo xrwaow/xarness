@@ -11,6 +11,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView
 
 from .. import session_store
+from .widgets import crop_path
 
 
 def _relative_time(iso: str | None) -> str:
@@ -56,7 +57,12 @@ class ResumeScreen(ModalScreen[str | None]):
         items = []
         for name, meta in entries:
             age = _relative_time(meta.get("updated_at"))
-            item = ListItem(Label(f"{escape(name)}  [dim]{age}[/]"))
+            workspace = meta.get("workspace")
+            label = f"{escape(name)}  [dim]{age}"
+            if workspace:
+                label += f" · {escape(crop_path(workspace))}"
+            label += "[/]"
+            item = ListItem(Label(label))
             item.session_name = name
             items.append(item)
         return items
@@ -84,7 +90,10 @@ class ResumeScreen(ModalScreen[str | None]):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.lower()
-        self._filtered = [(n, m) for n, m in self._entries if query in n.lower()]
+        self._filtered = [
+            (n, m) for n, m in self._entries
+            if query in n.lower() or query in (m.get("workspace") or "").lower()
+        ]
         listview = self.query_one("#resume-list", ListView)
         listview.clear()
         for item in self._build_items(self._filtered):

@@ -238,7 +238,11 @@ def _run_sessions(args: argparse.Namespace) -> None:
             return
         for name in names:
             meta = session_store.session_meta(name)
-            print(f"{name}\t{meta.get('updated_at', '?')}\t{meta.get('message_count', 0)} messages")
+            workspace = meta.get("workspace") or "?"
+            print(
+                f"{name}\t{meta.get('updated_at', '?')}\t"
+                f"{meta.get('message_count', 0)} messages\t{workspace}"
+            )
     elif args.action == "delete":
         if not args.name:
             print("error: 'delete' requires a session name", file=sys.stderr)

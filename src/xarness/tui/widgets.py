@@ -1169,6 +1169,20 @@ class AskBar(Static):
         self.remove_class("visible")
 
 
+def crop_path(path: str, max_len: int = 16) -> str:
+    """Shorten a path from the left, keeping the tail: .../sub/file.
+
+    Whole components are dropped until the remainder fits, so the result
+    always shows complete directory names (never a partial one)."""
+    if len(path) <= max_len:
+        return path
+    parts = path.rstrip("/").split("/")
+    while parts and len("/".join(parts)) > max_len:
+        parts.pop(0)
+    tail = "/".join(parts)
+    return f".../{tail}" if tail else path
+
+
 class StatusBar(Static):
     """Persistent footer: model, effort, session tokens, context headroom."""
 
@@ -1182,6 +1196,7 @@ class StatusBar(Static):
         total_out: int,
         context_used: int,
         max_context: int,
+        workspace: str | None = None,
     ) -> None:
         palette = theme.PALETTE
         percent_left = max(0, round(100 * (1 - context_used / max_context))) if max_context else 100
@@ -1199,6 +1214,9 @@ class StatusBar(Static):
         line.append("ctx ", style=palette["muted"])
         line.append(f"{_fmt_tokens(context_used)}/{_fmt_tokens(max_context)}", style=palette["text"])
         line.append(f" · {percent_left}% left", style=palette["muted"])
+        if workspace:
+            line.append("  │  ", style=palette["border"])
+            line.append(crop_path(workspace), style=palette["muted"])
         self._text = str(line)
         self.update(line)
 
