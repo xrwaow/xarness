@@ -3,8 +3,9 @@
 Roles are modeled faithfully to the OpenAI wire format — including the
 reserved ``tool`` role and tool-call fields — so a future tool-calling layer
 can append tool-call/tool-result messages here without touching UI code.
-Reasoning text and token usage are stored locally per assistant message but
-are never sent back over the wire.
+Reasoning text and token usage are stored locally per assistant message; by
+default reasoning is also sent back on later rounds (``keep_reasoning``), but
+usage never reaches the wire.
 """
 
 from __future__ import annotations
@@ -43,12 +44,15 @@ class Message:
     # headers. Never sent over the wire.
     header: str | None = None
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_wire(self, include_reasoning: bool = False) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}
         # Per spec, an assistant message that only calls tools should omit
         # content entirely — some providers reject an empty string there.
         if self.content or self.role != "assistant" or not self.tool_calls:
             message["content"] = self.content
+        if include_reasoning and self.role == "assistant" and self.reasoning is not None:
+            # DeepSeek-style field name; providers that don't know it ignore it.
+            message["reasoning_content"] = self.reasoning
         if self.name is not None:
             message["name"] = self.name
         if self.tool_call_id is not None:
@@ -77,5 +81,5 @@ class Conversation:
         self.messages.append(message)
         return message
 
-    def to_wire(self) -> list[dict[str, Any]]:
-        return [message.to_wire() for message in self.messages]
+    def to_wire(self, keep_reasoning: bool = False) -> list[dict[str, Any]]:
+        return [message.to_wire(include_reasoning=keep_reasoning) for message in self.messages]

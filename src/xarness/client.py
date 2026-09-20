@@ -135,6 +135,8 @@ class ChatClient:
         effort = reasoning_effort_for(self._profile.cot_strength)
         if effort is not None:
             payload["reasoning_effort"] = effort
+        if self._profile.provider is not None:
+            payload["provider"] = self._profile.provider
         if tools:
             payload["tools"] = tools
         return payload

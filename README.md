@@ -127,35 +127,59 @@ Copy the sample config and set your API key:
 
 ```sh
 mkdir -p ~/.config/xarness
-cp config.example.yaml ~/.config/xarness/config.yaml
+cp config.example.json ~/.config/xarness/config.json
 export OPENAI_API_KEY=sk-...
 ```
 
-Config lives at `~/.config/xarness/config.yaml` by default; override with
-`--config`. The key is read from the environment variable named by
-`api_key_env` — it is never stored in the YAML file. For providers that need
-no key (e.g. local models), set `api_key_env: null`.
+Config is JSON at `~/.config/xarness/config.json` by default; override with
+`--config`. Fields:
 
-Multiple profiles are supported; switch with `--profile` (or `/model` in the
-TUI, which also sets reasoning effort):
+- `default_profile` — which profile to use when `--profile` is not passed
+  (defaults to the only profile if exactly one is defined).
+- `default_theme` — startup color theme; optional, defaults to `carbonfox`.
+  Options: `"carbonfox"`, `"ayu-darker"`, `"one-light"`; `/theme` switches it
+  live.
+- `profiles` — list of profiles; switch with `--profile` (or `/model` in the
+  TUI, which also sets reasoning effort). Each profile needs a unique `name`
+  plus:
+  - `base_url` — OpenAI-compatible endpoint (must be http/https).
+  - `api_key_env` — environment variable holding the API key; never stored in
+    the config itself. Set to `null` for providers that need no key (e.g.
+    local models).
+  - `model_id` — the model to request.
+  - `shown_name` — optional display name in the UI.
+  - `max_context` — context-window size used for compaction (default 128000).
+  - `cot_strength` — reasoning effort: `off`, `low`, `medium`, or `high`.
+  - `keep_reasoning` — send assistant reasoning back to the model on later
+    rounds (default `true`).
+  - `provider` — optional OpenRouter provider routing, sent verbatim as the
+    request's `provider` field, e.g.
+    `{"order": ["openai", "together"], "allow_fallbacks": false}`.
 
-```sh
-xarness chat --profile deepseek
+A flat single-profile form (a `provider` object instead of `profiles`) also
+works:
+
+```json
+{
+  "provider": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model_id": "gpt-4.1",
+    "shown_name": "GPT-4.1",
+    "max_context": 128000,
+    "cot_strength": "medium",
+    "keep_reasoning": true
+  }
+}
 ```
-
-If the file has no top-level `profiles:` key, it is treated as a single flat
-profile (see the commented example in `config.example.yaml`).
 
 ## Run
 
 ```sh
 xarness                    # default profile
-xarness chat --profile deepseek
-xarness chat --config ./my-config.yaml
-xarness chat --workspace ./some-project    # sandbox root (default: cwd)
+xarness --profile deepseek
+xarness --workspace ./some-project    # sandbox root (default: cwd)
 ```
-
-(bare `xarness` behaves like `xarness chat`)
 
 ## Slash commands
 

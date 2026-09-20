@@ -446,7 +446,9 @@ class ChatController:
         first_content_at: float | None = None
 
         tools_schema = self.tools.schema() if self.tools is not None else None
-        async for event in self._client.stream(self.conversation.to_wire(), tools=tools_schema):
+        async for event in self._client.stream(
+            self.conversation.to_wire(keep_reasoning=self.profile.keep_reasoning), tools=tools_schema
+        ):
             if isinstance(event, ReasoningDelta):
                 if first_reasoning_at is None:
                     first_reasoning_at = time.monotonic()

@@ -80,22 +80,30 @@ async def wait_until_idle(app: AgentApp, timeout: float = 5.0) -> None:
 
 
 def write_config(path: Path, beta_key_env: str | None = "BETA_KEY") -> None:
+    import json
+
     path.write_text(
-        """
-default_profile: alpha
-profiles:
-  alpha:
-    base_url: https://alpha.example.test/v1
-    api_key_env: ALPHA_KEY
-    model_id: alpha-model
-    shown_name: Alpha Model
-  beta:
-    base_url: https://beta.example.test/v1
-    api_key_env: %s
-    model_id: beta-model
-    shown_name: Beta Model
-"""
-        % ("BETA_KEY" if beta_key_env else "null"),
+        json.dumps(
+            {
+                "default_profile": "alpha",
+                "profiles": [
+                    {
+                        "name": "alpha",
+                        "base_url": "https://alpha.example.test/v1",
+                        "api_key_env": "ALPHA_KEY",
+                        "model_id": "alpha-model",
+                        "shown_name": "Alpha Model",
+                    },
+                    {
+                        "name": "beta",
+                        "base_url": "https://beta.example.test/v1",
+                        "api_key_env": beta_key_env,
+                        "model_id": "beta-model",
+                        "shown_name": "Beta Model",
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -320,24 +328,24 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
         from xarness.config import ConfigError, list_profile_names
 
         with tempfile.TemporaryDirectory() as tmp:
-            named = Path(tmp) / "config.yaml"
+            named = Path(tmp) / "config.json"
             write_config(named)
             self.assertEqual(list_profile_names(named), ["alpha", "beta"])
 
-            flat = Path(tmp) / "flat.yaml"
+            flat = Path(tmp) / "flat.json"
             flat.write_text(
-                "provider:\n  base_url: https://x.test/v1\n  model_id: m\n",
+                '{"provider": {"base_url": "https://x.test/v1", "model_id": "m"}}',
                 encoding="utf-8",
             )
             self.assertEqual(list_profile_names(flat), [])
 
-            missing = Path(tmp) / "nope.yaml"
+            missing = Path(tmp) / "nope.json"
             with self.assertRaises(ConfigError):
                 list_profile_names(missing)
 
     async def test_slash_model_switches_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.yaml"
+            config_path = Path(tmp) / "config.json"
             write_config(config_path)
             env = {"ALPHA_KEY": "a-key", "BETA_KEY": "b-key"}
             with patch.dict(os.environ, env):
@@ -387,7 +395,7 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
 
     async def test_slash_model_missing_api_key_shows_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.yaml"
+            config_path = Path(tmp) / "config.json"
             write_config(config_path, beta_key_env=None)
             env = {"ALPHA_KEY": "a-key"}  # beta needs no key, but its base_url is unreachable
             with patch.dict(os.environ, env):
