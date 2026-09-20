@@ -96,6 +96,7 @@ CSS_VARIABLES: dict[str, str] = {}
 CURRENT_THEME: str = DEFAULT_THEME
 SHIMMER_PROCESSING: tuple[str, str] = ("", "")
 SHIMMER_THINKING: tuple[str, str] = ("", "")
+SHIMMER_COMPACTING: tuple[str, str] = ("", "")
 
 SHIMMER_FPS: int = 20
 SHIMMER_BAND_WIDTH: int = 6
@@ -106,6 +107,7 @@ def set_theme(name: str) -> None:
     """Select the active palette. Call once, before AgentApp() is built
     (or from /theme, followed by App.refresh_css())."""
     global PALETTE, CSS_VARIABLES, CURRENT_THEME, SHIMMER_PROCESSING, SHIMMER_THINKING
+    global SHIMMER_COMPACTING
     if name not in THEMES:
         raise ValueError(f"unknown theme '{name}', options: {list(THEMES)}")
     PALETTE = THEMES[name]
@@ -127,6 +129,9 @@ def set_theme(name: str) -> None:
     })
     SHIMMER_PROCESSING = (PALETTE["muted"], PALETTE["text"])
     SHIMMER_THINKING = (PALETTE["muted"], PALETTE["surface"])
+    # Compaction gets the accent color so it reads as a distinct, "shinier"
+    # event than the neutral Processing/Thinking shimmers.
+    SHIMMER_COMPACTING = (PALETTE["muted"], PALETTE["accent"])
 
 
 set_theme(DEFAULT_THEME)

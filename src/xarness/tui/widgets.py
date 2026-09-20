@@ -31,6 +31,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
 
 from .. import theme
+from ..conversation import Message as ConversationMessage
 from ..events import ToolCallStatus
 from ..gitwork import DiffStat
 
@@ -250,20 +251,36 @@ class UserMessage(Vertical):
     after "›" instead of returning to the left edge of the surface. Text
     color comes from CSS ($c-text) so live /theme switches recolor it.
 
+    Clicking the message reveals a small "↩ undo to here" affordance;
+    clicking that posts :class:`UndoRequested` so the app can roll the
+    conversation back to this turn (see ChatController.rollback_plan_to).
+
     Initial content is rendered in compose(): Textual dispatches on_mount
     before the widget counts as mounted, so mount-time updates get skipped
     by any is_mounted guard and must not be the only render path.
     """
 
+    class UndoRequested(Message):
+        """The user asked to undo back to this message."""
+
+        def __init__(self, user_message: "UserMessage") -> None:
+            super().__init__()
+            self.user_message = user_message
+
     def __init__(self, text: str) -> None:
         super().__init__(classes="msg user")
         self._text = text
         self._suffix = ""
+        # The conversation message this widget renders, bound by the app once
+        # the turn is under way (live) or when replaying history. Click-to-undo
+        # needs it to locate the turn in the conversation.
+        self.message: ConversationMessage | None = None
 
     def compose(self):
         with Horizontal(classes="user-row"):
             yield Static("›", classes="user-marker", markup=False)
             yield Static(self._build_content(), classes="user-content", markup=False)
+        yield _UndoButton(self)
 
     def _build_content(self) -> Text:
         line = Text(self._text)
@@ -291,6 +308,26 @@ class UserMessage(Vertical):
         """The queued message reached the model; drop the queued marker."""
         self._suffix = ""
         self.apply_palette()
+
+    def on_click(self, event: events.Click) -> None:
+        """Reveal (or hide) the undo affordance. Only messages the app has
+        bound to a conversation turn are undoable."""
+        if self.message is None:
+            return
+        self.toggle_class("undo-armed")
+        event.stop()
+
+
+class _UndoButton(Static):
+    """The click-to-undo affordance a UserMessage reveals when clicked."""
+
+    def __init__(self, owner: UserMessage) -> None:
+        super().__init__("↩ undo to here", classes="user-undo", markup=False)
+        self._owner = owner
+
+    def on_click(self, event: events.Click) -> None:
+        self._owner.post_message(UserMessage.UndoRequested(self._owner))
+        event.stop()
 
 
 class AssistantMessage(Vertical):
@@ -1267,14 +1304,25 @@ class GeneratingBar(Static):
 
 
 class PendingIndicator(Horizontal):
-    """Shimmering 'Processing' state, shown until the first token of any kind."""
+    """Shimmering busy state, shown until the first token of any kind.
 
-    def __init__(self) -> None:
+    Also reused for compaction ("Compacting"), which has no interrupt hint.
+    """
+
+    def __init__(
+        self,
+        label: str = "Processing",
+        colors: tuple[str, str] | None = None,
+        hint: str = "esc to interrupt",
+    ) -> None:
         super().__init__(classes="msg pending")
+        self._label = label
+        self._colors = colors or theme.SHIMMER_PROCESSING
+        self._hint = hint
         self._start = time.monotonic()
 
     def compose(self):
-        yield ShimmerText("Processing", *theme.SHIMMER_PROCESSING, id="pending-shimmer")
+        yield ShimmerText(self._label, *self._colors, id="pending-shimmer")
         yield Static("", id="pending-elapsed", classes="pending-elapsed", markup=False)
 
     def on_mount(self) -> None:
@@ -1285,8 +1333,9 @@ class PendingIndicator(Horizontal):
         if not self.is_mounted:
             return
         elapsed = time.monotonic() - self._start
+        detail = f"{elapsed:.0f}s · {self._hint}" if self._hint else f"{elapsed:.0f}s"
         self.query_one("#pending-elapsed", Static).update(
-            Text(f"  ({elapsed:.0f}s · esc to interrupt)", style=theme.PALETTE["muted"])
+            Text(f"  ({detail})", style=theme.PALETTE["muted"])
         )
 
 
@@ -1337,24 +1386,36 @@ class ToolWritingIndicator(Horizontal):
             pass  # DOM pruned during app shutdown
 
 
-class ErrorLine(Static):
-    """A request-level failure, rendered inline in the scrollback.
+class MessageLine(Static):
+    """Unified one-line status message in the scrollback.
 
-    Color comes from CSS ($c-error) so theme switches recolor it live.
+    One widget for every non-conversational line — notices, warnings,
+    confirmations, errors — with ``kind`` picking the glyph and the CSS class
+    ($c-muted / $c-warning / $c-success / $c-error), so theme switches recolor
+    every kind live. :class:`ErrorLine` and :class:`NoticeLine` are the two
+    named shorthands the rest of the app uses.
     """
 
+    _GLYPHS = {"error": "✗ ", "warn": "! ", "success": "✓ "}
+
+    def __init__(self, message: str, kind: str = "notice") -> None:
+        super().__init__(
+            Text(f"{self._GLYPHS.get(kind, '')}{message}"), classes=f"msg {kind}"
+        )
+
+
+class ErrorLine(MessageLine):
+    """A request-level failure, rendered inline in the scrollback."""
+
     def __init__(self, message: str) -> None:
-        super().__init__(Text(f"✗ {message}"), classes="msg error")
+        super().__init__(message, kind="error")
 
 
-class NoticeLine(Static):
-    """Muted one-line status notice (e.g. 'worked for 2m 15s').
-
-    Color comes from CSS ($c-muted) so theme switches recolor it live.
-    """
+class NoticeLine(MessageLine):
+    """Muted one-line status notice (e.g. 'worked for 2m 15s')."""
 
     def __init__(self, message: str) -> None:
-        super().__init__(Text(message), classes="msg notice")
+        super().__init__(message, kind="notice")
 
 
 class AskBar(Static):

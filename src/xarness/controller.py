@@ -47,6 +47,10 @@ from .tools import ToolRegistry, ToolResult
 # usage data. Deliberately conservative; results are labeled approximate.
 _CHARS_PER_TOKEN = 4
 
+# A round's live partial output, mutated in place while it streams:
+# (reasoning_parts, content_parts, pending calls, call order).
+PartialRound = tuple[list[str], list[str], dict[str, dict[str, str]], list[str]]
+
 
 def _is_summary(message: Message) -> bool:
     """True for the summary user message a compaction leaves behind."""
@@ -134,6 +138,9 @@ class ChatController:
         # (before, after) token counts of the most recent compaction, for the
         # compact tool's result line.
         self.last_compaction: tuple[int, int] | None = None
+        # Live view of the round currently streaming. Cleared when the round
+        # completes; read by save_interrupted_round() when a turn is cancelled.
+        self._partial_round: PartialRound | None = None
 
     async def send(self, user_text: str) -> AsyncIterator[StreamEvent]:
         """Send a user message, streaming the first round."""
@@ -170,6 +177,34 @@ class ChatController:
                 header=result.header or None,
             )
         )
+
+    def save_interrupted_round(self) -> bool:
+        """Persist the partial round a cancelled turn was streaming.
+
+        Keeps the assistant text and reasoning that had arrived, but drops a
+        trailing reasoning-only segment — thinking that never led to an answer
+        — and any half-streamed tool call (it has no result to pair with, and
+        an orphaned tool call would be rejected on the next request). Returns
+        True when a message was added; an empty or reasoning-only round adds
+        nothing, so interrupting a turn that had not answered yet leaves the
+        history untouched.
+        """
+        partial = self._partial_round
+        self._partial_round = None
+        if partial is None:
+            return False
+        reasoning_parts, content_parts, _pending, _call_order = partial
+        content = "".join(content_parts)
+        if not content:
+            return False
+        self.conversation.add(
+            Message(
+                role="assistant",
+                content=content,
+                reasoning="".join(reasoning_parts) or None,
+            )
+        )
+        return True
 
     def inject_user_message(self, text: str) -> None:
         """Add a user message mid-turn (steering).
@@ -273,6 +308,46 @@ class ChatController:
         return RollbackPlan(
             user_text=user_text, checkpoint_sha=sha, keep=keep, dropped=dropped,
             clears_compaction=clears,
+        )
+
+    def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
+        """Plan a rollback to an arbitrary earlier user message (click-to-undo):
+        drop that message and everything after it, restoring the workspace to
+        the checkpoint taken when it was sent.
+
+        Handles messages the last compaction summarized away too — the
+        pre-compaction snapshot is restored first, then truncated at the
+        clicked turn. Returns None when the message is not a user turn in this
+        conversation, or is the latest one (nothing after it to drop).
+        """
+        if message.role != "user":
+            return None
+        messages = self.conversation.messages
+        index = next((i for i, m in enumerate(messages) if m is message), None)
+        if index is not None:
+            if index == len(messages) - 1:
+                return None  # nothing after it yet
+            keep = list(messages[:index])
+            dropped = list(messages[index:])
+            clears = not any(_is_summary(m) for m in keep)
+            return RollbackPlan(
+                user_text=message.content, checkpoint_sha=message.checkpoint_sha,
+                keep=keep, dropped=dropped, clears_compaction=clears,
+            )
+        snapshot = self.conversation.compact_snapshot
+        if snapshot is None:
+            return None
+        idx = next((i for i, m in enumerate(snapshot) if m is message), None)
+        if idx is None:
+            return None
+        keep = list(snapshot[:idx])
+        kept_ids = {id(m) for m in keep}
+        # Only the live history's messages count for usage subtraction: the
+        # snapshot's own spend was already folded when compaction removed it.
+        dropped = [m for m in messages if id(m) not in kept_ids]
+        return RollbackPlan(
+            user_text=message.content, checkpoint_sha=message.checkpoint_sha,
+            keep=keep, dropped=dropped, clears_compaction=True,
         )
 
     def _subtract_usage(self, usage: Usage) -> None:
@@ -444,6 +519,9 @@ class ChatController:
         call_order: list[str] = []
         first_reasoning_at: float | None = None
         first_content_at: float | None = None
+        # Expose this round's partial output live, so a cancelled turn can
+        # persist whatever had streamed before the interruption.
+        self._partial_round = (reasoning_parts, content_parts, pending, call_order)
 
         tools_schema = self.tools.schema() if self.tools is not None else None
         async for event in self._client.stream(
@@ -467,6 +545,7 @@ class ChatController:
                 # Authoritative once the stream is done parsing.
                 pending[event.call_id] = {"name": event.name, "arguments": event.arguments_json}
             elif isinstance(event, TurnComplete):
+                self._partial_round = None  # round completed; nothing partial left
                 reasoning = "".join(reasoning_parts) or None
                 reasoning_seconds: float | None = None
                 if first_reasoning_at is not None:

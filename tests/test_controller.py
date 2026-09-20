@@ -605,5 +605,68 @@ def test_rollback_is_a_noop_without_a_finished_turn() -> None:
     assert controller.rollback_plan() is None  # no response yet
 
 
+def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
+    """Click-to-undo truncates at any earlier user message, restoring its
+    checkpoint and subtracting every dropped turn's usage."""
+    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    controller = ChatController(PROFILE, "key", client=client)
+    asyncio.run(collect(controller, "first"))
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    asyncio.run(collect(controller, "second"))
+    client.script = [ContentDelta("three"), TurnComplete(usage=Usage(7, 2))]
+    asyncio.run(collect(controller, "third"))
+
+    first_user = controller.conversation.messages[0]
+    plan = controller.rollback_plan_to(first_user)
+    assert plan is not None
+    assert plan.user_text == "first"
+    assert plan.keep == []
+
+    controller.apply_rollback(plan)
+    assert controller.conversation.messages == []
+    assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
+
+
+def test_rollback_plan_to_rejects_non_turns_and_the_latest() -> None:
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    controller.conversation.add(Message(role="user", content="first"))
+    controller.conversation.add(Message(role="assistant", content="one"))
+    controller.conversation.add(Message(role="user", content="pending"))
+    messages = controller.conversation.messages
+    assert controller.rollback_plan_to(messages[1]) is None  # not a user turn
+    assert controller.rollback_plan_to(messages[2]) is None  # nothing after it yet
+
+
+def test_save_interrupted_round_keeps_partial_answer() -> None:
+    """An interrupted round is saved with the text and reasoning it managed
+    to stream before the cancellation."""
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    controller._partial_round = (["thinking "], ["partial answer"], {}, [])
+    assert controller.save_interrupted_round() is True
+    message = controller.conversation.messages[-1]
+    assert message.role == "assistant"
+    assert message.content == "partial answer"
+    assert message.reasoning == "thinking "
+    # Cleared, so a second call is a no-op (the round is only saved once).
+    assert controller.save_interrupted_round() is False
+
+
+def test_save_interrupted_round_drops_reasoning_only() -> None:
+    """A round interrupted while still thinking (no answer text) saves nothing."""
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    controller._partial_round = (["just thinking"], [], {}, [])
+    assert controller.save_interrupted_round() is False
+    assert controller.conversation.messages == []
+
+
+def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:
+    """Half-streamed tool calls are dropped: they have no result to pair with,
+    and an orphaned tool call would be rejected on the next request."""
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    controller._partial_round = ([], [], {"c1": {"name": "noop", "arguments": "{}"}}, ["c1"])
+    assert controller.save_interrupted_round() is False
+    assert controller.conversation.messages == []
+
+
 async def _drain(stream: AsyncIterator[Any]) -> list[Any]:
     return [event async for event in stream]

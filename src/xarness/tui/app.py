@@ -25,7 +25,7 @@ from textual.worker import Worker
 from .. import theme
 from ..config import ConfigError, ProviderProfile, load_all_profiles, resolve_api_key
 from ..conversation import Conversation, Message
-from ..controller import ChatController
+from ..controller import ChatController, RollbackPlan
 from ..events import (
     ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
     ToolCallArgumentsDone, ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
@@ -42,9 +42,9 @@ from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
     AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
-    NoticeLine, PendingIndicator, ShimmerText, StatusBar, SuggestionPopup,
-    ThinkingBlock, ToolCallBlock, ToolWritingIndicator, UserMessage,
-    _format_duration, _write_file_loc,
+    MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
+    SuggestionPopup, ThinkingBlock, ToolCallBlock, ToolWritingIndicator,
+    UserMessage, _format_duration, _write_file_loc,
 )
 
 
@@ -52,6 +52,9 @@ INPUT_PLACEHOLDER = (
     "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
+
+# How long a first Esc stays "armed" waiting for the confirming second one.
+INTERRUPT_ARM_SECONDS = 2.5
 
 
 # Divider mounted in the chat log at every compaction point (live and on
@@ -159,6 +162,10 @@ class AgentApp(App[None]):
         self._ask_future: asyncio.Future[str | None] | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
+        # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
+        # the second one within INTERRUPT_ARM_SECONDS actually cancels.
+        self._interrupt_armed = False
+        self._interrupt_timer = None
         self._at_search_timer = None
         self._profiles_cache: dict[str, ProviderProfile] = {}
         self.ensure_system_message()
@@ -257,7 +264,7 @@ class AgentApp(App[None]):
         cmd = parts[0] if parts else ""
         if cmd == "tools":
             names = ", ".join(t["function"]["name"] for t in self.tool_registry.schema())
-            self._post_line(ErrorLine(f"tools: {names}"))
+            self._post_line(MessageLine(f"tools: {names}", kind="info"))
         elif cmd == "sessions":
             self.push_screen(ResumeScreen(), self._on_session_selected)
         elif cmd == "new":
@@ -371,14 +378,44 @@ class AgentApp(App[None]):
         (installs, background jobs, network calls) is not undone."""
         label = "retry" if resend else "undo"
         if self._turn_busy or self._compacting:
-            self._post_line(ErrorLine(
-                f"/{label}: wait for the current turn or compaction to finish first"
+            self._post_line(MessageLine(
+                f"/{label}: wait for the current turn or compaction to finish first",
+                kind="warn",
             ))
             return
         plan = self.controller.rollback_plan()
         if plan is None:
             self._post_line(NoticeLine(f"nothing to {label}"))
             return
+        await self._apply_rollback(plan, resend=resend)
+
+    @work(group="undo", exclusive=True)
+    async def _run_undo_to(self, message: Message) -> None:
+        """Click-to-undo: drop the clicked user message and everything after
+        it (file edits reverted), putting that message back in the input."""
+        if self._turn_busy or self._compacting:
+            self._post_line(MessageLine(
+                "wait for the current turn or compaction to finish first",
+                kind="warn",
+            ))
+            return
+        plan = self.controller.rollback_plan_to(message)
+        if plan is None:
+            self._post_line(NoticeLine("nothing to undo there"))
+            return
+        await self._apply_rollback(plan, resend=False, scope="messages from here on")
+
+    def on_user_message_undo_requested(self, event: UserMessage.UndoRequested) -> None:
+        event.stop()
+        message = event.user_message.message
+        if message is not None:
+            self._run_undo_to(message)
+
+    async def _apply_rollback(
+        self, plan: RollbackPlan, resend: bool, scope: str = "last turn"
+    ) -> None:
+        """Carry out a rollback plan: rewrite the history, revert the files,
+        and report what happened. Shared by /undo, /retry, and click-to-undo."""
         if plan.compaction_only:
             # Undoing the compaction itself: history restored, the turn that
             # triggered it stays intact, no files reverted, input untouched.
@@ -410,13 +447,13 @@ class AgentApp(App[None]):
         else:
             note = "file edits could not be reverted (no checkpoint or git failed)"
         if resend:
-            self._post_line(NoticeLine(f"retrying: last turn rolled back ({note})"))
+            self._post_line(NoticeLine(f"retrying: {scope} rolled back ({note})"))
             self._submit(plan.user_text)
         else:
             chat_input = self.query_one("#chat-input", ChatInput)
             chat_input.load_text(plan.user_text)
             chat_input.focus()
-            self._post_line(NoticeLine(f"undone: last turn removed ({note})"))
+            self._post_line(NoticeLine(f"undone: {scope} removed ({note})"))
         # Persist the rolled-back state: without this, /new + /sessions
         # resumes the session as it was before the undo.
         self._persist_git_state()
@@ -825,7 +862,9 @@ class AgentApp(App[None]):
     ) -> None:
         """Render one persisted message into the chat log."""
         if message.role == "user":
-            await chat.mount(UserMessage(message.content))
+            widget = UserMessage(message.content)
+            widget.message = message
+            await chat.mount(widget)
         elif message.role == "assistant":
             if message.reasoning:
                 thinking = ThinkingBlock()
@@ -984,7 +1023,7 @@ class AgentApp(App[None]):
             if len(self._queued) == 1:
                 self._post_line(NoticeLine("press enter to send now"))
         else:
-            self._worker = self._run_turn(text)
+            self._worker = self._run_turn(text, user_message)
 
     def _flush_queued_now(self) -> None:
         """Enter on an empty input while messages are queued: send now.
@@ -1046,7 +1085,24 @@ class AgentApp(App[None]):
             diff_summary.collapse()
             return
         if self._turn_busy and self._worker is not None:
-            self._worker.cancel()
+            if self._interrupt_armed:
+                # Second esc within the window: actually stop the turn.
+                self._disarm_interrupt()
+                self._worker.cancel()
+            else:
+                # First esc only arms the interrupt, so a stray keypress can't
+                # kill a turn mid-flight.
+                self._interrupt_armed = True
+                self._post_line(MessageLine("press esc again to interrupt", kind="warn"))
+                self._interrupt_timer = self.set_timer(
+                    INTERRUPT_ARM_SECONDS, self._disarm_interrupt
+                )
+
+    def _disarm_interrupt(self) -> None:
+        self._interrupt_armed = False
+        if self._interrupt_timer is not None:
+            self._interrupt_timer.stop()
+            self._interrupt_timer = None
 
     async def _ask_user(self, questions: list[str]) -> list[str] | None:
         """Callback for the ask tool: show the questions one at a time in the
@@ -1081,7 +1137,7 @@ class AgentApp(App[None]):
         return await self._run_compaction()
 
     @work(group="turn")
-    async def _run_turn(self, text: str) -> None:
+    async def _run_turn(self, text: str, user_widget: UserMessage | None = None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tool calls).
 
         Each round streams one model response. If the round requested tool
@@ -1125,6 +1181,15 @@ class AgentApp(App[None]):
                 round_has_tools = False
 
                 async for event in stream:
+                    if user_widget is not None and user_widget.message is None:
+                        # Bind the widget to its conversation message so
+                        # click-to-undo can locate this turn. The user message
+                        # is the last one added when the round starts.
+                        user_widget.message = next(
+                            (m for m in reversed(self.controller.conversation.messages)
+                             if m.role == "user"),
+                            None,
+                        )
                     if isinstance(event, ReasoningDelta):
                         if thinking is None:
                             await self._dismiss_indicator(indicator)
@@ -1231,7 +1296,9 @@ class AgentApp(App[None]):
                 if self._queued:
                     for queued_text in self._queued:
                         self.controller.inject_user_message(queued_text)
-                    for widget in self._queued_widgets:
+                    injected = self.controller.conversation.messages[-len(self._queued):]
+                    for widget, message in zip(self._queued_widgets, injected):
+                        widget.message = message
                         widget.mark_sent()
                     self._queued_widgets.clear()
                     self._queued.clear()
@@ -1254,6 +1321,12 @@ class AgentApp(App[None]):
             for block in tool_blocks.values():
                 if block.status is ToolCallStatus.MAKING_CALL:
                     block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+            # Keep whatever the model had produced before the interruption —
+            # everything up to the last non-thinking block — so the next turn
+            # and a later /resume still see it. An empty or reasoning-only
+            # round saves nothing, leaving the history untouched.
+            if self.controller.save_interrupted_round():
+                self._persist_git_state()
             self._post_line(ErrorLine("interrupted"))
         finally:
             gen_bar.remove_class("active")
@@ -1263,9 +1336,11 @@ class AgentApp(App[None]):
             # that ran tools, recompute once — not per keystroke or per round.
             if turn_had_tools and self.git_info is not None:
                 await self.refresh_diff_summary()
+            self._disarm_interrupt()
             if self._queued:
-                self._queued_widgets.pop(0).mark_sent()
-                self._worker = self._run_turn(self._queued.pop(0))
+                widget = self._queued_widgets.pop(0)
+                widget.mark_sent()
+                self._worker = self._run_turn(self._queued.pop(0), widget)
 
     async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
         if indicator is not None and indicator.is_mounted:
@@ -1287,8 +1362,9 @@ class AgentApp(App[None]):
             # Messages submitted while the summarizer ran start now — the
             # history rewrite is done, so it's safe to open a turn.
             if self._queued and not self._turn_busy:
-                self._queued_widgets.pop(0).mark_sent()
-                self._worker = self._run_turn(self._queued.pop(0))
+                widget = self._queued_widgets.pop(0)
+                widget.mark_sent()
+                self._worker = self._run_turn(self._queued.pop(0), widget)
 
     async def _run_pending_compact(self) -> None:
         """Run a /compact requested mid-turn (steering) at a safe boundary."""
@@ -1306,7 +1382,18 @@ class AgentApp(App[None]):
         """Compact via the controller and refresh everything that depends on
         it. Returns the summary, prefixed with the token-count line the
         compact tool reports ("compacted: N → M tokens (freed K)")."""
-        summary = await self.controller.compact()
+        chat = self.query_one("#chat-log", VerticalScroll)
+        # A shimmering "Compacting" line while the summarizer runs, so the
+        # pause reads as work rather than a hang.
+        indicator = PendingIndicator(
+            "Compacting", theme.SHIMMER_COMPACTING, hint=""
+        )
+        await chat.mount(indicator)
+        try:
+            summary = await self.controller.compact()
+        finally:
+            if indicator.is_mounted:
+                await indicator.remove()
         # The summarization round's own spend just entered the controller's
         # cumulative total; mirror it now rather than waiting for the next
         # round's TurnComplete.

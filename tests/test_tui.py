@@ -26,9 +26,13 @@ from xarness.tools import Tool, ToolRegistry, ToolResult, build_registry
 from xarness.tui.app import AgentApp
 from xarness.tui.widgets import (
     AskBar,
+    AssistantMessage,
     ChatInput,
     ErrorLine,
+    MessageLine,
     NoticeLine,
+    PendingIndicator,
+    ShimmerText,
     StatusBar,
     ThinkingBlock,
     ToolCallBlock,
@@ -882,6 +886,167 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("nothing to retry" in n for n in notices))
             self.assertEqual(
                 [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+
+    async def test_escape_needs_a_second_press_to_interrupt(self) -> None:
+        """A single Esc only arms the interrupt and prompts for confirmation;
+        a second one cancels the running turn."""
+
+        class GatedClient:
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+
+            async def stream(self, wire_messages, tools=None):
+                yield ProcessingStarted()
+                yield ContentDelta("working")
+                await self.gate.wait()
+                yield TurnComplete(usage=Usage(10, 2))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
+        async with app.run_test() as pilot:
+            await pilot.press("a", "enter")
+            await wait_for(lambda: app._turn_busy)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            # Still running: the first Esc only asked for confirmation.
+            self.assertTrue(app._turn_busy)
+            warnings = [str(w.content) for w in app.query(MessageLine)]
+            self.assertTrue(any("press esc again" in w for w in warnings))
+
+            await pilot.press("escape")
+            await wait_until_idle(app)
+            self.assertFalse(app._turn_busy)
+            errors = [str(e.content) for e in app.query(ErrorLine)]
+            self.assertTrue(any("interrupted" in e for e in errors))
+
+    async def test_click_a_message_to_undo_back_to_it(self) -> None:
+        """Clicking a user message reveals the undo affordance; clicking that
+        rolls the conversation back to the clicked turn."""
+        app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+        client.next_scripts = [
+            [ContentDelta("two"), TurnComplete(usage=Usage(6, 4))],
+            [ContentDelta("three"), TurnComplete(usage=Usage(7, 5))],
+        ]
+        async with app.run_test() as pilot:
+            for key in ("a", "b", "c"):
+                await pilot.press(key, "enter")
+                await wait_until_idle(app)
+
+            first = app.query(UserMessage).first()
+            # Scroll the log home so the (older) first message is on screen.
+            app.query_one("#chat-log", VerticalScroll).scroll_home(animate=False)
+            await pilot.pause()
+            await pilot.click(first, offset=(3, 1))
+            await pilot.pause()
+            self.assertTrue(first.has_class("undo-armed"))
+
+            # The affordance hugs its own label, not the whole message line.
+            button = first.query_one(".user-undo")
+            self.assertLess(button.region.width, first.region.width)
+
+            await pilot.click(button, offset=(2, 0))
+            await wait_for(lambda: app.query_one(ChatInput).text == "a")
+
+            # Every turn from the clicked one on is gone; its text is back in
+            # the input box ready to edit or resend.
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+            self.assertEqual(len(app.query(UserMessage)), 0)
+
+    async def test_compaction_shows_a_shimmering_indicator(self) -> None:
+        """While the summarizer runs, a shimmering "Compacting" line stands in
+        for the (otherwise silent) pause."""
+        app, _client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+
+            gate = asyncio.Event()
+
+            async def gated_compact() -> str:
+                await gate.wait()
+                return "compacted: 40 → 7 tokens (freed 33)"
+
+            app.controller.compact = gated_compact  # type: ignore[method-assign]
+            app._run_manual_compact()
+            await wait_for(lambda: app._compacting)
+            await pilot.pause()
+
+            labels = [
+                indicator.query_one("#pending-shimmer", ShimmerText).label
+                for indicator in app.query(PendingIndicator)
+            ]
+            self.assertIn("Compacting", labels)
+
+            gate.set()
+            await wait_for(lambda: not app._compacting)
+            await pilot.pause()
+            self.assertEqual(len(app.query(PendingIndicator)), 0)
+
+    async def test_interrupt_saves_the_partial_answer(self) -> None:
+        """Interrupting mid-answer keeps the text (and reasoning) the model had
+        produced, up to the last non-thinking block."""
+
+        class GatedClient:
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+
+            async def stream(self, wire_messages, tools=None):
+                yield ProcessingStarted()
+                yield ReasoningDelta("thinking hard")
+                yield ContentDelta("partial answer")
+                await self.gate.wait()
+                yield TurnComplete(usage=Usage(10, 2))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_for(lambda: app.query(AssistantMessage))
+
+            await pilot.press("escape")
+            await pilot.press("escape")
+            await wait_until_idle(app)
+
+            roles = [m.role for m in app.controller.conversation.messages]
+            self.assertEqual(roles, ["system", "user", "assistant"])
+            saved = app.controller.conversation.messages[-1]
+            self.assertEqual(saved.content, "partial answer")
+            self.assertEqual(saved.reasoning, "thinking hard")
+
+    async def test_interrupt_before_any_answer_saves_nothing(self) -> None:
+        """A turn interrupted while still thinking (no answer text) adds no
+        assistant message."""
+
+        class GatedClient:
+            def __init__(self) -> None:
+                self.gate = asyncio.Event()
+
+            async def stream(self, wire_messages, tools=None):
+                yield ProcessingStarted()
+                yield ReasoningDelta("still thinking")
+                await self.gate.wait()
+                yield TurnComplete(usage=Usage(10, 2))
+
+        client = GatedClient()
+        controller = ChatController(PROFILE, "test-key", client=client)
+        app = AgentApp(PROFILE, "test-key", controller=controller)
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_for(lambda: app.query(ThinkingBlock))
+
+            await pilot.press("escape")
+            await pilot.press("escape")
+            await wait_until_idle(app)
+
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages],
+                ["system", "user"],
             )
 
     async def test_compact_tool_reports_token_counts(self) -> None:

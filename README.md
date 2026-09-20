@@ -65,6 +65,12 @@ changed (`Edited 2 files +26 -0`); click it to expand a per-file list
 | `/undo` | Drop the last turn: revert its file edits, put your message back in the input |
 | `/retry` | Revert the last turn's file edits and resend your message |
 
+To undo further back, click any of your messages in the scrollback: a small
+`↩ undo to here` affordance appears, and clicking it drops that message and
+everything after it — file edits reverted to that turn's checkpoint, and the
+message put back in the input. Messages the last `/compact` summarized away
+can be clicked too (the pre-compaction history is restored first).
+
 `/accept` is how you follow change-per-feature: let the agent build one
 feature, `/accept` it, move on to the next. Everything before the last
 accept is out of `/diff`'s and `/undo`'s reach — use git itself (a repo you
@@ -199,7 +205,7 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/new` | Start a new chat |
 | `/compact` | Summarize and truncate the conversation now, freeing context window. While the agent is working it's steered instead: it runs at the next round boundary, before any queued messages are injected |
 | `/auto_compact` | Toggle automatic compaction when the context window passes the profile's `auto_compact_threshold` (checked after each turn) |
-| `/undo` | Drop the last turn (file edits reverted, message back in the input). If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
+| `/undo` | Drop the last turn (file edits reverted, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |
 
@@ -212,7 +218,7 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `Ctrl+T` | Expand/collapse the most recent "Thought for Xs" block (clicking it works too) |
 | `Ctrl+C` | Copy the current selection, or quit if nothing is selected |
 | `Ctrl+Shift+C` | Copy the current selection (never quits) |
-| `Escape` | Interrupt the agent mid-turn |
+| `Escape` | Interrupt the agent mid-turn (press again to confirm) |
 
 Note: `Shift+Enter` is only distinguishable from `Enter` on terminals with
 extended keyboard support; `Alt+Enter` is the portable fallback.
@@ -223,6 +229,14 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   token of any kind, then `Thinking` (pulsing) while reasoning-channel tokens
   arrive (`reasoning_content` / `reasoning` delta fields), then the streamed
   answer. Models without a reasoning channel skip the thinking state.
+  Compaction shows its own shimmering `Compacting` line while it summarizes.
+- **Interrupting**: one `Escape` only arms the interrupt and shows a
+  `press esc again to interrupt` prompt; a second `Escape` within a couple of
+  seconds actually stops the turn, so a stray keypress can't kill work.
+  Whatever the model had already written is kept — saved up to the last
+  non-thinking block, so a trailing run of reasoning that never produced an
+  answer is dropped — and a turn interrupted before any answer leaves the
+  history untouched.
 - **Thoughts**: after a turn with reasoning, a collapsed `▸ Thought for Xs`
   indicator stays in the scrollback; `Ctrl+T` or a click expands it inline.
   Reasoning text is kept in the conversation history regardless of visibility.

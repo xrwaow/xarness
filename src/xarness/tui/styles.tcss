@@ -46,6 +46,25 @@ UserMessage {
     color: $c-text;
 }
 
+/* Click-to-undo affordance: hidden until the message is clicked. Sized to
+   its text (not the full line) so only the label itself is clickable. */
+.user-undo {
+    display: none;
+    width: auto;
+    height: auto;
+    padding: 0 0 0 2;
+    color: $c-muted;
+}
+
+UserMessage.undo-armed .user-undo {
+    display: block;
+}
+
+.user-undo:hover {
+    color: $c-highlight;
+    text-style: underline;
+}
+
 AssistantMessage {
     height: auto;
     color: $c-text;
@@ -169,17 +188,27 @@ ToolWritingIndicator {
     padding: 0 1;
 }
 
-ErrorLine,
-NoticeLine {
+/* Every MessageLine kind (ErrorLine/NoticeLine are subclasses) is padded
+   the same way; the class rules below only pick the color. */
+MessageLine {
     padding: 0 1;
 }
 
-ErrorLine {
+.msg.error {
     color: $c-error;
 }
 
-NoticeLine {
+.msg.notice,
+.msg.info {
     color: $c-muted;
+}
+
+.msg.warn {
+    color: $c-warning;
+}
+
+.msg.success {
+    color: $c-success;
 }
 
 StatusBar {
