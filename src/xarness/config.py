@@ -50,6 +50,10 @@ class ProviderProfile(BaseModel):
     cot_strength: CotStrength = CotStrength.MEDIUM
     # Send assistant reasoning back to the model on later rounds.
     keep_reasoning: bool = True
+    # Auto-compact after each turn once the context estimate passes
+    # auto_compact_threshold of max_context (0.9 = 90% full).
+    auto_compact: bool = False
+    auto_compact_threshold: float = Field(default=0.9, gt=0.0, le=1.0)
     # OpenRouter-style provider routing, sent verbatim as the request's
     # "provider" field; ignored by endpoints that don't support it.
     provider: dict[str, Any] | None = None

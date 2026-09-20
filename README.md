@@ -152,6 +152,12 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
   - `cot_strength` — reasoning effort: `off`, `low`, `medium`, or `high`.
   - `keep_reasoning` — send assistant reasoning back to the model on later
     rounds (default `true`).
+  - `auto_compact` — compact automatically after each turn once the context
+    estimate passes `auto_compact_threshold` of `max_context` (default
+    `false`; `/auto_compact` toggles it at runtime).
+  - `auto_compact_threshold` — fraction of the context window that triggers
+    auto-compaction, e.g. `0.9` = 90% full; must be in (0, 1]
+    (default `0.9`).
   - `provider` — optional OpenRouter provider routing, sent verbatim as the
     request's `provider` field, e.g.
     `{"order": ["openai", "together"], "allow_fallbacks": false}`.
@@ -192,7 +198,7 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/compact` | Summarize and truncate the conversation now, freeing context window. While the agent is working it's steered instead: it runs at the next round boundary, before any queued messages are injected |
-| `/auto_compact` | Toggle automatic compaction when the context window is 90% full (checked after each turn) |
+| `/auto_compact` | Toggle automatic compaction when the context window passes the profile's `auto_compact_threshold` (checked after each turn) |
 | `/undo` | Drop the last turn (file edits reverted, message back in the input). If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |

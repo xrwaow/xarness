@@ -192,6 +192,12 @@ class ShimmerText(Static):
         self.peak_color = peak_color
         self._render_frame()
 
+    def set_label(self, label: str) -> None:
+        """Swap the text in place (ToolWritingIndicator follows whichever
+        tool call is currently streaming)."""
+        self.label = label
+        self._render_frame()
+
     def _tick(self) -> None:
         if not self.is_mounted:
             return
@@ -459,23 +465,58 @@ def _json_tool_args(args_text: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _write_file_loc(args_text: str) -> int | None:
+    """Best-effort line count of write_file's ``content`` argument while its
+    JSON is still streaming. Complete JSON counts exactly; a partial one
+    counts the escaped ``\\n`` sequences after the "content" key."""
+    content = _json_tool_args(args_text).get("content")
+    if isinstance(content, str):
+        return content.count("\n") + 1 if content else 0
+    match = re.search(r'"content"\s*:\s*"', args_text)
+    if match is None:
+        return None
+    rest = args_text[match.end():]
+    # Stop at the unescaped closing quote; also tolerate a dangling backslash
+    # from a fragment boundary landing mid-escape.
+    i = 0
+    while i < len(rest):
+        if rest[i] == "\\":
+            i += 2
+            continue
+        if rest[i] == '"':
+            rest = rest[:i]
+            break
+        i += 1
+    rest = rest.rstrip("\\")
+    return rest.count("\\n") + 1 if rest else 0
+
+
 def _header_detail_text(tool_name: str, header: str) -> Text | None:
     """The stored header summary, laid out after the verb + tool name.
 
-    edit_file's ``+N -M path`` counts and run_bash's command go on their own
-    line (``Ran edit_file\n+3 -1 src/app.py``); everything else appends
-    dimmed after a space. run_bash's command is truncated for the header —
-    the full command shows in the expanded body.
+    Every tool's detail appends dimmed after a space, all on one line
+    (``edit_file +3 -1 src/app.py``). run_bash's command is truncated for
+    the header — the full command shows in the expanded body.
     """
     if not header:
         return None
     muted = theme.PALETTE["muted"]
     if tool_name == "edit_file":
-        detail = Text("\n", style=muted)
-        detail.append(header, style=muted)
+        # The tool's header is "+N -M path"; the counts get the diff's
+        # add/del colors so they read at a glance, path stays dimmed.
+        detail = Text(" ", style=muted)
+        counts = re.match(r"^(\+\d+) (-\d+) (.+)$", header)
+        if counts:
+            adds, dels, path = counts.groups()
+            detail.append(adds, style=theme.PALETTE["diff_add"])
+            detail.append(" ", style=muted)
+            detail.append(dels, style=theme.PALETTE["diff_del"])
+            detail.append(f" {path}", style=muted)
+        else:
+            detail.append(header, style=muted)
         return detail
     if tool_name == "run_bash":
-        detail = Text("\n", style=muted)
+        detail = Text(" ", style=muted)
         detail.append(_shorten(header, 80), style=muted)
         return detail
     detail = Text(" ")
@@ -485,7 +526,7 @@ def _header_detail_text(tool_name: str, header: str) -> Text | None:
 
 def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Text | None:
     """The dimmed detail that follows the verb in the settled header, e.g.
-    ``Ran read_file [dimmed]src/app.py``. Returns None (plain verb + name)
+    ``read_file [dimmed]src/app.py``. Returns None (plain verb + name)
     for tools without a useful summary or unparseable arguments.
 
     Kept best-effort and defensive: model-supplied arguments are not trusted
@@ -503,6 +544,15 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
             return None
         detail = Text(" ")
         detail.append(_shorten(path), style=muted)
+        if tool_name == "read_file":
+            # Surface the requested range: read_file index.html [start_line=270, end_line=30]
+            ranges = []
+            if args.get("start_line") is not None:
+                ranges.append(f"start_line={args['start_line']}")
+            if args.get("end_line") is not None:
+                ranges.append(f"end_line={args['end_line']}")
+            if ranges:
+                detail.append(f" [{', '.join(ranges)}]", style=muted)
         return detail
     if tool_name == "run_bash":
         command = as_str(args.get("command"))
@@ -585,7 +635,7 @@ class ToolCallBlock(Vertical):
     _STATUS_VERB: ClassVar[dict[ToolCallStatus, str]] = {
         ToolCallStatus.MAKING_CALL: "Running",
         ToolCallStatus.PARSING_ERROR: "Failed",
-        ToolCallStatus.CALL_SUCCEEDED: "Ran",
+        ToolCallStatus.CALL_SUCCEEDED: "",  # no verb: just "read_file path"
         ToolCallStatus.CALL_FAILED: "Failed",
     }
 
@@ -756,15 +806,25 @@ class ToolCallBlock(Vertical):
         verb = self._STATUS_VERB[self._status]
         # Verb + tool name inherit the stylesheet's muted color; the detail
         # suffix (path, command, token counts, …) bakes the palette's muted
-        # style in so it reads dimmer next to it.
-        summary = Text(f"{verb} {self.tool_name}")
+        # style in so it reads dimmer next to it. Succeeded calls drop the
+        # verb entirely: "read_file index.html [start_line=…]".
+        summary = Text(f"{verb} {self.tool_name}" if verb else self.tool_name)
         hide_detail = self.has_class("expanded") and self.tool_name in _EXPAND_PLAIN_TOOLS
         if self._status is ToolCallStatus.CALL_SUCCEEDED and not hide_detail:
-            detail = _header_detail_text(self.tool_name, self._header)
-            if detail is None:
+            if self.tool_name == "read_file":
+                # The stored header is just the path; the [start_line=…]
+                # range suffix comes from the call's arguments.
                 detail = _tool_header_detail(
                     self.tool_name, self.accumulated_arguments, self._output_text
                 )
+                if detail is None:
+                    detail = _header_detail_text(self.tool_name, self._header)
+            else:
+                detail = _header_detail_text(self.tool_name, self._header)
+                if detail is None:
+                    detail = _tool_header_detail(
+                        self.tool_name, self.accumulated_arguments, self._output_text
+                    )
             if detail is not None:
                 summary.append_text(detail)
         summary_row.mount(Static(summary, classes="toolcall-summary-text", markup=False))
@@ -1231,13 +1291,50 @@ class PendingIndicator(Horizontal):
 
 
 class ToolWritingIndicator(Horizontal):
-    """Single amber-dot 'Writing tools' shimmer shown while tool-call
+    """Single amber-dot 'Writing <tool>' shimmer shown while tool-call
     arguments are still streaming — replaces the per-block 'Running [tool]'
-    shinies, which only make sense once a call actually executes."""
+    shinies, which only make sense once a call actually executes. The label
+    follows whichever call is being written next, and write_file's grows a
+    live '+LOC' count as its content argument streams in."""
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(classes="msg toolwriting")
+        self.tool_name = tool_name
+        self._loc: int | None = None
 
     def compose(self):
         yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
-        yield ShimmerText("Writing tools", *theme.SHIMMER_THINKING, classes="toolwriting-shimmer")
+        # Yellow from the theme (the warning palette key): base and peak are
+        # the same color so the text stays solidly yellow, with the shimmer
+        # band showing as a bold sweep.
+        yield ShimmerText(
+            self._label(), theme.PALETTE["warning"], theme.PALETTE["warning"],
+            classes="toolwriting-shimmer",
+        )
+
+    def _label(self) -> str:
+        if self._loc is not None:
+            return f"Writing {self.tool_name} +{self._loc} LOC"
+        return f"Writing {self.tool_name}"
+
+    def set_tool(self, tool_name: str) -> None:
+        """Follow the tool call that just started streaming."""
+        self.tool_name = tool_name
+        self._loc = None
+        self._refresh()
+
+    def set_loc(self, loc: int) -> None:
+        """Update the live line count (write_file only)."""
+        self._loc = loc
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one(".toolwriting-shimmer", ShimmerText).set_label(self._label())
+        except NoMatches:
+            pass  # DOM pruned during app shutdown
 
 
 class ErrorLine(Static):
@@ -1367,10 +1464,16 @@ class ChatInput(TextArea):
     class PopupDismiss(Message):
         pass
 
+    class ModeToggle(Message):
+        """Tab pressed with no popup active — toggle plan/write mode."""
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "newline", "Newline", priority=True, show=False),
         Binding("alt+enter", "newline", "Newline", priority=True, show=False),
+        # priority beats Widget's inherited tab→focus_next; _on_key still
+        # claims tab first while a popup is open (popup confirm).
+        Binding("tab", "toggle_mode", "Mode", priority=True, show=False),
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -1461,6 +1564,9 @@ class ChatInput(TextArea):
 
     def action_newline(self) -> None:
         self.insert("\n")
+
+    def action_toggle_mode(self) -> None:
+        self.post_message(self.ModeToggle())
 
     def insert_mention(self, value: str) -> None:
         row, col = self.cursor_location

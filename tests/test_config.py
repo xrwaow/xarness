@@ -239,3 +239,46 @@ def test_typo_field_is_reported(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="model"):
         load_config(path)
+
+
+def test_auto_compact_defaults(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {"provider": {"base_url": "https://api.openai.com/v1", "model_id": "gpt-4.1"}},
+    )
+    profile = load_config(path).profile
+    assert profile.auto_compact is False
+    assert profile.auto_compact_threshold == 0.9
+
+
+def test_auto_compact_options_honored(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "provider": {
+                "base_url": "https://api.openai.com/v1",
+                "model_id": "gpt-4.1",
+                "auto_compact": True,
+                "auto_compact_threshold": 0.75,
+            },
+        },
+    )
+    profile = load_config(path).profile
+    assert profile.auto_compact is True
+    assert profile.auto_compact_threshold == 0.75
+
+
+@pytest.mark.parametrize("threshold", [0, -0.5, 1.5])
+def test_bad_auto_compact_threshold_rejected(tmp_path: Path, threshold: float) -> None:
+    path = write(
+        tmp_path,
+        {
+            "provider": {
+                "base_url": "https://api.openai.com/v1",
+                "model_id": "gpt-4.1",
+                "auto_compact_threshold": threshold,
+            },
+        },
+    )
+    with pytest.raises(ConfigError, match="auto_compact_threshold"):
+        load_config(path)

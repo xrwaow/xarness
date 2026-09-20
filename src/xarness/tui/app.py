@@ -27,8 +27,8 @@ from ..config import ConfigError, ProviderProfile, load_all_profiles, resolve_ap
 from ..conversation import Conversation, Message
 from ..controller import ChatController
 from ..events import (
-    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDone,
-    ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
+    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
+    ToolCallArgumentsDone, ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
 )
 from ..file_search import search_files
 from ..gitwork import (
@@ -44,12 +44,12 @@ from .widgets import (
     AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
     NoticeLine, PendingIndicator, ShimmerText, StatusBar, SuggestionPopup,
     ThinkingBlock, ToolCallBlock, ToolWritingIndicator, UserMessage,
-    _format_duration,
+    _format_duration, _write_file_loc,
 )
 
 
 INPUT_PLACEHOLDER = (
-    "Send a message…  (Enter: send · Shift+Enter: newline · Ctrl+T: thoughts)"
+    "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 
@@ -68,9 +68,13 @@ SLASH_COMMANDS = [
     ("mode", "switch between plan (read-only) and write mode"),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
+    ("delete", (
+        "delete the current session: revert its file changes, remove the "
+        "saved session file, start a fresh chat"
+    )),
     ("compact", "summarize and truncate the conversation now, freeing context window"),
     ("auto_compact", (
-        "toggle automatic compaction when the context window is 90% full "
+        "toggle automatic compaction when the context window is {pct} full "
         "(checked after each turn)"
     )),
     ("diff", "show pending changes (optionally: /diff <path>)"),
@@ -141,8 +145,9 @@ class AgentApp(App[None]):
         self.last_in = 0
         self._turn_busy = False
         # /auto_compact: run compaction automatically when the context window
-        # is 90% full (checked at the end of each turn).
-        self.auto_compact = False
+        # passes the profile's auto_compact_threshold (checked at the end of
+        # each turn). Off unless the config enables it; /auto_compact toggles.
+        self.auto_compact = self.profile.auto_compact
         # True while a manual /compact is summarizing: submissions queue
         # (like a busy turn) instead of racing the history rewrite.
         self._compacting = False
@@ -260,6 +265,11 @@ class AgentApp(App[None]):
                 self._post_line(ErrorLine("/new: wait for the compaction to finish first"))
             else:
                 self._start_new_session()
+        elif cmd == "delete":
+            if self._turn_busy or self._compacting:
+                self._post_line(ErrorLine("/delete: wait for the current turn or compaction to finish first"))
+            else:
+                self._start_delete()
         elif cmd == "compact":
             if self._compacting:
                 self._post_line(ErrorLine("/compact: already compacting"))
@@ -274,7 +284,8 @@ class AgentApp(App[None]):
                 self._run_manual_compact()
         elif cmd == "auto_compact":
             self.auto_compact = not self.auto_compact
-            state = "on — compaction runs at 90% context" if self.auto_compact else "off"
+            pct = f"{self.profile.auto_compact_threshold:.0%}"
+            state = f"on — compaction runs at {pct} context" if self.auto_compact else "off"
             self._post_line(NoticeLine(f"auto-compact {state}"))
         elif cmd == "accept":
             if self._git_action_preflight("accept") is not None:
@@ -303,16 +314,7 @@ class AgentApp(App[None]):
                 self._on_model_selected,
             )
         elif cmd == "mode":
-            new_mode = "plan" if self.mode == "write" else "write"
-            self.mode = new_mode
-            self.tool_registry = build_registry(
-                self.sandbox, self.sandbox_session, mode=new_mode,
-                ask_callback=self._ask_user, compact_callback=self._compact_conversation,
-                git_guard=self._make_git_guard(),
-            )
-            self.controller.tools = self.tool_registry  # rewire to the new registry
-            self.ensure_system_message()
-            self._refresh_status()
+            self._switch_mode()
         elif cmd == "undo":
             self._run_undo(resend=False)
         elif cmd == "retry":
@@ -333,6 +335,19 @@ class AgentApp(App[None]):
                 )
         else:
             self._post_line(ErrorLine(f"unknown command: /{cmd}"))
+
+    def _switch_mode(self) -> None:
+        """Toggle plan/write mode; shared by /mode and the Tab shortcut."""
+        new_mode = "plan" if self.mode == "write" else "write"
+        self.mode = new_mode
+        self.tool_registry = build_registry(
+            self.sandbox, self.sandbox_session, mode=new_mode,
+            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
+            git_guard=self._make_git_guard(),
+        )
+        self.controller.tools = self.tool_registry  # rewire to the new registry
+        self.ensure_system_message()
+        self._refresh_status()
 
     # ------------------------------------------------------------------
     # /undo + /retry
@@ -604,6 +619,39 @@ class AgentApp(App[None]):
                 "since the last accept were reverted"
             ))
 
+    @work(group="git-action", exclusive=True)
+    async def _start_delete(self) -> None:
+        """Slash /delete: end the current session for good — the workspace is
+        restored to the session's baseline (like /reject), the saved session
+        file is removed, and a fresh session starts. (Guarding happens
+        synchronously in the slash-command handler; the worker assumes it
+        passed.)"""
+        info = self.git_info
+        reverted = ""
+        if info is not None:
+            try:
+                stat = await diff_stat(info)
+                await revert_to_tree(info, info.baseline_tree)
+            except GitWorktreeError as exc:
+                # Keep the session file: it's the only record of what changed.
+                self._post_line(ErrorLine(f"/delete failed: {exc}"))
+                return
+            self._rewrite_checkpoints(info.baseline_tree)
+            reverted = (
+                f"{len(stat.files)} file(s) +{stat.additions} -{stat.deletions} reverted"
+                if stat.files else "no file changes to revert"
+            )
+        deleted = False
+        if self.session_name is not None:
+            from ..session_store import delete_session
+            deleted = delete_session(self.session_name)
+        self._start_new_session()
+        await self.refresh_diff_summary()
+        # Posted after _start_new_session: it wipes the chat log.
+        parts = [reverted] if reverted else []
+        parts.append("saved session removed" if deleted else "no saved session file")
+        self._post_line(NoticeLine(f"deleted: {', '.join(parts)} — started a fresh session"))
+
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
             self._apply_theme(name)
@@ -817,13 +865,22 @@ class AgentApp(App[None]):
                         ToolCallStatus.CALL_SUCCEEDED, output="", header="compacted"
                     )
 
+    def on_chat_input_mode_toggle(self, event: ChatInput.ModeToggle) -> None:
+        self._switch_mode()
+
     def on_chat_input_slash_query(self, event: ChatInput.SlashQuery) -> None:
         q = event.query.lower()
         # Table-style rows: commands padded to a shared column, descriptions
         # dimmed — same layout language as the session list.
         width = max(len(name) for name, _ in SLASH_COMMANDS)
+        # {pct} in a description is the profile's auto-compact threshold,
+        # interpolated here since SLASH_COMMANDS is profile-independent.
+        pct = f"{self.profile.auto_compact_threshold:.0%}"
         matches = [
-            (name, f"/{name:<{width}}  [dim]{desc}[/]")
+            (
+                name,
+                f"/{name:<{width}}  [dim]{desc.format(pct=pct) if '{pct}' in desc else desc}[/]",
+            )
             for name, desc in SLASH_COMMANDS
             if name.startswith(q)
         ]
@@ -1044,6 +1101,10 @@ class AgentApp(App[None]):
         indicator_live = False
         writing: ToolWritingIndicator | None = None
         pending_writes = 0
+        # Arguments streamed so far per in-flight call, so write_file's
+        # +LOC can be counted while the JSON is still arriving.
+        stream_args: dict[str, str] = {}
+        stream_names: dict[str, str] = {}
         thinking: ThinkingBlock | None = None
         had_stream_error = False
 
@@ -1059,6 +1120,8 @@ class AgentApp(App[None]):
                 tool_blocks = {}
                 writing = None
                 pending_writes = 0
+                stream_args = {}
+                stream_names = {}
                 round_has_tools = False
 
                 async for event in stream:
@@ -1086,12 +1149,27 @@ class AgentApp(App[None]):
                             indicator_live = False
                         if thinking is not None:
                             thinking.finish(duration=None)
-                        # One shared "Writing tools" shimmer while arguments
-                        # stream; per-call blocks appear once args are complete.
+                        # One shared "Writing <tool>" shimmer while arguments
+                        # stream; per-call blocks appear once args are
+                        # complete. The label follows whichever call is
+                        # being written next.
                         pending_writes += 1
+                        stream_args[event.call_id] = ""
+                        stream_names[event.call_id] = event.name
                         if writing is None:
-                            writing = ToolWritingIndicator()
+                            writing = ToolWritingIndicator(event.name)
                             await chat.mount(writing)
+                        else:
+                            writing.set_tool(event.name)
+                    elif isinstance(event, ToolCallArgumentsDelta):
+                        name = stream_names.get(event.call_id)
+                        if name is None:
+                            continue
+                        stream_args[event.call_id] += event.text
+                        if writing is not None and name == "write_file" and writing.tool_name == "write_file":
+                            loc = _write_file_loc(stream_args[event.call_id])
+                            if loc is not None:
+                                writing.set_loc(loc)
                     elif isinstance(event, ToolCallArgumentsDone):
                         block = ToolCallBlock(event.call_id, event.name)
                         block.append_arguments(event.arguments_json)
@@ -1256,14 +1334,15 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"{label}: {counts}"))
 
     async def _maybe_auto_compact(self) -> None:
-        """End-of-turn hook for /auto_compact: compact at 90% context.
+        """End-of-turn hook for /auto_compact: compact at the profile's
+        auto_compact_threshold of the context window.
 
         Runs only at a turn boundary, so there are no pending tool calls to
         break pairing. The context estimate matches the status bar's
         (last round's prompt + cumulative output)."""
         if not self.auto_compact:
             return
-        if self.last_in + self.total_out < 0.9 * self.profile.max_context:
+        if self.last_in + self.total_out < self.profile.auto_compact_threshold * self.profile.max_context:
             return
         try:
             await self._run_compaction()

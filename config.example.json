@@ -10,7 +10,9 @@
       "shown_name": "GPT-4.1",
       "max_context": 128000,
       "cot_strength": "medium",
-      "keep_reasoning": true
+      "keep_reasoning": true,
+      "auto_compact": true,
+      "auto_compact_threshold": 0.9
     },
     {
       "name": "deepseek",

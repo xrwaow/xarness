@@ -393,6 +393,75 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("/accept: no change tracking" in e for e in errors))
             self.assertTrue(any("/reject: no change tracking" in e for e in errors))
 
+    async def test_delete_reverts_changes_and_removes_session(self):
+        """Slash /delete restores the workspace to the baseline, removes the
+        saved session file, and starts a fresh session."""
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script)
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            (info.workspace / "app.py").write_text("un-accepted edit\n")
+            (info.workspace / "created.txt").write_text("new\n")
+            # The turn's completion persisted the session.
+            self.assertTrue(session_store.session_path("testsess").exists())
+
+            app._handle_slash_command("/delete")
+            await self.wait_until(
+                lambda: any("deleted: 2 file(s)" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            self.assertFalse((info.workspace / "created.txt").exists())
+            self.assertFalse(session_store.session_path("testsess").exists())
+            # Fresh session: empty conversation, new session name.
+            self.assertEqual(
+                [m for m in app.controller.conversation.messages if m.role != "system"],
+                [],
+            )
+            self.assertNotEqual(app.session_name, "testsess")
+            summary = app.query_one("#diff-summary", DiffSummary)
+            self.assertFalse(summary.has_class("visible"))
+
+    async def test_delete_without_tracking_still_removes_session(self):
+        """No git tracking: /delete skips the revert but still removes the
+        session file and starts fresh."""
+        app, _info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app.git_info = None
+        app.controller.git_info = None
+        session_store.save_session("testsess", "m", Conversation())
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/delete")
+            await self.wait_until(
+                lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+            self.assertFalse(session_store.session_path("testsess").exists())
+            self.assertNotEqual(app.session_name, "testsess")
+            notices = [str(n.content) for n in app.query(NoticeLine)]
+            self.assertTrue(any("saved session removed" in n for n in notices))
+
+    async def test_delete_without_session_file(self):
+        """--no-session (session_name None): /delete still reverts and starts
+        fresh, and says there was no saved session file."""
+        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app.session_name = None
+        (info.workspace / "app.py").write_text("un-accepted edit\n")
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/delete")
+            await self.wait_until(
+                lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            notices = [str(n.content) for n in app.query(NoticeLine)]
+            self.assertTrue(any("no saved session file" in n for n in notices))
+
     # ------------------------------------------------------------------
     # resume reconnection
 

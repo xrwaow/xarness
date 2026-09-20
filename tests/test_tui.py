@@ -380,6 +380,10 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             return None if t is None else t.plain
 
         self.assertEqual(detail("read_file", '{"path": "src/app.py"}'), " src/app.py")
+        self.assertEqual(
+            detail("read_file", '{"path": "index.html", "start_line": 270, "end_line": 300}'),
+            " index.html [start_line=270, end_line=300]",
+        )
         self.assertEqual(detail("write_file", '{"path": "new.py"}'), " new.py")
         self.assertEqual(detail("edit_file", '{"path": "f.py", "edits": []}'), " f.py")
         self.assertEqual(
@@ -393,7 +397,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(detail("glob", '{"glob": "**/*.py", "path": "src"}'), " **/*.py, src")
         self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
-        # ask renders as a plain "Ran ask" — no argument summary.
+        # ask renders as a plain "ask" — no argument summary.
         self.assertIsNone(detail("ask", '{"questions": ["Which one?", "Why?"]}'))
         self.assertEqual(
             detail("compact", "", "compacted: 12,000 → 3,400 tokens (freed 8,600)\nsummary"),
@@ -537,7 +541,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                     )
 
     async def test_parallel_tool_calls_show_single_writing_indicator(self) -> None:
-        """While args stream: one 'Writing tools' shimmer, no per-call blocks.
+        """While args stream: one 'Writing <tool>' shimmer, no per-call blocks.
         Blocks appear (and the indicator leaves) once args are done."""
         app, client = make_app(
             [
@@ -566,11 +570,127 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(len(app.query(ToolCallBlock)), 1)
             self.assertEqual(len(app.query(ToolWritingIndicator)), 1)
+            # The label names the call still being written (call_2).
+            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "Writing noop")
 
             await wait_until_idle(app)
             # Indicator gone; both blocks settled.
             self.assertEqual(len(app.query(ToolWritingIndicator)), 0)
             self.assertEqual(len(app.query(ToolCallBlock)), 2)
+
+    async def test_write_file_loc_counts_partial_content(self) -> None:
+        """write_file's +LOC counts complete JSON exactly and partial JSON
+        (mid-stream) from the escaped newlines seen so far."""
+        from xarness.tui.widgets import _write_file_loc
+
+        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb\\nc"}'), 3)
+        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb"}'), 2)
+        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb\\n'), 3)
+        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "'), 0)
+        self.assertEqual(_write_file_loc('{"path": "g.py"}'), None)
+        # An escaped quote inside content doesn't end the string early.
+        self.assertEqual(_write_file_loc('{"content": "a\\"b\\nc"}'), 2)
+
+    async def test_write_file_streams_loc_in_writing_indicator(self) -> None:
+        """While write_file's content streams, the shared indicator grows a
+        live '+LOC' count; the label follows the next tool call after it."""
+        app, client = make_app(
+            [
+                ToolCallStarted("call_1", "write_file"),
+                ToolCallArgumentsDelta("call_1", '{"path": "g.py", "content": "a\\nb\\n'),
+                ToolCallArgumentsDelta("call_1", 'c\\nd"}'),
+                ToolCallArgumentsDone(
+                    "call_1", "write_file", '{"path": "g.py", "content": "a\\nb\\nc\\nd"}'
+                ),
+                TurnComplete(has_tool_calls=True),
+            ],
+            delay=0.3,
+        )
+        client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=Usage(5, 2))]
+        ]
+        async with app.run_test() as pilot:
+            app._submit("go")
+
+            # Wait for the first content fragment: 2 escaped newlines so far.
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                indicators = app.query(ToolWritingIndicator)
+                if indicators and "+3 LOC" in indicators[0]._label():
+                    break
+            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "Writing write_file +3 LOC")
+
+            await wait_until_idle(app)
+            self.assertEqual(len(app.query(ToolWritingIndicator)), 0)
+
+    async def test_settled_summary_drops_ran_and_colors_edit_counts(self) -> None:
+        """Settled blocks read 'read_file index.html [start_line=…]' with no
+        'Ran' verb, and edit_file's +N -M counts get the diff colors."""
+        from xarness import theme
+        from xarness.tui.widgets import _header_detail_text
+
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            log = app.query_one("#chat-log", VerticalScroll)
+            block = ToolCallBlock("c1", "read_file")
+            await log.mount(block)
+            block.append_arguments('{"path": "index.html", "start_line": 270, "end_line": 300}')
+            block.set_result(ToolCallStatus.CALL_SUCCEEDED, output="data", header="index.html")
+            await pilot.pause()
+
+            summary = block.query_one(".toolcall-summary-text", Static).content
+            self.assertEqual(summary.plain, "read_file index.html [start_line=270, end_line=300]")
+
+            detail = _header_detail_text("edit_file", "+3 -1 src/app.py")
+            self.assertEqual(detail.plain, " +3 -1 src/app.py")
+            spans = {(detail.plain[s.start:s.end], str(s.style)) for s in detail.spans}
+            self.assertIn(("+3", theme.PALETTE["diff_add"]), spans)
+            self.assertIn(("-1", theme.PALETTE["diff_del"]), spans)
+
+    async def test_auto_compact_uses_configured_threshold(self) -> None:
+        """_maybe_auto_compact fires at the profile's auto_compact_threshold
+        (from config), not a hardcoded 90%; it stays off unless enabled."""
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            self.assertFalse(app.auto_compact)  # config default: off
+            app.profile = app.profile.model_copy(
+                update={"auto_compact": True, "auto_compact_threshold": 0.1}
+            )
+            app.auto_compact = True
+            calls: list[str] = []
+
+            async def fake_compact() -> str:
+                calls.append("compact")
+                return "compacted: 900 → 90 tokens (freed 810)"
+
+            app._run_compaction = fake_compact  # type: ignore[method-assign]
+
+            # 100/1000 = 10% ≥ threshold: compaction fires.
+            app.last_in = 100
+            await app._maybe_auto_compact()
+            self.assertEqual(calls, ["compact"])
+
+            # 50/1000 = 5% < threshold: nothing happens.
+            calls.clear()
+            app.last_in = 50
+            await app._maybe_auto_compact()
+            self.assertEqual(calls, [])
+
+    async def test_tab_toggles_mode(self) -> None:
+        """Tab in the input toggles plan/write mode, same as /mode."""
+        from xarness.prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
+
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertEqual(app.mode, "plan")
+            self.assertIn("PLAN mode", app.controller.conversation.messages[0].content)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertEqual(app.mode, "write")
+            self.assertIn("WRITE mode", app.controller.conversation.messages[0].content)
 
     async def test_ask_tool_returns_user_answers(self) -> None:
         """The ask tool shows questions one at a time in the AskBar; answers

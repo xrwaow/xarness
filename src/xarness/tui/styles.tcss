@@ -142,7 +142,7 @@ ToolCallBlock {
 }
 
 .toolcall-summary-text {
-    color: $c-muted;
+    color: $c-text;
 }
 
 .toolcall-row {
