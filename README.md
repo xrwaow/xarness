@@ -236,7 +236,8 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   Whatever the model had already written is kept — saved up to the last
   non-thinking block, so a trailing run of reasoning that never produced an
   answer is dropped — and a turn interrupted before any answer leaves the
-  history untouched.
+  history untouched. A round that fails mid-stream (provider or transport
+  error) keeps its partial answer the same way.
 - **Thoughts**: after a turn with reasoning, a collapsed `▸ Thought for Xs`
   indicator stays in the scrollback; `Ctrl+T` or a click expands it inline.
   Reasoning text is kept in the conversation history regardless of visibility.

@@ -15,6 +15,7 @@ from xarness.events import (
     ContentDelta,
     ProcessingStarted,
     ReasoningDelta,
+    StreamError,
     ToolCallArgumentsDelta,
     ToolCallArgumentsDone,
     ToolCallStarted,
@@ -1048,6 +1049,27 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                 [m.role for m in app.controller.conversation.messages],
                 ["system", "user"],
             )
+
+    async def test_stream_error_saves_the_partial_answer(self) -> None:
+        """A round that ends with a stream error keeps its partial answer, the
+        same as a user interrupt — not just a cancellation."""
+        app, _client = make_app([
+            ContentDelta("half an answer"),
+            StreamError("boom"),
+        ])
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages],
+                ["system", "user", "assistant"],
+            )
+            self.assertEqual(
+                app.controller.conversation.messages[-1].content, "half an answer"
+            )
+            errors = [str(e.content) for e in app.query(ErrorLine)]
+            self.assertTrue(any("boom" in e for e in errors))
 
     async def test_compact_tool_reports_token_counts(self) -> None:
         app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])

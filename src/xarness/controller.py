@@ -179,15 +179,17 @@ class ChatController:
         )
 
     def save_interrupted_round(self) -> bool:
-        """Persist the partial round a cancelled turn was streaming.
+        """Persist the partial round a turn was streaming when it ended early.
 
-        Keeps the assistant text and reasoning that had arrived, but drops a
-        trailing reasoning-only segment — thinking that never led to an answer
-        — and any half-streamed tool call (it has no result to pair with, and
-        an orphaned tool call would be rejected on the next request). Returns
+        Called both when the user interrupts a turn and when a round ends
+        without completing (a provider or transport error). Keeps the
+        assistant text and reasoning that had arrived, but drops a trailing
+        reasoning-only segment — thinking that never led to an answer — and
+        any half-streamed tool call (it has no result to pair with, and an
+        orphaned tool call would be rejected on the next request). Returns
         True when a message was added; an empty or reasoning-only round adds
-        nothing, so interrupting a turn that had not answered yet leaves the
-        history untouched.
+        nothing, so a turn that had not answered yet leaves the history
+        untouched.
         """
         partial = self._partial_round
         self._partial_round = None

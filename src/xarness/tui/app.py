@@ -1260,6 +1260,14 @@ class AgentApp(App[None]):
                 if indicator_live:
                     await self._dismiss_indicator(indicator)
 
+                # A round that ended without finishing — a provider or
+                # transport error, say — still streamed something. Keep it
+                # (up to the last non-thinking block) instead of dropping the
+                # partial answer; a completed round has nothing partial left,
+                # so this is a no-op then.
+                if self.controller.save_interrupted_round():
+                    self._persist_git_state()
+
                 if not round_has_tools:
                     if not had_stream_error:
                         worked = _format_duration(time.monotonic() - turn_start)
