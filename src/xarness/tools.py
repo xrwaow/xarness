@@ -963,6 +963,7 @@ def build_registry(
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
+            registry.register(_make_grep_tool(sandbox))
             if session is not None:
                 registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         else:
