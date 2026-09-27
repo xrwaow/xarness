@@ -73,14 +73,10 @@ class FakeClient:
             yield event
 
 
-def make_registry(
-    ask_callback=None, compact_callback=None
-) -> ToolRegistry:
-    """Registry for TUI tests: web_search/ask/compact plus a deterministic
-    stub tool ("noop") the scripted tool-call rounds can invoke."""
-    registry = build_registry(
-        None, None, ask_callback=ask_callback, compact_callback=compact_callback
-    )
+def make_registry(ask_callback=None) -> ToolRegistry:
+    """Registry for TUI tests: ask_user plus a deterministic stub tool
+    ("noop") the scripted tool-call rounds can invoke."""
+    registry = build_registry(None, None, ask_callback=ask_callback)
 
     async def _noop(args: dict[str, Any]) -> ToolResult:
         return ToolResult(ok=True, output="ok")
@@ -94,10 +90,8 @@ def make_app(script: list[Any], delay: float = 0.01) -> tuple[AgentApp, FakeClie
     controller = ChatController(PROFILE, "test-key", client=client)
     app = AgentApp(PROFILE, "test-key", controller=controller)
     # Swap in a registry with a deterministic stub tool: the default one has
-    # no sandbox tools here, and web_search would hit the network.
-    registry = make_registry(
-        ask_callback=app._ask_user, compact_callback=app._compact_conversation
-    )
+    # no sandbox tools here.
+    registry = make_registry(ask_callback=app._ask_user)
     app.tool_registry = registry
     app.controller.tools = registry
     return app, client
@@ -402,8 +396,8 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(detail("glob", '{"glob": "**/*.py", "path": "src"}'), " **/*.py, src")
         self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
-        # ask renders as a plain "ask" — no argument summary.
-        self.assertIsNone(detail("ask", '{"questions": ["Which one?", "Why?"]}'))
+        # ask_user renders as a plain "ask_user" — no argument summary.
+        self.assertIsNone(detail("ask_user", '{"questions": ["Which one?", "Why?"]}'))
         self.assertEqual(
             detail("compact", "", "compacted: 12,000 → 3,400 tokens (freed 8,600)\nsummary"),
             " 12,000 → 3,400 tokens (freed 8,600)",
@@ -702,9 +696,9 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         typed into the normal chat input become the tool result."""
         app, client = make_app(
             [
-                ToolCallStarted("call_1", "ask"),
+                ToolCallStarted("call_1", "ask_user"),
                 ToolCallArgumentsDone(
-                    "call_1", "ask", '{"questions": ["Which db?", "Confirm?"]}'
+                    "call_1", "ask_user", '{"questions": ["Which db?", "Confirm?"]}'
                 ),
                 TurnComplete(has_tool_calls=True),
             ],
@@ -746,9 +740,9 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         """Esc while a question is pending skips it; the turn keeps running."""
         app, client = make_app(
             [
-                ToolCallStarted("call_1", "ask"),
+                ToolCallStarted("call_1", "ask_user"),
                 ToolCallArgumentsDone(
-                    "call_1", "ask", '{"questions": ["Which db?"]}'
+                    "call_1", "ask_user", '{"questions": ["Which db?"]}'
                 ),
                 TurnComplete(has_tool_calls=True),
             ],
@@ -1071,7 +1065,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             errors = [str(e.content) for e in app.query(ErrorLine)]
             self.assertTrue(any("boom" in e for e in errors))
 
-    async def test_compact_tool_reports_token_counts(self) -> None:
+    async def test_manual_compact_reports_token_counts(self) -> None:
         app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
@@ -1080,7 +1074,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             client.script = [
                 ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))
             ]
-            result = await app._compact_conversation()
+            result = await app._run_compaction()
 
             # Before/after on one line, then the summary itself.
             first_line, _, rest = result.partition("\n")

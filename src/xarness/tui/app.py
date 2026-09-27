@@ -145,7 +145,7 @@ class AgentApp(App[None]):
         self.mode: Literal["plan", "write"] = "write"
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
-            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
+            ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
         self.controller = controller or ChatController(
@@ -370,7 +370,7 @@ class AgentApp(App[None]):
         self.mode = new_mode
         self.tool_registry = build_registry(
             self.sandbox, self.sandbox_session, mode=new_mode,
-            ask_callback=self._ask_user, compact_callback=self._compact_conversation,
+            ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
         self.controller.tools = self.tool_registry  # rewire to the new registry
@@ -914,6 +914,19 @@ class AgentApp(App[None]):
         self.profile_name = name
         self._refresh_status()
 
+    async def _mount_spaced(
+        self,
+        chat: "VerticalScroll",
+        widget: "ThinkingBlock | AssistantMessage",
+    ) -> None:
+        """Mount a cot/assistant block, keeping a blank line above it when it
+        directly follows tool call blocks (which carry no spacing of their
+        own)."""
+        children = chat.children
+        if children and isinstance(children[-1], ToolCallBlock):
+            widget.add_class("after-tools")
+        await chat.mount(widget)
+
     async def _render_history(self) -> None:
         """Rebuild #chat-log from the conversation.
 
@@ -959,7 +972,7 @@ class AgentApp(App[None]):
         elif message.role == "assistant":
             if message.reasoning:
                 thinking = ThinkingBlock()
-                await chat.mount(thinking)
+                await self._mount_spaced(chat, thinking)
                 thinking.append_reasoning(message.reasoning)
                 thinking.finish(message.reasoning_seconds, estimate_if_unknown=False)
             # Tool-call-only rounds render no AssistantMessage body; an
@@ -967,7 +980,7 @@ class AgentApp(App[None]):
             # "(no output)", matching the live-stream finalize path.
             if message.content or not message.tool_calls:
                 assistant = AssistantMessage()
-                await chat.mount(assistant)
+                await self._mount_spaced(chat, assistant)
                 if message.content:
                     await assistant.append_delta(message.content)
                 await assistant.finalize()
@@ -1223,10 +1236,6 @@ class AgentApp(App[None]):
             ask_bar.hide()
             chat_input.placeholder = INPUT_PLACEHOLDER
 
-    async def _compact_conversation(self) -> str:
-        """Callback for the compact tool: summarize + truncate the history."""
-        return await self._run_compaction()
-
     @work(group="turn")
     async def _run_turn(self, text: str, user_widget: UserMessage | None = None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tool calls).
@@ -1287,7 +1296,7 @@ class AgentApp(App[None]):
                             indicator_live = False
                             thinking = ThinkingBlock()
                             self._last_thinking = thinking
-                            await chat.mount(thinking)
+                            await self._mount_spaced(chat, thinking)
                         thinking.append_reasoning(event.text)
                     elif isinstance(event, ContentDelta):
                         if assistant is None:
@@ -1297,7 +1306,7 @@ class AgentApp(App[None]):
                             if thinking is not None:
                                 thinking.finish(duration=None)
                             assistant = AssistantMessage()
-                            await chat.mount(assistant)
+                            await self._mount_spaced(chat, assistant)
                         await assistant.append_delta(event.text)
                     elif isinstance(event, ToolCallStarted):
                         if indicator_live:
@@ -1452,7 +1461,7 @@ class AgentApp(App[None]):
 
     @work(group="compact")
     async def _run_manual_compact(self) -> None:
-        """Slash /compact: same compaction the compact tool runs, on demand."""
+        """Slash /compact: run the compaction on demand."""
         self._compacting = True
         try:
             try:
@@ -1484,8 +1493,8 @@ class AgentApp(App[None]):
 
     async def _run_compaction(self) -> str:
         """Compact via the controller and refresh everything that depends on
-        it. Returns the summary, prefixed with the token-count line the
-        compact tool reports ("compacted: N → M tokens (freed K)")."""
+        it. Returns the summary, prefixed with the token-count line
+        ("compacted: N → M tokens (freed K)")."""
         chat = self.query_one("#chat-log", VerticalScroll)
         # A shimmering "Compacting" line while the summarizer runs, so the
         # pause reads as work rather than a hang.

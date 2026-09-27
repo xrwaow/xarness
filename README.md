@@ -13,17 +13,22 @@ When a filesystem sandbox is available, the model gets:
 | Tool | Mode | What it does |
 | --- | --- | --- |
 | `read_file` | plan + write | Read a file (large files return a structural outline; read sections with `start_line`/`end_line`) |
+| `ls` | plan | List a directory's immediate entries (ignore rules applied) |
+| `glob` | plan | Find files by glob pattern |
+| `grep` | plan | Search file contents by regex |
 | `write_file` | write | Create or overwrite a file |
 | `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
 | `run_bash` | write | Run a shell command in a persistent sandboxed shell (cwd, env vars, and background jobs survive across calls) |
-| `web_search` | always | Search the web via the Brave Search API (needs `BRAVE_API_KEY` set) — runs in the harness process, never inside the sandbox |
-| `ask` | always | Ask you a clarifying question in the TUI |
-| `compact` | always | Summarize and truncate the conversation to reclaim context |
+| `ask_user` | plan + write | Ask you a clarifying question in the TUI |
+
+`web_search` is disabled for now (the implementation isn't good enough to
+ship). Compaction is not a tool the model can call — it's the `/compact`
+command or automatic (`auto_compact`).
 
 Switch between modes with `/mode`:
 
-- **plan** — read-only: the model can inspect files and search the web, but
-  cannot edit or run state-changing commands.
+- **plan** — read-only: the model can inspect files (`read_file`, `ls`,
+  `glob`, `grep`), but cannot edit or run state-changing commands.
 - **write** — the model can read, edit, and run shell commands.
 
 ### Sandbox
@@ -264,7 +269,7 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
   approximate local estimate is shown. The status bar keeps running session
   totals and context headroom against `max_context`. Compaction's own
-  summarization round is included in the totals, and the `compact` tool
+  summarization round is included in the totals, and the compaction notice
   reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
 
 ## Layout of the code
@@ -278,7 +283,7 @@ src/xarness/
   controller.py   conversation state + event enrichment (no UI imports)
   conversation.py plain message history, wire-format faithful
   prompts.py      system prompts (general + plan/write mode clauses)
-  tools.py        tool registry: read/write/edit, run_bash, web_search, ask, compact
+  tools.py        tool registry: read/write/edit, run_bash, ls/glob/grep, ask_user
   sandbox.py      bubblewrap sandbox: one-shot file tools + persistent shell
   session_store.py  save/load conversations as JSON, keyed by session name
   file_search.py  bounded filename search backing @-mention autocomplete

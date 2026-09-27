@@ -59,7 +59,7 @@ def _registry_for(
     workspace: Path,
     subtree: str = "",
     git_dir: Path | None = None,
-    mode: str = "write",
+    mode: str = "plan",
 ):
     if shutil.which("bwrap") is None:
         pytest.skip("bwrap not available")
@@ -169,30 +169,35 @@ def test_grep_no_matches_is_ok_not_error(tmp_path) -> None:
 # subtree scoping: the agent's workspace IS the --workspace dir
 
 
-def _scoped_registry(tmp_path):
+def _scoped_registry(tmp_path, mode: str = "plan"):
     repo = _make_repo(tmp_path)
     info, _ = asyncio.run(setup_tracking(repo / "pkg", "sess-scoped"))
-    return repo, _registry_for(
-        info.workspace, subtree=info.subtree, git_dir=info.git_dir,
+    registry = _registry_for(
+        info.workspace, subtree=info.subtree, git_dir=info.git_dir, mode=mode,
     )
+    return repo, info, registry
 
 
 def test_scoped_session_tools_root_at_the_workspace(tmp_path) -> None:
     """With --workspace inside a bigger repo, tool paths are relative to that
     directory: ls lists its entries, and writes land inside it on the host."""
-    repo, registry = _scoped_registry(tmp_path)
+    repo, info, plan_registry = _scoped_registry(tmp_path)
     # ls lists the workspace dir's own entries, not the repo root's.
-    ls = _call(registry, "ls", "{}")
+    ls = _call(plan_registry, "ls", "{}")
     assert ls.ok
     assert "controller.py" in ls.output.splitlines()
     assert "app.py" not in ls.output.splitlines()  # repo root, outside
 
-    # Reads and writes are workspace-relative.
-    read = _call(registry, "read_file", '{"path": "util.py"}')
+    # Reads are workspace-relative.
+    read = _call(plan_registry, "read_file", '{"path": "util.py"}')
     assert read.ok
     assert read.output == "x = 1\n"
 
-    write = _call(registry, "write_file", '{"path": "new.py", "content": "ok = 1\\n"}')
+    # Writes land inside the workspace dir on the host (write mode).
+    write_registry = _registry_for(
+        info.workspace, subtree=info.subtree, git_dir=info.git_dir, mode="write",
+    )
+    write = _call(write_registry, "write_file", '{"path": "new.py", "content": "ok = 1\\n"}')
     assert write.ok
     assert (repo / "pkg" / "new.py").read_text() == "ok = 1\n"
     # Nothing leaked outside the workspace dir.
@@ -200,7 +205,7 @@ def test_scoped_session_tools_root_at_the_workspace(tmp_path) -> None:
 
 
 def test_scoped_session_explore_tools(tmp_path) -> None:
-    _repo, registry = _scoped_registry(tmp_path)
+    _repo, _info, registry = _scoped_registry(tmp_path)
     glob = _call(registry, "glob", '{"glob": "**/*.py"}')
     assert glob.ok
     assert sorted(glob.output.splitlines()) == ["controller.py", "util.py"]

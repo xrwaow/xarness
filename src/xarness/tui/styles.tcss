@@ -23,6 +23,20 @@ Screen {
     margin-bottom: 1;
 }
 
+/* Tool call blocks are spacing-free: they pack tightly against whatever
+   precedes/follows them. Blank lines around a round are owned by the
+   cot/assistant/user messages instead. */
+.msg.toolcall {
+    margin-bottom: 0;
+}
+
+/* A cot/assistant message that directly follows tool call blocks still
+   gets a separating blank line (added by app.py when mounting). */
+AssistantMessage.after-tools,
+ThinkingBlock.after-tools {
+    margin-top: 1;
+}
+
 UserMessage {
     width: 1fr;
     height: auto;

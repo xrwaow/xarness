@@ -3,8 +3,12 @@
 read_file/write_file/edit_file/ls/glob/grep/run_bash execute inside a bwrap
 sandbox (see sandbox.py) scoped to one workspace directory, with no network
 access — run_bash uses a persistent SandboxSession so shell state survives
-across calls within one chat. web_search is the one tool that runs outside
-the sandbox, since it's the only one that needs a real network path.
+across calls within one chat.
+
+Plan mode exposes read_file plus the read-only exploration tools (ls, glob,
+grep); write mode exposes read_file plus the editing tools (write_file,
+edit_file, run_bash). ask_user is available in both modes. web_search is
+disabled for now (see build_registry).
 """
 
 from __future__ import annotations
@@ -12,7 +16,6 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import re
 import shlex
 import shutil
 from collections.abc import Awaitable, Callable
@@ -121,16 +124,18 @@ async def _web_search_handler(args: dict[str, Any]) -> ToolResult:
     return ToolResult(ok=True, output="\n\n".join(lines))
 
 
-web_search_tool = Tool(
-    name="web_search",
-    description="Search the web and return results as text.",
-    parameters_schema={
-        "type": "object",
-        "properties": {"query": {"type": "string", "description": "search query"}},
-        "required": ["query"],
-    },
-    handler=_web_search_handler,
-)
+# web_search is disabled for now: the implementation isn't good enough to
+# ship, so it is not registered in build_registry. Kept here for reference.
+# web_search_tool = Tool(
+#     name="web_search",
+#     description="Search the web and return results as text.",
+#     parameters_schema={
+#         "type": "object",
+#         "properties": {"query": {"type": "string", "description": "search query"}},
+#         "required": ["query"],
+#     },
+#     handler=_web_search_handler,
+# )
 
 
 # Files larger than this return a structural outline instead of contents
@@ -565,8 +570,10 @@ def _make_run_bash_tool(
     )
 
 
-def _make_ask_tool(ask_callback: Callable[[list[str]], Awaitable[list[str] | None]]) -> Tool:
-    """ask: hand questions to the user and return their answers as the result."""
+def _make_ask_user_tool(
+    ask_callback: Callable[[list[str]], Awaitable[list[str] | None]],
+) -> Tool:
+    """ask_user: hand questions to the user and return their answers as the result."""
 
     async def _ask_user(args: dict[str, Any]) -> ToolResult:
         raw = args.get("questions")
@@ -582,7 +589,7 @@ def _make_ask_tool(ask_callback: Callable[[list[str]], Awaitable[list[str] | Non
         return ToolResult(ok=True, output="\n\n".join(pairs))
 
     return Tool(
-        name="ask",
+        name="ask_user",
         description=(
             "Ask the user one or more questions and wait for their answers. "
             "Use when you need a decision, a missing detail, or confirmation "
@@ -603,40 +610,8 @@ def _make_ask_tool(ask_callback: Callable[[list[str]], Awaitable[list[str] | Non
     )
 
 
-def _make_compact_tool(compact_callback: Callable[[], Awaitable[str]]) -> Tool:
-    """compact: summarize the conversation so far to free context window."""
-
-    async def _compact(args: dict[str, Any]) -> ToolResult:
-        # The callback (controller.compact via the app) returns the summary
-        # prefixed with the before/after token counts on the first line.
-        summary = await compact_callback()
-        # The summary's first line carries the token counts
-        # ("compacted: N → M tokens (freed K)\n...") — lift them into the
-        # header so the tool-call header alone shows what compaction bought.
-        match = re.search(
-            r"compacted: ([\d,]+) → ([\d,]+) tokens \(freed ([\d,]+)\)", summary
-        )
-        header = ""
-        if match:
-            before, after, freed = match.groups()
-            header = f"{before} → {after} tokens (freed {freed})"
-        return ToolResult(ok=True, output=summary, header=header)
-
-    return Tool(
-        name="compact",
-        description=(
-            "Compact the conversation: everything before this turn is replaced "
-            "with a short summary, freeing context window. Use when the chat is "
-            "long and earlier details no longer need to be verbatim. The current "
-            "turn is not affected."
-        ),
-        parameters_schema={"type": "object", "properties": {}},
-        handler=_compact,
-    )
-
-
 # ---------------------------------------------------------------------------
-# read-only exploration: ls / glob / grep (available in plan and write mode)
+# read-only exploration: ls / glob / grep (plan mode only)
 
 
 async def _git_ignored_set(sandbox: SandboxConfig, rel_paths: list[str]) -> set[str]:
@@ -966,34 +941,32 @@ def build_registry(
     allow_subagent: bool = True,
     max_calls_per_turn: int | None = None,
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
-    compact_callback: Callable[[], Awaitable[str]] | None = None,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
-    Both modes expose read_file plus the read-only exploration tools (ls,
-    glob, grep); write mode additionally exposes write_file, edit_file, and
-    run_bash. ``ask_callback`` enables the ask tool (prompts the user in the
-    TUI); ``compact_callback`` enables the compact tool (summarizes +
-    truncates the conversation). ``git_guard`` optionally vetoes run_bash
-    commands that would rewrite the user's branch/refs (see gitwork.py).
-    ``allow_subagent`` is reserved for
-    subagent registration in a later phase.
+    Plan mode is read-only: read_file plus the exploration tools (ls, glob,
+    grep). Write mode trades those for the editing tools: read_file,
+    write_file, edit_file, and run_bash. ``ask_user`` is available in both
+    modes when ``ask_callback`` is given. ``git_guard`` optionally vetoes
+    run_bash commands that would rewrite the user's branch/refs (see
+    gitwork.py). ``allow_subagent`` is reserved for subagent registration in a
+    later phase.
     """
     registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
-    registry.register(web_search_tool)
+    # web_search is disabled for now — not implemented well enough to ship.
+    # registry.register(web_search_tool)
     if ask_callback is not None:
-        registry.register(_make_ask_tool(ask_callback))
-    if compact_callback is not None:
-        registry.register(_make_compact_tool(compact_callback))
+        registry.register(_make_ask_user_tool(ask_callback))
     if sandbox is not None:
         registry.register(_make_read_tool(sandbox))  # read_file always available
-        registry.register(_make_ls_tool(sandbox))
-        registry.register(_make_glob_tool(sandbox))
-        registry.register(_make_grep_tool(sandbox))
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
             if session is not None:
                 registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
+        else:
+            registry.register(_make_ls_tool(sandbox))
+            registry.register(_make_glob_tool(sandbox))
+            registry.register(_make_grep_tool(sandbox))
     return registry
