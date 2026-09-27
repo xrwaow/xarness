@@ -18,6 +18,7 @@ from xarness.events import (
     TurnComplete,
     Usage,
 )
+from xarness.gitwork import TurnCheckpoint
 from xarness.tools import ToolResult, build_registry
 
 PROFILE = ProviderProfile(
@@ -521,7 +522,7 @@ def test_compact_then_undo_restores_messages_and_usage() -> None:
     plan = controller.rollback_plan()
     assert plan is not None and plan.compaction_only
     assert plan.user_text == ""
-    assert plan.checkpoint_sha is None
+    assert plan.revert_turns == []  # compaction only: no files reverted
     controller.apply_rollback(plan)
     assert [m.role for m in controller.conversation.messages] == [
         "user", "assistant", "user", "assistant",
@@ -578,13 +579,13 @@ def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:
 
 
 def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
-    """Resumed sessions have no snapshot: fall back to the last user message
-    (its persisted checkpoint sha is used for the worktree revert)."""
+    """Resumed sessions have no snapshot: fall back to the last user message.
+    Its persisted before/after trees drive the file revert."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     controller.conversation.add(Message(role="user", content="old"))
     controller.conversation.add(Message(role="assistant", content="a", usage=Usage(5, 3)))
     controller.conversation.add(
-        Message(role="user", content="last", checkpoint_sha="abc123")
+        Message(role="user", content="last", checkpoint_sha="abc123", after_tree="def456")
     )
     controller.conversation.add(Message(role="assistant", content="b", usage=Usage(9, 4)))
     controller.usage_total = Usage(input_tokens=14, output_tokens=7)
@@ -592,7 +593,7 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     plan = controller.rollback_plan()
     assert plan is not None
     assert plan.user_text == "last"
-    assert plan.checkpoint_sha == "abc123"
+    assert plan.revert_turns == [TurnCheckpoint("abc123", "def456")]
     controller.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == ["old", "a"]
     assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)

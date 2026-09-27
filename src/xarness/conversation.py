@@ -34,8 +34,14 @@ class Message:
     # message (assistant messages only; never sent over the wire).
     usage: Usage | None = None
     # Local-only: git checkpoint tree sha taken when this user message was
-    # sent — the state /undo //retry restore the workspace to.
+    # sent — the workspace state *before* the turn's edits. /undo //retry
+    # reverse the turn's diff (checkpoint_sha → after_tree).
     checkpoint_sha: str | None = None
+    # Local-only: workspace tree sha after the turn's edits finished — the
+    # state the turn produced. Recorded once the turn completes; together
+    # with checkpoint_sha it lets /undo reverse exactly this turn's changes
+    # without disturbing edits made since.
+    after_tree: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None

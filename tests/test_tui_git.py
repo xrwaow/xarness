@@ -17,11 +17,13 @@ from unittest import mock
 
 from textual.widgets import Static
 from xarness import session_store
-from xarness.conversation import Conversation
+from xarness.conversation import Conversation, Message
 from xarness.controller import ChatController
 from xarness.gitwork import GitInfo, diff_stat, setup_tracking
 from xarness.events import ContentDelta, ToolCallArgumentsDone, ToolCallStarted, TurnComplete
+from xarness.tools import Tool, ToolResult
 from xarness.tui.app import AgentApp
+from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.widgets import DiffSummary, ErrorLine, NoticeLine
 from xarness.tui.widgets import ChatInput, UserMessage
 from test_tui import PROFILE, make_registry
@@ -82,14 +84,37 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "init")
 
-    async def make_git_app(self, script: list[Any]) -> tuple[AgentApp, GitInfo]:
-        """App bound to the test repo with direct-write change tracking."""
+    async def make_git_app(
+        self, script: list[Any], edits: dict[str, str | None] | None = None
+    ) -> tuple[AgentApp, GitInfo]:
+        """App bound to the test repo with direct-write change tracking.
+
+        ``edits`` maps workspace-relative paths to content to write when the
+        scripted ``noop`` tool runs with ``{"edit": true}`` — so a test can
+        make the agent's file edits happen *during* a turn (and therefore be
+        attributed to it) rather than writing them out of band.
+        """
         info, _ = await setup_tracking(self.repo, "testsess")
         assert info is not None
         client = FakeClient(script)
         controller = ChatController(PROFILE, "k", client=client)
+        registry = make_registry()
+        if edits is not None:
+            async def _apply(args: dict[str, Any]) -> ToolResult:
+                if args.get("edit"):
+                    for rel, content in edits.items():
+                        path = info.workspace / rel
+                        if content is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            path.write_text(content)
+                return ToolResult(ok=True, output="ok")
+
+            registry.register(Tool(
+                name="noop", description="", parameters_schema={}, handler=_apply
+            ))
         app = AgentApp(
-            PROFILE, "k", controller=controller, tool_registry=make_registry(),
+            PROFILE, "k", controller=controller, tool_registry=registry,
             workspace=info.agent_workspace, session_name="testsess", git_info=info,
         )
         return app, info
@@ -124,15 +149,17 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             ToolCallArgumentsDone("c1", "noop", "{}"),
             TurnComplete(has_tool_calls=True),
         ]
-        app, info = await self.make_git_app(script)
+        app, info = await self.make_git_app(
+            script, edits={"app.py": "line1\nline2\nline3\nline4\n"}
+        )
         client = app.controller._client
-        # Queue: turn-1 final answer, then turn-2's tool round + final answer
-        # (a turn only recomputes the summary when it ran tools).
+        # Queue: turn-1 final answer, then turn-2's tool round (which edits)
+        # + final answer (a turn only recomputes the summary when it ran tools).
         client.next_scripts = [
             [ContentDelta("done"), TurnComplete(usage=None)],
             [
                 ToolCallStarted("c2", "noop"),
-                ToolCallArgumentsDone("c2", "noop", "{}"),
+                ToolCallArgumentsDone("c2", "noop", '{"edit": true}'),
                 TurnComplete(has_tool_calls=True),
             ],
             [ContentDelta("done"), TurnComplete(usage=None)],
@@ -147,9 +174,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             await self.wait_until(lambda: not app._turn_busy)
             self.assertFalse(summary.has_class("visible"))
 
-            # The agent edits a file in the workspace; next tool turn the
-            # summary must appear with correct counts.
-            (info.workspace / "app.py").write_text("line1\nline2\nline3\nline4\n")
+            # The agent edits a file in the workspace during the next tool
+            # turn; the summary must appear, attributed to the agent.
             await pilot.press("a", "g", "a", "i", "n", "enter")
             await self.wait_until(lambda: not app._turn_busy)
 
@@ -168,15 +194,20 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             del_text = str(rows.first().query_one(".diff-file-del").content)
             self.assertIn("+2", add_text)
             self.assertIn("-0", del_text)
+            # Agent-caused: tagged as such, not as drift.
+            source = str(rows.first().query_one(".diff-file-source").content)
+            self.assertEqual(source, "agent")
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\nline3\nline4\n")
 
     async def test_diff_content_renders_requested_diff(self):
         script = [
             ToolCallStarted("c1", "noop"),
-            ToolCallArgumentsDone("c1", "noop", "{}"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
             TurnComplete(has_tool_calls=True),
         ]
-        app, info = await self.make_git_app(script)
-        (info.workspace / "app.py").write_text("edited\n")
+        app, info = await self.make_git_app(script, edits={"app.py": "edited\n"})
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
         async with app.run_test() as pilot:
             await pilot.press("g", "o", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -196,9 +227,17 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(content.has_class("show"))
 
     async def test_slash_diff_toggles_panel_and_per_file_diff(self):
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.workspace / "app.py").write_text("agent edit\n")
-        (info.workspace / "new.py").write_text("brand new\n")
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(
+            script, edits={"app.py": "agent edit\n", "new.py": "brand new\n"}
+        )
+        app.controller._client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=None)]
+        ]
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -232,9 +271,17 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         """esc #1 minimizes an open diff (list stays up, row stays highlighted,
         focus moves to the list); arrows + enter navigate/open from there;
         esc #2 collapses the list back to the bare summary line."""
-        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
-        (info.workspace / "app.py").write_text("agent edit\n")
-        (info.workspace / "new.py").write_text("brand new\n")
+        app, info = await self.make_git_app(
+            [
+                ToolCallStarted("c1", "noop"),
+                ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
+                TurnComplete(has_tool_calls=True),
+            ],
+            edits={"app.py": "agent edit\n", "new.py": "brand new\n"},
+        )
+        app.controller._client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=None)]
+        ]
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
             await self.wait_until(lambda: not app._turn_busy)
@@ -393,31 +440,32 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("/accept: no change tracking" in e for e in errors))
             self.assertTrue(any("/reject: no change tracking" in e for e in errors))
 
-    async def test_delete_reverts_changes_and_removes_session(self):
-        """Slash /delete restores the workspace to the baseline, removes the
-        saved session file, and starts a fresh session."""
+    async def test_delete_leaves_workspace_untouched(self):
+        """Slash /delete is pure bookkeeping: it removes the saved session file
+        and starts a fresh session, but never touches workspace files."""
         script = [
             ToolCallStarted("c1", "noop"),
-            ToolCallArgumentsDone("c1", "noop", "{}"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
             TurnComplete(has_tool_calls=True),
         ]
-        app, info = await self.make_git_app(script)
+        app, info = await self.make_git_app(
+            script, edits={"app.py": "agent edit\n", "created.txt": "new\n"}
+        )
         client = app.controller._client
         client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
-            (info.workspace / "app.py").write_text("un-accepted edit\n")
-            (info.workspace / "created.txt").write_text("new\n")
             # The turn's completion persisted the session.
             self.assertTrue(session_store.session_path("testsess").exists())
 
             app._handle_slash_command("/delete")
             await self.wait_until(
-                lambda: any("deleted: 2 file(s)" in str(n.content) for n in app.query(NoticeLine))
+                lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
             )
 
-            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
-            self.assertFalse((info.workspace / "created.txt").exists())
+            # The agent's edits survive: /delete must not revert the workspace.
+            self.assertEqual((info.workspace / "app.py").read_text(), "agent edit\n")
+            self.assertEqual((info.workspace / "created.txt").read_text(), "new\n")
             self.assertFalse(session_store.session_path("testsess").exists())
             # Fresh session: empty conversation, new session name.
             self.assertEqual(
@@ -425,8 +473,10 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
                 [],
             )
             self.assertNotEqual(app.session_name, "testsess")
+            # The surviving edits are still visible as drift against the old
+            # baseline — /delete did not revert or re-baseline anything.
             summary = app.query_one("#diff-summary", DiffSummary)
-            self.assertFalse(summary.has_class("visible"))
+            self.assertTrue(summary.has_class("visible"))
 
     async def test_delete_without_tracking_still_removes_session(self):
         """No git tracking: /delete skips the revert but still removes the
@@ -447,18 +497,18 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("saved session removed" in n for n in notices))
 
     async def test_delete_without_session_file(self):
-        """--no-session (session_name None): /delete still reverts and starts
-        fresh, and says there was no saved session file."""
+        """--no-session (session_name None): /delete starts fresh, reports no
+        saved session file, and leaves the workspace untouched."""
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         app.session_name = None
-        (info.workspace / "app.py").write_text("un-accepted edit\n")
+        (info.workspace / "app.py").write_text("manual edit\n")
         async with app.run_test() as pilot:
             app._handle_slash_command("/delete")
             await self.wait_until(
                 lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
             )
 
-            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            self.assertEqual((info.workspace / "app.py").read_text(), "manual edit\n")
             notices = [str(n.content) for n in app.query(NoticeLine)]
             self.assertTrue(any("no saved session file" in n for n in notices))
 
@@ -484,6 +534,11 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.git_info.workspace, info.workspace)
             self.assertEqual(app.git_info.baseline_tree, info.baseline_tree)
+            # The workspace changed outside the session while it was closed:
+            # the harness surfaces it and asks, rather than deciding.
+            await self.wait_until(lambda: isinstance(app.screen, ConfirmScreen))
+            await pilot.press("n")  # keep tracking against the last known state
+            await pilot.pause()
             summary = app.query_one("#diff-summary", DiffSummary)
             self.assertTrue(summary.has_class("visible"))
             text = str(app.query_one("#diff-summary-text").content)
@@ -524,22 +579,21 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
     async def test_undo_reverts_file_edits_and_restores_input(self):
         script = [
             ToolCallStarted("c1", "noop"),
-            ToolCallArgumentsDone("c1", "noop", "{}"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
             TurnComplete(has_tool_calls=True),
         ]
-        app, info = await self.make_git_app(script)
+        app, info = await self.make_git_app(
+            script, edits={"app.py": "agent edit\n", "created.txt": "new\n"}
+        )
         client = app.controller._client
         client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
-            # What the turn's tools did: edit a tracked file, create a new one.
-            (info.workspace / "app.py").write_text("agent edit\n")
-            (info.workspace / "created.txt").write_text("new\n")
 
             app._handle_slash_command("/undo")
             await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
 
-            # File state restored to the turn's checkpoint.
+            # File state restored to before the turn.
             self.assertEqual(
                 (info.workspace / "app.py").read_text(), "line1\nline2\n"
             )
@@ -557,16 +611,16 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
     async def test_retry_reverts_file_edits_and_resends(self):
         script = [
             ToolCallStarted("c1", "noop"),
-            ToolCallArgumentsDone("c1", "noop", "{}"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
             TurnComplete(has_tool_calls=True),
         ]
-        app, info = await self.make_git_app(script)
+        app, info = await self.make_git_app(
+            script, edits={"app.py": "agent edit\n", "created.txt": "new\n"}
+        )
         client = app.controller._client
         client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
         async with app.run_test() as pilot:
             await self.run_simple_turn(app, pilot)
-            (info.workspace / "app.py").write_text("agent edit\n")
-            (info.workspace / "created.txt").write_text("new\n")
             client.next_scripts.append(
                 [ContentDelta("second answer"), TurnComplete(usage=None)]
             )
@@ -591,6 +645,95 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
                 ["hi", "second answer"],
             )
             self.assertEqual(len(app.query(UserMessage)), 1)
+
+    async def test_undo_with_no_agent_edits_is_a_noop_on_files(self):
+        """A turn that changed no files (the agent hasn't written anything
+        yet): /undo rolls back the conversation and leaves the workspace
+        alone — it must not fall back to reverting the baseline."""
+        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            (info.workspace / "manual.txt").write_text("manual edit\n")
+
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+
+            self.assertEqual(
+                (info.workspace / "manual.txt").read_text(), "manual edit\n"
+            )
+            self.assertEqual(
+                [m.role for m in app.controller.conversation.messages], ["system"]
+            )
+
+    async def test_undo_without_reversible_turns_leaves_files_alone(self):
+        """A turn with no after-tree (e.g. a legacy resumed turn) is not
+        reversible: /undo rolls back the conversation and touches no files."""
+        app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
+        app.controller.conversation.add(
+            Message(role="user", content="did nothing", checkpoint_sha=info.baseline_tree)
+        )
+        app.controller.conversation.add(Message(role="assistant", content="ok"))
+        (info.workspace / "manual.txt").write_text("manual edit\n")
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "did nothing")
+
+            self.assertEqual(
+                (info.workspace / "manual.txt").read_text(), "manual edit\n"
+            )
+            notices = [str(n.content) for n in app.query(NoticeLine)]
+            self.assertTrue(any("no file edits to revert" in n for n in notices))
+
+    async def test_undo_keeps_manual_edits_made_after_the_turn(self):
+        """Undo reverses only the turn's own edits: a manual edit to an
+        unrelated file made after the turn survives."""
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script, edits={"app.py": "agent edit\n"})
+        app.controller._client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=None)]
+        ]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            # A manual edit made after the turn — not part of it.
+            (info.workspace / "notes.txt").write_text("my notes\n")
+
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            self.assertEqual((info.workspace / "notes.txt").read_text(), "my notes\n")
+
+    async def test_undo_conflict_reports_and_leaves_workspace_untouched(self):
+        """A manual edit on the same lines the turn changed conflicts: /undo
+        reports the conflict and changes neither files nor conversation."""
+        script = [
+            ToolCallStarted("c1", "noop"),
+            ToolCallArgumentsDone("c1", "noop", '{"edit": true}'),
+            TurnComplete(has_tool_calls=True),
+        ]
+        app, info = await self.make_git_app(script, edits={"app.py": "agent change\n"})
+        app.controller._client.next_scripts = [
+            [ContentDelta("done"), TurnComplete(usage=None)]
+        ]
+        async with app.run_test() as pilot:
+            await self.run_simple_turn(app, pilot)
+            (info.workspace / "app.py").write_text("manual change\n")
+
+            app._handle_slash_command("/undo")
+            await self.wait_until(
+                lambda: any("conflict" in str(e.content) for e in app.query(ErrorLine))
+            )
+
+            # The workspace is untouched and the turn is still in the history.
+            self.assertEqual((info.workspace / "app.py").read_text(), "manual change\n")
+            self.assertTrue(any(
+                m.role == "assistant" for m in app.controller.conversation.messages
+            ))
+            self.assertEqual(app.query_one(ChatInput).text, "")
 
     async def test_user_files_are_visible_to_the_agent_immediately(self):
         """Direct-write mode: files the user adds mid-session are in the
@@ -624,6 +767,37 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
                     "could not be reverted" in str(n.content)
                     for n in app.query(NoticeLine)
                 )
+            )
+    async def test_resume_drift_accept_rebaselines(self):
+        """Choosing to accept the drift makes the current workspace state the
+        new baseline, clearing /diff without touching files."""
+        info, _ = await setup_tracking(self.repo, "testsess")
+        assert info is not None
+        (self.repo / "app.py").write_text("external edit\n")
+        session_store.save_session("testsess", "m", Conversation(), git=info.to_block())
+
+        client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
+        app = AgentApp(
+            PROFILE, "k", controller=ChatController(PROFILE, "k", client=client),
+            session_name="testsess",
+        )
+        async with app.run_test() as pilot:
+            await app._on_session_selected("testsess")
+            await pilot.pause()
+            await self.wait_until(lambda: isinstance(app.screen, ConfirmScreen))
+            await pilot.press("y")  # accept drift as the new baseline
+            await pilot.pause()
+            await self.wait_until(lambda: not isinstance(app.screen, ConfirmScreen))
+            await pilot.pause()
+
+            # Files are untouched; the baseline now matches them so /diff is
+            # empty again.
+            self.assertEqual((self.repo / "app.py").read_text(), "external edit\n")
+            self.assertNotEqual(app.git_info.baseline_tree, info.baseline_tree)
+            summary = app.query_one("#diff-summary", DiffSummary)
+            self.assertFalse(summary.has_class("visible"))
+            await self.wait_until(
+                lambda: any("drift accepted" in str(n.content) for n in app.query(NoticeLine))
             )
 
 

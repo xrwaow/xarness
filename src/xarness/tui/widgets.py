@@ -1195,6 +1195,12 @@ class DiffSummary(Vertical):
             row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
             directory = f.path.rsplit("/", 1)[0] + "/" if "/" in f.path else ""
             row.mount(Static(Text(directory), classes="diff-file-dir", markup=False))
+            # Source tag: "agent" for a turn's edits, "drift" for changes
+            # made outside the session.
+            source_class = "drift" if "drift" in f.source else "agent"
+            row.mount(Static(
+                Text(f.source), classes=f"diff-file-source {source_class}", markup=False,
+            ))
             if f.is_new:
                 row.mount(Static(Text("new"), classes="diff-file-new", markup=False))
             row.mount(Static(

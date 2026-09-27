@@ -432,6 +432,20 @@ DiffSummary.expanded #diff-body {
     text-style: italic;
 }
 
+.diff-file-source {
+    width: auto;
+    margin-left: 1;
+    text-style: italic;
+}
+
+.diff-file-source.agent {
+    color: $c-muted;
+}
+
+.diff-file-source.drift {
+    color: $c-warning;
+}
+
 .diff-file-add {
     width: auto;
     margin-left: 2;
@@ -480,29 +494,63 @@ DiffSummary.expanded #diff-body {
 }
 
 #confirm-title {
-    color: $c-error;
+    color: $c-text;
     text-style: bold;
     margin-bottom: 1;
 }
 
+/* The drift summary: a distinct inset block so the "what changed" detail
+   reads apart from the question, with its own scroll for long lists. */
 #confirm-detail {
     color: $c-text;
-    margin-bottom: 1;
-}
-
-#confirm-modal > Input {
-    border: none;
-    background: $c-surface;
-    color: $c-text;
+    background: $c-bg;
+    border-left: thick $c-warning;
     padding: 0 1;
     margin-bottom: 1;
+    max-height: 12;
+    overflow-y: auto;
+    scrollbar-size: 0 0;
 }
 
-#confirm-modal > Input:focus {
+#confirm-buttons {
+    height: auto;
+    align-horizontal: right;
+}
+
+/* Textual ships blue buttons out of the box; recolor every state to the
+   active palette so the modal matches the rest of the UI. */
+#confirm-buttons > Button {
+    width: auto;
+    min-width: 14;
+    margin-left: 2;
+    padding: 0 2;
     border: none;
+    background: $c-border;
+    color: $c-text;
 }
 
-ResumeScreen, PickerScreen {
+#confirm-buttons > Button:hover,
+#confirm-buttons > Button:focus,
+#confirm-buttons > Button.-active {
+    background: $c-highlight;
+    color: $c-bg;
+    text-style: bold;
+}
+
+#confirm-buttons > Button#confirm-yes {
+    background: $c-accent;
+    color: $c-bg;
+    text-style: bold;
+}
+
+#confirm-buttons > Button#confirm-yes:hover,
+#confirm-buttons > Button#confirm-yes:focus,
+#confirm-buttons > Button#confirm-yes.-active {
+    background: $c-accent2;
+    color: $c-bg;
+}
+
+ResumeScreen, PickerScreen, ConfirmScreen {
     align: center middle;
 }
 
@@ -534,10 +582,9 @@ ResumeScreen, PickerScreen {
 }
 
 /* Textual's Input tints the background 5% $foreground while focused, which
-   renders as a darker box inside the surface modal; kill it (search +
-   confirm inputs are focused essentially all the time). */
-#resume-search:focus,
-#confirm-modal > Input:focus {
+   renders as a darker box inside the surface modal; kill it (the resume
+   search is focused essentially all the time). */
+#resume-search:focus {
     background-tint: transparent;
 }
 

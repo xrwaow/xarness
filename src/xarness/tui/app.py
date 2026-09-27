@@ -32,12 +32,14 @@ from ..events import (
 )
 from ..file_search import search_files
 from ..gitwork import (
-    GitInfo, GitWorktreeError, accept_changes, check_blocked_git, diff_stat,
-    git_diff, revert_to_tree, setup_tracking,
+    DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
+    attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
+    setup_tracking, snapshot_tree, tree_diff_stat,
 )
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
+from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -57,6 +59,19 @@ ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 INTERRUPT_ARM_SECONDS = 2.5
 
 
+def _format_drift_detail(stat: DiffStat, limit: int = 6) -> str:
+    """A short plain-text summary of drifted files for the confirm modal."""
+    if not stat.files:
+        return ""
+    lines = []
+    for f in stat.files[:limit]:
+        tag = " (new)" if f.is_new else ""
+        lines.append(f"  {f.path}{tag}  +{f.additions} -{f.deletions}")
+    if len(stat.files) > limit:
+        lines.append(f"  … and {len(stat.files) - limit} more")
+    return "\n".join(lines)
+
+
 # Divider mounted in the chat log at every compaction point (live and on
 # /resume): everything above is history the model no longer sees verbatim.
 COMPACTED_DIVIDER = (
@@ -72,8 +87,8 @@ SLASH_COMMANDS = [
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
     ("delete", (
-        "delete the current session: revert its file changes, remove the "
-        "saved session file, start a fresh chat"
+        "delete the current session: remove the saved session file and start "
+        "a fresh chat (your files are left exactly as they are)"
     )),
     ("compact", "summarize and truncate the conversation now, freeing context window"),
     ("auto_compact", (
@@ -221,6 +236,12 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(notice))
         # On a resumed session this reconnects the pending-changes summary.
         await self.refresh_diff_summary()
+        # A session loaded before mount (e.g. a future `--session <name>` resume)
+        # may have drifted while it was closed; surface it the same way a
+        # /sessions resume does, rather than deciding for the user.
+        drift = await self._detect_resume_drift()
+        if drift is not None and self.git_info is not None:
+            self._prompt_resume_drift(self.git_info, drift[0], drift[1])
 
     # ------------------------------------------------------------------
     # Status bar
@@ -434,18 +455,32 @@ class AgentApp(App[None]):
                     "compaction undone: pre-compaction history restored"
                 ))
             return
-        sha = self.controller.apply_rollback(plan)
-        reverted = await self.controller.revert_changes(sha)
+        # Reverse the turn's file edits FIRST, against the live workspace.
+        # A conflict aborts the whole undo, leaving both the workspace and
+        # the conversation exactly as they were.
+        label = "retry" if resend else "undo"
+        try:
+            await self.controller.revert_changes(plan.revert_turns)
+        except RevertConflict as exc:
+            self._post_line(ErrorLine(
+                f"/{label} conflict: the turn's changes overlap edits made "
+                f"since — nothing was changed\n{exc}"
+            ))
+            return
+        except (GitWorktreeError, OSError) as exc:
+            self._post_line(ErrorLine(f"/{label} failed: {exc}"))
+            return
+        self.controller.apply_rollback(plan)
         await self._render_history()
         self._sync_totals_from_controller()
         self._refresh_status()
         await self.refresh_diff_summary()
-        if reverted:
-            note = "file edits reverted"
-        elif self.git_info is None:
+        if self.git_info is None:
             note = "no git tracking for this session — file edits could not be reverted"
+        elif not plan.revert_turns:
+            note = "no file edits to revert"
         else:
-            note = "file edits could not be reverted (no checkpoint or git failed)"
+            note = "file edits reverted"
         if resend:
             self._post_line(NoticeLine(f"retrying: {scope} rolled back ({note})"))
             self._submit(plan.user_text)
@@ -484,7 +519,9 @@ class AgentApp(App[None]):
             await widget.clear()
             return
         try:
-            stat = await diff_stat(info)
+            # Attribute each file to its source: agent turns vs. changes made
+            # outside the session (drift).
+            stat = await attributed_diff_stat(info, self.controller.turn_checkpoints())
         except GitWorktreeError:
             await widget.clear()  # tracking broken (e.g. repo gone): stay quiet
             return
@@ -571,19 +608,24 @@ class AgentApp(App[None]):
             )
 
     def _rewrite_checkpoints(self, sha: str) -> None:
-        """Point every turn's checkpoint at ``sha`` (the accepted tree), so
-        /undo //retry can no longer revert file state past an accept."""
+        """Point every turn's checkpoints at ``sha`` (the accepted tree), so
+        /undo //retry can no longer revert file state past an accept: both the
+        before and after tree become the accepted state, making each turn's
+        diff empty."""
         for message in self.controller.conversation.messages:
             if message.role == "user" and message.checkpoint_sha is not None:
                 message.checkpoint_sha = sha
+                message.after_tree = sha
         if self.controller.conversation.undo_snapshot:
             for message in self.controller.conversation.undo_snapshot:
                 if message.role == "user" and message.checkpoint_sha is not None:
                     message.checkpoint_sha = sha
+                    message.after_tree = sha
         if self.controller.conversation.compact_snapshot:
             for message in self.controller.conversation.compact_snapshot:
                 if message.role == "user" and message.checkpoint_sha is not None:
                     message.checkpoint_sha = sha
+                    message.after_tree = sha
 
     def _git_action_preflight(self, label: str) -> GitInfo | None:
         """Shared /accept //reject guards; mounts an error line if blocked."""
@@ -658,26 +700,11 @@ class AgentApp(App[None]):
 
     @work(group="git-action", exclusive=True)
     async def _start_delete(self) -> None:
-        """Slash /delete: end the current session for good — the workspace is
-        restored to the session's baseline (like /reject), the saved session
-        file is removed, and a fresh session starts. (Guarding happens
-        synchronously in the slash-command handler; the worker assumes it
-        passed.)"""
-        info = self.git_info
-        reverted = ""
-        if info is not None:
-            try:
-                stat = await diff_stat(info)
-                await revert_to_tree(info, info.baseline_tree)
-            except GitWorktreeError as exc:
-                # Keep the session file: it's the only record of what changed.
-                self._post_line(ErrorLine(f"/delete failed: {exc}"))
-                return
-            self._rewrite_checkpoints(info.baseline_tree)
-            reverted = (
-                f"{len(stat.files)} file(s) +{stat.additions} -{stat.deletions} reverted"
-                if stat.files else "no file changes to revert"
-            )
+        """Slash /delete: end the current session for good. Deleting a session
+        is pure bookkeeping — the saved session file is removed and a fresh
+        session starts; the workspace is never touched (no revert, no accept).
+        (Guarding happens synchronously in the slash-command handler; the
+        worker assumes it passed.)"""
         deleted = False
         if self.session_name is not None:
             from ..session_store import delete_session
@@ -685,9 +712,11 @@ class AgentApp(App[None]):
         self._start_new_session()
         await self.refresh_diff_summary()
         # Posted after _start_new_session: it wipes the chat log.
-        parts = [reverted] if reverted else []
-        parts.append("saved session removed" if deleted else "no saved session file")
-        self._post_line(NoticeLine(f"deleted: {', '.join(parts)} — started a fresh session"))
+        state = "saved session removed" if deleted else "no saved session file"
+        self._post_line(NoticeLine(
+            f"deleted: {state} — started a fresh session; your files are "
+            "untouched"
+        ))
 
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
@@ -780,11 +809,73 @@ class AgentApp(App[None]):
             # Session predates git tracking. Set up tracking now if possible
             # (same policy as cli.py — including auto-init on a bare directory).
             await self._setup_tracking_for_resume(name, notes, errors)
+        # Workspace changes made outside this session (while it was closed)
+        # are surfaced, not decided on, after the history is re-rendered.
+        drift = await self._detect_resume_drift()
         await self._render_history()
         for note in notes:
             self._post_line(NoticeLine(note))
         for error in errors:
             self._post_line(ErrorLine(error))
+        await self.refresh_diff_summary()
+        if drift is not None and self.git_info is not None:
+            self._prompt_resume_drift(self.git_info, drift[0], drift[1])
+
+    async def _detect_resume_drift(self) -> tuple[str, str] | None:
+        """(last_known, current) when the workspace changed outside this
+        session since it was last open, else None.
+
+        ``last_known`` is the last turn's after-tree, or the baseline when
+        the session has no reversible turns (e.g. an older session saved
+        before after-trees were recorded)."""
+        info = self.git_info
+        if info is None:
+            return None
+        turns = self.controller.turn_checkpoints()
+        last_known = turns[-1].after_tree if turns else info.baseline_tree
+        try:
+            current = await snapshot_tree(info.workspace, info.subtree)
+        except GitWorktreeError:
+            return None
+        if current == last_known:
+            return None
+        return last_known, current
+
+    @work(group="resume-drift", exclusive=True)
+    async def _prompt_resume_drift(self, info: GitInfo, last_known: str, current: str) -> None:
+        """The workspace changed outside this session while it was closed.
+
+        Show what drifted and let the user choose: accept it as the new
+        baseline, or keep tracking against the last known state. Never pick
+        for them."""
+        try:
+            stat = await tree_diff_stat(info, last_known, current)
+        except GitWorktreeError:
+            return
+        detail = _format_drift_detail(stat)
+        choice = await self.push_screen_wait(ConfirmScreen(
+            "Workspace changed outside this session since it was last open:",
+            confirm_label="Accept as baseline",
+            cancel_label="Keep tracking",
+            detail=detail,
+        ))
+        if not choice:
+            self._post_line(NoticeLine(
+                "keeping tracking against the last known state — the drift "
+                "shows up in /diff"
+            ))
+            return
+        try:
+            await accept_changes(info)
+        except GitWorktreeError as exc:
+            self._post_line(ErrorLine(f"could not accept the drift: {exc}"))
+            return
+        self._rewrite_checkpoints(info.baseline_tree)
+        self._persist_git_state()
+        self._post_line(NoticeLine(
+            "drift accepted: the workspace is the new baseline; /diff and "
+            "/undo now measure from here"
+        ))
         await self.refresh_diff_summary()
 
     async def _setup_tracking_for_resume(
@@ -1337,6 +1428,11 @@ class AgentApp(App[None]):
                 self._persist_git_state()
             self._post_line(ErrorLine("interrupted"))
         finally:
+            # Record where the turn left the workspace so /undo //retry can
+            # reverse exactly this turn's diff later (interruptions included),
+            # and persist it for a later /resume.
+            await self.controller.finish_turn()
+            self._persist_git_state()
             gen_bar.remove_class("active")
             self._turn_busy = False
             self._worker = None

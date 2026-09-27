@@ -6,9 +6,11 @@ and no accept/reject step. Git is used purely as an undo log:
 
   - at session start the workspace state is snapshotted as a tree object
     (the session's ``baseline_tree``) — the base /diff measures against
-  - each turn takes another snapshot (a ``checkpoint``), recorded on the
-    turn's user message
-  - /undo and /retry restore the workspace to the turn's checkpoint tree
+  - each turn records two snapshots on its user message: ``checkpoint_sha``
+    (before the turn's edits) and ``after_tree`` (once they finish)
+  - /undo and /retry reverse the turn's own diff (before → after) onto the
+    live workspace with a 3-way merge, so edits made outside the session
+    since the turn are preserved rather than clobbered
 
 Snapshots are built with a throwaway index (``GIT_INDEX_FILE`` pointing at a
 temp file): the user's index, HEAD, and refs are never touched, and no
@@ -36,11 +38,20 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .ignore import DEFAULT_IGNORE_DIRS, DEFAULT_IGNORE_FILE_GLOBS
+
 _GIT_TIMEOUT = 30.0
 
 
 class GitWorktreeError(Exception):
     """A git operation the harness manages failed; surfaced to the user."""
+
+
+class RevertConflict(GitWorktreeError):
+    """A turn's changes overlap unresolvably with edits made since the turn.
+
+    Raised by the revert path so the caller can surface the conflict instead
+    of silently picking a side; the workspace is left untouched."""
 
 
 @dataclass(slots=True)
@@ -93,6 +104,19 @@ class GitInfo:
             subtree=block.get("subtree", ""),
             baseline_tree=block.get("baseline_tree", ""),
         )
+
+
+@dataclass(slots=True)
+class TurnCheckpoint:
+    """One turn's before/after workspace trees.
+
+    ``before_tree`` is the state when the turn's user message was sent,
+    ``after_tree`` the state once the turn's edits finished. Reversing the
+    turn means applying ``before_tree - after_tree`` to the live workspace.
+    """
+
+    before_tree: str
+    after_tree: str
 
 
 # ----------------------------------------------------------------------
@@ -228,6 +252,29 @@ async def snapshot_tree(root: Path, subtree: str = "") -> str:
             pass
 
 
+async def _ensure_default_excludes(git_dir: Path) -> None:
+    """Add xarness's default noise-dir ignores to the repo's local, untracked
+    exclude file (``.git/info/exclude``), so every :func:`snapshot_tree` call
+    skips them exactly like the explore tools already do — without ever
+    touching the user's own ``.gitignore`` or writing anything tracked.
+
+    ``info/exclude`` is git's per-clone, machine-local exclude mechanism (the
+    same category as local git config): it never affects committed history and
+    is never pushed. Idempotent — safe to call every session start.
+    """
+    exclude_file = git_dir / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+    marker = "# xarness: default ignores"
+    if marker in existing:
+        return
+    lines = [marker, *(f"/{d}/" for d in sorted(DEFAULT_IGNORE_DIRS)),
+             *DEFAULT_IGNORE_FILE_GLOBS]
+    exclude_file.write_text(
+        existing.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+
 async def setup_tracking(
     workspace: Path,
     session_id: str,
@@ -264,6 +311,11 @@ async def setup_tracking(
             f"{subtree}/; the rest of the repo is visible to the agent but "
             "read-only"
         )
+    # Make the default noise dirs (node_modules, .venv, caches, …) invisible to
+    # snapshots before the baseline is taken, so even the first snapshot skips
+    # them. Written to the repo's local info/exclude, never the user's
+    # .gitignore.
+    await _ensure_default_excludes(repo.git_common_dir)
     baseline = await snapshot_tree(repo.root, subtree)
     info = GitInfo(
         session_id=session_id,
@@ -284,8 +336,11 @@ async def setup_tracking(
 
 
 async def checkpoint(info: GitInfo) -> str:
-    """Snapshot the workspace's current state so the turn can be rolled back
-    with :func:`revert_to_tree`. Returns the tree sha to restore."""
+    """Snapshot the workspace's current state as a tree sha.
+
+    Used for both halves of a turn's checkpoint: the before-tree taken when
+    its user message is sent, and the after-tree recorded once its edits
+    finish. :func:`revert_turn` reverses the difference."""
     return await snapshot_tree(info.workspace, info.subtree)
 
 
@@ -302,7 +357,7 @@ async def accept_changes(info: GitInfo) -> str:
     return sha
 
 
-async def revert_to_tree(info: GitInfo, tree: str) -> None:
+async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -> None:
     """Restore the workspace to a snapshot tree, discarding every file change
     made since it: modifications, deletions, and newly created files.
 
@@ -314,10 +369,13 @@ async def revert_to_tree(info: GitInfo, tree: str) -> None:
       2. ``read-tree`` + ``checkout-index -f`` write every target-tree file
          back over the working tree (restoring modified and deleted ones).
 
-    Only reverts files — anything run_bash did outside the workspace
-    (installs, background jobs, network calls) is not undone."""
+    ``current`` is the workspace's current snapshot tree, when the caller
+    already has it (e.g. :func:`revert_turn`); passing it skips a redundant
+    re-snapshot. Only reverts files — anything run_bash did outside the
+    workspace (installs, background jobs, network calls) is not undone."""
     root = info.workspace
-    current = await snapshot_tree(root, info.subtree)
+    if current is None:
+        current = await snapshot_tree(root, info.subtree)
 
     # Paths present now but absent in the target: created since the
     # checkpoint. diff-tree current→tree reports them as deletions (D).
@@ -356,6 +414,128 @@ async def revert_to_tree(info: GitInfo, tree: str) -> None:
             pass
 
 
+async def _wrap_commit(root: Path, tree: str, parent: str | None = None) -> str:
+    """Wrap a bare tree sha in a throwaway, unreachable commit object.
+
+    ``git merge-tree`` operates on commit-ish, not bare trees, so a snapshot
+    tree needs a commit wrapper. No ref is created and nothing is reachable
+    from HEAD or any branch — the commit is an unreferenced object in the
+    object store, exactly like the snapshot trees themselves. Identity is
+    supplied via the environment so this works in a repo with no
+    ``user.name``/``user.email`` configured.
+    """
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "xarness",
+        "GIT_AUTHOR_EMAIL": "xarness@localhost",
+        "GIT_COMMITTER_NAME": "xarness",
+        "GIT_COMMITTER_EMAIL": "xarness@localhost",
+    }
+    args = ["commit-tree", tree, "-m", "checkpoint"]
+    if parent:
+        args += ["-p", parent]
+    rc, out, err = await _run_git(args, cwd=root, env=env)
+    if rc != 0:
+        raise GitWorktreeError(f"could not wrap checkpoint: {err.strip()}")
+    return out.strip()
+
+
+_CONFLICT_STAGE_RE = re.compile(r"^\d+ [0-9a-f]+ [123]\t(.+)$")
+
+
+def _conflict_summary(out: str) -> str:
+    """A short, human-readable summary of a ``merge-tree`` conflict.
+
+    merge-tree's raw output is a tree oid, per-stage blob lines, and git's
+    internal CONFLICT notices — not something to show verbatim in a toast.
+    Extract just the conflicting paths."""
+    paths: list[str] = []
+    for line in out.splitlines():
+        match = _CONFLICT_STAGE_RE.match(line)
+        if match:
+            path = _clean_numstat_path(match.group(1))
+            if path not in paths:
+                paths.append(path)
+    if not paths:
+        notices = [line.strip() for line in out.splitlines() if line.startswith("CONFLICT")]
+        return "; ".join(notices)
+    listed = ", ".join(paths[:5])
+    if len(paths) > 5:
+        listed += f", … (+{len(paths) - 5} more)"
+    return f"conflicting files: {listed}"
+
+
+async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str | None:
+    """Reverse one turn's edits onto the current live state via 3-way merge.
+
+    ``before_tree`` is the workspace before the turn, ``after_tree`` the
+    state the turn produced. The merge base is ``after_tree`` (what the turn
+    left behind), "ours" is the live workspace now (including any manual
+    edits made since), and "theirs" is ``before_tree`` (the target). The
+    merge therefore applies the *reverse* of the turn's own diff on top of
+    the live state, leaving unrelated changes made since the turn untouched.
+
+    Returns a short conflict description if the turn's changes overlap
+    unresolvably with edits made since; None on a clean revert. On conflict
+    the workspace is left exactly as it was — nothing is partially applied.
+    """
+    if before_tree == after_tree:
+        return None  # the turn made no edits — nothing to reverse
+
+    root = info.workspace
+    current_tree = await snapshot_tree(root, info.subtree)
+
+    base = await _wrap_commit(root, after_tree)     # state right after the turn
+    theirs = await _wrap_commit(root, before_tree)  # target: state before the turn
+    ours = await _wrap_commit(root, current_tree)   # live now, incl. manual edits
+
+    rc, out, err = await _run_git(
+        ["merge-tree", "--write-tree", f"--merge-base={base}", ours, theirs],
+        cwd=root,
+    )
+    if rc != 0:
+        # Conflict: merge-tree still prints a (conflict-marked) tree, but we
+        # must not apply it. Surface a readable summary and leave files alone.
+        return _conflict_summary(out) or err.strip() or "merge conflict"
+    lines = out.strip().splitlines()
+    if not lines:
+        raise GitWorktreeError(f"merge produced no tree: {err.strip()}")
+    result_tree = lines[0]
+    # Safe: reverting to the merge RESULT, not a raw historical snapshot. The
+    # current tree is passed through so revert_to_tree needn't re-snapshot.
+    await revert_to_tree(info, result_tree, current_tree)
+    return None
+
+
+async def revert_turns(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None:
+    """Reverse a range of turns, newest first.
+
+    Each turn is reversed against the live state left by the previous call,
+    so a multi-turn drop undoes the most recent turn's diff first. Returns
+    conflict text on the first unresolvable overlap (leaving the workspace
+    as it stood before that turn's revert), or None when all reverted
+    cleanly. An empty list is a no-op.
+    """
+    for turn in reversed(turns):
+        conflict = await revert_turn(info, turn.before_tree, turn.after_tree)
+        if conflict is not None:
+            return conflict
+    return None
+
+
+async def undo_last_turn(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None:
+    """Reverse the most recent turn, or do nothing when there is none.
+
+    The empty case is deliberate: with no turn since the baseline there is
+    nothing to reverse, and falling back to ``baseline_tree`` would destroy
+    every change made outside the session.
+    """
+    if not turns:
+        return None  # nothing to revert — do not touch baseline_tree
+    last = turns[-1]
+    return await revert_turn(info, last.before_tree, last.after_tree)
+
+
 # ----------------------------------------------------------------------
 # diff computation
 
@@ -369,21 +549,18 @@ def _clean_numstat_path(raw: str) -> str:
     return path
 
 
-async def _diff_trees(info: GitInfo, *extra: str) -> str:
-    """Diff the workspace's current state (tracked, uncommitted, and
-    untracked-not-ignored files) against the session's baseline tree.
+async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra: str) -> str:
+    """Raw ``git diff`` between two snapshot trees.
 
-    Both sides are snapshot trees, so this is a plain tree-to-tree diff —
-    the user's index is never touched. ``-M`` is passed explicitly so
-    rename detection works regardless of the user's diff.renames config.
-    With a scoped subtree the diff is limited to it and its paths are
-    reported relative to it (git --relative)."""
+    Both sides are tree objects, so the user's index is never touched. ``-M``
+    is passed explicitly so rename detection works regardless of the user's
+    diff.renames config. With a scoped subtree the diff is limited to it and
+    its paths are reported relative to it (git --relative)."""
     root = info.workspace
-    current = await snapshot_tree(root, info.subtree)
     args = ["diff", "-M"]
     if info.subtree:
         args.append("--relative")
-    args += [info.baseline_tree, current]
+    args += [base_tree, other_tree]
     rc, out, err = await _run_git(
         [*args, *extra],
         cwd=root / info.subtree if info.subtree else root,
@@ -393,11 +570,15 @@ async def _diff_trees(info: GitInfo, *extra: str) -> str:
     return out
 
 
-async def diff_stat(info: GitInfo) -> DiffStat:
-    """Per-file +/- line counts of everything that changed since the
-    session's baseline. With a scoped subtree, limited to it, paths
-    relative to it."""
-    out = await _diff_trees(info, "--numstat")
+async def _diff_trees(info: GitInfo, *extra: str) -> str:
+    """Diff the workspace's current state (tracked, uncommitted, and
+    untracked-not-ignored files) against the session's baseline tree."""
+    current = await snapshot_tree(info.workspace, info.subtree)
+    return await _diff_tree_pair(info, info.baseline_tree, current, *extra)
+
+
+def _parse_numstat(out: str) -> list[FileDiff]:
+    """Parse ``git diff --numstat`` output into FileDiff rows."""
     files: list[FileDiff] = []
     for line in out.splitlines():
         if not line.strip():
@@ -411,13 +592,86 @@ async def diff_stat(info: GitInfo) -> DiffStat:
             additions=0 if adds == "-" else int(adds or 0),
             deletions=0 if dels == "-" else int(dels or 0),
         ))
-    rc, tree, _ = await _run_git(
-        ["ls-tree", "--name-only", "-r", info.baseline_tree], cwd=info.workspace
-    )
-    base_files = set(tree.splitlines()) if rc == 0 else set()
+    return files
+
+
+# Snapshot trees are immutable, so a tree pair's diff and a tree's file list
+# never change once the objects exist. Cache them (keyed on the shas plus the
+# subtree, since paths are reported relative to it) so /diff stays cheap on
+# long sessions. Values are immutable (raw output / frozenset), so callers
+# can't corrupt the cache by mutating what they get back.
+_numstat_cache: dict[tuple[str, str, str], str] = {}
+_tree_files_cache: dict[tuple[str, str], frozenset[str]] = {}
+
+
+async def _numstat_between(info: GitInfo, base_tree: str, other_tree: str) -> str:
+    """Cached ``git diff --numstat`` between two snapshot trees."""
+    key = (info.subtree, base_tree, other_tree)
+    cached = _numstat_cache.get(key)
+    if cached is None:
+        cached = await _diff_tree_pair(info, base_tree, other_tree, "--numstat")
+        _numstat_cache[key] = cached
+    return cached
+
+
+async def _tree_files(info: GitInfo, tree: str) -> set[str]:
+    """Paths in a snapshot tree, subtree-relative when the session is scoped
+    (matching the paths ``--relative`` diffs report). Cached per tree."""
+    key = (info.subtree, tree)
+    cached = _tree_files_cache.get(key)
+    if cached is None:
+        rc, out, _ = await _run_git(
+            ["ls-tree", "--name-only", "-r", tree], cwd=info.workspace
+        )
+        names = set(out.splitlines()) if rc == 0 else set()
+        if info.subtree:
+            prefix = info.subtree + "/"
+            names = {n[len(prefix):] for n in names if n.startswith(prefix)}
+        cached = frozenset(names)
+        _tree_files_cache[key] = cached
+    return set(cached)
+
+
+async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffStat:
+    """Per-file +/- counts between two snapshot trees, with ``is_new`` set
+    relative to ``base_tree``."""
+    files = _parse_numstat(await _numstat_between(info, base_tree, other_tree))
+    base_files = await _tree_files(info, base_tree)
     for f in files:
         f.is_new = f.path not in base_files
     return DiffStat(files=files)
+
+
+async def diff_stat(info: GitInfo) -> DiffStat:
+    """Per-file +/- line counts of everything that changed since the
+    session's baseline. With a scoped subtree, limited to it, paths
+    relative to it."""
+    return await tree_diff_stat(info, info.baseline_tree, await snapshot_tree(
+        info.workspace, info.subtree
+    ))
+
+
+async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> DiffStat:
+    """Pending changes since ``baseline_tree``, tagged by source.
+
+    ``baseline_tree`` only ever moves via :func:`accept_changes`, so this is
+    always the full, correct picture of "what's changed since the user last
+    accepted" — regardless of how many turns or drift-detection gaps happened
+    in between. Turn diffs are used only to *tag* paths within that total as
+    agent-caused; anything else in the total is drift (made outside the
+    session — manual edits, or edits from a prior harness run).
+    """
+    current = await snapshot_tree(info.workspace, info.subtree)
+    total = await tree_diff_stat(info, info.baseline_tree, current)
+
+    agent_touched: set[str] = set()
+    for turn in turns:
+        for f in (await tree_diff_stat(info, turn.before_tree, turn.after_tree)).files:
+            agent_touched.add(f.path)
+
+    for f in total.files:
+        f.source = "agent" if f.path in agent_touched else "drift"
+    return total
 
 
 async def git_diff(info: GitInfo, path: str | None = None) -> str:
@@ -438,6 +692,10 @@ class FileDiff:
     additions: int
     deletions: int
     is_new: bool = False
+    # Who caused the change: "agent" (some turn's diff touched the path) or
+    # "drift" (made outside the session). A path is one or the other, never
+    # both — attribution is per-file, so there is no combined value.
+    source: str = "agent"
 
 
 @dataclass(slots=True)

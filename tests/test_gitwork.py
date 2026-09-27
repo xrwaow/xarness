@@ -9,11 +9,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from xarness import gitwork
 from xarness.gitwork import (
-    GitInfo, accept_changes, check_blocked_git, checkpoint, detect_repo,
-    diff_stat, git_diff, revert_to_tree, setup_tracking, snapshot_tree,
+    GitInfo, TurnCheckpoint, accept_changes, attributed_diff_stat, check_blocked_git,
+    checkpoint, detect_repo, diff_stat, git_diff, revert_to_tree, revert_turn,
+    setup_tracking, snapshot_tree, tree_diff_stat, undo_last_turn,
 )
 
 
@@ -100,6 +102,41 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(workspace, "sess1", allow_init=False)
         assert info is None
         assert not (workspace / ".git").exists()
+
+    async def test_setup_tracking_excludes_default_noise_dirs(self):
+        """The default noise dirs are written to the repo's local
+        info/exclude, so snapshots skip them even with no .gitignore."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "node_modules").mkdir()
+        (repo / "node_modules" / "pkg.js").write_text("x\n")
+        (repo / "kept.txt").write_text("kept\n")
+
+        sha = await snapshot_tree(repo)
+        names = _git(repo, "ls-tree", "-r", "--name-only", sha).splitlines()
+        assert "kept.txt" in names
+        assert not any(n.startswith("node_modules/") for n in names)
+
+    async def test_ensure_default_excludes_is_idempotent(self):
+        """Re-running setup (a session resume) doesn't duplicate the block."""
+        repo = self.make_repo()
+        await setup_tracking(repo, "sess1")
+        await setup_tracking(repo, "sess2")
+
+        exclude = (repo / ".git" / "info" / "exclude").read_text()
+        assert exclude.count("# xarness: default ignores") == 1
+        assert "/node_modules/" in exclude
+
+    async def test_ensure_default_excludes_leaves_gitignore_alone(self):
+        """Only .git/info/exclude is written; the user's .gitignore is theirs."""
+        repo = self.make_repo()
+        gitignore = repo / ".gitignore"
+        gitignore.write_text("mine\n")
+
+        await setup_tracking(repo, "sess1")
+
+        assert gitignore.read_text() == "mine\n"
 
     async def test_setup_tracking_scopes_to_workspace_subdir(self):
         """--workspace pointing at a subdirectory of a bigger repo: the
@@ -231,6 +268,223 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert info is not None
         with self.assertRaises(gitwork.GitWorktreeError):
             await revert_to_tree(info, "0" * 40)
+
+    # ------------------------------------------------------------------
+    # revert_turn: reverse one turn's diff, preserving later edits
+
+    async def test_revert_turn_reverses_only_the_turns_diff(self):
+        """A turn's edits are reversed; an unrelated file changed after the
+        turn (outside the session) survives."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before = await checkpoint(info)
+        (repo / "app.py").write_text("agent edit\n")  # the turn's edit
+        after = await checkpoint(info)
+        (repo / "unrelated.txt").write_text("manual edit\n")  # after the turn
+
+        conflict = await revert_turn(info, before, after)
+
+        assert conflict is None
+        assert (repo / "app.py").read_text() == "line1\nline2\n"
+        assert (repo / "unrelated.txt").read_text() == "manual edit\n"
+
+    async def test_revert_turn_conflict_leaves_workspace_untouched(self):
+        """A manual edit on the same lines the turn changed conflicts; the
+        revert reports it and changes nothing."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before = await checkpoint(info)
+        (repo / "app.py").write_text("agent change\n")  # the turn's edit
+        after = await checkpoint(info)
+        (repo / "app.py").write_text("manual change\n")  # overlapping manual edit
+
+        conflict = await revert_turn(info, before, after)
+
+        assert conflict is not None
+        # A readable summary, not raw merge-tree output (tree oids, stage
+        # lines, git's internal CONFLICT notices).
+        assert "app.py" in conflict
+        assert "CONFLICT" not in conflict
+        assert (repo / "app.py").read_text() == "manual change\n"  # untouched
+
+    async def test_revert_turn_is_a_noop_when_the_turn_made_no_edits(self):
+        """before_tree == after_tree (a plan-mode or no-edit turn): nothing to
+        reverse, and drift made since is left alone."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        tree = await checkpoint(info)
+        (repo / "manual.txt").write_text("manual\n")
+
+        result = await revert_turn(info, tree, tree)
+
+        assert result is None
+        assert (repo / "manual.txt").read_text() == "manual\n"
+
+    async def test_revert_turn_noop_makes_no_git_calls(self):
+        """The no-edit early return skips the whole merge machinery — no
+        commit wrapping, no merge-tree, no revert."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        tree = await checkpoint(info)
+
+        with mock.patch.object(gitwork, "_wrap_commit", new=mock.AsyncMock()) as wrap, \
+                mock.patch.object(gitwork, "_run_git", new=mock.AsyncMock()) as run:
+            result = await revert_turn(info, tree, tree)
+
+        assert result is None
+        wrap.assert_not_called()
+        run.assert_not_called()
+
+    async def test_tree_diff_stat_cache_returns_fresh_rows(self):
+        """Repeated diffs of the same immutable tree pair are cached, but each
+        call hands back fresh rows so a caller can't corrupt the cache."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        before = await checkpoint(info)
+        (repo / "app.py").write_text("agent\n")
+        after = await checkpoint(info)
+
+        first = await tree_diff_stat(info, before, after)
+        first.files[0].additions = 999  # mutate the returned row
+        second = await tree_diff_stat(info, before, after)
+
+        assert second.files[0].additions == 1
+
+    async def test_revert_turns_applies_newest_first(self):
+        """A range reverts each turn's own diff; the net effect is the state
+        before the oldest turn, with no later turn's edit left behind."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before1 = await checkpoint(info)
+        (repo / "one.txt").write_text("one\n")
+        after1 = await checkpoint(info)
+        before2 = await checkpoint(info)
+        (repo / "two.txt").write_text("two\n")
+        after2 = await checkpoint(info)
+
+        conflict = await gitwork.revert_turns(info, [
+            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+        ])
+
+        assert conflict is None
+        assert not (repo / "one.txt").exists()
+        assert not (repo / "two.txt").exists()
+
+    async def test_undo_last_turn_is_a_noop_without_turns(self):
+        """No turn since the baseline: /undo must not fall back to reverting
+        the baseline and destroying changes made outside the session."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "app.py").write_text("manual edit\n")
+        baseline = info.baseline_tree
+
+        result = await undo_last_turn(info, [])
+
+        assert result is None
+        assert (repo / "app.py").read_text() == "manual edit\n"
+        assert info.baseline_tree == baseline
+
+    async def test_undo_last_turn_reverses_the_most_recent(self):
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        before = await checkpoint(info)
+        (repo / "app.py").write_text("agent\n")
+        after = await checkpoint(info)
+
+        result = await undo_last_turn(info, [TurnCheckpoint(before, after)])
+
+        assert result is None
+        assert (repo / "app.py").read_text() == "line1\nline2\n"
+
+    # ------------------------------------------------------------------
+    # attributed diff
+
+    async def test_attributed_diff_tags_agent_and_drift(self):
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before = await checkpoint(info)
+        (repo / "agent.txt").write_text("agent\n")  # turn edit
+        after = await checkpoint(info)
+        (repo / "manual.txt").write_text("manual\n")  # drift after the turn
+
+        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["agent.txt"].source == "agent"
+        assert by_path["manual.txt"].source == "drift"
+        assert by_path["manual.txt"].is_new
+
+    async def test_attributed_diff_keeps_drift_after_a_later_turn(self):
+        """Drift is anchored to baseline_tree, not the last turn: a file made
+        outside the session still shows (tagged drift) after a later agent
+        turn, even though both sides of that turn's diff contain it."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        # Drift created outside the session, never accepted.
+        (repo / "drift.txt").write_text("outside\n")
+        # A later agent turn: its before_tree already contains the drift, and
+        # it edits a different file.
+        before = await checkpoint(info)
+        (repo / "agent.txt").write_text("agent\n")
+        after = await checkpoint(info)
+
+        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["drift.txt"].source == "drift"
+        assert by_path["agent.txt"].source == "agent"
+
+    async def test_attributed_diff_tags_drift_between_turns(self):
+        """Drift injected between two turns (not just before the first or
+        after the last) is still tagged drift, not absorbed."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before1 = await checkpoint(info)
+        (repo / "one.txt").write_text("one\n")
+        after1 = await checkpoint(info)
+        (repo / "mid.txt").write_text("mid\n")  # drift between the turns
+        before2 = await checkpoint(info)
+        (repo / "two.txt").write_text("two\n")
+        after2 = await checkpoint(info)
+
+        stat = await attributed_diff_stat(info, [
+            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+        ])
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["mid.txt"].source == "drift"
+        assert by_path["one.txt"].source == "agent"
+        assert by_path["two.txt"].source == "agent"
+
+    async def test_attributed_diff_turn_touched_wins_within_a_file(self):
+        """Attribution is per-file: a file a turn touched stays tagged agent
+        even if it was also edited outside the session afterwards."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before = await checkpoint(info)
+        (repo / "app.py").write_text("agent\n")
+        after = await checkpoint(info)
+        (repo / "app.py").write_text("agent\nmanual\n")
+
+        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["app.py"].source == "agent"
 
     # ------------------------------------------------------------------
     # diff

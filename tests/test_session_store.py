@@ -17,12 +17,12 @@ PROFILE = ProviderProfile(
 
 
 def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
-    """usage / checkpoint_sha / undo_snapshot survive save + load, and stay
-    out of the wire format."""
+    """usage / checkpoint_sha / after_tree / undo_snapshot survive save +
+    load, and stay out of the wire format."""
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
 
     conversation = Conversation()
-    user = Message(role="user", content="hi", checkpoint_sha="abc123")
+    user = Message(role="user", content="hi", checkpoint_sha="abc123", after_tree="def456")
     assistant = Message(
         role="assistant", content="hello", reasoning="thoughts", usage=Usage(12, 3)
     )
@@ -34,13 +34,18 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     loaded = session_store.load_session("s")
     assert [m.role for m in loaded.messages] == ["user", "assistant"]
     assert loaded.messages[0].checkpoint_sha == "abc123"
+    assert loaded.messages[0].after_tree == "def456"
     assert loaded.messages[1].usage == Usage(12, 3)
     assert loaded.messages[1].reasoning == "thoughts"
     assert loaded.undo_snapshot is not None
     assert loaded.undo_snapshot[0].checkpoint_sha == "abc123"
+    assert loaded.undo_snapshot[0].after_tree == "def456"
 
     # Local-only fields never reach the wire.
-    assert all("usage" not in m and "checkpoint_sha" not in m for m in loaded.to_wire())
+    assert all(
+        "usage" not in m and "checkpoint_sha" not in m and "after_tree" not in m
+        for m in loaded.to_wire()
+    )
 
 
 def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:

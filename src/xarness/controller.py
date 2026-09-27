@@ -38,9 +38,9 @@ from .events import (
     TurnComplete,
     Usage,
 )
-from .gitwork import GitInfo, GitWorktreeError
+from .gitwork import GitInfo, GitWorktreeError, RevertConflict, TurnCheckpoint
 from .gitwork import checkpoint as git_checkpoint
-from .gitwork import revert_to_tree
+from .gitwork import revert_turns
 from .tools import ToolRegistry, ToolResult
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
@@ -78,6 +78,24 @@ def _message_key(message: Message) -> tuple:
     return (message.role, message.content, message.tool_call_id)
 
 
+def _turns_in(messages: list[Message]) -> list[TurnCheckpoint]:
+    """The turns in ``messages`` that can be reversed, oldest first.
+
+    A turn is a user message carrying both a before tree (``checkpoint_sha``)
+    and an after tree. Turns from sessions saved before after-trees existed
+    are skipped: their files cannot be reversed without risking the loss of
+    edits made since, so /undo falls back to conversation-only rollback.
+
+    ``revert_turns`` walks the list newest-first, so this returns
+    chronological order.
+    """
+    return [
+        TurnCheckpoint(m.checkpoint_sha, m.after_tree)
+        for m in messages
+        if m.role == "user" and m.checkpoint_sha and m.after_tree
+    ]
+
+
 class StreamClient(Protocol):
     """Anything that can stream a round; ChatClient is the real implementation."""
 
@@ -93,7 +111,7 @@ class RollbackPlan:
     """What /undo or /retry needs to do, computed by :meth:`rollback_plan`."""
 
     user_text: str  # the turn's user message (input box / resend)
-    checkpoint_sha: str | None  # git state to restore; None = cannot revert
+    revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
     keep: list[Message]  # what the conversation becomes
     dropped: list[Message]  # messages whose usage must be subtracted
     # True when the restore point is before the most recent compaction, so
@@ -282,7 +300,7 @@ class ChatController:
             kept_values = {_message_key(m) for m in keep}
             dropped = [m for m in messages if _message_key(m) not in kept_values]
             return RollbackPlan(
-                user_text="", checkpoint_sha=None, keep=keep, dropped=dropped,
+                user_text="", revert_turns=[], keep=keep, dropped=dropped,
                 clears_compaction=True, compaction_only=True,
             )
         if snapshot and snapshot[-1].role == "user":
@@ -291,7 +309,6 @@ class ChatController:
                 return None  # the turn produced no response yet
             keep = list(snapshot[:-1])
             user_text = snapshot[-1].content
-            sha = snapshot[-1].checkpoint_sha
             kept_ids = {id(m) for m in keep}
             dropped = [m for m in messages if id(m) not in kept_ids]
             # If the restore point is before the compaction (the undone turn
@@ -304,12 +321,11 @@ class ChatController:
                 return None
             keep = list(messages[:index])
             user_text = messages[index].content
-            sha = messages[index].checkpoint_sha
             dropped = list(messages[index:])
             clears = False
         return RollbackPlan(
-            user_text=user_text, checkpoint_sha=sha, keep=keep, dropped=dropped,
-            clears_compaction=clears,
+            user_text=user_text, revert_turns=_turns_in(dropped), keep=keep,
+            dropped=dropped, clears_compaction=clears,
         )
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
@@ -333,7 +349,7 @@ class ChatController:
             dropped = list(messages[index:])
             clears = not any(_is_summary(m) for m in keep)
             return RollbackPlan(
-                user_text=message.content, checkpoint_sha=message.checkpoint_sha,
+                user_text=message.content, revert_turns=_turns_in(dropped),
                 keep=keep, dropped=dropped, clears_compaction=clears,
             )
         snapshot = self.conversation.compact_snapshot
@@ -347,8 +363,11 @@ class ChatController:
         # Only the live history's messages count for usage subtraction: the
         # snapshot's own spend was already folded when compaction removed it.
         dropped = [m for m in messages if id(m) not in kept_ids]
+        # Revert every dropped turn — the ones the snapshot summarized away
+        # (from the clicked turn onward) plus those that ran after compaction.
+        revert = _turns_in([*snapshot[idx:], *dropped])
         return RollbackPlan(
-            user_text=message.content, checkpoint_sha=message.checkpoint_sha,
+            user_text=message.content, revert_turns=revert,
             keep=keep, dropped=dropped, clears_compaction=True,
         )
 
@@ -361,10 +380,11 @@ class ChatController:
             0, self.usage_total.output_tokens - usage.output_tokens
         )
 
-    def apply_rollback(self, plan: RollbackPlan) -> str | None:
+    def apply_rollback(self, plan: RollbackPlan) -> None:
         """Truncate the conversation, subtract the dropped turns' usage from
-        the running totals, and clear the snapshot. Returns the checkpoint
-        sha so the caller can revert the file edits."""
+        the running totals, and clear the snapshot. The file edits are
+        reversed separately (see :meth:`revert_changes`) so a conflict can
+        abort before the conversation changes."""
         self.conversation.messages = list(plan.keep)
         self.conversation.undo_snapshot = None
         for message in plan.dropped:
@@ -384,20 +404,51 @@ class ChatController:
             # would only offer a stale second undo of the same turn) is
             # dropped too.
             self.conversation.compact_snapshot = None
-        return plan.checkpoint_sha
 
-    async def revert_changes(self, sha: str | None) -> bool:
-        """Restore the workspace to a checkpoint tree. False when there is no
-        git tracking / no sha / the revert failed — the caller should tell
-        the user file edits could not be reverted."""
+    async def finish_turn(self) -> None:
+        """Record the workspace state after the turn's edits as ``after_tree``
+        on the turn's user message, so /undo can reverse exactly this turn's
+        diff later. Called by the app once a turn's rounds and tools have
+        finished (including on interruption). No-op without git tracking, when
+        no turn is open, or when the snapshot fails."""
         info = self.git_info
-        if info is None or sha is None:
-            return False
+        if info is None:
+            return
+        turn = next(
+            (m for m in reversed(self.conversation.messages)
+             if m.role == "user" and m.checkpoint_sha is not None),
+            None,
+        )
+        if turn is None:
+            return
         try:
-            await revert_to_tree(info, sha)
-        except (GitWorktreeError, OSError):
-            return False
-        return True
+            turn.after_tree = await git_checkpoint(info)
+        except GitWorktreeError:
+            return
+
+    def turn_checkpoints(self) -> list[TurnCheckpoint]:
+        """The reversible turns since the baseline, oldest first.
+
+        Includes turns the last compaction summarized away (kept in
+        ``compact_snapshot``), so /diff attribution and the resume drift check
+        still see their edits."""
+        pre = self.conversation.compact_snapshot or []
+        return _turns_in([*pre, *self.conversation.messages])
+
+    async def revert_changes(self, turns: list[TurnCheckpoint]) -> None:
+        """Reverse the given turns' file edits (newest first) onto the live
+        workspace.
+
+        Raises :class:`RevertConflict` when a turn's changes overlap
+        unresolvably with edits made since (the workspace is left untouched),
+        or :class:`GitWorktreeError` on another git failure. No tracking, or
+        an empty turn list, is a clean no-op."""
+        info = self.git_info
+        if info is None or not turns:
+            return
+        conflict = await revert_turns(info, turns)
+        if conflict is not None:
+            raise RevertConflict(conflict)
 
     # ------------------------------------------------------------------
     # compaction

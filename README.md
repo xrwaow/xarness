@@ -44,17 +44,23 @@ read-only by convention.
 The agent edits your files directly — there is no separate worktree and no
 accept/reject step. Instead, every session snapshots your workspace state
 into a git tree object at startup (via a throwaway index: your index, HEAD,
-and refs are never touched), and every turn takes another snapshot.
+and refs are never touched), and every turn records two more: the state
+*before* the turn and the state *after* its edits finished.
 
 No setup is required: if the workspace isn't a git repo (or has no commits
 yet), xarness runs `git init` itself so tracking works. Your files are never
 modified by this, and no commits are ever created — snapshots are plain tree
-objects. Opt out with `--no-init-repo` (the agent still edits the directory
-directly; there is just no /diff or /undo for file changes).
+objects (and an unreferenced commit wrapper for the 3-way merge below). Opt
+out with `--no-init-repo` (the agent still edits the directory directly;
+there is just no /diff or /undo for file changes).
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
-(`name  dir/  +N -M`), and click a row to read that file's unified diff.
+(`name  dir/  agent  +N -M`), and click a row to read that file's unified
+diff. Each row is tagged with its source: `agent` for edits a turn made,
+and `drift` (in the warning color) for changes made outside the session —
+manual edits, or edits from a previous harness run while this session was
+closed.
 
 | Command | Action |
 | --- | --- |
@@ -62,12 +68,12 @@ changed (`Edited 2 files +26 -0`); click it to expand a per-file list
 | `/diff <path>` | Show one file's unified diff |
 | `/accept` | Lock in the changes made so far: `/diff` resets, `/undo` can no longer revert past this point |
 | `/reject` | Discard all changes made since the last `/accept` |
-| `/undo` | Drop the last turn: revert its file edits, put your message back in the input |
-| `/retry` | Revert the last turn's file edits and resend your message |
+| `/undo` | Drop the last turn: reverse its file edits, put your message back in the input |
+| `/retry` | Reverse the last turn's file edits and resend your message |
 
 To undo further back, click any of your messages in the scrollback: a small
 `↩ undo to here` affordance appears, and clicking it drops that message and
-everything after it — file edits reverted to that turn's checkpoint, and the
+everything after it — each dropped turn's own file edits reversed, and the
 message put back in the input. Messages the last `/compact` summarized away
 can be clicked too (the pre-compaction history is restored first).
 
@@ -88,20 +94,23 @@ The rest of the repo stays mounted read-only for context (and reachable via
 
 ### Undo and retry
 
-Each turn starts with a checkpoint: a git tree snapshot of the workspace's
-current state (tracked changes, uncommitted changes, and untracked files —
-gitignored files are excluded, matching classic git semantics). `/undo` and
-`/retry` restore the workspace to that snapshot, removing every file change
-the turn made — edits, deletions, and newly created files.
+Each turn records the workspace state before it and the state after its
+edits finished. `/undo` and `/retry` reverse *exactly that turn's diff* onto
+the live workspace with a 3-way merge, removing every file change the turn
+made — edits, deletions, and newly created files — while leaving changes
+made since (by you, or by a previous harness run) untouched. If a manual
+edit overlaps the lines the turn changed, the merge conflicts: the undo
+reports it and changes nothing rather than picking a side.
 
-**Only file edits are reverted.** Non-file side effects of `run_bash` —
+**Only file edits are reversed.** Non-file side effects of `run_bash` —
 package installs, background jobs, network calls, anything outside the
 workspace — are *not* undone. `/undo` puts the removed message back into the
 input box; `/retry` resends it immediately. Both also roll back the turn's
 token usage from the session totals, and work across a mid-turn `/compact`
 (the pre-compaction history is restored). Without git tracking (no repo,
 `--no-init-repo`, or setup failure) they still remove the messages and fix
-the token counts, but tell you the file edits could not be reverted.
+the token counts, but tell you the file edits could not be reverted. With no
+turn to reverse, `/undo` is a no-op on the filesystem.
 
 ## Sessions
 
@@ -117,7 +126,11 @@ xarness sessions delete my-session
 
 Resuming reconnects to the session's change tracking (the persisted baseline
 snapshot); sessions created by older builds with worktree isolation resume
-with fresh tracking instead.
+with fresh tracking instead. If the workspace changed outside the session
+while it was closed, resuming shows what drifted and asks whether to accept
+it as the new baseline or keep tracking against the last known state — it
+never silently reverts or accepts. `/delete` removes the saved session file
+and starts a fresh chat, and never touches your workspace files.
 
 ## Install
 
@@ -203,9 +216,10 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
+| `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
 | `/compact` | Summarize and truncate the conversation now, freeing context window. While the agent is working it's steered instead: it runs at the next round boundary, before any queued messages are injected |
 | `/auto_compact` | Toggle automatic compaction when the context window passes the profile's `auto_compact_threshold` (checked after each turn) |
-| `/undo` | Drop the last turn (file edits reverted, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
+| `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |
 
