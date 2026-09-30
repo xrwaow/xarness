@@ -8,6 +8,7 @@ events and hold no conversation state of their own (the reasoning text inside
 
 from __future__ import annotations
 
+import difflib
 import json
 import random
 import re
@@ -502,14 +503,12 @@ def _json_tool_args(args_text: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _write_file_loc(args_text: str) -> int | None:
-    """Best-effort line count of write_file's ``content`` argument while its
-    JSON is still streaming. Complete JSON counts exactly; a partial one
-    counts the escaped ``\\n`` sequences after the "content" key."""
-    content = _json_tool_args(args_text).get("content")
-    if isinstance(content, str):
-        return content.count("\n") + 1 if content else 0
-    match = re.search(r'"content"\s*:\s*"', args_text)
+def _partial_string(args_text: str, key: str, unescape: bool = False) -> str | None:
+    """Best-effort extraction of a string argument from tool-call JSON that
+    may still be streaming: the text after ``"key": "`` up to the (not yet
+    arrived, possibly) closing quote. Returns None when the key hasn't
+    appeared at all."""
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"', args_text)
     if match is None:
         return None
     rest = args_text[match.end():]
@@ -525,7 +524,93 @@ def _write_file_loc(args_text: str) -> int | None:
             break
         i += 1
     rest = rest.rstrip("\\")
-    return rest.count("\\n") + 1 if rest else 0
+    if unescape:
+        rest = rest.replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+    return rest
+
+
+def _write_file_loc(args_text: str) -> int | None:
+    """Best-effort line count of write_file's ``content`` argument while its
+    JSON is still streaming. Complete JSON counts exactly; a partial one
+    counts the escaped ``\\n`` sequences after the "content" key."""
+    content = _json_tool_args(args_text).get("content")
+    if isinstance(content, str):
+        return content.count("\n") + 1 if content else 0
+    raw = _partial_string(args_text, "content")
+    if raw is None:
+        return None
+    return raw.count("\\n") + 1 if raw else 0
+
+
+def _live_edit_counts(args_text: str) -> str | None:
+    """'+N -M' running diffstat of edit_file's arguments while they stream
+    (complete JSON only — partially streamed edits aren't counted)."""
+    args = _json_tool_args(args_text)
+    edits = args.get("edits")
+    if not isinstance(edits, list):
+        old, new = args.get("old_string"), args.get("new_string")
+        if isinstance(old, str) and old:
+            edits = [{"old_string": old, "new_string": new if isinstance(new, str) else ""}]
+        else:
+            return None
+    adds = dels = 0
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        old, new = edit.get("old_string", ""), edit.get("new_string", "")
+        if not isinstance(old, str) or not old:
+            continue
+        diff = list(difflib.unified_diff(
+            old.splitlines(), new.splitlines() if isinstance(new, str) else [], n=0, lineterm=""
+        ))
+        adds += sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+        dels += sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    if not adds and not dels:
+        return None
+    return f"+{adds} -{dels}"
+
+
+def _stream_label(tool_name: str, args_text: str) -> str:
+    """Live one-line label for a call whose arguments are streaming or that
+    is executing: '<tool> <detail>', e.g. 'write_file g.py +4 LOC',
+    'run_bash git status', '+2 -1 edit_file app.py'. Falls back to the bare
+    tool name until enough of the arguments has arrived."""
+    args = _json_tool_args(args_text)
+    path = args.get("path")
+    if not isinstance(path, str):
+        path = _partial_string(args_text, "path")
+
+    if tool_name == "write_file":
+        loc = _write_file_loc(args_text)
+        detail = " ".join(
+            part for part in (path, f"+{loc} LOC" if loc is not None else None) if part
+        )
+        return f"write_file {detail}".rstrip()
+    if tool_name == "edit_file" and path:
+        counts = _live_edit_counts(args_text)
+        return f"{counts} edit_file {path}" if counts else f"edit_file {path}"
+    if tool_name == "read_file" and path:
+        return f"read_file {path}"
+    if tool_name == "run_bash":
+        command = args.get("command")
+        if not isinstance(command, str):
+            command = _partial_string(args_text, "command", unescape=True)
+        if command:
+            # One line only — later lines (a compound command, say) don't fit.
+            return "run_bash " + _shorten(command.splitlines()[0])
+    if tool_name == "grep":
+        regex = args.get("regex")
+        if not isinstance(regex, str):
+            regex = _partial_string(args_text, "regex")
+        if regex:
+            return f"grep {regex}"
+    if tool_name == "glob":
+        pattern = args.get("glob")
+        if not isinstance(pattern, str):
+            pattern = _partial_string(args_text, "glob")
+        if pattern:
+            return f"glob {pattern}"
+    return tool_name
 
 
 def _header_detail_text(tool_name: str, header: str) -> Text | None:
@@ -701,6 +786,24 @@ class ToolCallBlock(Vertical):
     def append_arguments(self, text: str) -> None:
         self.accumulated_arguments += text
         self._refresh_body()
+        # Once the arguments are known, the shimmer says the actual call —
+        # 'run_bash git status', 'write_file g.py +4 LOC' — not just the
+        # bare tool name.
+        if self.is_mounted:
+            try:
+                self.query_one(".toolcall-shimmer", ShimmerText).set_label(
+                    _stream_label(self.tool_name, self.accumulated_arguments)
+                )
+            except NoMatches:
+                pass  # DOM pruned during app shutdown
+
+    def append_output(self, text: str) -> None:
+        """Output streaming in while the call runs (run_bash) — the expanded
+        body grows live; a collapsed block only accumulates the text (the
+        final result replaces it via set_result anyway)."""
+        self._output_text += text
+        if self.is_mounted and self.has_class("expanded"):
+            self._refresh_body()
 
     def set_result(
         self,
@@ -727,6 +830,9 @@ class ToolCallBlock(Vertical):
             self.remove_class("expanded")
         else:
             self.add_class("expanded")
+        # Body may have accumulated while collapsed (args streamed in,
+        # run_bash output arrived) — render it on expand.
+        self._refresh_body()
         self._render_summary()
 
     def on_click(self, event: events.Click) -> None:
@@ -835,6 +941,10 @@ class ToolCallBlock(Vertical):
             summary_row = self.query_one(".toolcall-summary", Horizontal)
         except NoMatches:
             return  # DOM pruned during app shutdown
+        if self._status is ToolCallStatus.MAKING_CALL:
+            # Still executing: the shimmer carries the live label
+            # ('run_bash git status'). Leave it alone.
+            return
         shimmer = summary_row.query(".toolcall-shimmer")
         if shimmer:
             shimmer.remove()
@@ -995,10 +1105,11 @@ _NO_DIFF: object = object()
 
 
 class DiffText(VerticalScroll):
-    """Capped, focusable diff pane with its own scrollbar. Up/down pages by
-    the pane's full visible height; only when the pane is already scrolled to
-    its top/bottom do the arrows step to the previous/next file's diff. With
-    the full diff (or nothing) open the arrows never step files."""
+    """Capped, focusable diff pane with its own scrollbar. Up/down page by
+    the pane's full visible height and stop at the pane's top/bottom — they
+    never switch files. Left/right step to the previous/next file's diff;
+    with the full diff open, right opens the first file's diff.
+    At the first/last file the arrows do nothing."""
 
     can_focus = True
 
@@ -1014,18 +1125,25 @@ class DiffText(VerticalScroll):
             return False
         key = summary._active_key
         if not isinstance(key, str):
+            # Full multi-file diff open: right steps into the first file.
+            if key is None and delta == 1 and summary._stat is not None:
+                if summary._stat.files:
+                    summary.post_message(summary.DiffRequested(summary._stat.files[0].path))
+                    return True
             return False
         return summary._request_neighbour(key, delta)
 
     def action_scroll_up(self) -> None:
-        if self.scroll_offset.y <= 0 and self._step_file(-1):
-            return
         self.scroll_page_up(animate=False)
 
     def action_scroll_down(self) -> None:
-        if self.is_vertical_scroll_end and self._step_file(1):
-            return
         self.scroll_page_down(animate=False)
+
+    def key_left(self) -> None:
+        self._step_file(-1)
+
+    def key_right(self) -> None:
+        self._step_file(1)
 
 
 class DiffSummary(Vertical):
@@ -1346,16 +1464,16 @@ class PendingIndicator(Horizontal):
 
 
 class ToolWritingIndicator(Horizontal):
-    """Single amber-dot 'Writing <tool>' shimmer shown while tool-call
-    arguments are still streaming — replaces the per-block 'Running [tool]'
-    shinies, which only make sense once a call actually executes. The label
-    follows whichever call is being written next, and write_file's grows a
-    live '+LOC' count as its content argument streams in."""
+    """Single amber-dot shimmer shown while tool-call arguments are still
+    streaming — replaces the per-block 'Running [tool]' shinies, which only
+    make sense once a call actually executes. The label is the live call
+    itself, '<tool> <detail>', updated as each argument fragment arrives:
+    'write_file g.py +4 LOC', 'run_bash git stat…', and so on."""
 
     def __init__(self, tool_name: str) -> None:
         super().__init__(classes="msg toolwriting")
         self.tool_name = tool_name
-        self._loc: int | None = None
+        self._args = ""
 
     def compose(self):
         yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
@@ -1368,19 +1486,17 @@ class ToolWritingIndicator(Horizontal):
         )
 
     def _label(self) -> str:
-        if self._loc is not None:
-            return f"Writing {self.tool_name} +{self._loc} LOC"
-        return f"Writing {self.tool_name}"
+        return _stream_label(self.tool_name, self._args)
 
     def set_tool(self, tool_name: str) -> None:
         """Follow the tool call that just started streaming."""
         self.tool_name = tool_name
-        self._loc = None
+        self._args = ""
         self._refresh()
 
-    def set_loc(self, loc: int) -> None:
-        """Update the live line count (write_file only)."""
-        self._loc = loc
+    def update_args(self, args_text: str) -> None:
+        """Feed the streamed arguments so the label grows live detail."""
+        self._args = args_text
         self._refresh()
 
     def _refresh(self) -> None:

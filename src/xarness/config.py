@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
 
-DEFAULT_THEME = "carbonfox"
+DEFAULT_THEME = "ayu-darker"
 
 
 class ConfigError(Exception):
@@ -186,6 +186,30 @@ def list_profile_names(path: Path) -> list[str]:
     if not isinstance(data.get("profiles"), list):
         return []
     return [p.name for p in _named_profiles(path, data)]
+
+
+def save_preferences(
+    path: Path,
+    *,
+    default_theme: str | None = None,
+    default_profile: str | None = None,
+) -> None:
+    """Persist UI preferences (chosen theme / profile) into the config file so
+    they carry over to the next session.
+
+    ``default_profile`` is only written when the file uses the named-profiles
+    form — the flat form has nothing to select, and a stray ``default_profile``
+    there would make the config invalid.
+    """
+    data = _read(path)
+    if default_theme is not None:
+        data["default_theme"] = default_theme
+    if default_profile is not None and isinstance(data.get("profiles"), list):
+        data["default_profile"] = default_profile
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not write {path}: {exc}") from exc
 
 
 def load_all_profiles(path: Path) -> dict[str, ProviderProfile]:

@@ -490,7 +490,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         from xarness import theme
 
         previous = theme.CURRENT_THEME
-        theme.set_theme("carbonfox")
+        theme.set_theme("ayu-darker")
         self.addCleanup(theme.set_theme, previous)
 
         app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
@@ -570,7 +570,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(ToolCallBlock)), 1)
             self.assertEqual(len(app.query(ToolWritingIndicator)), 1)
             # The label names the call still being written (call_2).
-            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "Writing noop")
+            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "noop")
 
             await wait_until_idle(app)
             # Indicator gone; both blocks settled.
@@ -617,7 +617,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                 indicators = app.query(ToolWritingIndicator)
                 if indicators and "+3 LOC" in indicators[0]._label():
                     break
-            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "Writing write_file +3 LOC")
+            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "write_file g.py +3 LOC")
 
             await wait_until_idle(app)
             self.assertEqual(len(app.query(ToolWritingIndicator)), 0)

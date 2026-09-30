@@ -1,33 +1,15 @@
-"""Shared ignore rules for file exploration (ls/glob/grep, @-mention
-autocomplete).
+"""Glob-to-regex translation for file matching (the glob tool).
 
-This is deliberately NOT a .gitignore parser. Ignore handling is layered:
-git's own tools (``ls-files --exclude-standard``, ``check-ignore``, ``rg``)
-apply whatever the worktree's .gitignore says; the defaults here catch the
-noise repos commonly don't bother ignoring, independent of any .gitignore.
+No ignore rules live here anymore: ignored paths (whatever the user's
+``.gitignore``/``.git/info/exclude`` say) are shadowed out of the sandbox at
+mount time — see ``sandbox._hidden_paths`` — so no tool-side filtering is
+needed.
 """
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from functools import lru_cache
-
-DEFAULT_IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                        "dist", "build", ".cache", ".pytest_cache", ".mypy_cache",
-                        ".ruff_cache", ".idea", ".vscode"}
-DEFAULT_IGNORE_FILE_GLOBS = ("*.pyc", "*.egg-info", ".DS_Store")
-
-
-def is_ignored(rel_path: str) -> bool:
-    """True if any path component is a default-ignored directory name or
-    matches a default-ignored file glob (e.g. ``pkg.egg-info`` dirs)."""
-    for part in rel_path.split("/"):
-        if part in DEFAULT_IGNORE_DIRS:
-            return True
-        if any(fnmatch.fnmatchcase(part, glob) for glob in DEFAULT_IGNORE_FILE_GLOBS):
-            return True
-    return False
 
 
 @lru_cache(maxsize=256)

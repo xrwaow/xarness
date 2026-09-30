@@ -160,8 +160,8 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
 
 - `default_profile` — which profile to use when `--profile` is not passed
   (defaults to the only profile if exactly one is defined).
-- `default_theme` — startup color theme; optional, defaults to `carbonfox`.
-  Options: `"carbonfox"`, `"ayu-darker"`, `"one-light"`; `/theme` switches it
+- `default_theme` — startup color theme; optional, defaults to `ayu-darker`.
+  Options: `"ayu-darker"`, `"one-light"`; `/theme` switches it
   live.
 - `profiles` — list of profiles; switch with `--profile` (or `/model` in the
   TUI, which also sets reasoning effort). Each profile needs a unique `name`

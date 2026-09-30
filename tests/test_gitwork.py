@@ -103,41 +103,6 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert info is None
         assert not (workspace / ".git").exists()
 
-    async def test_setup_tracking_excludes_default_noise_dirs(self):
-        """The default noise dirs are written to the repo's local
-        info/exclude, so snapshots skip them even with no .gitignore."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        (repo / "node_modules").mkdir()
-        (repo / "node_modules" / "pkg.js").write_text("x\n")
-        (repo / "kept.txt").write_text("kept\n")
-
-        sha = await snapshot_tree(repo)
-        names = _git(repo, "ls-tree", "-r", "--name-only", sha).splitlines()
-        assert "kept.txt" in names
-        assert not any(n.startswith("node_modules/") for n in names)
-
-    async def test_ensure_default_excludes_is_idempotent(self):
-        """Re-running setup (a session resume) doesn't duplicate the block."""
-        repo = self.make_repo()
-        await setup_tracking(repo, "sess1")
-        await setup_tracking(repo, "sess2")
-
-        exclude = (repo / ".git" / "info" / "exclude").read_text()
-        assert exclude.count("# xarness: default ignores") == 1
-        assert "/node_modules/" in exclude
-
-    async def test_ensure_default_excludes_leaves_gitignore_alone(self):
-        """Only .git/info/exclude is written; the user's .gitignore is theirs."""
-        repo = self.make_repo()
-        gitignore = repo / ".gitignore"
-        gitignore.write_text("mine\n")
-
-        await setup_tracking(repo, "sess1")
-
-        assert gitignore.read_text() == "mine\n"
-
     async def test_setup_tracking_scopes_to_workspace_subdir(self):
         """--workspace pointing at a subdirectory of a bigger repo: the
         session is scoped to that subtree — snapshots, diffs, and reverts

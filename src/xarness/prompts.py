@@ -9,7 +9,7 @@ it, so the prompt the model sees always matches the tool set it was given.
 from __future__ import annotations
 
 GENERAL_SYSTEM_PROMPT = (
-    "You are an agent working inside a sandboxed workspace."
+    "You are a coding agent working inside a sandboxed workspace."
     "Ground rules:\n"
     "- File paths in tool calls are relative to the workspace root. Never use "
     "absolute paths.\n"

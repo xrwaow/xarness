@@ -23,7 +23,9 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
 
 from .. import theme
-from ..config import ConfigError, ProviderProfile, load_all_profiles, resolve_api_key
+from ..config import (
+    ConfigError, ProviderProfile, load_all_profiles, resolve_api_key, save_preferences,
+)
 from ..conversation import Conversation, Message
 from ..controller import ChatController, RollbackPlan
 from ..events import (
@@ -46,7 +48,7 @@ from .widgets import (
     AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
     MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
     SuggestionPopup, ThinkingBlock, ToolCallBlock, ToolWritingIndicator,
-    UserMessage, _format_duration, _write_file_loc,
+    UserMessage, _format_duration,
 )
 
 
@@ -96,6 +98,10 @@ SLASH_COMMANDS = [
         "(checked after each turn)"
     )),
     ("diff", "show pending changes (optionally: /diff <path>)"),
+    ("output_limit", (
+        "show or set the per-tool output cap in chars — tool results longer "
+        "than this are truncated before reaching the model (/output_limit <chars>)"
+    )),
     ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
     ("reject", "discard all changes made since the last /accept"),
     ("undo", (
@@ -161,6 +167,7 @@ class AgentApp(App[None]):
         self.total_in = 0
         self.total_out = 0
         self.last_in = 0
+        self.last_out = 0
         self._turn_busy = False
         # /auto_compact: run compaction automatically when the context window
         # passes the profile's auto_compact_threshold (checked at the end of
@@ -247,7 +254,10 @@ class AgentApp(App[None]):
     # Status bar
 
     def _refresh_status(self) -> None:
-        context_used = self.last_in + self.total_out
+        # The last round's prompt already includes the entire prior
+        # conversation (including earlier assistant outputs), so the current
+        # context is that prompt plus only the newest round's output.
+        context_used = self.last_in + self.last_out
         self.query_one("#status-bar", StatusBar).update_status(
             shown_name=self.profile.display_name,
             effort=self.profile.cot_strength.value,
@@ -343,6 +353,8 @@ class AgentApp(App[None]):
             )
         elif cmd == "mode":
             self._switch_mode()
+        elif cmd == "output_limit":
+            self._handle_output_limit(parts[1].strip() if len(parts) > 1 else "")
         elif cmd == "undo":
             self._run_undo(resend=False)
         elif cmd == "retry":
@@ -388,6 +400,27 @@ class AgentApp(App[None]):
             (m.usage for m in reversed(self.controller.conversation.messages) if m.usage), None
         )
         self.last_in = last.input_tokens if last else 0
+        self.last_out = last.output_tokens if last else 0
+
+    def _handle_output_limit(self, arg: str) -> None:
+        """Show or set the per-tool output cap the model receives."""
+        registry = self.tool_registry
+        if not arg:
+            self._post_line(NoticeLine(
+                f"tool output limit: {registry.max_output_chars:,} chars "
+                "(set with /output_limit <chars>)"
+            ))
+            return
+        try:
+            limit = int(arg)
+        except ValueError:
+            self._post_line(ErrorLine(f"/output_limit: not a number: {arg}"))
+            return
+        if limit < 256:
+            self._post_line(ErrorLine("/output_limit: must be at least 256"))
+            return
+        registry.max_output_chars = limit
+        self._post_line(NoticeLine(f"tool output limit set to {limit:,} chars"))
 
     @work(group="undo", exclusive=True)
     async def _run_undo(self, resend: bool) -> None:
@@ -720,7 +753,7 @@ class AgentApp(App[None]):
 
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
-            self._apply_theme(name)
+            self._handle_theme_command(name)
 
     def _handle_theme_command(self, arg: str) -> None:
         """Apply an explicitly named theme, or report the available ones."""
@@ -728,6 +761,26 @@ class AgentApp(App[None]):
             self._post_line(ErrorLine(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}"))
             return
         self._apply_theme(arg)
+        self._save_preference(default_theme=arg)
+
+    def _save_preference(
+        self,
+        *,
+        default_theme: str | None = None,
+        default_profile: str | None = None,
+    ) -> None:
+        """Write a chosen theme/model back to the config file so it becomes
+        the default for the next session. Failures are reported, never fatal."""
+        if self.config_path is None:
+            return
+        try:
+            save_preferences(
+                self.config_path,
+                default_theme=default_theme,
+                default_profile=default_profile,
+            )
+        except ConfigError as exc:
+            self._post_line(NoticeLine(f"note: could not save preference: {exc}"))
 
     def _apply_theme(self, name: str) -> None:
         """Switch palette live: CSS variables, input caret, shimmers, dots,
@@ -762,7 +815,7 @@ class AgentApp(App[None]):
             from ..session_store import new_session_name
             self.session_name = new_session_name()
         self.ensure_system_message()
-        self.total_in = self.total_out = self.last_in = 0
+        self.total_in = self.total_out = self.last_in = self.last_out = 0
         self._last_thinking = None
         self._queued.clear()
         self._compact_pending = False
@@ -913,6 +966,7 @@ class AgentApp(App[None]):
         self.profile = profile
         self.profile_name = name
         self._refresh_status()
+        self._save_preference(default_profile=name)
 
     async def _mount_spaced(
         self,
@@ -1331,15 +1385,16 @@ class AgentApp(App[None]):
                         if name is None:
                             continue
                         stream_args[event.call_id] += event.text
-                        if writing is not None and name == "write_file" and writing.tool_name == "write_file":
-                            loc = _write_file_loc(stream_args[event.call_id])
-                            if loc is not None:
-                                writing.set_loc(loc)
+                        if writing is not None:
+                            writing.update_args(stream_args[event.call_id])
                     elif isinstance(event, ToolCallArgumentsDone):
                         block = ToolCallBlock(event.call_id, event.name)
+                        await chat.mount(block)
+                        # After mount: append_arguments refreshes the summary
+                        # label ('run_bash git status') in place; before it,
+                        # the widget isn't mounted and the update no-ops.
                         block.append_arguments(event.arguments_json)
                         tool_blocks[event.call_id] = block
-                        await chat.mount(block)
                         pending_writes = max(0, pending_writes - 1)
                         if pending_writes == 0 and writing is not None:
                             await self._dismiss_indicator(writing)
@@ -1377,7 +1432,11 @@ class AgentApp(App[None]):
                 # Execute the calls this round requested, in stream order.
                 turn_had_tools = True
                 for call_id, block in tool_blocks.items():
-                    result = await self.tool_registry.call(block.tool_name, block.accumulated_arguments)
+                    result = await self.tool_registry.call(
+                        block.tool_name,
+                        block.accumulated_arguments,
+                        output_sink=block.append_output,
+                    )
                     if result.parse_error:
                         status = ToolCallStatus.PARSING_ERROR
                     elif result.ok:
@@ -1542,7 +1601,7 @@ class AgentApp(App[None]):
         (last round's prompt + cumulative output)."""
         if not self.auto_compact:
             return
-        if self.last_in + self.total_out < self.profile.auto_compact_threshold * self.profile.max_context:
+        if self.last_in + self.last_out < self.profile.auto_compact_threshold * self.profile.max_context:
             return
         try:
             await self._run_compaction()
@@ -1566,6 +1625,7 @@ class AgentApp(App[None]):
 
         if event.usage is not None:
             self.last_in = event.usage.input_tokens
+            self.last_out = event.usage.output_tokens
         # The controller folds every round's usage (including compaction's
         # own summarization round) into its cumulative total; mirror it.
         self.total_in = self.controller.usage_total.input_tokens

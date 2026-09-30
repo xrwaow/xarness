@@ -1,6 +1,6 @@
 {
   "default_profile": "openai",
-  "default_theme": "carbonfox",
+  "default_theme": "ayu-darker",
   "profiles": [
     {
       "name": "openai",

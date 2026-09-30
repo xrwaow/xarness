@@ -34,7 +34,9 @@ def _make_repo(base: Path) -> Path:
     _git(repo, "init", "-q", "-b", "main", ".")
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
-    (repo / ".gitignore").write_text("secret.txt\nignored_dir/\n")
+    (repo / ".gitignore").write_text(
+        "secret.txt\nignored_dir/\n__pycache__/\nnode_modules/\n"
+    )
     (repo / "app.py").write_text("print('hi')\n")
     (repo / "pkg").mkdir()
     (repo / "pkg" / "controller.py").write_text("class Controller:\n    pass\n")
@@ -83,10 +85,11 @@ def test_ls_filters_gitignored_and_default_ignored(tmp_path) -> None:
     assert "app.py" in names
     assert "pkg/" in names
     assert "notes.txt" in names          # untracked but not ignored
-    assert ".git/" not in names          # layer b
-    assert "__pycache__/" not in names   # layer b
-    assert "node_modules/" not in names  # layer b
-    assert "secret.txt" not in names     # layer a (committed .gitignore)
+    assert ".git/" in names              # visible, but mounted read-only
+    # gitignored -> shadowed; only the repo's own rules hide anything
+    assert "secret.txt" not in names
+    assert "__pycache__/" not in names
+    assert "node_modules/" not in names
     # directories first, then alphabetical
     assert names == sorted(names, key=lambda n: (not n.endswith("/"), n.rstrip("/")))
 
@@ -145,7 +148,7 @@ def test_grep_rg_present_and_absent_return_equivalent_results(tmp_path, monkeypa
     assert "pkg/controller.py:1:class Controller:" in with_rg.output
     # node_modules is not gitignored — only the default-ignore layer hides it
     assert "node_modules" not in with_rg.output
-    assert "ignored_dir" not in with_rg.output  # layer a
+    assert "ignored_dir" not in with_rg.output  # gitignored -> shadowed
 
     real_which = shutil.which
     monkeypatch.setattr(

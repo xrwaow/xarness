@@ -38,7 +38,6 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .ignore import DEFAULT_IGNORE_DIRS, DEFAULT_IGNORE_FILE_GLOBS
 
 _GIT_TIMEOUT = 30.0
 
@@ -252,29 +251,6 @@ async def snapshot_tree(root: Path, subtree: str = "") -> str:
             pass
 
 
-async def _ensure_default_excludes(git_dir: Path) -> None:
-    """Add xarness's default noise-dir ignores to the repo's local, untracked
-    exclude file (``.git/info/exclude``), so every :func:`snapshot_tree` call
-    skips them exactly like the explore tools already do — without ever
-    touching the user's own ``.gitignore`` or writing anything tracked.
-
-    ``info/exclude`` is git's per-clone, machine-local exclude mechanism (the
-    same category as local git config): it never affects committed history and
-    is never pushed. Idempotent — safe to call every session start.
-    """
-    exclude_file = git_dir / "info" / "exclude"
-    exclude_file.parent.mkdir(parents=True, exist_ok=True)
-    existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
-    marker = "# xarness: default ignores"
-    if marker in existing:
-        return
-    lines = [marker, *(f"/{d}/" for d in sorted(DEFAULT_IGNORE_DIRS)),
-             *DEFAULT_IGNORE_FILE_GLOBS]
-    exclude_file.write_text(
-        existing.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n", encoding="utf-8"
-    )
-
-
 async def setup_tracking(
     workspace: Path,
     session_id: str,
@@ -311,11 +287,6 @@ async def setup_tracking(
             f"{subtree}/; the rest of the repo is visible to the agent but "
             "read-only"
         )
-    # Make the default noise dirs (node_modules, .venv, caches, …) invisible to
-    # snapshots before the baseline is taken, so even the first snapshot skips
-    # them. Written to the repo's local info/exclude, never the user's
-    # .gitignore.
-    await _ensure_default_excludes(repo.git_common_dir)
     baseline = await snapshot_tree(repo.root, subtree)
     info = GitInfo(
         session_id=session_id,

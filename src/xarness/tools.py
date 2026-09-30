@@ -19,10 +19,11 @@ import os
 import shlex
 import shutil
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ignore import DEFAULT_IGNORE_DIRS, glob_to_regex, is_ignored
+from .ignore import glob_to_regex
 from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
 
 
@@ -46,15 +47,87 @@ class Tool:
     handler: Callable[[dict[str, Any]], Awaitable[ToolResult]]
 
 
+def tool(name: str, description: str, required: tuple[str, ...] = (), **params: Any) -> Callable:
+    """Decorator: turn an async handler into a Tool with a generated schema.
+
+    Each keyword argument after ``required`` declares one parameter. Its
+    value is the JSON-schema type (``path="string"``), a ``(type,
+    description)`` pair (``start_line=("integer", "1-based …")``), or a full
+    schema dict for structured params (arrays, items, …).
+    """
+    properties = {
+        pname: spec if isinstance(spec, dict)
+        else {"type": spec[0], "description": spec[1]} if isinstance(spec, tuple)
+        else {"type": spec}
+        for pname, spec in params.items()
+    }
+
+    def deco(handler):
+        return Tool(
+            name=name,
+            description=description,
+            parameters_schema={
+                "type": "object",
+                "properties": properties,
+                "required": list(required),
+            },
+            handler=handler,
+        )
+
+    return deco
+
+
+# Per-tool cap on the text sent back to the model (adjustable with
+# /output_limit in the TUI). Applies to every tool via ToolRegistry.call.
+DEFAULT_OUTPUT_LIMIT = 32768
+
+
+def _truncate_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    note = f"\n[output truncated at {limit} chars — raise the cap with /output_limit <chars>]"
+    return text[: max(limit - len(note), 0)] + note
+
+
+def _bad(error: str) -> ToolResult:
+    return ToolResult(ok=False, error=error, parse_error=True)
+
+
+# Output sink for the call in flight: registry.call sets it around the
+# handler await, run_bash forwards streamed shell lines to it so the TUI can
+# show live output while the command runs.
+_output_sink: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "tool_output_sink", default=None
+)
+
+
+def _exec_error(result, fallback: str) -> ToolResult:
+    return ToolResult(ok=False, error=result.stderr.strip() or fallback)
+
+
+def _check_path(sandbox: SandboxConfig, path: str, mode: str | None = None) -> ToolResult | None:
+    error = sandbox.validate_relpath(path, mode=mode)
+    return None if error is None else _bad(error)
+
+
+def _refs_guard(path: str) -> ToolResult | None:
+    if path.startswith((".refs/", "./.refs/")):
+        return ToolResult(ok=False, error="'.refs/' is read-only")
+    return None
+
+
 @dataclass(slots=True)
 class ToolRegistry:
     """Named tool set exposed to the model.
 
-    ``max_calls_per_turn`` is reserved for per-turn call limiting in a later
-    phase; it is stored but not yet enforced.
+    ``max_output_chars`` caps the text of every tool result before it goes
+    on the wire (see _truncate_output); the TUI's /output_limit command
+    mutates it live. ``max_calls_per_turn`` is reserved for per-turn call
+    limiting in a later phase; it is stored but not yet enforced.
     """
 
     max_calls_per_turn: int | None = None
+    max_output_chars: int = DEFAULT_OUTPUT_LIMIT
     _tools: dict[str, Tool] = field(default_factory=dict)
 
     def register(self, tool: Tool) -> None:
@@ -73,7 +146,15 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
-    async def call(self, name: str, arguments_json: str) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        arguments_json: str,
+        output_sink: Callable[[str], None] | None = None,
+    ) -> ToolResult:
+        """Execute one call. ``output_sink``, when given, receives streamed
+        output lines while the call runs (run_bash) so a UI can render them
+        live; the final ToolResult is unchanged either way."""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(ok=False, error=f"unknown tool '{name}'")
@@ -82,15 +163,20 @@ class ToolRegistry:
         except json.JSONDecodeError as exc:
             return ToolResult(ok=False, error=f"invalid arguments JSON: {exc}", parse_error=True)
         if not isinstance(args, dict):
-            return ToolResult(
-                ok=False,
-                error=f"invalid arguments JSON: expected an object, got {type(args).__name__}",
-                parse_error=True,
+            return _bad(
+                f"invalid arguments JSON: expected an object, got {type(args).__name__}"
             )
         try:
-            return await tool.handler(args)
+            token = _output_sink.set(output_sink)
+            try:
+                result = await tool.handler(args)
+            finally:
+                _output_sink.reset(token)
         except Exception as exc:  # noqa: BLE001
-            return ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+            result = ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+        result.output = _truncate_output(result.output, self.max_output_chars)
+        result.error = _truncate_output(result.error, self.max_output_chars)
+        return result
 
 
 async def _web_search_handler(args: dict[str, Any]) -> ToolResult:
@@ -181,11 +267,22 @@ def _python_outline(source: str) -> str | None:
 
 
 def _make_read_tool(sandbox: SandboxConfig) -> Tool:
-    async def _read_file(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "read_file",
+        "Read a file's contents. Paths are relative to the workspace root, "
+        "or '.refs/<alias>' for externally referenced files. Files over "
+        f"{OUTLINE_THRESHOLD} lines return a structural outline with line "
+        "numbers instead of contents; read specific sections of those by "
+        "passing start_line and end_line (1-based, inclusive).",
+        required=("path",),
+        path="string",
+        start_line=("integer", "1-based line to start reading from (default 1)"),
+        end_line=("integer", "1-based last line to read (default: end of file)"),
+    )
+    async def read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        error = sandbox.validate_relpath(path, mode="read")
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
+        if err := _check_path(sandbox, path, mode="read"):
+            return err
 
         try:
             start = int(args["start_line"]) if args.get("start_line") is not None else 1
@@ -202,7 +299,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         # newlines, undercounting files that don't end with one).
         count_result = await run_in_sandbox(sandbox, ["awk", "END{print NR}", target])
         if count_result.exit_code != 0:
-            return ToolResult(ok=False, error=count_result.stderr.strip() or "read failed")
+            return _exec_error(count_result, "read failed")
         try:
             total_lines = int(count_result.stdout.split()[0])
         except (IndexError, ValueError):
@@ -226,7 +323,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
 
         result = await run_in_sandbox(sandbox, ["sed", "-n", f"{start},{end}p", target])
         if result.exit_code != 0:
-            return ToolResult(ok=False, error=result.stderr.strip() or "read failed")
+            return _exec_error(result, "read failed")
 
         output = result.stdout
         if end < total_lines:
@@ -239,7 +336,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     async def _outline_result(sandbox: SandboxConfig, path: str, total_lines: int) -> ToolResult:
         cat_result = await run_in_sandbox(sandbox, ["cat", sandbox.tool_path(path)])
         if cat_result.exit_code != 0:
-            return ToolResult(ok=False, error=cat_result.stderr.strip() or "read failed")
+            return _exec_error(cat_result, "read failed")
         outline = _python_outline(cat_result.stdout)
         if outline is None:
             # Not a Python file (or no defs/classes): fall back to a preview
@@ -273,43 +370,24 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             header=path,
         )
 
-    return Tool(
-        name="read_file",
-        description=(
-            "Read a file's contents. Paths are relative to the workspace root, "
-            "or '.refs/<alias>' for externally referenced files. Files over "
-            f"{OUTLINE_THRESHOLD} lines return a structural outline with line "
-            "numbers instead of contents; read specific sections of those by "
-            "passing start_line and end_line (1-based, inclusive)."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "start_line": {
-                    "type": "integer",
-                    "description": "1-based line to start reading from (default 1)",
-                },
-                "end_line": {
-                    "type": "integer",
-                    "description": "1-based last line to read (default: end of file)",
-                },
-            },
-            "required": ["path"],
-        },
-        handler=_read_file,
-    )
+    return read_file
 
 
 def _make_write_tool(sandbox: SandboxConfig) -> Tool:
-    async def _write_file(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "write_file",
+        "Create a new file or overwrite an existing one with completely new "
+        "contents. Prefer edit_file for changing part of an existing file. "
+        "Cannot write under '.refs/', which is read-only.",
+        required=("path", "content"),
+        path="string",
+        content=("string", "the full new file contents"),
+    )
+    async def write_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
         content = args.get("content", "")
-        error = sandbox.validate_relpath(path)
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
-        if path.startswith((".refs/", "./.refs/")):
-            return ToolResult(ok=False, error="'.refs/' is read-only")
+        if err := _check_path(sandbox, path) or _refs_guard(path):
+            return err
 
         target = sandbox.tool_path(path)
         exists = await run_in_sandbox(sandbox, ["test", "-e", target])
@@ -318,27 +396,11 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
             sandbox, ["tee", target], input_bytes=content.encode()
         )
         if write_result.exit_code != 0:
-            return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+            return _exec_error(write_result, "write failed")
         verb = "created" if created else "overwrote"
         return ToolResult(ok=True, output=f"{verb} {path} ({len(content)} bytes)", header=path)
 
-    return Tool(
-        name="write_file",
-        description=(
-            "Create a new file or overwrite an existing one with completely new "
-            "contents. Prefer edit_file for changing part of an existing file. "
-            "Cannot write under '.refs/', which is read-only."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string", "description": "the full new file contents"},
-            },
-            "required": ["path", "content"],
-        },
-        handler=_write_file,
-    )
+    return write_file
 
 
 # Upper bound on the diff lines echoed back by edit_file.
@@ -434,13 +496,51 @@ def _format_edit_diff(path: str, before: str, after: str) -> str:
 
 
 def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
-    async def _edit_file(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "edit_file",
+        "Edit an existing file by replacing exact, unique strings with new "
+        "text. Pass 'edits': a list of {old_string, new_string} replacements, "
+        "applied in order — batch every change you want to make to the same "
+        "file into one call rather than calling this tool repeatedly. Each "
+        "old_string must match the file exactly and uniquely; include enough "
+        "surrounding context (a few lines) to disambiguate if the snippet "
+        "could appear more than once. Edits are all-or-nothing: if any one "
+        "fails to match, nothing is written. The result includes a diff of "
+        "what changed. Use write_file to create a file or replace its whole "
+        "contents. Cannot write under '.refs/', which is read-only.",
+        required=("path",),
+        path="string",
+        edits={
+            "type": "array",
+            "description": (
+                "replacements to apply, in order (prefer this over the "
+                "single-edit old_string/new_string pair)"
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "old_string": {
+                        "type": "string",
+                        "description": "the exact text to replace (must match once)",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "the replacement text",
+                    },
+                },
+                "required": ["old_string", "new_string"],
+            },
+        },
+        old_string=(
+            "string",
+            "single-edit form: the exact text to replace (must match once)",
+        ),
+        new_string=("string", "single-edit form: the replacement text"),
+    )
+    async def edit_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        error = sandbox.validate_relpath(path)
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
-        if path.startswith((".refs/", "./.refs/")):
-            return ToolResult(ok=False, error="'.refs/' is read-only")
+        if err := _check_path(sandbox, path) or _refs_guard(path):
+            return err
 
         edits, parse_error = _collect_edits(args)
         if parse_error is not None:
@@ -448,7 +548,7 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
 
         read_result = await run_in_sandbox(sandbox, ["cat", sandbox.tool_path(path)])
         if read_result.exit_code != 0:
-            return ToolResult(ok=False, error=read_result.stderr.strip() or "read failed")
+            return _exec_error(read_result, "read failed")
 
         current = read_result.stdout
         updated, failure = _apply_edits(current, edits)
@@ -459,7 +559,7 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             sandbox, ["tee", sandbox.tool_path(path)], input_bytes=updated.encode()
         )
         if write_result.exit_code != 0:
-            return ToolResult(ok=False, error=write_result.stderr.strip() or "write failed")
+            return _exec_error(write_result, "write failed")
         plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
         diff = _format_edit_diff(path, current, updated)
         adds = sum(
@@ -476,73 +576,32 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             header=f"+{adds} -{dels} {path}",
         )
 
-    return Tool(
-        name="edit_file",
-        description=(
-            "Edit an existing file by replacing exact, unique strings with new "
-            "text. Pass 'edits': a list of {old_string, new_string} replacements, "
-            "applied in order — batch every change you want to make to the same "
-            "file into one call rather than calling this tool repeatedly. Each "
-            "old_string must match the file exactly and uniquely; include enough "
-            "surrounding context (a few lines) to disambiguate if the snippet "
-            "could appear more than once. Edits are all-or-nothing: if any one "
-            "fails to match, nothing is written. The result includes a diff of "
-            "what changed. Use write_file to create a file or replace its whole "
-            "contents. Cannot write under '.refs/', which is read-only."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "edits": {
-                    "type": "array",
-                    "description": (
-                        "replacements to apply, in order (prefer this over the "
-                        "single-edit old_string/new_string pair)"
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_string": {
-                                "type": "string",
-                                "description": "the exact text to replace (must match once)",
-                            },
-                            "new_string": {
-                                "type": "string",
-                                "description": "the replacement text",
-                            },
-                        },
-                        "required": ["old_string", "new_string"],
-                    },
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "single-edit form: the exact text to replace (must match once)",
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "single-edit form: the replacement text",
-                },
-            },
-            "required": ["path"],
-        },
-        handler=_edit_file,
-    )
+    return edit_file
 
 
 def _make_run_bash_tool(
     session: SandboxSession,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> Tool:
-    async def _run_bash(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "run_bash",
+        "Run a shell command inside the sandboxed workspace. No network access. "
+        "The shell persists across calls within this chat — cwd and exported "
+        "variables carry over. Branch/ref git operations (checkout <ref>, "
+        "switch, worktree, branch -d/-D, reset --hard, rebase) are rejected; "
+        "status/diff/log/show/blame/add/commit work.",
+        required=("command",),
+        command="string",
+    )
+    async def run_bash(args: dict[str, Any]) -> ToolResult:
         command = args.get("command", "")
         if not command:
-            return ToolResult(ok=False, error="'command' is required", parse_error=True)
+            return _bad("'command' is required")
         if git_guard is not None:
             block_reason = git_guard(command)
             if block_reason:
                 return ToolResult(ok=False, error=block_reason, header=command)
-        result = await session.run(command)
+        result = await session.run(command, on_output=_output_sink.get())
         if result.timed_out:
             return ToolResult(ok=False, error="command timed out (shell restarted)", header=command)
         return ToolResult(
@@ -552,22 +611,7 @@ def _make_run_bash_tool(
             header=command,
         )
 
-    return Tool(
-        name="run_bash",
-        description=(
-            "Run a shell command inside the sandboxed workspace. No network access. "
-            "The shell persists across calls within this chat — cwd and exported "
-            "variables carry over. Branch/ref git operations (checkout <ref>, "
-            "switch, worktree, branch -d/-D, reset --hard, rebase) are rejected; "
-            "status/diff/log/show/blame/add/commit work."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-        handler=_run_bash,
-    )
+    return run_bash
 
 
 def _make_ask_user_tool(
@@ -575,173 +619,137 @@ def _make_ask_user_tool(
 ) -> Tool:
     """ask_user: hand questions to the user and return their answers as the result."""
 
-    async def _ask_user(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "ask_user",
+        "Ask the user one or more questions and wait for their answers. "
+        "Use when you need a decision, a missing detail, or confirmation "
+        "before acting. Keep questions short and self-contained.",
+        required=("questions",),
+        questions={
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "the questions to ask (one or more)",
+        },
+    )
+    async def ask_user(args: dict[str, Any]) -> ToolResult:
         raw = args.get("questions")
         if isinstance(raw, str):
             raw = [raw]
         questions = [q.strip() for q in raw or [] if isinstance(q, str) and q.strip()]
         if not questions:
-            return ToolResult(ok=False, error="'questions' must be a non-empty list", parse_error=True)
+            return _bad("'questions' must be a non-empty list")
         answers = await ask_callback(questions)
         if answers is None:
             return ToolResult(ok=True, output="(user skipped the questions — no answers given)")
         pairs = [f"Q: {q}\nA: {a}" for q, a in zip(questions, answers)]
         return ToolResult(ok=True, output="\n\n".join(pairs))
 
-    return Tool(
-        name="ask_user",
-        description=(
-            "Ask the user one or more questions and wait for their answers. "
-            "Use when you need a decision, a missing detail, or confirmation "
-            "before acting. Keep questions short and self-contained."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "the questions to ask (one or more)",
-                }
-            },
-            "required": ["questions"],
-        },
-        handler=_ask_user,
-    )
+    return ask_user
 
 
 # ---------------------------------------------------------------------------
 # read-only exploration: ls / glob / grep (plan mode only)
-
-
-async def _git_ignored_set(sandbox: SandboxConfig, rel_paths: list[str]) -> set[str]:
-    """Workspace-relative paths the repo's ignore rules flag (ignore layer a).
-    ``--no-index`` makes this purely rule-based, matching rg's behavior —
-    without it git refuses to report tracked files, and a tracked file that
-    matches an ignore rule would then be visible in ls/glob but hidden in
-    grep. Empty when git can't answer (no repo, git failed) — the caller
-    then keeps only the default-ignore filtering."""
-    if not rel_paths:
-        return set()
-    res = await run_in_sandbox(
-        sandbox,
-        ["git", "-C", sandbox.tool_root, "check-ignore", "--stdin", "--no-index"],
-        input_bytes=("\n".join(rel_paths) + "\n").encode(),
-    )
-    if res.exit_code not in (0, 1):
-        return set()
-    return {line for line in res.stdout.splitlines() if line}
-
+# Ignore rules are NOT applied here: ignored paths (gitignored + default
+# noise) are shadowed out of the sandbox at mount time, so every tool —
+# bash included — simply cannot see them.
 
 def _make_ls_tool(sandbox: SandboxConfig) -> Tool:
-    async def _ls(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "ls",
+        "List a directory's immediate entries (not recursive); directories "
+        "end with '/'. Ignored files (gitignored, caches, ...) are shadowed "
+        "out of the sandbox and never appear. Paths are relative "
+        "to the workspace root.",
+        path=("string", "directory to list (default '.')"),
+    )
+    async def ls(args: dict[str, Any]) -> ToolResult:
         path = args.get("path") or "."
         if not isinstance(path, str):
-            return ToolResult(ok=False, error="'path' must be a string", parse_error=True)
-        error = sandbox.validate_relpath(path, mode="read")
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
+            return _bad("'path' must be a string")
+        if err := _check_path(sandbox, path, mode="read"):
+            return err
         target = sandbox.tool_path(path)
         is_dir = await run_in_sandbox(sandbox, ["test", "-d", target])
         if is_dir.exit_code != 0:
             exists = await run_in_sandbox(sandbox, ["test", "-e", target])
             if exists.exit_code == 0:
-                return ToolResult(ok=False, error=f"'{path}' is not a directory", parse_error=True)
-            return ToolResult(ok=False, error=f"path does not exist: {path}", parse_error=True)
+                return _bad(f"'{path}' is not a directory")
+            return _bad(f"path does not exist: {path}")
 
         # -p suffixes directories with '/', which doubles as the dir marker.
         listing = await run_in_sandbox(sandbox, ["ls", "-A", "-p", "--", target])
         if listing.exit_code != 0:
-            return ToolResult(ok=False, error=listing.stderr.strip() or "ls failed")
+            return _exec_error(listing, "ls failed")
         entries = [e for e in listing.stdout.splitlines() if e]
+        # A shadowed directory is empty but its name still lists; drop the
+        # names of anything hidden under the listed path (shadowed files
+        # read as empty but also shouldn't be offered).
+        base = "" if path in (".", "") else path.strip("/") + "/"
+        skip: set[str] = set()
+        for h in sandbox.hidden_paths:
+            if base and not h.startswith(base):
+                continue
+            first = h[len(base):].split("/", 1)[0]
+            skip.update((first, first + "/"))
+        entries = [e for e in entries if e not in skip]
         if not entries:
             return ToolResult(ok=True, output="(empty directory)")
+        entries.sort(key=lambda e: (not e.endswith("/"), e.rstrip("/")))
+        return ToolResult(ok=True, output="\n".join(entries), header=path)
 
-        base = "" if path in (".", "") else path.rstrip("/") + "/"
-        git_ignored = await _git_ignored_set(
-            sandbox, [base + e.rstrip("/") for e in entries]
-        )
-        kept = [
-            e for e in entries
-            if base + e.rstrip("/") not in git_ignored  # layer a
-            and not is_ignored(base + e.rstrip("/"))    # layer b
-        ]
-        if not kept:
-            return ToolResult(ok=True, output="(nothing left after ignore filtering)")
-        kept.sort(key=lambda e: (not e.endswith("/"), e.rstrip("/")))
-        return ToolResult(ok=True, output="\n".join(kept), header=path)
-
-    return Tool(
-        name="ls",
-        description=(
-            "List a directory's immediate entries (not recursive); directories "
-            "end with '/'. Gitignored files and default-ignored dirs (.git, "
-            "node_modules, __pycache__, ...) are hidden. Paths are relative "
-            "to the workspace root."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "directory to list (default '.')"},
-            },
-        },
-        handler=_ls,
-    )
+    return ls
 
 
-async def _list_files_respecting_gitignore(sandbox: SandboxConfig, base: str) -> list[str]:
+async def _list_files(sandbox: SandboxConfig, base: str) -> list[str]:
     """Files under ``base`` (agent-workspace-relative, "" = root) as
-    agent-workspace-relative posix paths, honoring the repo's ignore rules
-    (layer a) via git. Falls back to ``find`` when the workspace isn't a git
-    repo; default-ignored dirs are pruned either way by the caller (layer b)."""
-    argv = ["git", "-C", sandbox.tool_root, "ls-files", "--cached", "--others",
-            "--exclude-standard", "--"]
-    if base:
-        argv.append(base)
-    res = await run_in_sandbox(sandbox, argv)
-    if res.exit_code == 0:
-        return [line for line in res.stdout.splitlines() if line]
-
-    target = sandbox.tool_path(base or ".")
-    prune: list[str] = ["("]
-    for i, name in enumerate(sorted(DEFAULT_IGNORE_DIRS)):
-        if i:
-            prune.append("-o")
-        prune += ["-name", name]
-    prune += [")", "-prune", "-o", "-type", "f", "-print"]
-    res = await run_in_sandbox(sandbox, ["find", target, *prune])
+    agent-workspace-relative posix paths. No ignore logic: hidden paths are
+    shadowed out of the container, so find simply never sees them."""
+    target = sandbox.tool_root if base in ("", ".") else sandbox.tool_path(base)
+    res = await run_in_sandbox(
+        sandbox,
+        ["find", target, "-name", ".git", "-prune",
+         "-o", "-type", "f", "-print"],
+    )
     if res.exit_code != 0:
         raise RuntimeError(res.stderr.strip() or f"could not list files under {base or '.'}")
     prefix = sandbox.tool_root + "/"
-    return [line[len(prefix):] for line in res.stdout.splitlines() if line.startswith(prefix)]
+    out = []
+    for line in res.stdout.splitlines():
+        out.append(line[len(prefix):] if line.startswith(prefix) else line)
+    return out
 
 
 def _make_glob_tool(sandbox: SandboxConfig) -> Tool:
-    async def _glob(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "glob",
+        "Find files by glob pattern (e.g. '**/controller.py', 'src/*.py'). "
+        "Matches paths relative to 'path' (default workspace root); "
+        "ignored files (gitignored, caches, ...) are shadowed out of the "
+        "sandbox and never matched. "
+        "Results are capped and sorted shortest-path-first.",
+        required=("glob",),
+        glob=("string", "glob pattern ('**/' = any depth)"),
+        path=("string", "base directory to search (default '.')"),
+    )
+    async def glob(args: dict[str, Any]) -> ToolResult:
         pattern = args.get("glob", "")
         if not pattern:
-            return ToolResult(ok=False, error="'glob' is required", parse_error=True)
+            return _bad("'glob' is required")
         path = args.get("path") or "."
         if not isinstance(pattern, str) or not isinstance(path, str):
-            return ToolResult(ok=False, error="'glob'/'path' must be strings", parse_error=True)
-        error = sandbox.validate_relpath(path, mode="read")
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
+            return _bad("'glob'/'path' must be strings")
+        if err := _check_path(sandbox, path, mode="read"):
+            return err
         base = "" if path in (".", "") else path.strip("/")
         if base:
             is_dir = await run_in_sandbox(sandbox, ["test", "-d", sandbox.tool_path(base)])
             if is_dir.exit_code != 0:
                 return ToolResult(ok=False, error=f"path is not a directory: {path}", parse_error=True)
 
-        files = await _list_files_respecting_gitignore(sandbox, base)
-        # Layer a, rule-based (covers tracked files matching ignore rules,
-        # which ls-files --cached would otherwise always list).
-        git_ignored = await _git_ignored_set(sandbox, files)
-        files = [f for f in files if f not in git_ignored]
+        files = await _list_files(sandbox, base)
         if base:
             prefix = base + "/"
             files = [f[len(prefix):] for f in files if f.startswith(prefix)]
-        files = [f for f in files if not is_ignored(f"{base}/{f}" if base else f)]  # layer b
 
         matcher = glob_to_regex(pattern)
         matches = [f for f in files if matcher.fullmatch(f)]
@@ -755,24 +763,7 @@ def _make_glob_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=True, output="(no matches)", header=_search_header(pattern, path))
         return ToolResult(ok=True, output="\n".join(matches), header=_search_header(pattern, path))
 
-    return Tool(
-        name="glob",
-        description=(
-            "Find files by glob pattern (e.g. '**/controller.py', 'src/*.py'). "
-            "Matches paths relative to 'path' (default workspace root); "
-            "gitignored files and default-ignored dirs are never matched. "
-            "Results are capped and sorted shortest-path-first."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "glob": {"type": "string", "description": "glob pattern ('**/' = any depth)"},
-                "path": {"type": "string", "description": "base directory to search (default '.')"},
-            },
-            "required": ["glob"],
-        },
-        handler=_glob,
-    )
+    return glob
 
 
 def _rg_argv(regex: str, include: str, path: str, root: str) -> list[str]:
@@ -789,7 +780,7 @@ def _git_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
     else:
         spec = path
     return ["git", "-C", root, "grep", "-n", "--untracked",
-            "--exclude-standard", "-E", "-e", regex, "--", spec]
+            "-E", "-e", regex, "--", spec]
 
 
 def _plain_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
@@ -807,27 +798,37 @@ def _search_header(query: str, path: str) -> str:
 
 
 def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
-    async def _grep(args: dict[str, Any]) -> ToolResult:
+    @tool(
+        "grep",
+        "Search file contents with a regex; returns 'path:line:content' "
+        "per match. Optional 'include_pattern' scopes the search (a single "
+        "path or a glob like '**/*.py'); optional 'path' sets the base "
+        "directory. Ignored files (gitignored, caches, ...) are shadowed "
+        "out of the sandbox and never match. "
+        "Matches are capped per file and in total.",
+        required=("regex",),
+        regex="string",
+        include_pattern=("string", "single path or glob scoping the search"),
+        path=("string", "base directory (default '.')"),
+    )
+    async def grep(args: dict[str, Any]) -> ToolResult:
         regex = args.get("regex", "")
         if not regex:
-            return ToolResult(ok=False, error="'regex' is required", parse_error=True)
+            return _bad("'regex' is required")
         include = args.get("include_pattern") or ""
         path = args.get("path") or "."
         if not isinstance(regex, str) or not isinstance(include, str) or not isinstance(path, str):
-            return ToolResult(
-                ok=False, error="'regex'/'include_pattern'/'path' must be strings", parse_error=True
-            )
-        error = sandbox.validate_relpath(path, mode="read")
-        if error:
-            return ToolResult(ok=False, error=error, parse_error=True)
+            return _bad("'regex'/'include_pattern'/'path' must be strings")
+        if err := _check_path(sandbox, path, mode="read"):
+            return err
         if path not in (".", ""):
             exists = await run_in_sandbox(sandbox, ["test", "-e", sandbox.tool_path(path)])
             if exists.exit_code != 0:
-                return ToolResult(ok=False, error=f"path does not exist: {path}", parse_error=True)
+                return _bad(f"path does not exist: {path}")
 
-        # Prefer rg (reads .gitignore natively); git grep is the fallback and
-        # always exists in this harness. Exit 127 means the binary wasn't
-        # actually reachable inside the sandbox — try the next backend.
+        # Prefer rg; git grep is the fallback and always exists in this
+        # harness. Exit 127 means the binary wasn't actually reachable
+        # inside the sandbox — try the next backend.
         backends = []
         root = sandbox.tool_root
         if shutil.which("rg") is not None:
@@ -841,17 +842,9 @@ def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
 
         if res.exit_code not in (0, 1) and not res.stdout:
             err = res.stderr.strip()
-            if "cannot be used for tracked contents" in err:
-                # A tracked file matches an ignore rule; git refuses the
-                # combination outright. Retry without --exclude-standard —
-                # layer b still filters, we just lose git's layer a here.
-                retry = [a for a in backends[-1] if a != "--exclude-standard"]
-                res = await run_in_sandbox(sandbox, retry)
-            err = res.stderr.strip()
             if res.exit_code not in (0, 1) and not res.stdout:
                 if "not a git repository" in err:
-                    # No repo to lean on (isolation disabled): plain grep,
-                    # with only the default-ignore filtering on top.
+                    # No repo to lean on (isolation disabled): plain grep.
                     res = await run_in_sandbox(
                         sandbox, _plain_grep_argv(regex, include, path, root)
                     )
@@ -875,8 +868,6 @@ def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
                 # '.'; rg strips it. Normalize so backends agree.
                 fpath = fpath[2:]
                 raw = f"{fpath}:{parts[1]}:{parts[2]}"
-            if is_ignored(fpath):  # layer b — neither -g nor pathspec knows it
-                continue
             seen = counts.get(fpath, 0)
             if seen >= _MAX_GREP_PER_FILE:
                 per_file_truncated = True
@@ -909,29 +900,7 @@ def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
             header=_search_header(regex, include or path),
         )
 
-    return Tool(
-        name="grep",
-        description=(
-            "Search file contents with a regex; returns 'path:line:content' "
-            "per match. Optional 'include_pattern' scopes the search (a single "
-            "path or a glob like '**/*.py'); optional 'path' sets the base "
-            "directory. Gitignored files and default-ignored dirs are skipped. "
-            "Matches are capped per file and in total."
-        ),
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "regex": {"type": "string"},
-                "include_pattern": {
-                    "type": "string",
-                    "description": "single path or glob scoping the search",
-                },
-                "path": {"type": "string", "description": "base directory (default '.')"},
-            },
-            "required": ["regex"],
-        },
-        handler=_grep,
-    )
+    return grep
 
 
 def build_registry(
@@ -963,7 +932,6 @@ def build_registry(
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
-            registry.register(_make_grep_tool(sandbox))
             if session is not None:
                 registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         else:

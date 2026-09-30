@@ -1,7 +1,9 @@
 """Fast, bounded filename search for @-mention autocomplete.
 
-Caps scanned entries and skips heavy directories so a huge repo (or an
-accidentally-scoped workspace like $HOME) can't freeze the UI.
+Caps scanned entries and skips dot-directories so a huge repo (or an
+accidentally-scoped workspace like $HOME) can't freeze the UI. No ignore
+rules applied — the sandbox hides ignored paths; this is host-side and only
+feeds autocomplete.
 """
 
 from __future__ import annotations
@@ -9,8 +11,6 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-
-from .ignore import DEFAULT_IGNORE_DIRS
 
 _MAX_SCAN = 20_000
 _MAX_RESULTS = 50
@@ -20,7 +20,7 @@ def _walk_bounded(root: Path) -> list[str]:
     results: list[str] = []
     scanned = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root)
             results.append(rel)

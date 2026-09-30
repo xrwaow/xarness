@@ -11,8 +11,14 @@ into the sandbox itself.
 from __future__ import annotations
 
 import asyncio
+import atexit
+import os
 import shutil
+import subprocess
+import tempfile
 import uuid
+from collections.abc import Callable
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -20,6 +26,65 @@ from typing import Literal
 
 class SandboxUnavailable(Exception):
     """Raised when bwrap isn't installed or usable on this host."""
+
+
+_SHADOW: tuple[str, str] | None = None
+
+
+def _shadow_placeholders() -> tuple[str, str]:
+    """Host paths of an empty file and an empty directory, bind-mounted over
+    hidden paths to make them vanish (empty and read-only: writes hit the
+    placeholder, never the underlying worktree). One set is reused for the
+    process lifetime and cleaned up at exit."""
+    global _SHADOW
+    if _SHADOW is None:
+        root = tempfile.mkdtemp(prefix="xarness-shadow-")
+        file_path = os.path.join(root, "f")
+        dir_path = os.path.join(root, "d")
+        open(file_path, "w").close()
+        os.mkdir(dir_path)
+        atexit.register(shutil.rmtree, root, True)
+        _SHADOW = (file_path, dir_path)
+    return _SHADOW
+
+
+def _git_ignored_paths(workspace: Path) -> list[str]:
+    """Workspace-relative paths the repo's ignore rules flag, directories
+    collapsed to single entries (``--directory``). Empty when git can't
+    answer (no repo, git failed) — the default walk still covers its own
+    noise."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(workspace), "ls-files", "--others", "--ignored",
+             "--exclude-standard", "--directory"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if res.returncode != 0:
+        return []
+    return [line.rstrip("/") for line in res.stdout.splitlines() if line]
+
+
+def _hidden_paths(workspace: Path) -> list[str]:
+    """Workspace-relative paths to shadow out of the container: exactly what
+    the repo's ignore rules flag (``.gitignore`` + ``.git/info/exclude``),
+    nothing invented here. ".git" stays visible (read-only). Children of an
+    already-hidden directory are dropped — shadowing the parent suffices.
+    Empty when git can't answer (no repo, failed)."""
+    hidden: list[str] = []
+    seen_dirs: list[str] = []
+
+    def buried(rel: str) -> bool:
+        return any(rel == d or rel.startswith(d + "/") for d in seen_dirs)
+
+    for rel in _git_ignored_paths(workspace):
+        if rel == ".git" or rel.startswith(".git/") or buried(rel):
+            continue
+        if (workspace / rel).is_dir():
+            seen_dirs.append(rel)
+        hidden.append(rel)
+    return hidden
 
 
 @dataclass(slots=True)
@@ -36,10 +101,17 @@ class SandboxConfig:
     allow_network: bool = False
     timeout_seconds: float = 60.0
     # Host path of the repo's .git dir. Bound into the sandbox at its real
-    # path so git works inside the sandbox: the agent's shell git commands
-    # (status/diff/add/commit) need it. Read-write because git add/commit
-    # must update the index and object store.
+    # path so git reads (status/diff/log) work inside the sandbox. Bound
+    # read-only: the agent never commits — the harness checkpoints on the
+    # host (gitwork), so only it touches the index and object store.
     git_dir: Path | None = None
+    # Workspace-relative paths (files and directories) hidden from the
+    # container: exactly what the repo's ignore rules flag. Computed once at
+    # construction; each path is shadowed with an empty placeholder in
+    # build_argv, so ignored content is not just filtered from tool output —
+    # it does not exist as far as every tool (bash included) can tell.
+    # ".git" is excluded: it stays visible, read-only.
+    hidden_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if shutil.which("bwrap") is None:
@@ -62,6 +134,10 @@ class SandboxConfig:
                 )
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
+        self.hidden_paths = tuple(
+            p for p in _hidden_paths(self.workspace)
+            if not self.subtree or not (self.subtree == p or self.subtree.startswith(p + "/"))
+        )
 
     def ref_path(self, alias: str) -> str:
         return f"{self.tool_root}/.refs/{alias}"
@@ -125,18 +201,31 @@ class SandboxConfig:
             # Whole workspace read-only — git keeps working (the .git file at
             # the worktree root stays reachable) and the agent can read the
             # surrounding project — with the session's subtree re-bound
-            # read-write on top (later binds shadow earlier ones).
+            # read-write on top (later binds shadow earlier ones). Hidden
+            # paths are shadowed before that re-bind, so the subtree itself
+            # is never hidden from the agent; everything else ignores apply
+            # to the surrounding repo too.
             argv += ["--ro-bind", str(self.workspace), "/workspace"]
+        else:
+            argv += ["--bind", str(self.workspace), "/workspace"]
+        if self.subtree:
             argv += [
                 "--bind", str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
             ]
             chdir = f"/workspace/{self.subtree}"
-        else:
-            argv += ["--bind", str(self.workspace), "/workspace"]
+        # Shadow hidden paths last: the subtree re-bind above restores the
+        # agent's own tree wholesale, so shadows must land after it to stick
+        # (ancestors of the subtree were filtered out at construction —
+        # shadowing one would bury the re-bind beneath it).
+        empty_file, empty_dir = _shadow_placeholders()
+        for rel in self.hidden_paths:
+            host = self.workspace / rel
+            is_dir = host.is_dir() and not host.is_symlink()
+            argv += ["--bind", empty_dir if is_dir else empty_file, f"/workspace/{rel}"]
         if self.git_dir is not None:
             # Same path as on the host, so git inside the sandbox resolves
-            # it unchanged.
-            argv += ["--bind", str(self.git_dir), str(self.git_dir)]
+            # it unchanged. Read-only: the harness does all git writes.
+            argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
         for alias, host_path in self.external_refs.items():
             argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
         argv += ["--chdir", chdir, "--unshare-all"]
@@ -206,7 +295,11 @@ class SandboxSession:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-    async def run(self, command: str) -> SandboxResult:
+    async def run(self, command: str, on_output: Callable[[str], None] | None = None) -> SandboxResult:
+        """Run one command in the persistent shell.
+
+        ``on_output``, when given, is called with each output line as it
+        arrives (so a TUI can show live output while the command runs)."""
         async with self._lock:
             await self._ensure_started()
             assert self._proc is not None and self._proc.stdin and self._proc.stdout
@@ -225,6 +318,8 @@ class SandboxSession:
                     if text.startswith(marker):
                         return int(text[len(marker):].strip() or "-1")
                     output.append(text)
+                    if on_output is not None:
+                        on_output(text)
 
             try:
                 exit_code = await asyncio.wait_for(

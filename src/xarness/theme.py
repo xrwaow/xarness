@@ -64,32 +64,9 @@ THEMES: dict[str, dict[str, str]] = {
         "diff_hunk": "#7c4dff",
         "diff_meta": "#a0a1a7",
     },
-    "carbonfox": {
-        "bg": "#161616",              # background (IBM Carbon gray-90)
-        "surface": "#232323",         # elevated surface
-        "border": "#353535",          # border.variant
-        "text": "#f2f4f8",            # text
-        "muted": "#7a7d82",           # comment (bg blended toward fg)
-        "user": "#25be6a",            # terminal.ansi.green / success
-        "reasoning": "#7a7d82",       # comment
-        "accent": "#be95ff",          # terminal.ansi.magenta / keyword
-        "accent2": "#3ddbd9",         # terminal.ansi.orange slot (teal)
-        "status": "#78a9ff",          # terminal.ansi.blue
-        "error": "#ee5396",           # terminal.ansi.red
-        "success": "#25be6a",         # green status dot / tool call succeeded
-        "warning": "#ff7eb6",         # pink status dot / call in flight
-        "highlight": "#f2f4f8",       # generic UI emphasis (hover, focus)
-        "cursor": "#be95ff",          # input caret block
-        "diff_add": "#42be65",        # added line text
-        "diff_add_bg": "#1c2b21",     # added line background tint
-        "diff_del": "#ee5396",        # removed line text
-        "diff_del_bg": "#2e1c26",     # removed line background tint
-        "diff_hunk": "#78a9ff",       # @@ hunk headers
-        "diff_meta": "#7a7d82",       # line-number gutter / metadata
-    },
 }
 
-DEFAULT_THEME = "carbonfox"
+DEFAULT_THEME = "ayu-darker"
 
 PALETTE: dict[str, str] = {}
 CSS_VARIABLES: dict[str, str] = {}

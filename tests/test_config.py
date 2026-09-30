@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from xarness.config import ConfigError, CotStrength, load_config, resolve_api_key
+from xarness.config import ConfigError, CotStrength, load_config, resolve_api_key, save_preferences
 
 
 def write(tmp_path: Path, data: dict) -> Path:
@@ -127,7 +127,33 @@ def test_default_theme(tmp_path: Path) -> None:
     path = write(tmp_path, {"default_theme": "one-light", "provider": {"base_url": "https://x.test/v1", "model_id": "m"}})
     assert load_config(path).default_theme == "one-light"
     path2 = write(tmp_path, {"provider": {"base_url": "https://x.test/v1", "model_id": "m"}})
-    assert load_config(path2).default_theme == "carbonfox"  # default
+    assert load_config(path2).default_theme == "ayu-darker"  # default
+
+
+def test_save_preferences(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "default_theme": "one-light",
+            "profiles": [
+                {"name": "a", "base_url": "https://x.test/v1", "model_id": "m"},
+                {"name": "b", "base_url": "https://y.test/v1", "model_id": "m2"},
+            ],
+        },
+    )
+    save_preferences(path, default_theme="one-light", default_profile="b")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["default_theme"] == "one-light"
+    assert data["default_profile"] == "b"
+    assert load_config(path).profile.model_id == "m2"
+
+
+def test_save_preferences_flat_form_ignores_profile(tmp_path: Path) -> None:
+    path = write(tmp_path, {"provider": {"base_url": "https://x.test/v1", "model_id": "m"}})
+    save_preferences(path, default_theme="one-light", default_profile="a")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["default_theme"] == "one-light"
+    assert "default_profile" not in data  # would make a flat config invalid
 
 
 def test_missing_file(tmp_path: Path) -> None:
