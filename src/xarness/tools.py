@@ -544,9 +544,11 @@ def _make_run_bash_tool(
         "run_bash",
         "Run a shell command inside the sandboxed workspace. No network access. "
         "The shell persists across calls within this chat — cwd and exported "
-        "variables carry over. Branch/ref git operations (checkout <ref>, "
-        "switch, worktree, branch -d/-D, reset --hard, rebase) are rejected; "
-        "status/diff/log/show/blame/add/commit work.",
+        "variables carry over. The command's stdin is /dev/null, so "
+        "interactive commands read EOF instead of hanging. Branch/ref git "
+        "operations (checkout <ref>, switch, worktree, branch -d/-D, reset "
+        "--hard, rebase) are rejected; status/diff/log/show/blame/add/commit "
+        "work.",
         required=("command",),
         command="string",
         timeout_seconds=(
@@ -557,7 +559,9 @@ def _make_run_bash_tool(
     )
     async def run_bash(args: dict[str, Any]) -> ToolResult:
         command = args.get("command", "")
-        if not command:
+        if not isinstance(command, str) or not command.strip():
+            # Whitespace-only would make the persistent-shell group below an
+            # empty `{ }`, a syntax error that kills the shell.
             return _bad("'command' is required")
         raw_timeout = args.get("timeout_seconds")
         timeout: float | None = None

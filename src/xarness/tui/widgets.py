@@ -314,6 +314,36 @@ class UserMessage(Vertical):
         event.stop()
 
 
+class CompactionSummary(Static):
+    """The handoff summary an auto-compaction leaves in the transcript.
+
+    Deliberately not rendered as a plain user message: padded on both
+    sides and colored with the accent, so the model-facing handoff reads
+    as a distinct event in the scrollback — live (mounted right after the
+    compaction runs) and on /resume replay. Colors come from CSS, so
+    /theme switches apply."""
+
+    DEFAULT_CSS = """
+    CompactionSummary {
+        width: 1fr;
+        height: auto;
+        padding: 0 2;
+        color: $c-accent;
+    }
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        super().__init__(Text(text), classes="msg compaction-summary", markup=False)
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def apply_palette(self) -> None:
+        """Re-render on /theme (color lives in CSS; nothing to rebuild)."""
+
+
 class SteerQueueBar(Vertical):
     """Queued steer messages, pinned above the chat input.
 
@@ -696,19 +726,6 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
             return None
         detail = Text(" ")
         detail.append(_shorten(query), style=muted)
-        return detail
-    if tool_name == "compact":
-        # The compact tool's result line carries the token counts
-        # ("compacted: N → M tokens (freed K)\n...") — surface them so the
-        # header alone shows what the compaction bought.
-        match = re.search(
-            r"compacted: ([\d,]+) → ([\d,]+) tokens \(freed ([\d,]+)\)", output_text
-        )
-        if match is None:
-            return None
-        before, after, freed = match.groups()
-        detail = Text(" ")
-        detail.append(f"{before} → {after} tokens (freed {freed})", style=muted)
         return detail
     return None
 

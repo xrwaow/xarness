@@ -198,6 +198,8 @@ def save_preferences(
     *,
     default_theme: str | None = None,
     default_profile: str | None = None,
+    auto_compact: bool | None = None,
+    profile: str | None = None,
 ) -> None:
     """Persist UI preferences (chosen theme / profile) into the config file so
     they carry over to the next session.
@@ -205,6 +207,10 @@ def save_preferences(
     ``default_profile`` is only written when the file uses the named-profiles
     form — the flat form has nothing to select, and a stray ``default_profile``
     there would make the config invalid.
+
+    ``auto_compact`` is written onto the named profile (``profile``, defaulting
+    to the file's default); in the flat form it goes to the top level (or into
+    the ``provider`` section when the config uses one).
     """
     data = _read(path)
     if default_theme is not None:
@@ -213,6 +219,17 @@ def save_preferences(
     # make a flat config invalid, so it is not written there.
     if default_profile is not None and isinstance(data.get("profiles"), list):
         data["default_profile"] = default_profile
+    if auto_compact is not None:
+        if isinstance(data.get("profiles"), list):
+            target = profile or data.get("default_profile")
+            entries = [p for p in data["profiles"] if p.get("name") == target]
+            if not entries:
+                raise ConfigError(f"no profile named {target!r} in {path}")
+            entries[0]["auto_compact"] = auto_compact
+        elif "provider" in data:
+            data["provider"]["auto_compact"] = auto_compact
+        else:
+            data["auto_compact"] = auto_compact
     try:
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:

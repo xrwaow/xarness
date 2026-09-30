@@ -22,8 +22,10 @@ When a filesystem sandbox is available, the model gets:
 | `ask_user` | plan + write | Ask you a clarifying question in the TUI |
 
 `web_search` is disabled for now (the implementation isn't good enough to
-ship). Compaction is not a tool the model can call — it's the `/compact`
-command or automatic (`auto_compact`).
+ship). Compaction is not a tool the model can call — it's automatic
+(`auto_compact`): when the context window crosses the configured threshold,
+the conversation is summarized into a handoff (the task, what's known so
+far, and what to do next) that continues as the next user message.
 
 Switch between modes with `/mode`:
 
@@ -79,7 +81,7 @@ closed.
 To undo further back, click any of your messages in the scrollback: a small
 `↩ undo to here` affordance appears, and clicking it drops that message and
 everything after it — each dropped turn's own file edits reversed, and the
-message put back in the input. Messages the last `/compact` summarized away
+message put back in the input. Messages the last compaction summarized away
 can be clicked too (the pre-compaction history is restored first).
 
 `/accept` is how you follow change-per-feature: let the agent build one
@@ -111,8 +113,8 @@ reports it and changes nothing rather than picking a side.
 package installs, background jobs, network calls, anything outside the
 workspace — are *not* undone. `/undo` puts the removed message back into the
 input box; `/retry` resends it immediately. Both also roll back the turn's
-token usage from the session totals, and work across a mid-turn `/compact`
-(the pre-compaction history is restored). Without git tracking (no repo,
+token usage from the session totals, and work across a compaction (the
+pre-compaction history is restored). Without git tracking (no repo,
 `--no-init-repo`, or setup failure) they still remove the messages and fix
 the token counts, but tell you the file edits could not be reverted. With no
 turn to reverse, `/undo` is a no-op on the filesystem.
@@ -222,7 +224,6 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
-| `/compact` | Summarize and truncate the conversation now, freeing context window. While the agent is working it's steered instead: it runs at the next round boundary, before any queued messages are injected |
 | `/auto_compact` | Toggle automatic compaction when the context window passes the profile's `auto_compact_threshold` (checked after each turn) |
 | `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
@@ -271,6 +272,8 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   totals and context headroom against `max_context`. Compaction's own
   summarization round is included in the totals, and the compaction notice
   reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
+  The handoff itself is shown in the transcript as a distinct padded block
+  (also on resume), and `/undo` restores the pre-compaction history.
 
 ## Layout of the code
 

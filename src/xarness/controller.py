@@ -147,16 +147,15 @@ class ChatController:
         # every round's usage — including compaction's own summarization
         # round. /undo subtracts the usage of the messages it drops.
         self.usage_total = Usage(input_tokens=0, output_tokens=0)
-        # Set by compact() when it summarizes away the compact tool call
-        # itself: the next record_tool_result call is that call's own result
-        # and must not be appended (the history ends on the summary).
-        self._drop_next_tool_result = False
         # Usage folded into the totals for messages that compaction later
         # removed during the current turn. /undo must subtract it too, since
         # the message objects that carry it no longer exist.
         self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
+        # True once a rollback subtracted _absorbed_usage: a later compaction
+        # undo must re-fold the restored turns' spend (see apply_rollback).
+        self._absorbed_spent = False
         # (before, after) token counts of the most recent compaction, for the
-        # compact tool's result line.
+        # compaction notice.
         self.last_compaction: tuple[int, int] | None = None
         # Live view of the round currently streaming. Cleared when the round
         # completes; read by save_interrupted_round() when a turn is cancelled.
@@ -172,8 +171,8 @@ class ChatController:
         # so restoring it rolls back the whole turn — even one that compacted
         # the history mid-flight.
         self.conversation.turn_start = len(self.conversation.messages) - 1
-        self._drop_next_tool_result = False
         self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
+        self._absorbed_spent = False
         async for event in self._stream_round():
             yield event
 
@@ -184,11 +183,6 @@ class ChatController:
 
     def record_tool_result(self, call_id: str, result: ToolResult) -> None:
         """Append a ``tool`` role message with the outcome of one call."""
-        if self._drop_next_tool_result:
-            # compact() summarized away its own tool call; recording its
-            # result would leave an orphaned tool message on the wire.
-            self._drop_next_tool_result = False
-            return
         content = result.output if result.ok else f"error: {result.error}"
         self.conversation.add(
             Message(
@@ -387,6 +381,7 @@ class ChatController:
         abort before the conversation changes."""
         self.conversation.messages = list(plan.keep)
         self.conversation.turn_start = None
+        current_keys = {_message_key(m) for m in self.conversation.messages}
         for message in plan.dropped:
             if message.usage is not None:
                 self._subtract_usage(message.usage)
@@ -396,7 +391,20 @@ class ChatController:
         # undone later.
         if not plan.compaction_only:
             self._subtract_usage(self._absorbed_usage)
+            if self._absorbed_usage.input_tokens or self._absorbed_usage.output_tokens:
+                # Consumed: a later compaction undo restores those turns, so
+                # it must re-fold their spend (below) to keep the totals and
+                # a later per-turn undo from double-counting.
+                self._absorbed_spent = True
+        elif self._absorbed_spent:
+            # The absorbed subtraction already removed the restored turns'
+            # spend; fold it back so the totals match the restored history.
+            for message in plan.keep:
+                if (_message_key(message) not in current_keys
+                        and message.usage is not None):
+                    self._fold_usage(message.usage)
         self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
+        self._absorbed_spent = False
         self.last_compaction = None
         if plan.clears_compaction:
             # The restore point is before the compaction: its summary is no
@@ -456,29 +464,18 @@ class ChatController:
     async def compact(self) -> str:
         """Summarize the conversation and replace older messages with it.
 
-        Keeps the system prompt; everything after it becomes a single summary
-        user message. When compaction is requested mid-turn, the compact tool
-        call itself is summarized away too and its result is never recorded —
-        the model never sees the compaction mechanics, the history just ends
-        on the summary. (If the same round requested other tools as well,
-        the assistant message is kept so those results stay paired on the
-        wire.) Returns the summary text; the before/after token counts are
-        left in :attr:`last_compaction` for the compact tool's result line.
+        Compaction runs at a turn boundary (auto-compact), so there are no
+        pending tool calls to break pairing. Keeps the system prompt;
+        everything after it becomes a single handoff summary user message
+        (task, what's known so far, what to do next). Returns the summary
+        text; the before/after token counts are left in
+        :attr:`last_compaction` for the compaction notice.
         """
         messages = self.conversation.messages
-        # Mid-turn compaction: if the trailing assistant round requested only
-        # this compact call, summarize it away and suppress its tool result.
-        # With other pending calls in the same round, keep the message so
-        # their results stay paired on the wire.
-        last = messages[-1] if messages else None
-        pending_calls = last is not None and last.role == "assistant" and bool(last.tool_calls)
-        drop_call_round = pending_calls and len(last.tool_calls) == 1
-        keep_from = len(messages) - (1 if pending_calls and not drop_call_round else 0)
-        compactable = messages[1:keep_from]
+        compactable = messages[1:]
         if not compactable:
             self.last_compaction = None
             return "nothing to compact yet"
-        self._drop_next_tool_result = drop_call_round
 
         before_tokens = sum(self._message_tokens(m) for m in compactable)
         transcript = "\n\n".join(self._render_for_summary(m) for m in compactable)
@@ -494,15 +491,16 @@ class ChatController:
         # Snapshot for /undo: the full pre-compaction history. Taken here (not
         # on entry) so an empty compaction never clobbers an older snapshot.
         self.conversation.compact_snapshot = list(messages)
-        self.conversation.messages = [messages[0], summary_message, *messages[keep_from:]]
+        self.conversation.messages = [messages[0], summary_message]
         self.last_compaction = (before_tokens, self._message_tokens(summary_message))
         # Usage of removed messages that belongs to the current turn (at or
         # after turn_start): /undo must subtract it even though the message
         # objects are gone. Pre-turn usage stays folded, matching rollback
         # semantics; send() resets the tracker each turn.
+        self._absorbed_spent = False
         turn_start = self.conversation.turn_start
         if turn_start is not None:
-            for index in range(1, keep_from):
+            for index in range(1, len(messages)):
                 removed = messages[index]
                 if index >= turn_start and removed.usage is not None:
                     self._absorbed_usage.input_tokens += removed.usage.input_tokens
@@ -534,15 +532,22 @@ class ChatController:
         return "\n".join(parts)
 
     async def _summarize(self, transcript: str) -> tuple[str, Usage | None]:
-        """One-off summarization round through the same client, no tools.
+        """One-off handoff round through the same client, no tools.
 
-        Returns the summary text and the round's usage, so its cost can be
+        Returns the handoff text and the round's usage, so its cost can be
         folded into the session totals instead of being silently dropped."""
         prompt = (
-            "Summarize the following conversation between a user and a coding "
-            "assistant. Preserve the task the user wants, key decisions, file "
-            "paths, and the current state of any work in progress. Be concise — "
-            "a few short paragraphs at most. Reply with the summary only.\n\n"
+            "You are handing this conversation off to a fresh context. Write "
+            "the handoff the next assistant instance needs to continue the "
+            "work seamlessly. Cover, in this order:\n"
+            "1. The task: what the user is trying to accomplish, in their "
+            "terms.\n"
+            "2. What's known so far: key decisions, file paths, relevant "
+            "commands and their results, constraints discovered.\n"
+            "3. What's next: the current state of any work in progress and "
+            "the immediate next steps.\n"
+            "Be concise — a few short paragraphs at most. Reply with the "
+            "handoff only.\n\n"
             "--- conversation ---\n"
             f"{transcript}"
         )

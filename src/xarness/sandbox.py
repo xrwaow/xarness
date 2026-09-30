@@ -403,6 +403,10 @@ class SandboxSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # readline's default 64 KiB line limit raises ValueError on
+            # longer lines (minified bundles), which surfaces as a confusing
+            # tool error — allow chunky single lines instead.
+            limit=8 * 1024 * 1024,
         )
 
     async def run(
@@ -421,8 +425,25 @@ class SandboxSession:
             await self._ensure_started()
             assert self._proc is not None and self._proc.stdin and self._proc.stdout
             marker = f"__xarness_done_{uuid.uuid4().hex}__"
-            self._proc.stdin.write(f"{command}\necho {marker} $?\n".encode())
-            await self._proc.stdin.drain()
+            # The command runs in a group with stdin from /dev/null: a command
+            # that reads stdin (cat, wc, a REPL) — or a job it backgrounds —
+            # would otherwise swallow the marker line below (or a later
+            # command's lines) and stall the read loop until the timeout.
+            payload = f"{{ {command}\n}} </dev/null\necho {marker} $?\n".encode()
+            try:
+                self._proc.stdin.write(payload)
+                await self._proc.stdin.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                # The shell died between the liveness check in
+                # _ensure_started and this write (e.g. the previous command
+                # ran `exit`) — asyncio may not have reaped it yet, so the
+                # check passed. Restart once and resend; a fresh shell has
+                # no pending state to lose.
+                await self.close()
+                await self._ensure_started()
+                assert self._proc is not None and self._proc.stdin is not None
+                self._proc.stdin.write(payload)
+                await self._proc.stdin.drain()
 
             output: list[str] = []
 
@@ -432,8 +453,21 @@ class SandboxSession:
                     if not line:
                         return -1
                     text = line.decode(errors="replace")
-                    if text.startswith(marker):
-                        return int(text[len(marker):].strip() or "-1")
+                    # The marker can be glued to a final output line that
+                    # has no trailing newline (echo -n, cat of a file that
+                    # lacks one) — match it anywhere in the line, keeping
+                    # whatever precedes it as output.
+                    idx = text.find(marker)
+                    if idx != -1:
+                        head, tail = text[:idx], text[idx + len(marker):].strip()
+                        if head:
+                            output.append(head)
+                            if on_output is not None:
+                                on_output(head)
+                        try:
+                            return int(tail or "-1")
+                        except ValueError:
+                            return -1
                     output.append(text)
                     if on_output is not None:
                         on_output(text)

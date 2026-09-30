@@ -231,63 +231,6 @@ def test_compact_replaces_history_with_summary() -> None:
     assert client.received_tools is None
 
 
-def test_compact_drops_trailing_tool_call_round() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
-    controller = ChatController(PROFILE, "key", client=client)
-    asyncio.run(collect(controller, "first question"))
-
-    client.script = [
-        ToolCallStarted("call_1", "fake_tool"),
-        ToolCallArgumentsDone("call_1", "fake_tool", "{}"),
-        TurnComplete(has_tool_calls=True),
-    ]
-    asyncio.run(collect(controller, "use the tool"))
-
-    client.script = [ContentDelta("summary text"), TurnComplete()]
-    asyncio.run(controller.compact())
-
-    # The compact call itself is summarized away, and its result is never
-    # recorded: the history ends on the summary, with no compaction
-    # mechanics left on the wire.
-    controller.record_tool_result("call_1", ToolResult(ok=True, output="ok"))
-    assert [m.role for m in controller.conversation.messages] == ["user", "user"]
-    assert "summary text" in controller.conversation.messages[1].content
-    # The suppression is one-shot: the next real tool result is recorded.
-    controller.record_tool_result("call_2", ToolResult(ok=True, output="fine"))
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "tool",
-    ]
-
-
-def test_compact_keeps_round_with_multiple_tool_calls() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
-    controller = ChatController(PROFILE, "key", client=client)
-    asyncio.run(collect(controller, "first question"))
-
-    client.script = [
-        ToolCallStarted("call_1", "fake_tool"),
-        ToolCallArgumentsDone("call_1", "fake_tool", "{}"),
-        ToolCallStarted("call_2", "fake_tool"),
-        ToolCallArgumentsDone("call_2", "fake_tool", "{}"),
-        TurnComplete(has_tool_calls=True),
-    ]
-    asyncio.run(collect(controller, "use the tools"))
-
-    client.script = [ContentDelta("summary text"), TurnComplete()]
-    asyncio.run(controller.compact())
-
-    # With other pending calls in the same round, the assistant message is
-    # kept so their results stay paired on the wire (old behavior).
-    controller.record_tool_result("call_1", ToolResult(ok=True, output="ok"))
-    controller.record_tool_result("call_2", ToolResult(ok=True, output="ok"))
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "assistant", "tool", "tool",
-    ]
-    wire = controller.conversation.to_wire()
-    assert wire[2]["tool_calls"][0]["id"] == "call_1"
-    assert wire[3]["tool_call_id"] == "call_1"
-
-
 def test_compact_without_history_is_a_noop() -> None:
     client = FakeClient([])
     controller = ChatController(PROFILE, "key", client=client)
@@ -342,7 +285,6 @@ def test_compact_with_no_history_is_a_no_op() -> None:
         Message(role="system", content="system prompt")
     ]
     assert controller.last_compaction is None
-    assert controller._drop_next_tool_result is False
 
 
 def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
@@ -363,66 +305,73 @@ def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
 
 
 def test_undo_across_compaction_after_later_turn() -> None:
-    """Compaction in turn 2, another turn after it: /undo first removes the
-    later turn, then a second /undo restores the pre-compaction history."""
+    """Auto-compaction at a turn boundary, later turns after it: /undo
+    first removes the later turn, then a second /undo restores the
+    pre-compaction history."""
     client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
-    # Turn 2: model calls compact, then answers.
-    client.script = [
-        ToolCallStarted("call_1", "compact"),
-        ToolCallArgumentsDone("call_1", "compact", "{}"),
-        TurnComplete(usage=Usage(4, 1), has_tool_calls=True),
-    ]
+    # Turn 2: a normal answer; compaction then runs at the turn boundary.
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(4, 1))]
     asyncio.run(collect(controller, "second"))
     client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
     asyncio.run(controller.compact())
-    controller.record_tool_result("call_1", ToolResult(ok=True, output="compacted"))
-    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
-    asyncio.run(_drain(controller.continue_after_tools()))
 
-    # Turn 3 happens after the compaction.
-    client.script = [ContentDelta("third answer"), TurnComplete(usage=Usage(7, 2))]
+    # Later turns happen after the compaction.
+    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
     asyncio.run(collect(controller, "third"))
+    client.script = [ContentDelta("fourth answer"), TurnComplete(usage=Usage(7, 2))]
+    asyncio.run(collect(controller, "fourth"))
     assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "assistant", "user", "assistant",
+        "user", "user", "user", "assistant", "user", "assistant",
     ]
 
-    # First /undo: removes turn 3, back to the end of turn 2 (post-compaction).
+    # First /undo: removes turn 4, back to the end of turn 3 (post-compaction).
     plan = controller.rollback_plan()
-    assert plan is not None and plan.user_text == "third"
+    assert plan is not None and plan.user_text == "fourth"
     assert not plan.clears_compaction
     controller.apply_rollback(plan)
     assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "assistant",
+        "user", "user", "user", "assistant",
     ]
     assert controller.conversation.compact_snapshot is not None
 
-    # Second /undo: undoes the compaction itself — the full pre-compaction
-    # history comes back, turn 2 still intact.
+    # Second /undo: removes turn 3 — the first turn after the compaction.
+    plan = controller.rollback_plan()
+    assert plan is not None and plan.user_text == "third"
+    assert not plan.compaction_only
+    controller.apply_rollback(plan)
+    assert [m.role for m in controller.conversation.messages] == [
+        "user", "user",
+    ]
+    assert controller.conversation.compact_snapshot is not None
+
+    # Third /undo: undoes the compaction itself — the full pre-compaction
+    # history comes back, turns 1 and 2 still intact.
     plan = controller.rollback_plan()
     assert plan is not None and plan.compaction_only
-    assert plan.clears_compaction
+    assert plan.user_text == ""
+    assert plan.revert_turns == []  # compaction only: no files reverted
     controller.apply_rollback(plan)
     assert [m.role for m in controller.conversation.messages] == [
         "user", "assistant", "user", "assistant",
     ]
     assert controller.conversation.messages[2].content == "second"
     assert controller.conversation.compact_snapshot is None
-    # Usage back to the end of turn 2's compact round: the summarizer's and
-    # the final round's spend subtracted; turn 2's own spend (including the
-    # compact call, restored verbatim) stays until the turn is undone.
+    # Usage back to the end of turn 2: the summarizer's and turn 3's spend
+    # subtracted; turns 1-2's own spend stays until those turns are undone.
     assert controller.usage_total == Usage(input_tokens=9, output_tokens=4)
+    assert controller.conversation.turn_start is None
 
-    # Third /undo: removes turn 2 normally.
+    # Fourth /undo: removes turn 2 normally.
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "second"
     assert not plan.compaction_only
     controller.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == ["first", "one"]
     assert controller.conversation.messages[1].role == "assistant"
-    # Turn 2's spend (including the compact call) subtracted.
+    # Turn 2's spend subtracted.
     assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
 
     # A further /undo walks back the pre-compaction turns normally.
@@ -445,17 +394,14 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
-    client.script = [
-        ToolCallStarted("call_1", "compact"),
-        ToolCallArgumentsDone("call_1", "compact", "{}"),
-        TurnComplete(usage=Usage(4, 1), has_tool_calls=True),
-    ]
+    # Turn 2: a normal answer; compaction then runs at the turn boundary,
+    # and one more turn happens after it.
+    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(4, 1))]
     asyncio.run(collect(controller, "second"))
     client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
     asyncio.run(controller.compact())
-    controller.record_tool_result("call_1", ToolResult(ok=True, output="compacted"))
     client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
-    asyncio.run(_drain(controller.continue_after_tools()))
+    asyncio.run(collect(controller, "third"))
 
     session_store.save_session("s", "test-model", controller.conversation)
     resumed_conversation = session_store.load_session("s")
@@ -466,8 +412,12 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
 
     controller2 = ChatController(PROFILE, "key", client=client)
     controller2.conversation = resumed_conversation
-    # First /undo: undoes the compaction itself — full pre-compaction
-    # history restored, turn 2 intact.
+    # First /undo: removes turn 3 — the first turn after the compaction.
+    plan = controller2.rollback_plan()
+    assert plan is not None and plan.user_text == "third"
+    controller2.apply_rollback(plan)
+    # Second /undo: undoes the compaction itself — full pre-compaction
+    # history restored, turns 1 and 2 intact.
     plan = controller2.rollback_plan()
     assert plan is not None and plan.compaction_only
     assert plan.clears_compaction
@@ -477,78 +427,12 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     ]
     assert controller2.conversation.messages[2].content == "second"
     assert controller2.conversation.compact_snapshot is None
-    # Second /undo removes turn 2 normally.
+    # Third /undo removes turn 2 normally.
     plan = controller2.rollback_plan()
     assert plan is not None and plan.user_text == "second"
     controller2.apply_rollback(plan)
     assert [m.role for m in controller2.conversation.messages] == ["user", "assistant"]
     assert controller2.conversation.messages[1].content == "one"
-
-
-def test_compact_then_undo_restores_messages_and_usage() -> None:
-    """Undoing a turn that compacted mid-flight restores the pre-compact
-    message list AND un-does the summarizer's usage adjustment."""
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
-    controller = ChatController(PROFILE, "key", client=client)
-    asyncio.run(collect(controller, "first"))
-
-    # Turn 2, round 1: the model calls compact.
-    client.script = [
-        ToolCallStarted("call_1", "compact"),
-        ToolCallArgumentsDone("call_1", "compact", "{}"),
-        TurnComplete(usage=Usage(4, 1), has_tool_calls=True),
-    ]
-    asyncio.run(collect(controller, "second"))
-    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
-    asyncio.run(controller.compact())
-    controller.record_tool_result("call_1", ToolResult(ok=True, output="compacted"))
-    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
-    asyncio.run(_drain(controller.continue_after_tools()))
-
-    assert controller.usage_total == Usage(input_tokens=115, output_tokens=13)
-    # The compact call and its result were dropped: the history ends on the
-    # summary, followed only by the final round's reply.
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "assistant",
-    ]
-
-    # First /undo: undoes the compaction itself — the full pre-compaction
-    # history (including the compact-call round) is restored, turn 2 intact.
-    plan = controller.rollback_plan()
-    assert plan is not None and plan.compaction_only
-    assert plan.user_text == ""
-    assert plan.revert_turns == []  # compaction only: no files reverted
-    controller.apply_rollback(plan)
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "assistant", "user", "assistant",
-    ]
-    assert controller.conversation.messages[2].content == "second"
-    assert controller.conversation.compact_snapshot is None
-    # The summarizer's and the final round's spend subtracted; turn 2's own
-    # spend (the compact call, restored verbatim) stays until the turn is
-    # undone.
-    assert controller.usage_total == Usage(input_tokens=9, output_tokens=4)
-    assert controller.conversation.turn_start is None
-
-    # Second /undo: removes turn 2 normally.
-    plan2 = controller.rollback_plan()
-    assert plan2 is not None and plan2.user_text == "second"
-    assert not plan2.compaction_only
-    controller.apply_rollback(plan2)
-    assert [m.role for m in controller.conversation.messages] == ["user", "assistant"]
-    assert controller.conversation.messages[1].content == "one"
-    # Usage back to exactly the pre-turn total: turn 2's spend (including
-    # the compact call) now subtracted.
-    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
-
-    # A further /undo falls back to the previous turn (resumed-session
-    # semantics): it rolls back to an empty conversation.
-    plan3 = controller.rollback_plan()
-    assert plan3 is not None and plan3.user_text == "first"
-    controller.apply_rollback(plan3)
-    assert controller.conversation.messages == []
-    assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
-    assert controller.rollback_plan() is None
 
 
 def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:

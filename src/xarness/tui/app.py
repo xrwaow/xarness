@@ -26,7 +26,7 @@ from .. import theme
 from ..config import (
     ConfigError, ProviderProfile, load_all_profiles, resolve_api_key, save_preferences,
 )
-from ..conversation import Conversation, Message
+from ..conversation import SUMMARY_PREFIX, Conversation, Message
 from ..controller import ChatController, RollbackPlan
 from ..events import (
     ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
@@ -45,7 +45,8 @@ from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
-    AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
+    AskBar, AssistantMessage, ChatInput, CompactionSummary, DiffSummary,
+    ErrorLine, GeneratingBar,
     MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
     SteerQueueBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
     ToolWritingIndicator, UserMessage, _format_duration,
@@ -193,7 +194,6 @@ SLASH_COMMANDS = [
         "delete the current session: remove the saved session file and start "
         "a fresh chat (your files are left exactly as they are)"
     )),
-    ("compact", "summarize and truncate the conversation now, freeing context window"),
     ("auto_compact", (
         "toggle automatic compaction when the context window is {pct} full "
         "(checked after each turn)"
@@ -273,12 +273,10 @@ class AgentApp(App[None]):
         # passes the profile's auto_compact_threshold (checked at the end of
         # each turn). Off unless the config enables it; /auto_compact toggles.
         self.auto_compact = self.profile.auto_compact
-        # True while a manual /compact is summarizing: submissions queue
-        # (like a busy turn) instead of racing the history rewrite.
+        # True while a compaction is rewriting the history: submissions
+        # queue (like a busy turn) instead of racing the rewrite. Auto-
+        # compaction runs at the end of a turn; /new //delete wait it out.
         self._compacting = False
-        # /compact requested mid-turn: honored at the next round boundary
-        # (steering), like a queued message.
-        self._compact_pending = False
         self._queued: list[str] = []
         self._ask_future: asyncio.Future[str | None] | None = None
         self._last_thinking: ThinkingBlock | None = None
@@ -408,23 +406,12 @@ class AgentApp(App[None]):
                 self._post_line(ErrorLine("/delete: wait for the current turn or compaction to finish first"))
             else:
                 self._start_delete()
-        elif cmd == "compact":
-            if self._compacting:
-                self._post_line(ErrorLine("/compact: already compacting"))
-            elif self._turn_busy:
-                # Steer, don't error: the compaction runs at the next round
-                # boundary, before any queued messages are injected.
-                self._compact_pending = True
-                self._post_line(NoticeLine(
-                    "/compact queued: runs at the next round boundary"
-                ))
-            else:
-                self._run_manual_compact()
         elif cmd == "auto_compact":
             self.auto_compact = not self.auto_compact
             pct = f"{self.profile.auto_compact_threshold:.0%}"
             state = f"on — compaction runs at {pct} context" if self.auto_compact else "off"
             self._post_line(NoticeLine(f"auto-compact {state}"))
+            self._save_preference(auto_compact=self.auto_compact, profile=self.profile.name)
         elif cmd == "accept":
             if self._git_action_preflight("accept") is not None:
                 self._start_accept()
@@ -873,9 +860,12 @@ class AgentApp(App[None]):
         *,
         default_theme: str | None = None,
         default_profile: str | None = None,
+        auto_compact: bool | None = None,
+        profile: str | None = None,
     ) -> None:
-        """Write a chosen theme/model back to the config file so it becomes
-        the default for the next session. Failures are reported, never fatal."""
+        """Write a chosen theme/model/auto-compact setting back to the config
+        file so it becomes the default for the next session. Failures are
+        reported, never fatal."""
         if self.config_path is None:
             return
         try:
@@ -883,6 +873,8 @@ class AgentApp(App[None]):
                 self.config_path,
                 default_theme=default_theme,
                 default_profile=default_profile,
+                auto_compact=auto_compact,
+                profile=profile,
             )
         except ConfigError as exc:
             self._post_line(NoticeLine(f"note: could not save preference: {exc}"))
@@ -915,6 +907,7 @@ class AgentApp(App[None]):
         self.controller.conversation = Conversation()
         self.controller.usage_total = Usage(input_tokens=0, output_tokens=0)
         self.controller._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
+        self.controller._absorbed_spent = False
         self.controller.last_compaction = None
         if self.session_name is not None:
             from ..session_store import new_session_name
@@ -922,7 +915,6 @@ class AgentApp(App[None]):
         self.ensure_system_message()
         self._last_thinking = None
         self._queued.clear()
-        self._compact_pending = False
         self._refresh_steer_bar()
         chat = self.query_one("#chat-log", VerticalScroll)
         chat.remove_children()
@@ -1125,9 +1117,16 @@ class AgentApp(App[None]):
     ) -> None:
         """Render one persisted message into the chat log."""
         if message.role == "user":
-            widget = UserMessage(message.content)
-            widget.message = message
-            await chat.mount(widget)
+            if message.content.startswith(SUMMARY_PREFIX):
+                # The handoff an auto-compaction left behind: padded and
+                # accent-colored, not a plain user message.
+                await chat.mount(CompactionSummary(
+                    message.content.removeprefix(SUMMARY_PREFIX).strip()
+                ))
+            else:
+                widget = UserMessage(message.content)
+                widget.message = message
+                await chat.mount(widget)
         elif message.role == "assistant":
             if message.reasoning:
                 thinking = ThinkingBlock()
@@ -1156,13 +1155,6 @@ class AgentApp(App[None]):
                         output="" if is_error else result.content,
                         error=result.content[len("error: "):] if is_error else "",
                         header=result.header or "",
-                    )
-                elif call.name == "compact":
-                    # The compact call's own result is never recorded (the
-                    # model must not see it) — settle the block so it doesn't
-                    # replay as still-running.
-                    block.set_result(
-                        ToolCallStatus.CALL_SUCCEEDED, output="", header="compacted"
                     )
 
     def on_chat_input_mode_toggle(self, event: ChatInput.ModeToggle) -> None:
@@ -1429,7 +1421,6 @@ class AgentApp(App[None]):
         gen_bar.add_class("active")
         turn_start = time.monotonic()
         turn_had_tools = False
-        compacted_this_turn = False
         view = _RoundView(self, chat)
 
         stream = self.controller.send(text)
@@ -1485,14 +1476,6 @@ class AgentApp(App[None]):
                     )
                     self.controller.record_tool_result(call_id, result)
 
-                # Steer: a /compact typed mid-turn runs here — after tool
-                # results, before queued messages are injected — so the
-                # queued messages sit on top of the summary instead of being
-                # summarized away.
-                if self._compact_pending:
-                    await self._run_pending_compact()
-                    compacted_this_turn = True
-
                 # Steer: anything typed while this round was streaming is
                 # injected here — after the tool answers, before the next
                 # LLM call — so the model sees it right away instead of the
@@ -1514,12 +1497,9 @@ class AgentApp(App[None]):
 
                 stream = self.controller.continue_after_tools()
             if not view.had_stream_error:
-                # A /compact requested during the final round still runs —
-                # here, at the turn boundary. Auto-compact skips: the
-                # steered compaction just freed the context.
-                await self._run_pending_compact()
-                if not compacted_this_turn:
-                    await self._maybe_auto_compact()
+                # Auto-compact fires at the turn boundary: the history has no
+                # pending tool calls to break pairing.
+                await self._maybe_auto_compact()
         except asyncio.CancelledError:
             # `view` is the round in flight (reassigned at each loop top).
             await view.cancel()
@@ -1555,45 +1535,12 @@ class AgentApp(App[None]):
         if indicator is not None and indicator.is_mounted:
             await indicator.remove()
 
-    @work(group="compact")
-    async def _run_manual_compact(self) -> None:
-        """Slash /compact: run the compaction on demand."""
-        self._compacting = True
-        try:
-            try:
-                await self._run_compaction()
-            except RuntimeError as exc:
-                self._post_line(ErrorLine(f"/compact failed: {exc}"))
-                return
-            self._post_compaction_notice("compacted")
-        finally:
-            self._compacting = False
-            # Messages submitted while the summarizer ran start now — the
-            # history rewrite is done, so it's safe to open a turn.
-            if self._queued and not self._turn_busy:
-                queued_text = self._queued.pop(0)
-                widget = UserMessage(queued_text)
-                self.query_one("#chat-log", VerticalScroll).mount(widget)
-                self._refresh_steer_bar()
-                self._worker = self._run_turn(queued_text, widget)
-
-    async def _run_pending_compact(self) -> None:
-        """Run a /compact requested mid-turn (steering) at a safe boundary."""
-        if not self._compact_pending:
-            return
-        self._compact_pending = False
-        try:
-            await self._run_compaction()
-        except RuntimeError as exc:
-            self._post_line(ErrorLine(f"/compact failed: {exc}"))
-            return
-        self._post_compaction_notice("compacted")
-
     async def _run_compaction(self) -> str:
         """Compact via the controller and refresh everything that depends on
         it. Returns the summary, prefixed with the token-count line
         ("compacted: N → M tokens (freed K)")."""
         chat = self.query_one("#chat-log", VerticalScroll)
+        self._compacting = True
         # A shimmering "Compacting" line while the summarizer runs, so the
         # pause reads as work rather than a hang.
         indicator = PendingIndicator(
@@ -1605,10 +1552,18 @@ class AgentApp(App[None]):
         finally:
             if indicator.is_mounted:
                 await indicator.remove()
+            self._compacting = False
         self._refresh_status()
         # Mark the compaction point in the chat log — same divider /resume
-        # renders between the kept history and the summary.
+        # renders between the kept history and the summary — and show the
+        # handoff itself, rendered like the replayed one below it.
         self._post_line(NoticeLine(COMPACTED_DIVIDER))
+        for message in self.controller.conversation.messages:
+            if message.role == "user" and message.content.startswith(SUMMARY_PREFIX):
+                await chat.mount(CompactionSummary(
+                    message.content.removeprefix(SUMMARY_PREFIX).strip()
+                ))
+                break
         counts = self._compaction_counts()
         return f"compacted: {counts}\n{summary}" if counts else summary
 
@@ -1620,7 +1575,7 @@ class AgentApp(App[None]):
         before, after = counts
         return f"{before:,} → {after:,} tokens (freed {max(0, before - after):,})"
 
-    def _post_compaction_notice(self, label: str) -> None:
+    def _post_compaction_notice(self, label: str = "auto-compacted") -> None:
         counts = self._compaction_counts()
         if counts is None:
             self._post_line(NoticeLine(f"{label}: nothing to compact yet"))

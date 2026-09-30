@@ -30,6 +30,7 @@ from xarness.tui.widgets import (
     AskBar,
     AssistantMessage,
     ChatInput,
+    CompactionSummary,
     ErrorLine,
     MessageLine,
     NoticeLine,
@@ -393,10 +394,6 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
         # ask_user renders as a plain "ask_user" — no argument summary.
         self.assertIsNone(detail("ask_user", '{"questions": ["Which one?", "Why?"]}'))
-        self.assertEqual(
-            detail("compact", "", "compacted: 12,000 → 3,400 tokens (freed 8,600)\nsummary"),
-            " 12,000 → 3,400 tokens (freed 8,600)",
-        )
         # Malformed / missing args fall back to the plain header.
         self.assertIsNone(detail("read_file", "not json"))
         self.assertIsNone(detail("unknown_tool", "{}"))
@@ -965,7 +962,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                 return "compacted: 40 → 7 tokens (freed 33)"
 
             app.controller.compact = gated_compact  # type: ignore[method-assign]
-            app._run_manual_compact()
+            task = asyncio.create_task(app._run_compaction())
             await wait_for(lambda: app._compacting)
             await pilot.pause()
 
@@ -976,6 +973,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Compacting", labels)
 
             gate.set()
+            await task
             await wait_for(lambda: not app._compacting)
             await pilot.pause()
             self.assertEqual(len(app.query(PendingIndicator)), 0)
@@ -1063,7 +1061,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             errors = [str(e.content) for e in app.query(ErrorLine)]
             self.assertTrue(any("boom" in e for e in errors))
 
-    async def test_manual_compact_reports_token_counts(self) -> None:
+    async def test_compaction_reports_token_counts_and_mounts_the_handoff(self):
         app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
         async with app.run_test() as pilot:
             await pilot.press("h", "i", "enter")
@@ -1080,6 +1078,33 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertIn("summary text", rest)
             # The summarization round's spend is in the session totals.
             self.assertEqual((app.total_in, app.total_out), (105, 47))
+
+            # The handoff itself is in the log, rendered as a distinct
+            # padded block (not a plain user message), below the divider.
+            summaries = app.query(CompactionSummary)
+            self.assertEqual(len(summaries), 1)
+            self.assertIn("summary text", summaries[0].text)
+
+    async def test_resume_replays_the_compaction_handoff_distinctly(self) -> None:
+        """A compacted session replays with the handoff as a CompactionSummary
+        (padded, not a plain user message) below the divider."""
+        app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await wait_until_idle(app)
+            client.script = [
+                ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))
+            ]
+            await app._run_compaction()
+            await app._render_history()
+
+            self.assertEqual(len(app.query(CompactionSummary)), 1)
+            self.assertIn(
+                "summary text",
+                app.query(CompactionSummary)[0].text,
+            )
+            notices = [str(n.content) for n in app.query(MessageLine)]
+            self.assertTrue(any("compacted" in n for n in notices))
 
 
 class TestChatScroll(unittest.IsolatedAsyncioTestCase):
