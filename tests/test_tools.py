@@ -97,7 +97,7 @@ def test_handler_exception_is_contained() -> None:
 
 def test_plan_registry_is_read_only(tmp_path) -> None:
     names = {t["function"]["name"] for t in _registry_for(tmp_path, mode="plan").schema()}
-    assert names == {"read_file", "ls", "glob", "grep"}
+    assert names == {"read_file"}  # no sandbox session → no run_bash in plan
 
 
 def test_write_registry_exposes_write_tools(tmp_path) -> None:

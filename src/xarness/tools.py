@@ -1,29 +1,31 @@
 """Tool registry and the built-in tools.
 
-read_file/write_file/edit_file/ls/glob/grep/run_bash execute inside a bwrap
+read_file/write_file/edit_file/run_bash execute inside a bwrap
 sandbox (see sandbox.py) scoped to one workspace directory, with no network
 access — run_bash uses a persistent SandboxSession so shell state survives
 across calls within one chat.
 
-Plan mode exposes read_file plus the read-only exploration tools (ls, glob,
-grep); write mode exposes read_file plus the editing tools (write_file,
-edit_file, run_bash). ask_user is available in both modes. web_search is
+Plan mode exposes read_file plus run_bash against a read-only workspace
+mount; write mode exposes read_file plus the editing tools (write_file,
+edit_file, run_bash_host). ask_user is available in both modes. web_search is
 disabled for now (see build_registry).
 """
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import os
 import shlex
 import shutil
+import signal
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ignore import glob_to_regex
+from .permissions import Decision, HostBashRequest, add_prefix, is_compound, load_prefixes, prefix_matches, tokens
 from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
 
 
@@ -229,11 +231,6 @@ async def _web_search_handler(args: dict[str, Any]) -> ToolResult:
 OUTLINE_THRESHOLD = 500
 # Upper bound on lines returned by one ranged read.
 MAX_READ_LINES = 2000
-
-# Result caps for the read-only exploration tools (ls/glob/grep).
-_MAX_GLOB_RESULTS = 200
-_MAX_GREP_MATCHES = 200
-_MAX_GREP_PER_FILE = 20
 
 
 def _python_outline(source: str) -> str | None:
@@ -614,6 +611,128 @@ def _make_run_bash_tool(
     return run_bash
 
 
+HOST_BASH_TIMEOUT_DEFAULT = 120
+HOST_BASH_TIMEOUT_MIN = 1
+HOST_BASH_TIMEOUT_MAX = 600
+
+
+def _make_run_bash_host_tool(
+    sandbox: SandboxConfig,
+    approve_callback: Callable[[HostBashRequest], Awaitable[Decision]],
+    git_guard: Callable[[str], str | None] | None = None,
+) -> Tool:
+    """run_bash_host: run a command on the host, outside bwrap, behind an
+    approval prompt (see permissions.py for the saved prefix rules)."""
+    session_allowed: set[str] = set()
+
+    @tool(
+        "run_bash_host",
+        "Run a shell command on the host machine, outside the sandbox. The "
+        "user approves each call unless a saved rule allows it, and may deny "
+        "it. Use only when run_bash cannot do the job: network access, "
+        "host-only tools, or paths outside the workspace. Give a specific "
+        "`reason`. If denied, do not retry the same command; adapt using the "
+        "user's feedback. Output is truncated, so prefer filtering (e.g. "
+        "`| tail -50`).",
+        required=("command", "reason"),
+        command="string",
+        reason=("string", "why this needs the host rather than run_bash"),
+        timeout_seconds=("integer", "seconds before the command is killed (1-600, default 120)"),
+    )
+    async def run_bash_host(args: dict[str, Any]) -> ToolResult:
+        command = args.get("command", "")
+        reason = args.get("reason", "")
+        if not command:
+            return _bad("'command' is required")
+        if not reason:
+            return _bad("'reason' is required (tell the user why this needs the host)")
+        if git_guard is not None:
+            block_reason = git_guard(command)
+            if block_reason:
+                return ToolResult(ok=False, error=block_reason, header=command)
+        try:
+            timeout = int(args.get("timeout_seconds", HOST_BASH_TIMEOUT_DEFAULT))
+        except (TypeError, ValueError):
+            return _bad("'timeout_seconds' must be an integer")
+        timeout = max(HOST_BASH_TIMEOUT_MIN, min(HOST_BASH_TIMEOUT_MAX, timeout))
+
+        compound = is_compound(command)
+        req = HostBashRequest(
+            command=command,
+            reason=reason,
+            cwd=str(sandbox.workspace / sandbox.subtree) if sandbox.subtree
+            else str(sandbox.workspace),
+            suggested_prefix=(tokens(command) or ())[:2],
+            is_compound=compound,
+        )
+        # Order: exact commands allowed for this session, then saved prefix
+        # rules, then ask. Compound commands skip the rules entirely — a
+        # prefix can't vouch for what follows a `;` or `$( )`.
+        if not compound and command in session_allowed:
+            decision = Decision(kind="once")
+        elif not compound and prefix_matches(command, load_prefixes()):
+            decision = Decision(kind="once")
+        else:
+            decision = await approve_callback(req)
+            if decision.kind == "session":
+                session_allowed.add(command)
+            elif decision.kind == "prefix":
+                prefix = decision.prefix or req.suggested_prefix
+                if prefix:
+                    add_prefix(prefix)
+            elif decision.kind == "deny":
+                detail = f". Reason: {decision.deny_reason}" if decision.deny_reason else ""
+                return ToolResult(
+                    ok=False, error=f"User denied this command{detail}", header=command
+                )
+
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", command,
+            cwd=req.cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None and proc.pid is not None
+        chunks: list[str] = []
+
+        async def _drain() -> None:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return
+                text = line.decode(errors="replace")
+                chunks.append(text)
+                sink = _output_sink.get()
+                if sink is not None:
+                    sink(text)
+
+        try:
+            await asyncio.wait_for(_drain(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:  # kill the whole process group, not just bash
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return ToolResult(
+                ok=False,
+                output="".join(chunks),
+                error=f"command timed out after {timeout}s",
+                header=command,
+            )
+        exit_code = proc.returncode or 0
+        return ToolResult(
+            ok=exit_code == 0,
+            output="".join(chunks),
+            error="" if exit_code == 0 else f"exit code {exit_code}",
+            header=command,
+        )
+
+    return run_bash_host
+
+
 def _make_ask_user_tool(
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]],
 ) -> Tool:
@@ -653,256 +772,6 @@ def _make_ask_user_tool(
 # noise) are shadowed out of the sandbox at mount time, so every tool —
 # bash included — simply cannot see them.
 
-def _make_ls_tool(sandbox: SandboxConfig) -> Tool:
-    @tool(
-        "ls",
-        "List a directory's immediate entries (not recursive); directories "
-        "end with '/'. Ignored files (gitignored, caches, ...) are shadowed "
-        "out of the sandbox and never appear. Paths are relative "
-        "to the workspace root.",
-        path=("string", "directory to list (default '.')"),
-    )
-    async def ls(args: dict[str, Any]) -> ToolResult:
-        path = args.get("path") or "."
-        if not isinstance(path, str):
-            return _bad("'path' must be a string")
-        if err := _check_path(sandbox, path, mode="read"):
-            return err
-        target = sandbox.tool_path(path)
-        is_dir = await run_in_sandbox(sandbox, ["test", "-d", target])
-        if is_dir.exit_code != 0:
-            exists = await run_in_sandbox(sandbox, ["test", "-e", target])
-            if exists.exit_code == 0:
-                return _bad(f"'{path}' is not a directory")
-            return _bad(f"path does not exist: {path}")
-
-        # -p suffixes directories with '/', which doubles as the dir marker.
-        listing = await run_in_sandbox(sandbox, ["ls", "-A", "-p", "--", target])
-        if listing.exit_code != 0:
-            return _exec_error(listing, "ls failed")
-        entries = [e for e in listing.stdout.splitlines() if e]
-        # A shadowed directory is empty but its name still lists; drop the
-        # names of anything hidden under the listed path (shadowed files
-        # read as empty but also shouldn't be offered).
-        base = "" if path in (".", "") else path.strip("/") + "/"
-        skip: set[str] = set()
-        for h in sandbox.hidden_paths:
-            if base and not h.startswith(base):
-                continue
-            first = h[len(base):].split("/", 1)[0]
-            skip.update((first, first + "/"))
-        entries = [e for e in entries if e not in skip]
-        if not entries:
-            return ToolResult(ok=True, output="(empty directory)")
-        entries.sort(key=lambda e: (not e.endswith("/"), e.rstrip("/")))
-        return ToolResult(ok=True, output="\n".join(entries), header=path)
-
-    return ls
-
-
-async def _list_files(sandbox: SandboxConfig, base: str) -> list[str]:
-    """Files under ``base`` (agent-workspace-relative, "" = root) as
-    agent-workspace-relative posix paths. No ignore logic: hidden paths are
-    shadowed out of the container, so find simply never sees them."""
-    target = sandbox.tool_root if base in ("", ".") else sandbox.tool_path(base)
-    res = await run_in_sandbox(
-        sandbox,
-        ["find", target, "-name", ".git", "-prune",
-         "-o", "-type", "f", "-print"],
-    )
-    if res.exit_code != 0:
-        raise RuntimeError(res.stderr.strip() or f"could not list files under {base or '.'}")
-    prefix = sandbox.tool_root + "/"
-    out = []
-    for line in res.stdout.splitlines():
-        out.append(line[len(prefix):] if line.startswith(prefix) else line)
-    return out
-
-
-def _make_glob_tool(sandbox: SandboxConfig) -> Tool:
-    @tool(
-        "glob",
-        "Find files by glob pattern (e.g. '**/controller.py', 'src/*.py'). "
-        "Matches paths relative to 'path' (default workspace root); "
-        "ignored files (gitignored, caches, ...) are shadowed out of the "
-        "sandbox and never matched. "
-        "Results are capped and sorted shortest-path-first.",
-        required=("glob",),
-        glob=("string", "glob pattern ('**/' = any depth)"),
-        path=("string", "base directory to search (default '.')"),
-    )
-    async def glob(args: dict[str, Any]) -> ToolResult:
-        pattern = args.get("glob", "")
-        if not pattern:
-            return _bad("'glob' is required")
-        path = args.get("path") or "."
-        if not isinstance(pattern, str) or not isinstance(path, str):
-            return _bad("'glob'/'path' must be strings")
-        if err := _check_path(sandbox, path, mode="read"):
-            return err
-        base = "" if path in (".", "") else path.strip("/")
-        if base:
-            is_dir = await run_in_sandbox(sandbox, ["test", "-d", sandbox.tool_path(base)])
-            if is_dir.exit_code != 0:
-                return ToolResult(ok=False, error=f"path is not a directory: {path}", parse_error=True)
-
-        files = await _list_files(sandbox, base)
-        if base:
-            prefix = base + "/"
-            files = [f[len(prefix):] for f in files if f.startswith(prefix)]
-
-        matcher = glob_to_regex(pattern)
-        matches = [f for f in files if matcher.fullmatch(f)]
-        matches.sort(key=len)
-        cap = _MAX_GLOB_RESULTS
-        if len(matches) > cap:
-            output = "\n".join(matches[:cap])
-            output += f"\n[showing {cap} of {len(matches)} matches — narrow the glob or 'path']"
-            return ToolResult(ok=True, output=output, header=_search_header(pattern, path))
-        if not matches:
-            return ToolResult(ok=True, output="(no matches)", header=_search_header(pattern, path))
-        return ToolResult(ok=True, output="\n".join(matches), header=_search_header(pattern, path))
-
-    return glob
-
-
-def _rg_argv(regex: str, include: str, path: str, root: str) -> list[str]:
-    script = f"cd {root} && exec rg -n --no-heading --color=never"
-    if include:
-        script += f" -g {shlex.quote(include)}"
-    script += f" -- {shlex.quote(regex)} {shlex.quote(path)}"
-    return ["sh", "-c", script]
-
-
-def _git_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
-    if include:
-        spec = include if path in (".", "") else f":(glob){path}/**/{include}"
-    else:
-        spec = path
-    return ["git", "-C", root, "grep", "-n", "--untracked",
-            "-E", "-e", regex, "--", spec]
-
-
-def _plain_grep_argv(regex: str, include: str, path: str, root: str) -> list[str]:
-    script = f"cd {root} && exec grep -rnE --color=never"
-    if include:
-        script += f" --include={shlex.quote(include)}"
-    script += f" -- {shlex.quote(regex)} {shlex.quote(path)}"
-    return ["sh", "-c", script]
-
-
-def _search_header(query: str, path: str) -> str:
-    """Shared header shape for grep/glob: ``query, scope`` (scope dropped
-    when it's the workspace root)."""
-    return query if path in (".", "") else f"{query}, {path}"
-
-
-def _make_grep_tool(sandbox: SandboxConfig) -> Tool:
-    @tool(
-        "grep",
-        "Search file contents with a regex; returns 'path:line:content' "
-        "per match. Optional 'include_pattern' scopes the search (a single "
-        "path or a glob like '**/*.py'); optional 'path' sets the base "
-        "directory. Ignored files (gitignored, caches, ...) are shadowed "
-        "out of the sandbox and never match. "
-        "Matches are capped per file and in total.",
-        required=("regex",),
-        regex="string",
-        include_pattern=("string", "single path or glob scoping the search"),
-        path=("string", "base directory (default '.')"),
-    )
-    async def grep(args: dict[str, Any]) -> ToolResult:
-        regex = args.get("regex", "")
-        if not regex:
-            return _bad("'regex' is required")
-        include = args.get("include_pattern") or ""
-        path = args.get("path") or "."
-        if not isinstance(regex, str) or not isinstance(include, str) or not isinstance(path, str):
-            return _bad("'regex'/'include_pattern'/'path' must be strings")
-        if err := _check_path(sandbox, path, mode="read"):
-            return err
-        if path not in (".", ""):
-            exists = await run_in_sandbox(sandbox, ["test", "-e", sandbox.tool_path(path)])
-            if exists.exit_code != 0:
-                return _bad(f"path does not exist: {path}")
-
-        # Prefer rg; git grep is the fallback and always exists in this
-        # harness. Exit 127 means the binary wasn't actually reachable
-        # inside the sandbox — try the next backend.
-        backends = []
-        root = sandbox.tool_root
-        if shutil.which("rg") is not None:
-            backends.append(_rg_argv(regex, include, path, root))
-        backends.append(_git_grep_argv(regex, include, path, root))
-        res = await run_in_sandbox(sandbox, backends[0])
-        for argv in backends[1:]:
-            if res.exit_code != 127:
-                break
-            res = await run_in_sandbox(sandbox, argv)
-
-        if res.exit_code not in (0, 1) and not res.stdout:
-            err = res.stderr.strip()
-            if res.exit_code not in (0, 1) and not res.stdout:
-                if "not a git repository" in err:
-                    # No repo to lean on (isolation disabled): plain grep.
-                    res = await run_in_sandbox(
-                        sandbox, _plain_grep_argv(regex, include, path, root)
-                    )
-                if res.exit_code not in (0, 1):
-                    return ToolResult(
-                        ok=False,
-                        error=res.stderr.strip() or f"grep failed (exit {res.exit_code})",
-                    )
-
-        counts: dict[str, int] = {}
-        lines: list[str] = []
-        per_file_truncated = False
-        total_truncated = False
-        for raw in res.stdout.splitlines():
-            parts = raw.split(":", 2)
-            if len(parts) < 3:
-                continue
-            fpath = parts[0]
-            if fpath.startswith("./"):
-                # git grep prints './'-prefixed paths when the pathspec is
-                # '.'; rg strips it. Normalize so backends agree.
-                fpath = fpath[2:]
-                raw = f"{fpath}:{parts[1]}:{parts[2]}"
-            seen = counts.get(fpath, 0)
-            if seen >= _MAX_GREP_PER_FILE:
-                per_file_truncated = True
-                continue
-            if len(lines) >= _MAX_GREP_MATCHES:
-                total_truncated = True
-                break
-            counts[fpath] = seen + 1
-            lines.append(raw)
-
-        if not lines:
-            return ToolResult(ok=True, output="(no matches)")
-        output = "\n".join(lines)
-        notes = []
-        if total_truncated:
-            notes.append(
-                f"stopped at {_MAX_GREP_MATCHES} matches — narrow "
-                "'include_pattern' or the regex to see more"
-            )
-        elif per_file_truncated:
-            notes.append(
-                f"some files hit the {_MAX_GREP_PER_FILE}-matches-per-file cap "
-                "— narrow 'include_pattern' or the regex"
-            )
-        if notes:
-            output += "\n[" + "; ".join(notes) + "]"
-        return ToolResult(
-            ok=True,
-            output=output,
-            header=_search_header(regex, include or path),
-        )
-
-    return grep
-
-
 def build_registry(
     sandbox: SandboxConfig | None,
     session: SandboxSession | None,
@@ -910,17 +779,19 @@ def build_registry(
     allow_subagent: bool = True,
     max_calls_per_turn: int | None = None,
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
+    approve_callback: Callable[[HostBashRequest], Awaitable[Decision]] | None = None,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
-    Plan mode is read-only: read_file plus the exploration tools (ls, glob,
-    grep). Write mode trades those for the editing tools: read_file,
-    write_file, edit_file, and run_bash. ``ask_user`` is available in both
-    modes when ``ask_callback`` is given. ``git_guard`` optionally vetoes
-    run_bash commands that would rewrite the user's branch/refs (see
-    gitwork.py). ``allow_subagent`` is reserved for subagent registration in a
-    later phase.
+    Plan mode is read-only: read_file plus run_bash against a read-only
+    workspace mount. Write mode adds the editing tools: write_file,
+    edit_file, and run_bash_host (the latter behind a user approval prompt).
+    ``ask_user`` is available in both modes when ``ask_callback`` is given.
+    ``git_guard`` optionally vetoes run_bash commands that would rewrite the
+    user's branch/refs (see gitwork.py). ``approve_callback`` enables
+    run_bash_host (see permissions.py). ``allow_subagent`` is reserved for
+    subagent registration in a later phase.
     """
     registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
     # web_search is disabled for now — not implemented well enough to ship.
@@ -929,13 +800,19 @@ def build_registry(
         registry.register(_make_ask_user_tool(ask_callback))
     if sandbox is not None:
         registry.register(_make_read_tool(sandbox))  # read_file always available
+        # Plan mode is fully read-only: the workspace is mounted read-only
+        # (sandbox.read_only) and the persistent shell restarts under those
+        # mounts, so run_bash cannot change files. Write mode drops the
+        # read-only mount and adds the editing tools and (behind an
+        # approval prompt) run_bash_host.
+        sandbox.read_only = mode != "write"
+        if session is not None:
+            registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
-            if session is not None:
-                registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
-        else:
-            registry.register(_make_ls_tool(sandbox))
-            registry.register(_make_glob_tool(sandbox))
-            registry.register(_make_grep_tool(sandbox))
+            if session is not None and approve_callback is not None:
+                registry.register(
+                    _make_run_bash_host_tool(sandbox, approve_callback, git_guard)
+                )  # run_bash_host
     return registry

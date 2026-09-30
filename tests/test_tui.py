@@ -278,8 +278,9 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             # Queue while the tool round is in flight.
             await pilot.press("b", "enter")
             self.assertEqual(app._queued, ["b"])
-            notices = [str(n.content) for n in app.query(NoticeLine)]
-            self.assertTrue(any("press enter to send now" in n for n in notices))
+            # The send hint lives in the steer bar above the input now.
+            hints = app.query_one("#steer-queue-bar").query(".steer-hint")
+            self.assertEqual(len(hints), 1)
 
             client.gate.set()
             await wait_until_idle(app)
@@ -388,13 +389,6 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             detail("run_bash", '{"command": "git status\\nls"}'), " git status"
         )
-        self.assertEqual(detail("ls", '{}'), " .")
-        self.assertEqual(detail("ls", '{"path": "src"}'), " src")
-        self.assertEqual(
-            detail("grep", '{"regex": "foo", "include_pattern": "**/*.py"}'),
-            " foo, **/*.py",
-        )
-        self.assertEqual(detail("glob", '{"glob": "**/*.py", "path": "src"}'), " **/*.py, src")
         self.assertEqual(detail("web_search", '{"query": "tui toolkit"}'), " tui toolkit")
         # ask_user renders as a plain "ask_user" — no argument summary.
         self.assertIsNone(detail("ask_user", '{"questions": ["Which one?", "Why?"]}'))

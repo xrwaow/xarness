@@ -97,6 +97,10 @@ class SandboxConfig:
     # git and the surrounding project stay visible) and only this subtree is
     # re-bound read-write on top; the shell starts inside it.
     subtree: str = ""
+    # Read-only workspace (plan mode): the whole workspace is bound
+    # read-only, including any scoped subtree. Flipped by build_registry per
+    # mode; a persistent SandboxSession restarts its shell when this changes.
+    read_only: bool = False
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
     timeout_seconds: float = 60.0
@@ -207,10 +211,12 @@ class SandboxConfig:
             # to the surrounding repo too.
             argv += ["--ro-bind", str(self.workspace), "/workspace"]
         else:
-            argv += ["--bind", str(self.workspace), "/workspace"]
+            argv += ["--ro-bind" if self.read_only else "--bind",
+                     str(self.workspace), "/workspace"]
         if self.subtree:
             argv += [
-                "--bind", str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
+                "--ro-bind" if self.read_only else "--bind",
+                str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
             ]
             chdir = f"/workspace/{self.subtree}"
         # Shadow hidden paths last: the subtree re-bind above restores the
@@ -281,12 +287,19 @@ class SandboxSession:
 
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
+        self._read_only = config.read_only
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
 
     async def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
-            return
+            # A read_only flip (plan/write mode switch) changes the mount
+            # argv; the running shell was started under the old mounts, so
+            # restart it to pick up the new read-only (or read-write) view.
+            if self._read_only == self._config.read_only:
+                return
+            await self.close()
+        self._read_only = self._config.read_only
         argv = self._config.build_argv(["/bin/sh"])
         self._proc = await asyncio.create_subprocess_exec(
             *argv,

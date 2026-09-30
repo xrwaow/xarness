@@ -300,11 +300,6 @@ class UserMessage(Vertical):
             return
         self.query_one(".user-content", Static).update(self._build_content())
 
-    def mark_queued(self) -> None:
-        """Note that this message is waiting for the current turn to finish."""
-        self._suffix = "   (queued)"
-        self.apply_palette()
-
     def mark_sent(self) -> None:
         """The queued message reached the model; drop the queued marker."""
         self._suffix = ""
@@ -317,6 +312,27 @@ class UserMessage(Vertical):
             return
         self.toggle_class("undo-armed")
         event.stop()
+
+
+class SteerQueueBar(Vertical):
+    """Queued steer messages, pinned above the chat input.
+
+    While a turn is busy, submitted messages wait here instead of landing
+    in the chat log; each becomes a UserMessage in the log only when it is
+    actually sent (at a round boundary or turn end), so the transcript
+    reads in send order. Colors come from CSS, so /theme switches apply."""
+
+    def update_items(self, texts: list[str]) -> None:
+        for old in self.query(".steer-item, .steer-hint"):
+            old.remove()
+        for text in texts:
+            self.mount(Static(f"› {text}", classes="steer-item", markup=False))
+        if texts:
+            self.add_class("visible")
+            # Only the oldest message is "first in line" — enter sends it.
+            self.mount(Static("↵ enter to send now", classes="steer-hint", markup=False))
+        else:
+            self.remove_class("visible")
 
 
 class _UndoButton(Static):
@@ -573,7 +589,7 @@ def _live_edit_counts(args_text: str) -> str | None:
 def _stream_label(tool_name: str, args_text: str) -> str:
     """Live one-line label for a call whose arguments are streaming or that
     is executing: '<tool> <detail>', e.g. 'write_file g.py +4 LOC',
-    'run_bash git status', '+2 -1 edit_file app.py'. Falls back to the bare
+    'run_bash git status', 'edit_file +2 -1 app.py'. Falls back to the bare
     tool name until enough of the arguments has arrived."""
     args = _json_tool_args(args_text)
     path = args.get("path")
@@ -586,30 +602,20 @@ def _stream_label(tool_name: str, args_text: str) -> str:
             part for part in (path, f"+{loc} LOC" if loc is not None else None) if part
         )
         return f"write_file {detail}".rstrip()
-    if tool_name == "edit_file" and path:
+    if tool_name == "edit_file":
+        if not path:
+            return "edit_file"
         counts = _live_edit_counts(args_text)
-        return f"{counts} edit_file {path}" if counts else f"edit_file {path}"
+        return f"edit_file {counts} {path}" if counts else "edit_file"
     if tool_name == "read_file" and path:
         return f"read_file {path}"
-    if tool_name == "run_bash":
+    if tool_name in ("run_bash", "run_bash_host"):
         command = args.get("command")
         if not isinstance(command, str):
             command = _partial_string(args_text, "command", unescape=True)
         if command:
             # One line only — later lines (a compound command, say) don't fit.
-            return "run_bash " + _shorten(command.splitlines()[0])
-    if tool_name == "grep":
-        regex = args.get("regex")
-        if not isinstance(regex, str):
-            regex = _partial_string(args_text, "regex")
-        if regex:
-            return f"grep {regex}"
-    if tool_name == "glob":
-        pattern = args.get("glob")
-        if not isinstance(pattern, str):
-            pattern = _partial_string(args_text, "glob")
-        if pattern:
-            return f"glob {pattern}"
+            return tool_name + " " + _shorten(command.splitlines()[0])
     return tool_name
 
 
@@ -637,7 +643,7 @@ def _header_detail_text(tool_name: str, header: str) -> Text | None:
         else:
             detail.append(header, style=muted)
         return detail
-    if tool_name == "run_bash":
+    if tool_name in ("run_bash", "run_bash_host"):
         detail = Text(" ", style=muted)
         detail.append(_shorten(header, 80), style=muted)
         return detail
@@ -676,42 +682,13 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
             if ranges:
                 detail.append(f" [{', '.join(ranges)}]", style=muted)
         return detail
-    if tool_name == "run_bash":
+    if tool_name in ("run_bash", "run_bash_host"):
         command = as_str(args.get("command"))
         if not command:
             return None
         first = command.splitlines()[0]
         detail = Text(" ")
         detail.append(_shorten(first, 80), style=muted)
-        return detail
-    if tool_name == "ls":
-        path = as_str(args.get("path")) or "."
-        detail = Text(" ")
-        detail.append(_shorten(path), style=muted)
-        return detail
-    if tool_name == "grep":
-        regex = as_str(args.get("regex"))
-        if not regex:
-            return None
-        parts = [f"{_shorten(regex, 40)}"]
-        include = as_str(args.get("include_pattern"))
-        path = as_str(args.get("path"))
-        scope = include or path
-        if scope and scope != ".":
-            parts.append(_shorten(scope))
-        detail = Text(" ")
-        detail.append(", ".join(parts), style=muted)
-        return detail
-    if tool_name == "glob":
-        pattern = as_str(args.get("glob"))
-        if not pattern:
-            return None
-        path = as_str(args.get("path"))
-        parts = [_shorten(pattern, 40)]
-        if path and path != ".":
-            parts.append(_shorten(path))
-        detail = Text(" ")
-        detail.append(", ".join(parts), style=muted)
         return detail
     if tool_name == "web_search":
         query = as_str(args.get("query"))
@@ -736,7 +713,7 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
     return None
 
 
-_EXPAND_PLAIN_TOOLS = frozenset({"run_bash", "glob", "grep", "ls"})
+_EXPAND_PLAIN_TOOLS = frozenset({"run_bash", "run_bash_host"})
 
 
 class ToolCallBlock(Vertical):
@@ -842,10 +819,12 @@ class ToolCallBlock(Vertical):
     def recolor(self) -> None:
         """Re-render with the current palette (/theme).
 
-        The status dot and any expanded body (diffs, code blocks) bake
-        palette colors into rich styles, so both need a re-render."""
+        The status dot, any expanded body (diffs, code blocks), and the
+        settled summary row (edit_file's +N -M counts use diff colors)
+        bake palette colors into rich styles, so all need a re-render."""
         self._refresh_dot()
         self._refresh_body()
+        self._render_summary()
 
     def _refresh_dot(self) -> None:
         if self.is_mounted:

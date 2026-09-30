@@ -39,16 +39,18 @@ from ..gitwork import (
     setup_tracking, snapshot_tree, tree_diff_stat,
 )
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
+from ..permissions import Decision, HostBashRequest
 from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
 from .confirm_screen import ConfirmScreen
+from .host_bash_bar import HostBashBar
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
     AskBar, AssistantMessage, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
     MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
-    SuggestionPopup, ThinkingBlock, ToolCallBlock, ToolWritingIndicator,
-    UserMessage, _format_duration,
+    SteerQueueBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
+    ToolWritingIndicator, UserMessage, _format_duration,
 )
 
 
@@ -152,6 +154,7 @@ class AgentApp(App[None]):
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
+            approve_callback=self._approve_host_bash,
             git_guard=self._make_git_guard(),
         )
         self.controller = controller or ChatController(
@@ -180,8 +183,9 @@ class AgentApp(App[None]):
         # (steering), like a queued message.
         self._compact_pending = False
         self._queued: list[str] = []
-        self._queued_widgets: list[UserMessage] = []
         self._ask_future: asyncio.Future[str | None] | None = None
+        # Resolved by the host-bash approval bar while one is pending.
+        self._host_bash_future: asyncio.Future | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
         # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
@@ -202,7 +206,7 @@ class AgentApp(App[None]):
         round onward without duplicating prompts in the history.
         """
         conversation = self.controller.conversation
-        content = system_prompt_for(GENERAL_SYSTEM_PROMPT, self.mode)
+        content = system_prompt_for(GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox)
         if conversation.messages and conversation.messages[0].role == "system":
             conversation.messages[0].content = content
         else:
@@ -217,7 +221,9 @@ class AgentApp(App[None]):
             yield GeneratingBar(id="generating-bar")
             yield DiffSummary(id="diff-summary")
             yield AskBar(id="ask-bar")
+            yield HostBashBar(id="host-bash-bar")
             yield SuggestionPopup(id="suggestion-popup")
+            yield SteerQueueBar(id="steer-queue-bar")
             with Horizontal(id="input-row"):
                 yield Static("›", id="input-prompt")
                 yield ChatInput(
@@ -383,6 +389,7 @@ class AgentApp(App[None]):
         self.tool_registry = build_registry(
             self.sandbox, self.sandbox_session, mode=new_mode,
             ask_callback=self._ask_user,
+            approve_callback=self._approve_host_bash,
             git_guard=self._make_git_guard(),
         )
         self.controller.tools = self.tool_registry  # rewire to the new registry
@@ -802,6 +809,7 @@ class AgentApp(App[None]):
             thinking.recolor()
         for block in self.query(ToolCallBlock):
             block.recolor()
+        self.query_one("#host-bash-bar", HostBashBar).recolor()
         self._refresh_status()
         self.query_one("#diff-summary", DiffSummary).recolor()
 
@@ -819,7 +827,7 @@ class AgentApp(App[None]):
         self._last_thinking = None
         self._queued.clear()
         self._compact_pending = False
-        self._queued_widgets.clear()
+        self._refresh_steer_bar()
         chat = self.query_one("#chat-log", VerticalScroll)
         chat.remove_children()
         # Fresh, empty log: follow it again from the top of the new session.
@@ -1169,19 +1177,25 @@ class AgentApp(App[None]):
             return  # app shutting down; DOM already pruned
         chat.mount(widget)
 
+    def _refresh_steer_bar(self) -> None:
+        """Mirror the queued steer messages into the bar above the input.
+        They move into the chat log (as UserMessages) when actually sent."""
+        try:
+            bar = self.query_one("#steer-queue-bar", SteerQueueBar)
+        except NoMatches:
+            return  # app shutting down
+        bar.update_items(self._queued)
+
     def _submit(self, text: str) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
-        user_message = UserMessage(text)
         if self._turn_busy or self._compacting:
-            user_message.mark_queued()
+            # Queued: shown in the steer bar above the input until sent.
             self._queued.append(text)
-            self._queued_widgets.append(user_message)
+            self._refresh_steer_bar()
+            return
+        user_message = UserMessage(text)
         chat.mount(user_message)
-        if self._turn_busy or self._compacting:
-            if len(self._queued) == 1:
-                self._post_line(NoticeLine("press enter to send now"))
-        else:
-            self._worker = self._run_turn(text, user_message)
+        self._worker = self._run_turn(text, user_message)
 
     def _flush_queued_now(self) -> None:
         """Enter on an empty input while messages are queued: send now.
@@ -1205,10 +1219,24 @@ class AgentApp(App[None]):
             return True
         return False
 
-    def action_copy_or_quit(self) -> None:
-        """ctrl+c: copy the active selection if there is one, quit otherwise."""
-        if not self._copy_selection():
-            self.exit()
+    async def action_copy_or_quit(self) -> None:
+        """ctrl+c: copy the active selection if there is one, quit otherwise.
+
+        Quitting is immediate, but an in-flight turn is cancelled and given a
+        moment to unwind first — otherwise the worker keeps running against a
+        closed app and sprays cancellation errors on the way out.
+        """
+        if self._copy_selection():
+            return
+        self._disarm_interrupt()
+        worker = self._worker if self._turn_busy else None
+        if worker is not None:
+            worker.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        self.exit()
 
     def action_copy_selection(self) -> None:
         """ctrl+shift+c: copy the active selection, if any (never quits)."""
@@ -1219,6 +1247,12 @@ class AgentApp(App[None]):
         # so cancel the open modal here rather than interrupting the turn.
         if isinstance(self.screen, ModalScreen):
             self.screen.dismiss(None)
+            return
+        host_bar = self.query("#host-bash-bar", HostBashBar)
+        if host_bar and self._host_bash_future is not None and not self._host_bash_future.done():
+            # Esc while a host command waits for approval: deny (or back out
+            # of the prefix/deny input) — never an interrupt.
+            host_bar.first().action_escape()
             return
         chat_input = self.query_one("#chat-input", ChatInput)
         popup = self.query_one("#suggestion-popup", SuggestionPopup)
@@ -1289,6 +1323,24 @@ class AgentApp(App[None]):
             self._ask_future = None
             ask_bar.hide()
             chat_input.placeholder = INPUT_PLACEHOLDER
+
+    async def _approve_host_bash(self, req: HostBashRequest) -> Decision:
+        """Callback for run_bash_host: show the command, reason and cwd in
+        the bar above the input; the user allows once, for the session, via
+        a saved prefix, or denies (escape denies too). Buttons and the
+        bar's y/s/p/n keys resolve the future; the tool call blocks here."""
+        bar = self.query_one("#host-bash-bar", HostBashBar)
+        chat_input = self.query_one("#chat-input", ChatInput)
+        future: asyncio.Future[Decision] = asyncio.get_running_loop().create_future()
+        self._host_bash_future = future
+        try:
+            bar.show(req)
+            decision = await future
+        finally:
+            self._host_bash_future = None
+            bar.hide()
+            chat_input.focus()
+        return decision
 
     @work(group="turn")
     async def _run_turn(self, text: str, user_widget: UserMessage | None = None) -> None:
@@ -1464,11 +1516,16 @@ class AgentApp(App[None]):
                     for queued_text in self._queued:
                         self.controller.inject_user_message(queued_text)
                     injected = self.controller.conversation.messages[-len(self._queued):]
-                    for widget, message in zip(self._queued_widgets, injected):
+                    chat = self.query_one("#chat-log", VerticalScroll)
+                    for queued_text, message in zip(self._queued, injected):
+                        # Land the message in the transcript only now — after
+                        # the round's answer/tool calls it follows.
+                        widget = UserMessage(queued_text)
                         widget.message = message
                         widget.mark_sent()
-                    self._queued_widgets.clear()
+                        chat.mount(widget)
                     self._queued.clear()
+                    self._refresh_steer_bar()
 
                 stream = self.controller.continue_after_tools()
             if not had_stream_error:
@@ -1510,9 +1567,11 @@ class AgentApp(App[None]):
                 await self.refresh_diff_summary()
             self._disarm_interrupt()
             if self._queued:
-                widget = self._queued_widgets.pop(0)
-                widget.mark_sent()
-                self._worker = self._run_turn(self._queued.pop(0), widget)
+                queued_text = self._queued.pop(0)
+                widget = UserMessage(queued_text)
+                self.query_one("#chat-log", VerticalScroll).mount(widget)
+                self._refresh_steer_bar()
+                self._worker = self._run_turn(queued_text, widget)
 
     async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
         if indicator is not None and indicator.is_mounted:
@@ -1534,9 +1593,11 @@ class AgentApp(App[None]):
             # Messages submitted while the summarizer ran start now — the
             # history rewrite is done, so it's safe to open a turn.
             if self._queued and not self._turn_busy:
-                widget = self._queued_widgets.pop(0)
-                widget.mark_sent()
-                self._worker = self._run_turn(self._queued.pop(0), widget)
+                queued_text = self._queued.pop(0)
+                widget = UserMessage(queued_text)
+                self.query_one("#chat-log", VerticalScroll).mount(widget)
+                self._refresh_steer_bar()
+                self._worker = self._run_turn(queued_text, widget)
 
     async def _run_pending_compact(self) -> None:
         """Run a /compact requested mid-turn (steering) at a safe boundary."""
