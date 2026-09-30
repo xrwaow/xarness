@@ -28,7 +28,7 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     )
     conversation.add(user)
     conversation.add(assistant)
-    conversation.undo_snapshot = [user]
+    conversation.turn_start = 0
     session_store.save_session("s", "m", conversation)
 
     loaded = session_store.load_session("s")
@@ -37,9 +37,9 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     assert loaded.messages[0].after_tree == "def456"
     assert loaded.messages[1].usage == Usage(12, 3)
     assert loaded.messages[1].reasoning == "thoughts"
-    assert loaded.undo_snapshot is not None
-    assert loaded.undo_snapshot[0].checkpoint_sha == "abc123"
-    assert loaded.undo_snapshot[0].after_tree == "def456"
+    assert loaded.turn_start == 0
+    assert loaded.messages[loaded.turn_start].checkpoint_sha == "abc123"
+    assert loaded.messages[loaded.turn_start].after_tree == "def456"
 
     # Local-only fields never reach the wire.
     assert all(

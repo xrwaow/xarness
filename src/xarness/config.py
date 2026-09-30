@@ -135,15 +135,22 @@ def _named_profiles(path: Path, data: dict[str, Any]) -> list[ProviderProfile]:
     return profiles
 
 
-def _flat_profile(path: Path, data: dict[str, Any]) -> ProviderProfile:
-    """Validate the flat single-profile form."""
-    fields = data["provider"] if "provider" in data else {
+def _normalize(path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite either config shape into the named-profiles form.
+
+    The flat single-profile form becomes a one-entry ``profiles`` list named
+    "default" (in memory only — the file keeps its original style), so every
+    consumer works with one shape instead of branching per function."""
+    if isinstance(data.get("profiles"), list):
+        _named_profiles(path, data)  # validate the named form up front
+        return data
+    if "default_profile" in data:
+        raise ConfigError(f"'default_profile' in {path} is only meaningful alongside a 'profiles' section")
+    fields = dict(data["provider"]) if "provider" in data else {
         key: value for key, value in data.items()
         if key not in ("default_profile", "default_theme", "profiles", "provider")
     }
-    if "default_profile" in data:
-        raise ConfigError(f"'default_profile' in {path} is only meaningful alongside a 'profiles' section")
-    return _validate(path, ProviderProfile, fields)
+    return {**data, "profiles": [{"name": "default", **fields}], "default_profile": "default"}
 
 
 def load_config(path: Path, profile_name: str | None = None) -> LoadedConfig:
@@ -153,30 +160,28 @@ def load_config(path: Path, profile_name: str | None = None) -> LoadedConfig:
     the only profile when exactly one is defined.
     """
     data = _read(path)
-
-    if isinstance(data.get("profiles"), list):
-        profiles = _named_profiles(path, data)
-        names = [p.name for p in profiles]
-        selected = profile_name or data.get("default_profile") or (names[0] if len(names) == 1 else None)
-        if selected is None:
-            raise ConfigError(
-                f"{path} defines multiple profiles ({', '.join(names)}) but no 'default_profile'; "
-                "pass --profile to choose one"
-            )
-        if selected not in names:
-            raise ConfigError(
-                f"no profile named {selected!r} in {path}; available profiles: {', '.join(names)}"
-            )
-        by_name = {p.name: p for p in profiles}
-        return LoadedConfig(by_name[selected], selected, names, data.get("default_theme") or DEFAULT_THEME)
-
-    if profile_name is not None:
+    if not isinstance(data.get("profiles"), list) and profile_name is not None:
         raise ConfigError(
             f"{path} defines a single unnamed profile, so --profile {profile_name!r} has nothing to "
             "select; add a top-level 'profiles' section to use named profiles"
         )
+    normalized = _normalize(path, data)
+    profiles = _validate(path, list[ProviderProfile], normalized.get("profiles"))
+    names = [p.name for p in profiles]
+    selected = profile_name or normalized.get("default_profile") or (names[0] if len(names) == 1 else None)
+    if selected is None:
+        raise ConfigError(
+            f"{path} defines multiple profiles ({', '.join(names)}) but no 'default_profile'; "
+            "pass --profile to choose one"
+        )
+    if selected not in names:
+        raise ConfigError(
+            f"no profile named {selected!r} in {path}; available profiles: {', '.join(names)}"
+        )
+    by_name = {p.name: p for p in profiles}
     return LoadedConfig(
-        _flat_profile(path, data), "default", [], data.get("default_theme") or DEFAULT_THEME
+        by_name[selected], selected, names if isinstance(data.get("profiles"), list) else [],
+        data.get("default_theme") or DEFAULT_THEME,
     )
 
 
@@ -185,7 +190,7 @@ def list_profile_names(path: Path) -> list[str]:
     data = _read(path)
     if not isinstance(data.get("profiles"), list):
         return []
-    return [p.name for p in _named_profiles(path, data)]
+    return [p.name for p in _validate(path, list[ProviderProfile], _normalize(path, data)["profiles"])]
 
 
 def save_preferences(
@@ -204,6 +209,8 @@ def save_preferences(
     data = _read(path)
     if default_theme is not None:
         data["default_theme"] = default_theme
+    # default_profile only fits the named-profiles form; a stray one would
+    # make a flat config invalid, so it is not written there.
     if default_profile is not None and isinstance(data.get("profiles"), list):
         data["default_profile"] = default_profile
     try:
@@ -214,10 +221,8 @@ def save_preferences(
 
 def load_all_profiles(path: Path) -> dict[str, ProviderProfile]:
     """Every profile in the file, keyed by name ("default" for the flat form)."""
-    data = _read(path)
-    if isinstance(data.get("profiles"), list):
-        return {p.name: p for p in _named_profiles(path, data)}
-    return {"default": _flat_profile(path, data)}
+    data = _normalize(path, _read(path))
+    return {p.name: p for p in _validate(path, list[ProviderProfile], data["profiles"])}
 
 
 def resolve_api_key(profile: ProviderProfile) -> str | None:

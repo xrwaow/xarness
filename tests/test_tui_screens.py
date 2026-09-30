@@ -14,7 +14,7 @@ from textual.widgets import ListItem
 from xarness import session_store
 from xarness.config import CotStrength, ProviderProfile
 from xarness.controller import ChatController
-from xarness.conversation import Conversation, Message
+from xarness.conversation import Conversation, Message, ToolCall
 from xarness.events import (
     ContentDelta,
     ProcessingStarted,
@@ -124,13 +124,7 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
             Message(
                 role="assistant",
                 content="",
-                tool_calls=[
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "noop", "arguments": '{"x": 1}'},
-                    }
-                ],
+                tool_calls=[ToolCall("call_1", "noop", '{"x": 1}')],
             )
         )
         conversation.add(Message(role="tool", tool_call_id="call_1", content="success!"))
@@ -201,13 +195,7 @@ class TestRenderHistory(unittest.IsolatedAsyncioTestCase):
             Message(
                 role="assistant",
                 content="",
-                tool_calls=[
-                    {
-                        "id": "call_9",
-                        "type": "function",
-                        "function": {"name": "noop", "arguments": "{}"},
-                    }
-                ],
+                tool_calls=[ToolCall("call_9", "noop", "{}")],
             )
         )
         conversation.add(Message(role="tool", tool_call_id="call_9", content="ok"))

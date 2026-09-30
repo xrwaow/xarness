@@ -609,7 +609,7 @@ def _stream_label(tool_name: str, args_text: str) -> str:
         return f"edit_file {counts} {path}" if counts else "edit_file"
     if tool_name == "read_file" and path:
         return f"read_file {path}"
-    if tool_name in ("run_bash", "run_bash_host"):
+    if tool_name in "run_bash":
         command = args.get("command")
         if not isinstance(command, str):
             command = _partial_string(args_text, "command", unescape=True)
@@ -643,7 +643,7 @@ def _header_detail_text(tool_name: str, header: str) -> Text | None:
         else:
             detail.append(header, style=muted)
         return detail
-    if tool_name in ("run_bash", "run_bash_host"):
+    if tool_name in "run_bash":
         detail = Text(" ", style=muted)
         detail.append(_shorten(header, 80), style=muted)
         return detail
@@ -682,7 +682,7 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
             if ranges:
                 detail.append(f" [{', '.join(ranges)}]", style=muted)
         return detail
-    if tool_name in ("run_bash", "run_bash_host"):
+    if tool_name in "run_bash":
         command = as_str(args.get("command"))
         if not command:
             return None
@@ -713,7 +713,7 @@ def _tool_header_detail(tool_name: str, args_text: str, output_text: str) -> Tex
     return None
 
 
-_EXPAND_PLAIN_TOOLS = frozenset({"run_bash", "run_bash_host"})
+_EXPAND_PLAIN_TOOLS = frozenset({"run_bash"})
 
 
 class ToolCallBlock(Vertical):
@@ -1447,12 +1447,18 @@ class ToolWritingIndicator(Horizontal):
     streaming — replaces the per-block 'Running [tool]' shinies, which only
     make sense once a call actually executes. The label is the live call
     itself, '<tool> <detail>', updated as each argument fragment arrives:
-    'write_file g.py +4 LOC', 'run_bash git stat…', and so on."""
+    'write_file g.py +4 LOC', 'run_bash git stat…', and so on.
+
+    Owns the streaming-arguments state itself: fragments are accumulated per
+    call_id here (the only consumer), not mirrored through the turn driver.
+    The label follows the most recently updated call when several stream."""
 
     def __init__(self, tool_name: str) -> None:
         super().__init__(classes="msg toolwriting")
         self.tool_name = tool_name
-        self._args = ""
+        self._names: dict[str, str] = {}
+        self._args: dict[str, str] = {}
+        self._current: str | None = None
 
     def compose(self):
         yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
@@ -1465,17 +1471,29 @@ class ToolWritingIndicator(Horizontal):
         )
 
     def _label(self) -> str:
-        return _stream_label(self.tool_name, self._args)
+        name = self._names.get(self._current or "", self.tool_name)
+        return _stream_label(name, self._args.get(self._current or "", ""))
 
     def set_tool(self, tool_name: str) -> None:
         """Follow the tool call that just started streaming."""
         self.tool_name = tool_name
-        self._args = ""
+        self._current = None
         self._refresh()
 
-    def update_args(self, args_text: str) -> None:
-        """Feed the streamed arguments so the label grows live detail."""
-        self._args = args_text
+    def track_call(self, call_id: str, name: str) -> None:
+        """Register a newly started call; its arguments accumulate here."""
+        self._names[call_id] = name
+        self._args.setdefault(call_id, "")
+        self._current = call_id
+        self.tool_name = name
+        self._refresh()
+
+    def append_args_delta(self, call_id: str, text: str) -> None:
+        """Feed one streamed argument fragment so the label grows live detail."""
+        if call_id not in self._names:
+            return
+        self._args[call_id] += text
+        self._current = call_id
         self._refresh()
 
     def _refresh(self) -> None:

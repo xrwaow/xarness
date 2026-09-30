@@ -7,8 +7,7 @@ across calls within one chat.
 
 Plan mode exposes read_file plus run_bash against a read-only workspace
 mount; write mode exposes read_file plus the editing tools (write_file,
-edit_file, run_bash_host). ask_user is available in both modes. web_search is
-disabled for now (see build_registry).
+edit_file). ask_user is available in both modes.
 """
 
 from __future__ import annotations
@@ -18,14 +17,12 @@ import difflib
 import json
 import os
 import shlex
-import shutil
 import signal
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from .permissions import Decision, HostBashRequest, add_prefix, is_compound, load_prefixes, prefix_matches, tokens
 from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
 
 
@@ -124,11 +121,9 @@ class ToolRegistry:
 
     ``max_output_chars`` caps the text of every tool result before it goes
     on the wire (see _truncate_output); the TUI's /output_limit command
-    mutates it live. ``max_calls_per_turn`` is reserved for per-turn call
-    limiting in a later phase; it is stored but not yet enforced.
+    mutates it live.
     """
 
-    max_calls_per_turn: int | None = None
     max_output_chars: int = DEFAULT_OUTPUT_LIMIT
     _tools: dict[str, Tool] = field(default_factory=dict)
 
@@ -179,51 +174,6 @@ class ToolRegistry:
         result.output = _truncate_output(result.output, self.max_output_chars)
         result.error = _truncate_output(result.error, self.max_output_chars)
         return result
-
-
-async def _web_search_handler(args: dict[str, Any]) -> ToolResult:
-    """Runs OUTSIDE the sandbox — the only tool with real network access."""
-    import httpx
-
-    query = args.get("query", "")
-    if not query:
-        return ToolResult(ok=False, error="'query' is required", parse_error=True)
-
-    api_key = os.environ.get("BRAVE_API_KEY")
-    if not api_key:
-        return ToolResult(ok=False, error="BRAVE_API_KEY environment variable is not set")
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query},
-            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    results = data.get("web", {}).get("results", [])[:5]
-    if not results:
-        return ToolResult(ok=True, output="no results")
-    lines = [
-        f"{r.get('title', '')}\n{r.get('url', '')}\n{r.get('description', '')}"
-        for r in results
-    ]
-    return ToolResult(ok=True, output="\n\n".join(lines))
-
-
-# web_search is disabled for now: the implementation isn't good enough to
-# ship, so it is not registered in build_registry. Kept here for reference.
-# web_search_tool = Tool(
-#     name="web_search",
-#     description="Search the web and return results as text.",
-#     parameters_schema={
-#         "type": "object",
-#         "properties": {"query": {"type": "string", "description": "search query"}},
-#         "required": ["query"],
-#     },
-#     handler=_web_search_handler,
-# )
 
 
 # Files larger than this return a structural outline instead of contents
@@ -292,37 +242,50 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error="start_line is 1-based", parse_error=True)
 
         target = sandbox.tool_path(path)
-        # awk's NR counts lines regardless of a trailing newline (wc -l counts
-        # newlines, undercounting files that don't end with one).
-        count_result = await run_in_sandbox(sandbox, ["awk", "END{print NR}", target])
-        if count_result.exit_code != 0:
-            return _exec_error(count_result, "read failed")
-        try:
-            total_lines = int(count_result.stdout.split()[0])
-        except (IndexError, ValueError):
-            return ToolResult(ok=False, error=f"could not count lines in {path}")
-
-        if args.get("start_line") is None and args.get("end_line") is None:
-            if total_lines <= OUTLINE_THRESHOLD:
-                start, end = 1, max(total_lines, 1)
-            else:
-                return await _outline_result(sandbox, path, total_lines)
-        else:
-            end = total_lines if end is None else min(end, total_lines)
-            if end < start:
-                return ToolResult(
-                    ok=False,
-                    error=f"end_line ({end}) is before start_line ({start})",
-                    parse_error=True,
-                )
-            if end - start + 1 > MAX_READ_LINES:
-                end = start + MAX_READ_LINES - 1
-
-        result = await run_in_sandbox(sandbox, ["sed", "-n", f"{start},{end}p", target])
+        # One bwrap spawn does the whole read: the first output line is the
+        # total line count (awk's NR counts lines regardless of a trailing
+        # newline — wc -l counts newlines and undercounts files that don't
+        # end with one), the rest is the requested slice.
+        # A huge end just prints to EOF; it is clamped once total is known.
+        result = await run_in_sandbox(
+            sandbox,
+            [
+                "bash", "-c",
+                'total=$(awk \'END{print NR}\' "$1"); printf "%d\\n" "$total"; '
+                'sed -n "${2},${3}p" "$1"',
+                "read", target, str(start), str(end if end is not None else 10**9),
+            ],
+        )
         if result.exit_code != 0:
             return _exec_error(result, "read failed")
+        first_nl = result.stdout.find("\n")
+        if first_nl < 0:
+            return ToolResult(ok=False, error=f"could not count lines in {path}")
+        try:
+            total_lines = int(result.stdout[:first_nl].strip())
+        except ValueError:
+            return ToolResult(ok=False, error=f"could not count lines in {path}")
+        contents = result.stdout[first_nl + 1:]
 
-        output = result.stdout
+        ranged = args.get("start_line") is not None or args.get("end_line") is not None
+        if not ranged:
+            if total_lines <= OUTLINE_THRESHOLD:
+                return ToolResult(ok=True, output=contents, header=path)
+            return await _outline_result(path, total_lines, contents)
+        end = total_lines if end is None else min(end, total_lines)
+        if end < start:
+            return ToolResult(
+                ok=False,
+                error=f"end_line ({end}) is before start_line ({start})",
+                parse_error=True,
+            )
+        if end - start + 1 > MAX_READ_LINES:
+            end = start + MAX_READ_LINES - 1
+        # keepends: preserve the exact trailing-newline behavior of sed -n.
+        # contents already starts at line ``start`` (sed printed the slice);
+        # re-slice only to clamp past-EOF / MAX_READ_LINES ends.
+        output = "".join(contents.splitlines(keepends=True)[: end - start + 1])
+
         if end < total_lines:
             output += (
                 f"\n[showing lines {start}-{end} of {total_lines}; pass "
@@ -330,16 +293,13 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             )
         return ToolResult(ok=True, output=output, header=path)
 
-    async def _outline_result(sandbox: SandboxConfig, path: str, total_lines: int) -> ToolResult:
-        cat_result = await run_in_sandbox(sandbox, ["cat", sandbox.tool_path(path)])
-        if cat_result.exit_code != 0:
-            return _exec_error(cat_result, "read failed")
-        outline = _python_outline(cat_result.stdout)
+    async def _outline_result(path: str, total_lines: int, contents: str) -> ToolResult:
+        outline = _python_outline(contents)
         if outline is None:
             # Not a Python file (or no defs/classes): fall back to a preview
             # chunk, pointing at start_line/end_line for the rest.
             end = min(200, total_lines)
-            preview = "\n".join(cat_result.stdout.splitlines()[:end]) + "\n"
+            preview = "\n".join(contents.splitlines()[:end]) + "\n"
             return ToolResult(ok=True, output=(
                 f"[showing lines 1-{end} of {total_lines}; this file is too large "
                 "to read all at once and has no outline — pass start_line/end_line "
@@ -589,18 +549,35 @@ def _make_run_bash_tool(
         "status/diff/log/show/blame/add/commit work.",
         required=("command",),
         command="string",
+        timeout_seconds=(
+            "integer",
+            "kill the command after this many seconds (default: the session "
+            "timeout, 120); on timeout the shell is restarted",
+        ),
     )
     async def run_bash(args: dict[str, Any]) -> ToolResult:
         command = args.get("command", "")
         if not command:
             return _bad("'command' is required")
+        raw_timeout = args.get("timeout_seconds")
+        timeout: float | None = None
+        if raw_timeout is not None:
+            try:
+                timeout = float(int(raw_timeout))
+            except (TypeError, ValueError):
+                return _bad("'timeout_seconds' must be an integer")
+            if timeout < 1:
+                return _bad("'timeout_seconds' must be >= 1")
         if git_guard is not None:
             block_reason = git_guard(command)
             if block_reason:
                 return ToolResult(ok=False, error=block_reason, header=command)
-        result = await session.run(command, on_output=_output_sink.get())
+        result = await session.run(command, on_output=_output_sink.get(), timeout=timeout)
         if result.timed_out:
-            return ToolResult(ok=False, error="command timed out (shell restarted)", header=command)
+            label = f" after {int(timeout)}s" if timeout is not None else ""
+            return ToolResult(
+                ok=False, error=f"command timed out{label} (shell restarted)", header=command
+            )
         return ToolResult(
             ok=result.exit_code == 0,
             output=result.stdout,
@@ -609,128 +586,6 @@ def _make_run_bash_tool(
         )
 
     return run_bash
-
-
-HOST_BASH_TIMEOUT_DEFAULT = 120
-HOST_BASH_TIMEOUT_MIN = 1
-HOST_BASH_TIMEOUT_MAX = 600
-
-
-def _make_run_bash_host_tool(
-    sandbox: SandboxConfig,
-    approve_callback: Callable[[HostBashRequest], Awaitable[Decision]],
-    git_guard: Callable[[str], str | None] | None = None,
-) -> Tool:
-    """run_bash_host: run a command on the host, outside bwrap, behind an
-    approval prompt (see permissions.py for the saved prefix rules)."""
-    session_allowed: set[str] = set()
-
-    @tool(
-        "run_bash_host",
-        "Run a shell command on the host machine, outside the sandbox. The "
-        "user approves each call unless a saved rule allows it, and may deny "
-        "it. Use only when run_bash cannot do the job: network access, "
-        "host-only tools, or paths outside the workspace. Give a specific "
-        "`reason`. If denied, do not retry the same command; adapt using the "
-        "user's feedback. Output is truncated, so prefer filtering (e.g. "
-        "`| tail -50`).",
-        required=("command", "reason"),
-        command="string",
-        reason=("string", "why this needs the host rather than run_bash"),
-        timeout_seconds=("integer", "seconds before the command is killed (1-600, default 120)"),
-    )
-    async def run_bash_host(args: dict[str, Any]) -> ToolResult:
-        command = args.get("command", "")
-        reason = args.get("reason", "")
-        if not command:
-            return _bad("'command' is required")
-        if not reason:
-            return _bad("'reason' is required (tell the user why this needs the host)")
-        if git_guard is not None:
-            block_reason = git_guard(command)
-            if block_reason:
-                return ToolResult(ok=False, error=block_reason, header=command)
-        try:
-            timeout = int(args.get("timeout_seconds", HOST_BASH_TIMEOUT_DEFAULT))
-        except (TypeError, ValueError):
-            return _bad("'timeout_seconds' must be an integer")
-        timeout = max(HOST_BASH_TIMEOUT_MIN, min(HOST_BASH_TIMEOUT_MAX, timeout))
-
-        compound = is_compound(command)
-        req = HostBashRequest(
-            command=command,
-            reason=reason,
-            cwd=str(sandbox.workspace / sandbox.subtree) if sandbox.subtree
-            else str(sandbox.workspace),
-            suggested_prefix=(tokens(command) or ())[:2],
-            is_compound=compound,
-        )
-        # Order: exact commands allowed for this session, then saved prefix
-        # rules, then ask. Compound commands skip the rules entirely — a
-        # prefix can't vouch for what follows a `;` or `$( )`.
-        if not compound and command in session_allowed:
-            decision = Decision(kind="once")
-        elif not compound and prefix_matches(command, load_prefixes()):
-            decision = Decision(kind="once")
-        else:
-            decision = await approve_callback(req)
-            if decision.kind == "session":
-                session_allowed.add(command)
-            elif decision.kind == "prefix":
-                prefix = decision.prefix or req.suggested_prefix
-                if prefix:
-                    add_prefix(prefix)
-            elif decision.kind == "deny":
-                detail = f". Reason: {decision.deny_reason}" if decision.deny_reason else ""
-                return ToolResult(
-                    ok=False, error=f"User denied this command{detail}", header=command
-                )
-
-        proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", command,
-            cwd=req.cwd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-        assert proc.stdout is not None and proc.pid is not None
-        chunks: list[str] = []
-
-        async def _drain() -> None:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    return
-                text = line.decode(errors="replace")
-                chunks.append(text)
-                sink = _output_sink.get()
-                if sink is not None:
-                    sink(text)
-
-        try:
-            await asyncio.wait_for(_drain(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:  # kill the whole process group, not just bash
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-            return ToolResult(
-                ok=False,
-                output="".join(chunks),
-                error=f"command timed out after {timeout}s",
-                header=command,
-            )
-        exit_code = proc.returncode or 0
-        return ToolResult(
-            ok=exit_code == 0,
-            output="".join(chunks),
-            error="" if exit_code == 0 else f"exit code {exit_code}",
-            header=command,
-        )
-
-    return run_bash_host
 
 
 def _make_ask_user_tool(
@@ -776,26 +631,22 @@ def build_registry(
     sandbox: SandboxConfig | None,
     session: SandboxSession | None,
     mode: str = "write",
-    allow_subagent: bool = True,
-    max_calls_per_turn: int | None = None,
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
-    approve_callback: Callable[[HostBashRequest], Awaitable[Decision]] | None = None,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
     Plan mode is read-only: read_file plus run_bash against a read-only
     workspace mount. Write mode adds the editing tools: write_file,
-    edit_file, and run_bash_host (the latter behind a user approval prompt).
-    ``ask_user`` is available in both modes when ``ask_callback`` is given.
-    ``git_guard`` optionally vetoes run_bash commands that would rewrite the
-    user's branch/refs (see gitwork.py). ``approve_callback`` enables
-    run_bash_host (see permissions.py). ``allow_subagent`` is reserved for
-    subagent registration in a later phase.
+    edit_file. ``ask_user`` is available in both modes when ``ask_callback``
+    is given. ``git_guard`` optionally vetoes run_bash commands that would
+    rewrite the user's branch/refs (see gitwork.py).
+
+    Does NOT touch ``sandbox.read_only`` — the caller owns the sandbox's mode
+    (set it to ``mode != "write"`` before calling; a persistent
+    SandboxSession restarts its shell to pick up the new mounts).
     """
-    registry = ToolRegistry(max_calls_per_turn=max_calls_per_turn)
-    # web_search is disabled for now — not implemented well enough to ship.
-    # registry.register(web_search_tool)
+    registry = ToolRegistry()
     if ask_callback is not None:
         registry.register(_make_ask_user_tool(ask_callback))
     if sandbox is not None:
@@ -803,16 +654,10 @@ def build_registry(
         # Plan mode is fully read-only: the workspace is mounted read-only
         # (sandbox.read_only) and the persistent shell restarts under those
         # mounts, so run_bash cannot change files. Write mode drops the
-        # read-only mount and adds the editing tools and (behind an
-        # approval prompt) run_bash_host.
-        sandbox.read_only = mode != "write"
+        # read-only mount and adds the editing tools.
         if session is not None:
             registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file
             registry.register(_make_edit_tool(sandbox))  # edit_file
-            if session is not None and approve_callback is not None:
-                registry.register(
-                    _make_run_bash_host_tool(sandbox, approve_callback, git_guard)
-                )  # run_bash_host
     return registry

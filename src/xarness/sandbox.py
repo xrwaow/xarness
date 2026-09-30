@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import os
 import shutil
 import subprocess
@@ -22,6 +23,23 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+
+# Subdirectories of the persistent sandbox cache, created on demand.
+_CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
+
+
+def sandbox_cache_root() -> Path:
+    """Host directory backing the sandbox's persistent toolchain state
+    (uv-managed pythons, pip cache, cargo, npm, project venvs). Overridable
+    with XARNESS_SANDBOX_CACHE; defaults to ``~/.sandbox-cache``. Created
+    (with its subdirs) on first use. The uv cache itself is the host's own
+    ``~/.cache/uv``, bound separately."""
+    override = os.environ.get("XARNESS_SANDBOX_CACHE")
+    root = Path(override).expanduser() if override else Path.home() / ".sandbox-cache"
+    for sub in _CACHE_SUBDIRS:
+        (root / sub).mkdir(parents=True, exist_ok=True)
+    return root
 
 
 class SandboxUnavailable(Exception):
@@ -71,6 +89,9 @@ def _hidden_paths(workspace: Path) -> list[str]:
     the repo's ignore rules flag (``.gitignore`` + ``.git/info/exclude``),
     nothing invented here. ".git" stays visible (read-only). Children of an
     already-hidden directory are dropped — shadowing the parent suffices.
+    "uv.lock" is never hidden: uv needs it to build the project env, and an
+    empty shadow placeholder parses as a corrupt lock ("missing field
+    `version`").
     Empty when git can't answer (no repo, failed)."""
     hidden: list[str] = []
     seen_dirs: list[str] = []
@@ -79,7 +100,7 @@ def _hidden_paths(workspace: Path) -> list[str]:
         return any(rel == d or rel.startswith(d + "/") for d in seen_dirs)
 
     for rel in _git_ignored_paths(workspace):
-        if rel == ".git" or rel.startswith(".git/") or buried(rel):
+        if rel == "uv.lock" or rel == ".git" or rel.startswith(".git/") or buried(rel):
             continue
         if (workspace / rel).is_dir():
             seen_dirs.append(rel)
@@ -103,7 +124,7 @@ class SandboxConfig:
     read_only: bool = False
     external_refs: dict[str, Path] = field(default_factory=dict)
     allow_network: bool = False
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 120.0
     # Host path of the repo's .git dir. Bound into the sandbox at its real
     # path so git reads (status/diff/log) work inside the sandbox. Bound
     # read-only: the agent never commits — the harness checkpoints on the
@@ -196,6 +217,75 @@ class SandboxConfig:
                 args += ["--ro-bind", link, link]
         return args
 
+    def _cache_binds_and_env(self) -> list[str]:
+        """Writable toolchain caches plus read-only toolchain homes, so uv,
+        pip, cargo and npm work inside the sandbox (offline installs from
+        warm caches, no writes leaking into the real HOME).
+
+        The cache root is bound at its real path (so the env vars below
+        point at valid in-sandbox locations and persist across sessions);
+        uv shares the host's ``~/.cache/uv`` directly; ``~/.rustup``,
+        ``~/.cargo`` and ``~/.local`` are bound read-only so rustup shims,
+        cargo, and user-installed tools (uv, pip) on PATH still resolve."""
+        root = sandbox_cache_root()
+        argv = ["--bind", str(root), str(root)]
+        for var, sub in (
+            ("PIP_CACHE_DIR", "pip"),
+            ("CARGO_HOME", "cargo"),
+            ("npm_config_cache", "npm"),
+        ):  # (UV_* envs are set below — see the comments there.)
+            argv += ["--setenv", var, f"{root}/{sub}"]
+        argv += ["--setenv", "UV_LINK_MODE", "copy"]
+        # uv's cache is the host's own (~/.cache/uv), bound read-write: it's
+        # content-addressed and safe to share, and already warm — so uv sync
+        # / uv run install offline from day one, with no cache-warming step.
+        host_uv_cache = Path.home() / ".cache" / "uv"
+        host_uv_cache.mkdir(parents=True, exist_ok=True)
+        argv += ["--bind", str(host_uv_cache), str(host_uv_cache)]
+        argv += ["--setenv", "UV_CACHE_DIR", str(host_uv_cache)]
+        # uv's project env lives outside the workspace, keyed by the
+        # workspace path: the project's own .venv has absolute paths baked
+        # in for its real host location, which never matches the /workspace
+        # mount (or any subtree path) inside the sandbox — without this uv
+        # would try to rebuild .venv in the user's worktree, corrupting it.
+        # VIRTUAL_ENV is dropped for the same mismatch reason.
+        venv = root / "venvs" / hashlib.sha1(
+            str(self.workspace / self.subtree).encode()
+        ).hexdigest()[:12]
+        venv.mkdir(parents=True, exist_ok=True)
+        argv += [
+            "--setenv", "UV_PROJECT_ENVIRONMENT", str(venv),
+            "--unsetenv", "VIRTUAL_ENV",
+        ]
+        # Interpreter + discovery: match the host project venv's Python so
+        # the wheels already in the host cache fit (e.g. host on 3.13 while
+        # the sandbox's default `python3` is 3.14 — different wheel tags).
+        # And discover uv-managed interpreters where the host put them
+        # (~/.local/share/uv/python, covered by the read-only ~/.local
+        # bind), not the sandbox cache.
+        host_python_dir = Path.home() / ".local" / "share" / "uv" / "python"
+        if host_python_dir.is_dir():
+            argv += ["--setenv", "UV_PYTHON_INSTALL_DIR", str(host_python_dir)]
+        host_venv_cfg = self.workspace / ".venv" / "pyvenv.cfg"
+        try:
+            for line in host_venv_cfg.read_text().splitlines():
+                if line.startswith("version"):
+                    argv += ["--setenv", "UV_PYTHON", line.split("=", 1)[1].strip()]
+                    break
+        except OSError:
+            pass
+        # No network: never reach for the index — cached index data and
+        # wheels must be enough (otherwise every uv call stalls on DNS
+        # retries before failing).
+        if not self.allow_network:
+            argv += ["--setenv", "UV_OFFLINE", "1"]
+        home = Path.home()
+        for name in (".rustup", ".cargo", ".local"):
+            p = home / name
+            if p.is_dir():
+                argv += ["--ro-bind", str(p), str(p)]
+        return argv
+
     def build_argv(self, command: list[str]) -> list[str]:
         argv = ["bwrap"]
         argv += self._system_ro_binds()
@@ -228,10 +318,17 @@ class SandboxConfig:
             host = self.workspace / rel
             is_dir = host.is_dir() and not host.is_symlink()
             argv += ["--bind", empty_dir if is_dir else empty_file, f"/workspace/{rel}"]
+        uv_lock = self.workspace / "uv.lock"
+        if uv_lock.is_file():
+            # Read-only: uv run may read the lock to build the project env
+            # (UV_PROJECT_ENVIRONMENT, outside the workspace) but must not
+            # rewrite the user's lockfile from inside the sandbox.
+            argv += ["--ro-bind", str(uv_lock), "/workspace/uv.lock"]
         if self.git_dir is not None:
             # Same path as on the host, so git inside the sandbox resolves
             # it unchanged. Read-only: the harness does all git writes.
             argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
+        argv += self._cache_binds_and_env()
         for alias, host_path in self.external_refs.items():
             argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
         argv += ["--chdir", chdir, "--unshare-all"]
@@ -308,11 +405,18 @@ class SandboxSession:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-    async def run(self, command: str, on_output: Callable[[str], None] | None = None) -> SandboxResult:
+    async def run(
+        self,
+        command: str,
+        on_output: Callable[[str], None] | None = None,
+        timeout: float | None = None,
+    ) -> SandboxResult:
         """Run one command in the persistent shell.
 
         ``on_output``, when given, is called with each output line as it
-        arrives (so a TUI can show live output while the command runs)."""
+        arrives (so a TUI can show live output while the command runs).
+        ``timeout`` overrides the sandbox's default ``timeout_seconds`` for
+        this one command (None = default)."""
         async with self._lock:
             await self._ensure_started()
             assert self._proc is not None and self._proc.stdin and self._proc.stdout
@@ -336,7 +440,8 @@ class SandboxSession:
 
             try:
                 exit_code = await asyncio.wait_for(
-                    _read_until_marker(), timeout=self._config.timeout_seconds
+                    _read_until_marker(),
+                    timeout=timeout if timeout is not None else self._config.timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 await self.close()

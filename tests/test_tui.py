@@ -10,6 +10,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from xarness.config import CotStrength, ProviderProfile
+from xarness.conversation import Message
 from xarness.controller import ChatController
 from xarness.events import (
     ContentDelta,
@@ -658,14 +659,17 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
 
             app._run_compaction = fake_compact  # type: ignore[method-assign]
 
-            # 100/1000 = 10% ≥ threshold: compaction fires.
-            app.last_in = 100
+            # 100/1000 = 10% ≥ threshold: compaction fires. (last_in is a
+            # read-only view of the conversation's per-message usage.)
+            app.controller.conversation.add(
+                Message(role="assistant", content="", usage=Usage(100, 0))
+            )
             await app._maybe_auto_compact()
             self.assertEqual(calls, ["compact"])
 
             # 50/1000 = 5% < threshold: nothing happens.
             calls.clear()
-            app.last_in = 50
+            app.controller.conversation.messages[-1].usage = Usage(50, 0)
             await app._maybe_auto_compact()
             self.assertEqual(calls, [])
 

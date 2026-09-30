@@ -54,6 +54,7 @@ def _call(registry, name: str, args: str):
 def test_plan_mode_binds_workspace_read_only(tmp_path) -> None:
     sandbox = _sandbox(_make_repo(tmp_path))
     session = SandboxSession(sandbox)
+    sandbox.read_only = True  # the caller (app) owns the sandbox's mode
     registry = build_registry(sandbox, session, mode="plan")
     names = {t["function"]["name"] for t in registry.schema()}
     assert names == {"read_file", "run_bash"}
@@ -86,6 +87,8 @@ def test_mode_switch_restarts_shell_under_new_mounts(tmp_path) -> None:
     _call(write_registry, "run_bash", '{"command": "echo state > s.txt"}')
     assert sandbox.read_only is False
 
+    # The app flips the sandbox's mode itself (build_registry no longer does).
+    sandbox.read_only = True
     plan_registry = build_registry(sandbox, session, mode="plan")
     assert sandbox.read_only is True
     blocked = _call(plan_registry, "run_bash", '{"command": "touch nope.txt; cat s.txt"}')
@@ -105,6 +108,7 @@ def test_subtree_scoped_plan_mode_keeps_subtree_read_only(tmp_path) -> None:
         workspace=info.workspace, subtree=info.subtree, git_dir=info.git_dir,
     )
     session = SandboxSession(sandbox)
+    sandbox.read_only = True
     registry = build_registry(sandbox, session, mode="plan")
     read = _call(registry, "read_file", '{"path": "util.py"}')
     assert read.ok

@@ -21,6 +21,28 @@ SUMMARY_PREFIX = "[earlier conversation, summarized]"
 
 
 @dataclass(slots=True)
+class ToolCall:
+    """One tool call the model requested — the single shape used everywhere
+    (stream events, history, wire format, TUI)."""
+
+    call_id: str
+    name: str
+    arguments_json: str
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "id": self.call_id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments_json},
+        }
+
+    @classmethod
+    def from_wire(cls, call: dict[str, Any]) -> ToolCall:
+        fn = call.get("function") or {}
+        return cls(call.get("id", ""), fn.get("name", ""), fn.get("arguments", ""))
+
+
+@dataclass(slots=True)
 class Message:
     """One conversation message, mirroring the API's message object."""
 
@@ -44,7 +66,7 @@ class Message:
     after_tree: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
+    tool_calls: list[ToolCall] | None = None
     # Local-only: the tool call's one-line header summary (tool-role messages
     # only) — computed by the tool, persisted so /resume renders the same
     # headers. Never sent over the wire.
@@ -64,7 +86,7 @@ class Message:
         if self.tool_call_id is not None:
             message["tool_call_id"] = self.tool_call_id
         if self.tool_calls is not None:
-            message["tool_calls"] = self.tool_calls
+            message["tool_calls"] = [call.to_wire() for call in self.tool_calls]
         return message
 
 
@@ -73,14 +95,15 @@ class Conversation:
     """Ordered message history; the single source of truth for the chat."""
 
     messages: list[Message] = field(default_factory=list)
-    # Local-only: the message list as it stood when the current turn's user
-    # message was sent (set by the controller, used by /undo and /retry to
-    # roll the conversation back — including across a mid-turn compaction).
-    undo_snapshot: list[Message] | None = None
+    # Local-only: index of the current turn's user message (set by the
+    # controller when the turn begins; /undo //retry roll back to it —
+    # including across a mid-turn compaction). The turn snapshot is always
+    # the messages[:turn_start + 1] prefix of the list, so an index stands
+    # in for a full copy and survives save/load unchanged.
+    turn_start: int | None = None
     # Local-only: the full message list as it stood just before the most
-    # recent compaction. Lets /undo restore pre-compaction history even
-    # after later turns have replaced the undo snapshot. Only the most
-    # recent compaction is recoverable.
+    # recent compaction, so /undo can restore pre-compaction history. Only
+    # the most recent compaction is recoverable.
     compact_snapshot: list[Message] | None = None
 
     def add(self, message: Message) -> Message:

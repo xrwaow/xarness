@@ -39,11 +39,9 @@ from ..gitwork import (
     setup_tracking, snapshot_tree, tree_diff_stat,
 )
 from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
-from ..permissions import Decision, HostBashRequest
 from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
 from .confirm_screen import ConfirmScreen
-from .host_bash_bar import HostBashBar
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -82,6 +80,107 @@ COMPACTED_DIVIDER = (
     "— compacted: the model sees only the summary below; "
     "messages above are kept here for you —"
 )
+
+
+class _RoundView:
+    """Widget state for one streaming round: pending indicator, thinking
+    block, assistant message, tool-writing shimmer, tool-call blocks. The
+    turn driver (_run_turn) only loops rounds and executes tools."""
+
+    def __init__(self, app: "AgentApp", chat: "VerticalScroll") -> None:
+        self.app = app
+        self.chat = chat
+        self.indicator: PendingIndicator | None = None
+        self.indicator_live = False
+        self.thinking: ThinkingBlock | None = None
+        self.assistant: AssistantMessage | None = None
+        self.writing: ToolWritingIndicator | None = None
+        self.pending_writes = 0
+        self.tool_blocks: dict[str, ToolCallBlock] = {}
+        self.round_has_tools = False
+        self.had_stream_error = False
+
+    async def mount(self) -> None:
+        self.indicator = PendingIndicator()
+        self.indicator_live = True
+        await self.chat.mount(self.indicator)
+
+    async def handle(self, event) -> None:
+        if isinstance(event, ReasoningDelta):
+            if self.thinking is None:
+                await self._hide_indicator()
+                self.thinking = ThinkingBlock()
+                self.app._last_thinking = self.thinking
+                await self.app._mount_spaced(self.chat, self.thinking)
+            self.thinking.append_reasoning(event.text)
+        elif isinstance(event, ContentDelta):
+            if self.assistant is None:
+                await self._hide_indicator()
+                if self.thinking is not None:
+                    self.thinking.finish(duration=None)
+                self.assistant = AssistantMessage()
+                await self.app._mount_spaced(self.chat, self.assistant)
+            await self.assistant.append_delta(event.text)
+        elif isinstance(event, ToolCallStarted):
+            await self._hide_indicator()
+            if self.thinking is not None:
+                self.thinking.finish(duration=None)
+            # One shared "Writing <tool>" shimmer while arguments stream; the
+            # indicator accumulates the streamed args itself. Per-call blocks
+            # appear once args are complete.
+            self.pending_writes += 1
+            if self.writing is None:
+                self.writing = ToolWritingIndicator(event.name)
+                await self.chat.mount(self.writing)
+            else:
+                self.writing.set_tool(event.name)
+            self.writing.track_call(event.call_id, event.name)
+        elif isinstance(event, ToolCallArgumentsDelta):
+            if self.writing is not None:
+                self.writing.append_args_delta(event.call_id, event.text)
+        elif isinstance(event, ToolCallArgumentsDone):
+            block = ToolCallBlock(event.call_id, event.name)
+            await self.chat.mount(block)
+            # After mount: append_arguments refreshes the summary label in
+            # place; before it, the widget isn't mounted and the update no-ops.
+            block.append_arguments(event.arguments_json)
+            self.tool_blocks[event.call_id] = block
+            self.pending_writes = max(0, self.pending_writes - 1)
+            if self.pending_writes == 0 and self.writing is not None:
+                await self.app._dismiss_indicator(self.writing)
+                self.writing = None
+        elif isinstance(event, TurnComplete):
+            self.round_has_tools = event.has_tool_calls
+            await self.app._complete_round(event, self.thinking, self.assistant)
+        elif isinstance(event, StreamError):
+            await self._hide_indicator()
+            await self.chat.mount(ErrorLine(event.message))
+            self.had_stream_error = True
+
+    async def _hide_indicator(self) -> None:
+        if self.indicator_live:
+            await self.app._dismiss_indicator(self.indicator)
+            self.indicator_live = False
+
+    async def finish(self) -> None:
+        """Dismiss the round's transient indicators at the round's end."""
+        if self.writing is not None:
+            await self.app._dismiss_indicator(self.writing)
+            self.writing = None
+        await self._hide_indicator()
+
+    async def cancel(self) -> None:
+        """Settle the round's widgets for an interrupted turn."""
+        if self.writing is not None and self.writing.is_mounted:
+            await self.writing.remove()
+        if self.indicator is not None and self.indicator_live:
+            await self.app._dismiss_indicator(self.indicator)
+        if self.thinking is not None and not self.thinking.done:
+            self.thinking.finish(duration=None)
+        for block in self.tool_blocks.values():
+            if block.status is ToolCallStatus.MAKING_CALL:
+                block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+
 
 SLASH_COMMANDS = [
     ("tools", "list available tools"),
@@ -151,10 +250,12 @@ class AgentApp(App[None]):
         self.sandbox = sandbox
         self.sandbox_session = sandbox_session
         self.mode: Literal["plan", "write"] = "write"
+        # The app owns the sandbox's mode (build_registry doesn't mutate it).
+        if sandbox is not None:
+            sandbox.read_only = self.mode != "write"
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
-            approve_callback=self._approve_host_bash,
             git_guard=self._make_git_guard(),
         )
         self.controller = controller or ChatController(
@@ -167,10 +268,6 @@ class AgentApp(App[None]):
         self.profile_name = profile_name
         self.git_info = git_info
         self.startup_notices = startup_notices or []
-        self.total_in = 0
-        self.total_out = 0
-        self.last_in = 0
-        self.last_out = 0
         self._turn_busy = False
         # /auto_compact: run compaction automatically when the context window
         # passes the profile's auto_compact_threshold (checked at the end of
@@ -184,8 +281,6 @@ class AgentApp(App[None]):
         self._compact_pending = False
         self._queued: list[str] = []
         self._ask_future: asyncio.Future[str | None] | None = None
-        # Resolved by the host-bash approval bar while one is pending.
-        self._host_bash_future: asyncio.Future | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
         # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
@@ -221,7 +316,6 @@ class AgentApp(App[None]):
             yield GeneratingBar(id="generating-bar")
             yield DiffSummary(id="diff-summary")
             yield AskBar(id="ask-bar")
-            yield HostBashBar(id="host-bash-bar")
             yield SuggestionPopup(id="suggestion-popup")
             yield SteerQueueBar(id="steer-queue-bar")
             with Horizontal(id="input-row"):
@@ -386,10 +480,11 @@ class AgentApp(App[None]):
         """Toggle plan/write mode; shared by /mode and the Tab shortcut."""
         new_mode = "plan" if self.mode == "write" else "write"
         self.mode = new_mode
+        if self.sandbox is not None:
+            self.sandbox.read_only = new_mode != "write"
         self.tool_registry = build_registry(
             self.sandbox, self.sandbox_session, mode=new_mode,
             ask_callback=self._ask_user,
-            approve_callback=self._approve_host_bash,
             git_guard=self._make_git_guard(),
         )
         self.controller.tools = self.tool_registry  # rewire to the new registry
@@ -399,15 +494,25 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # /undo + /retry
 
-    def _sync_totals_from_controller(self) -> None:
-        """Mirror the controller's cumulative usage into the status bar."""
-        self.total_in = self.controller.usage_total.input_tokens
-        self.total_out = self.controller.usage_total.output_tokens
-        last = next(
-            (m.usage for m in reversed(self.controller.conversation.messages) if m.usage), None
-        )
-        self.last_in = last.input_tokens if last else 0
-        self.last_out = last.output_tokens if last else 0
+    @property
+    def total_in(self) -> int:
+        return self.controller.usage_total.input_tokens
+
+    @property
+    def total_out(self) -> int:
+        return self.controller.usage_total.output_tokens
+
+    def _last_usage(self) -> Usage | None:
+        messages = self.controller.conversation.messages
+        return next((m.usage for m in reversed(messages) if m.usage), None)
+
+    @property
+    def last_in(self) -> int:
+        return self._last_usage().input_tokens if self._last_usage() else 0
+
+    @property
+    def last_out(self) -> int:
+        return self._last_usage().output_tokens if self._last_usage() else 0
 
     def _handle_output_limit(self, arg: str) -> None:
         """Show or set the per-tool output cap the model receives."""
@@ -482,7 +587,6 @@ class AgentApp(App[None]):
             # triggered it stays intact, no files reverted, input untouched.
             self.controller.apply_rollback(plan)
             await self._render_history()
-            self._sync_totals_from_controller()
             self._refresh_status()
             self._persist_git_state()
             if resend:
@@ -512,7 +616,6 @@ class AgentApp(App[None]):
             return
         self.controller.apply_rollback(plan)
         await self._render_history()
-        self._sync_totals_from_controller()
         self._refresh_status()
         await self.refresh_diff_summary()
         if self.git_info is None:
@@ -656,11 +759,6 @@ class AgentApp(App[None]):
             if message.role == "user" and message.checkpoint_sha is not None:
                 message.checkpoint_sha = sha
                 message.after_tree = sha
-        if self.controller.conversation.undo_snapshot:
-            for message in self.controller.conversation.undo_snapshot:
-                if message.role == "user" and message.checkpoint_sha is not None:
-                    message.checkpoint_sha = sha
-                    message.after_tree = sha
         if self.controller.conversation.compact_snapshot:
             for message in self.controller.conversation.compact_snapshot:
                 if message.role == "user" and message.checkpoint_sha is not None:
@@ -809,7 +907,6 @@ class AgentApp(App[None]):
             thinking.recolor()
         for block in self.query(ToolCallBlock):
             block.recolor()
-        self.query_one("#host-bash-bar", HostBashBar).recolor()
         self._refresh_status()
         self.query_one("#diff-summary", DiffSummary).recolor()
 
@@ -823,7 +920,6 @@ class AgentApp(App[None]):
             from ..session_store import new_session_name
             self.session_name = new_session_name()
         self.ensure_system_message()
-        self.total_in = self.total_out = self.last_in = self.last_out = 0
         self._last_thinking = None
         self._queued.clear()
         self._compact_pending = False
@@ -837,17 +933,18 @@ class AgentApp(App[None]):
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
             return
-        from ..session_store import load_git_block, load_session
+        from ..session_store import load_state
         chat = self.query_one("#chat-log", VerticalScroll)
-        self.controller.conversation = load_session(name)
+        state = load_state(name)
+        self.controller.conversation = state.conversation
         self.session_name = name
         self.ensure_system_message()
         # Per-message usage is persisted: restore the status-bar totals.
-        self._sync_totals_from_controller()
+        self._refresh_status()
         # Notices mount after _render_history (which clears the chat log).
         notes: list[str] = []
         errors: list[str] = []
-        block = load_git_block(name)
+        block = state.git
         if block is not None:
             try:
                 info = GitInfo.from_block(block)
@@ -1047,12 +1144,10 @@ class AgentApp(App[None]):
                     await assistant.append_delta(message.content)
                 await assistant.finalize()
             for call in message.tool_calls or []:
-                call_id = call.get("id", "")
-                fn = call.get("function", {})
-                block = ToolCallBlock(call_id, fn.get("name", ""))
+                block = ToolCallBlock(call.call_id, call.name)
                 await chat.mount(block)
-                block.append_arguments(fn.get("arguments", ""))
-                result = tool_results.get(call_id)
+                block.append_arguments(call.arguments_json)
+                result = tool_results.get(call.call_id)
                 if result is not None:
                     is_error = result.content.startswith("error: ")
                     status = ToolCallStatus.CALL_FAILED if is_error else ToolCallStatus.CALL_SUCCEEDED
@@ -1062,7 +1157,7 @@ class AgentApp(App[None]):
                         error=result.content[len("error: "):] if is_error else "",
                         header=result.header or "",
                     )
-                elif fn.get("name") == "compact":
+                elif call.name == "compact":
                     # The compact call's own result is never recorded (the
                     # model must not see it) — settle the block so it doesn't
                     # replay as still-running.
@@ -1248,12 +1343,6 @@ class AgentApp(App[None]):
         if isinstance(self.screen, ModalScreen):
             self.screen.dismiss(None)
             return
-        host_bar = self.query("#host-bash-bar", HostBashBar)
-        if host_bar and self._host_bash_future is not None and not self._host_bash_future.done():
-            # Esc while a host command waits for approval: deny (or back out
-            # of the prefix/deny input) — never an interrupt.
-            host_bar.first().action_escape()
-            return
         chat_input = self.query_one("#chat-input", ChatInput)
         popup = self.query_one("#suggestion-popup", SuggestionPopup)
         if chat_input.popup_active is not None or popup.has_class("visible"):
@@ -1324,32 +1413,15 @@ class AgentApp(App[None]):
             ask_bar.hide()
             chat_input.placeholder = INPUT_PLACEHOLDER
 
-    async def _approve_host_bash(self, req: HostBashRequest) -> Decision:
-        """Callback for run_bash_host: show the command, reason and cwd in
-        the bar above the input; the user allows once, for the session, via
-        a saved prefix, or denies (escape denies too). Buttons and the
-        bar's y/s/p/n keys resolve the future; the tool call blocks here."""
-        bar = self.query_one("#host-bash-bar", HostBashBar)
-        chat_input = self.query_one("#chat-input", ChatInput)
-        future: asyncio.Future[Decision] = asyncio.get_running_loop().create_future()
-        self._host_bash_future = future
-        try:
-            bar.show(req)
-            decision = await future
-        finally:
-            self._host_bash_future = None
-            bar.hide()
-            chat_input.focus()
-        return decision
-
     @work(group="turn")
     async def _run_turn(self, text: str, user_widget: UserMessage | None = None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tool calls).
 
-        Each round streams one model response. If the round requested tool
-        calls, they're executed, their blocks settle, results are recorded
-        into the conversation, and the next round streams — until a round
-        comes back with no tool calls.
+        Each round streams one model response; its widgets are owned by a
+        :class:`_RoundView`. If the round requested tool calls, they're
+        executed, their blocks settle, results are recorded into the
+        conversation, and the next round streams — until a round comes back
+        with no tool calls.
         """
         self._turn_busy = True
         chat = self.query_one("#chat-log", VerticalScroll)
@@ -1358,33 +1430,13 @@ class AgentApp(App[None]):
         turn_start = time.monotonic()
         turn_had_tools = False
         compacted_this_turn = False
-        tool_blocks: dict[str, ToolCallBlock] = {}
-        indicator: PendingIndicator | None = None
-        indicator_live = False
-        writing: ToolWritingIndicator | None = None
-        pending_writes = 0
-        # Arguments streamed so far per in-flight call, so write_file's
-        # +LOC can be counted while the JSON is still arriving.
-        stream_args: dict[str, str] = {}
-        stream_names: dict[str, str] = {}
-        thinking: ThinkingBlock | None = None
-        had_stream_error = False
+        view = _RoundView(self, chat)
 
         stream = self.controller.send(text)
         try:
             while True:
-                indicator = PendingIndicator()
-                indicator_live = True
-                await chat.mount(indicator)
-
-                thinking = None
-                assistant = None
-                tool_blocks = {}
-                writing = None
-                pending_writes = 0
-                stream_args = {}
-                stream_names = {}
-                round_has_tools = False
+                view = _RoundView(self, chat)
+                await view.mount()
 
                 async for event in stream:
                     if user_widget is not None and user_widget.message is None:
@@ -1396,76 +1448,9 @@ class AgentApp(App[None]):
                              if m.role == "user"),
                             None,
                         )
-                    if isinstance(event, ReasoningDelta):
-                        if thinking is None:
-                            await self._dismiss_indicator(indicator)
-                            indicator_live = False
-                            thinking = ThinkingBlock()
-                            self._last_thinking = thinking
-                            await self._mount_spaced(chat, thinking)
-                        thinking.append_reasoning(event.text)
-                    elif isinstance(event, ContentDelta):
-                        if assistant is None:
-                            if indicator_live:
-                                await self._dismiss_indicator(indicator)
-                                indicator_live = False
-                            if thinking is not None:
-                                thinking.finish(duration=None)
-                            assistant = AssistantMessage()
-                            await self._mount_spaced(chat, assistant)
-                        await assistant.append_delta(event.text)
-                    elif isinstance(event, ToolCallStarted):
-                        if indicator_live:
-                            await self._dismiss_indicator(indicator)
-                            indicator_live = False
-                        if thinking is not None:
-                            thinking.finish(duration=None)
-                        # One shared "Writing <tool>" shimmer while arguments
-                        # stream; per-call blocks appear once args are
-                        # complete. The label follows whichever call is
-                        # being written next.
-                        pending_writes += 1
-                        stream_args[event.call_id] = ""
-                        stream_names[event.call_id] = event.name
-                        if writing is None:
-                            writing = ToolWritingIndicator(event.name)
-                            await chat.mount(writing)
-                        else:
-                            writing.set_tool(event.name)
-                    elif isinstance(event, ToolCallArgumentsDelta):
-                        name = stream_names.get(event.call_id)
-                        if name is None:
-                            continue
-                        stream_args[event.call_id] += event.text
-                        if writing is not None:
-                            writing.update_args(stream_args[event.call_id])
-                    elif isinstance(event, ToolCallArgumentsDone):
-                        block = ToolCallBlock(event.call_id, event.name)
-                        await chat.mount(block)
-                        # After mount: append_arguments refreshes the summary
-                        # label ('run_bash git status') in place; before it,
-                        # the widget isn't mounted and the update no-ops.
-                        block.append_arguments(event.arguments_json)
-                        tool_blocks[event.call_id] = block
-                        pending_writes = max(0, pending_writes - 1)
-                        if pending_writes == 0 and writing is not None:
-                            await self._dismiss_indicator(writing)
-                            writing = None
-                    elif isinstance(event, TurnComplete):
-                        round_has_tools = event.has_tool_calls
-                        await self._complete_round(event, thinking, assistant)
-                    elif isinstance(event, StreamError):
-                        if indicator_live:
-                            await self._dismiss_indicator(indicator)
-                            indicator_live = False
-                        await chat.mount(ErrorLine(event.message))
-                        had_stream_error = True
+                    await view.handle(event)
 
-                if writing is not None:
-                    await self._dismiss_indicator(writing)
-                    writing = None
-                if indicator_live:
-                    await self._dismiss_indicator(indicator)
+                await view.finish()
 
                 # A round that ended without finishing — a provider or
                 # transport error, say — still streamed something. Keep it
@@ -1475,15 +1460,15 @@ class AgentApp(App[None]):
                 if self.controller.save_interrupted_round():
                     self._persist_git_state()
 
-                if not round_has_tools:
-                    if not had_stream_error:
+                if not view.round_has_tools:
+                    if not view.had_stream_error:
                         worked = _format_duration(time.monotonic() - turn_start)
                         self._post_line(NoticeLine(f"Worked for {worked}"))
                     break
 
                 # Execute the calls this round requested, in stream order.
                 turn_had_tools = True
-                for call_id, block in tool_blocks.items():
+                for call_id, block in view.tool_blocks.items():
                     result = await self.tool_registry.call(
                         block.tool_name,
                         block.accumulated_arguments,
@@ -1528,7 +1513,7 @@ class AgentApp(App[None]):
                     self._refresh_steer_bar()
 
                 stream = self.controller.continue_after_tools()
-            if not had_stream_error:
+            if not view.had_stream_error:
                 # A /compact requested during the final round still runs —
                 # here, at the turn boundary. Auto-compact skips: the
                 # steered compaction just freed the context.
@@ -1536,15 +1521,8 @@ class AgentApp(App[None]):
                 if not compacted_this_turn:
                     await self._maybe_auto_compact()
         except asyncio.CancelledError:
-            if writing is not None and writing.is_mounted:
-                await writing.remove()
-            if indicator is not None and indicator_live:
-                await self._dismiss_indicator(indicator)
-            if thinking is not None and not thinking.done:
-                thinking.finish(duration=None)
-            for block in tool_blocks.values():
-                if block.status is ToolCallStatus.MAKING_CALL:
-                    block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+            # `view` is the round in flight (reassigned at each loop top).
+            await view.cancel()
             # Keep whatever the model had produced before the interruption —
             # everything up to the last non-thinking block — so the next turn
             # and a later /resume still see it. An empty or reasoning-only
@@ -1627,10 +1605,6 @@ class AgentApp(App[None]):
         finally:
             if indicator.is_mounted:
                 await indicator.remove()
-        # The summarization round's own spend just entered the controller's
-        # cumulative total; mirror it now rather than waiting for the next
-        # round's TurnComplete.
-        self._sync_totals_from_controller()
         self._refresh_status()
         # Mark the compaction point in the chat log — same divider /resume
         # renders between the kept history and the summary.
@@ -1684,13 +1658,6 @@ class AgentApp(App[None]):
         if thinking is not None:
             thinking.finish(event.reasoning_seconds)
 
-        if event.usage is not None:
-            self.last_in = event.usage.input_tokens
-            self.last_out = event.usage.output_tokens
-        # The controller folds every round's usage (including compaction's
-        # own summarization round) into its cumulative total; mirror it.
-        self.total_in = self.controller.usage_total.input_tokens
-        self.total_out = self.controller.usage_total.output_tokens
         self._refresh_status()
 
         if self.session_name:

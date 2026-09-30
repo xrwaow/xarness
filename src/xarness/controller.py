@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from .client import ChatClient
 from .config import ProviderProfile
-from .conversation import SUMMARY_PREFIX, Conversation, Message
+from .conversation import SUMMARY_PREFIX, Conversation, Message, ToolCall
 from .events import (
     ContentDelta,
     ReasoningDelta,
@@ -47,9 +47,11 @@ from .tools import ToolRegistry, ToolResult
 # usage data. Deliberately conservative; results are labeled approximate.
 _CHARS_PER_TOKEN = 4
 
-# A round's live partial output, mutated in place while it streams:
-# (reasoning_parts, content_parts, pending calls, call order).
-PartialRound = tuple[list[str], list[str], dict[str, dict[str, str]], list[str]]
+# A round's live partial output, mutated in place while it streams.
+@dataclass(slots=True)
+class PartialRound:
+    reasoning_parts: list[str]
+    content_parts: list[str]
 
 
 def _is_summary(message: Message) -> bool:
@@ -165,10 +167,11 @@ class ChatController:
         self.conversation.add(
             Message(role="user", content=user_text, checkpoint_sha=await self._take_checkpoint())
         )
-        # Snapshot for /undo //retry: the conversation as it stood when this
-        # turn began (user message included). Restoring it rolls back the
-        # whole turn — even one that compacted the history mid-flight.
-        self.conversation.undo_snapshot = list(self.conversation.messages)
+        # Snapshot marker for /undo //retry: the index of this turn's user
+        # message. The turn snapshot is the messages[:turn_start + 1] prefix,
+        # so restoring it rolls back the whole turn — even one that compacted
+        # the history mid-flight.
+        self.conversation.turn_start = len(self.conversation.messages) - 1
         self._drop_next_tool_result = False
         self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
         async for event in self._stream_round():
@@ -213,15 +216,14 @@ class ChatController:
         self._partial_round = None
         if partial is None:
             return False
-        reasoning_parts, content_parts, _pending, _call_order = partial
-        content = "".join(content_parts)
+        content = "".join(partial.content_parts)
         if not content:
             return False
         self.conversation.add(
             Message(
                 role="assistant",
                 content=content,
-                reasoning="".join(reasoning_parts) or None,
+                reasoning="".join(partial.reasoning_parts) or None,
             )
         )
         return True
@@ -283,7 +285,6 @@ class ChatController:
         there, /retry re-sends its text (which takes a fresh checkpoint).
         """
         messages = self.conversation.messages
-        snapshot = self.conversation.undo_snapshot
         compact_snapshot = self.conversation.compact_snapshot
         summary_idx = _summary_index(messages)
         last_real = _last_user_turn_index(messages)
@@ -303,14 +304,13 @@ class ChatController:
                 user_text="", revert_turns=[], keep=keep, dropped=dropped,
                 clears_compaction=True, compaction_only=True,
             )
-        if snapshot and snapshot[-1].role == "user":
-            snapshot_ids = {id(m) for m in snapshot}
-            if not any(id(m) not in snapshot_ids for m in messages):
+        turn_start = self.conversation.turn_start
+        if turn_start is not None and 0 <= turn_start < len(messages) and messages[turn_start].role == "user":
+            if turn_start == len(messages) - 1:
                 return None  # the turn produced no response yet
-            keep = list(snapshot[:-1])
-            user_text = snapshot[-1].content
-            kept_ids = {id(m) for m in keep}
-            dropped = [m for m in messages if id(m) not in kept_ids]
+            keep = list(messages[:turn_start])
+            user_text = messages[turn_start].content
+            dropped = list(messages[turn_start:])
             # If the restore point is before the compaction (the undone turn
             # is the one that compacted), the summary is gone from the
             # history — the compact snapshot is no longer reachable.
@@ -386,7 +386,7 @@ class ChatController:
         reversed separately (see :meth:`revert_changes`) so a conflict can
         abort before the conversation changes."""
         self.conversation.messages = list(plan.keep)
-        self.conversation.undo_snapshot = None
+        self.conversation.turn_start = None
         for message in plan.dropped:
             if message.usage is not None:
                 self._subtract_usage(message.usage)
@@ -496,15 +496,15 @@ class ChatController:
         self.conversation.compact_snapshot = list(messages)
         self.conversation.messages = [messages[0], summary_message, *messages[keep_from:]]
         self.last_compaction = (before_tokens, self._message_tokens(summary_message))
-        # Usage of removed messages that belongs to the current turn (not in
-        # the undo snapshot): /undo must subtract it even though the message
+        # Usage of removed messages that belongs to the current turn (at or
+        # after turn_start): /undo must subtract it even though the message
         # objects are gone. Pre-turn usage stays folded, matching rollback
         # semantics; send() resets the tracker each turn.
-        snapshot = self.conversation.undo_snapshot
-        if snapshot:
-            snapshot_ids = {id(m) for m in snapshot}
-            for removed in messages[1:keep_from]:
-                if removed.usage is not None and id(removed) not in snapshot_ids:
+        turn_start = self.conversation.turn_start
+        if turn_start is not None:
+            for index in range(1, keep_from):
+                removed = messages[index]
+                if index >= turn_start and removed.usage is not None:
                     self._absorbed_usage.input_tokens += removed.usage.input_tokens
                     self._absorbed_usage.output_tokens += removed.usage.output_tokens
         return summary
@@ -528,8 +528,7 @@ class ChatController:
         role = message.role
         parts = [f"{role}: {message.content}"] if message.content else [f"{role}:"]
         for call in message.tool_calls or []:
-            fn = call.get("function", {})
-            parts.append(f"  {role} called {fn.get('name', '?')}({fn.get('arguments', '')})")
+            parts.append(f"  {role} called {call.name}({call.arguments_json})")
         if role == "tool" and message.tool_call_id:
             parts.append(f"  (result for call {message.tool_call_id})")
         return "\n".join(parts)
@@ -566,15 +565,13 @@ class ChatController:
     # streaming
 
     async def _stream_round(self) -> AsyncIterator[StreamEvent]:
-        reasoning_parts: list[str] = []
-        content_parts: list[str] = []
-        pending: dict[str, dict[str, str]] = {}  # call_id -> {name, arguments}
-        call_order: list[str] = []
+        partial = PartialRound(reasoning_parts=[], content_parts=[])
+        done_calls: list[ToolCall] = []
         first_reasoning_at: float | None = None
         first_content_at: float | None = None
         # Expose this round's partial output live, so a cancelled turn can
         # persist whatever had streamed before the interruption.
-        self._partial_round = (reasoning_parts, content_parts, pending, call_order)
+        self._partial_round = partial
 
         tools_schema = self.tools.schema() if self.tools is not None else None
         async for event in self._client.stream(
@@ -583,54 +580,38 @@ class ChatController:
             if isinstance(event, ReasoningDelta):
                 if first_reasoning_at is None:
                     first_reasoning_at = time.monotonic()
-                reasoning_parts.append(event.text)
+                partial.reasoning_parts.append(event.text)
             elif isinstance(event, ContentDelta):
                 if first_content_at is None:
                     first_content_at = time.monotonic()
-                content_parts.append(event.text)
-            elif isinstance(event, ToolCallStarted):
-                pending[event.call_id] = {"name": event.name, "arguments": ""}
-                call_order.append(event.call_id)
-            elif isinstance(event, ToolCallArgumentsDelta):
-                if event.call_id in pending:
-                    pending[event.call_id]["arguments"] += event.text
+                partial.content_parts.append(event.text)
             elif isinstance(event, ToolCallArgumentsDone):
-                # Authoritative once the stream is done parsing.
-                pending[event.call_id] = {"name": event.name, "arguments": event.arguments_json}
+                # Authoritative once the stream is done parsing; the client
+                # has already assembled the full arguments for this call.
+                done_calls.append(ToolCall(event.call_id, event.name, event.arguments_json))
             elif isinstance(event, TurnComplete):
                 self._partial_round = None  # round completed; nothing partial left
-                reasoning = "".join(reasoning_parts) or None
+                reasoning = "".join(partial.reasoning_parts) or None
                 reasoning_seconds: float | None = None
                 if first_reasoning_at is not None:
                     end = first_content_at or time.monotonic()
                     reasoning_seconds = end - first_reasoning_at
-                tool_calls_wire = [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": pending[call_id]["name"],
-                            "arguments": pending[call_id]["arguments"],
-                        },
-                    }
-                    for call_id in call_order
-                ]
-                usage = event.usage or self._estimate_usage(content_parts)
+                usage = event.usage or self._estimate_usage(partial.content_parts)
                 self._fold_usage(usage)
                 self.conversation.add(
                     Message(
                         role="assistant",
-                        content="".join(content_parts),
+                        content="".join(partial.content_parts),
                         reasoning=reasoning,
                         reasoning_seconds=reasoning_seconds,
-                        tool_calls=tool_calls_wire or None,
+                        tool_calls=done_calls or None,
                         usage=usage,
                     )
                 )
                 event = TurnComplete(
                     usage=usage,
                     reasoning_seconds=reasoning_seconds,
-                    has_tool_calls=bool(call_order),
+                    has_tool_calls=bool(done_calls),
                 )
             yield event
 

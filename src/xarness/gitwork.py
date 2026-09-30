@@ -37,6 +37,7 @@ import shlex
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 
 _GIT_TIMEOUT = 30.0
@@ -499,12 +500,10 @@ async def undo_last_turn(info: GitInfo, turns: list[TurnCheckpoint]) -> str | No
 
     The empty case is deliberate: with no turn since the baseline there is
     nothing to reverse, and falling back to ``baseline_tree`` would destroy
-    every change made outside the session.
-    """
+    every change made outside the session."""
     if not turns:
-        return None  # nothing to revert — do not touch baseline_tree
-    last = turns[-1]
-    return await revert_turn(info, last.before_tree, last.after_tree)
+        return None
+    return await revert_turns(info, turns[-1:])
 
 
 # ----------------------------------------------------------------------
@@ -569,10 +568,18 @@ def _parse_numstat(out: str) -> list[FileDiff]:
 # Snapshot trees are immutable, so a tree pair's diff and a tree's file list
 # never change once the objects exist. Cache them (keyed on the shas plus the
 # subtree, since paths are reported relative to it) so /diff stays cheap on
-# long sessions. Values are immutable (raw output / frozenset), so callers
-# can't corrupt the cache by mutating what they get back.
+# long sessions. Values are immutable, so callers can't corrupt the cache by
+# mutating what they get back. Bounded (oldest entry evicted) so a long-lived
+# process doesn't grow without end.
+_CACHE_LIMIT = 512
 _numstat_cache: dict[tuple[str, str, str], str] = {}
 _tree_files_cache: dict[tuple[str, str], frozenset[str]] = {}
+
+
+def _cache_put(cache: dict, key, value):
+    if len(cache) >= _CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
 
 
 async def _numstat_between(info: GitInfo, base_tree: str, other_tree: str) -> str:
@@ -581,7 +588,7 @@ async def _numstat_between(info: GitInfo, base_tree: str, other_tree: str) -> st
     cached = _numstat_cache.get(key)
     if cached is None:
         cached = await _diff_tree_pair(info, base_tree, other_tree, "--numstat")
-        _numstat_cache[key] = cached
+        _cache_put(_numstat_cache, key, cached)
     return cached
 
 
@@ -599,7 +606,7 @@ async def _tree_files(info: GitInfo, tree: str) -> set[str]:
             prefix = info.subtree + "/"
             names = {n[len(prefix):] for n in names if n.startswith(prefix)}
         cached = frozenset(names)
-        _tree_files_cache[key] = cached
+        _cache_put(_tree_files_cache, key, cached)
     return set(cached)
 
 
@@ -666,7 +673,7 @@ class FileDiff:
     # Who caused the change: "agent" (some turn's diff touched the path) or
     # "drift" (made outside the session). A path is one or the other, never
     # both — attribution is per-file, so there is no combined value.
-    source: str = "agent"
+    source: Literal["agent", "drift"] = "agent"
 
 
 @dataclass(slots=True)

@@ -6,7 +6,8 @@ from typing import Any
 
 from xarness.config import CotStrength, ProviderProfile
 from xarness.controller import ChatController
-from xarness.conversation import Message
+from xarness.conversation import Message, ToolCall
+from xarness.controller import PartialRound
 from xarness.events import (
     ContentDelta,
     ProcessingStarted,
@@ -143,13 +144,7 @@ def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
     assert events[-1].has_tool_calls is True
     assistant = controller.conversation.messages[1]
     assert assistant.role == "assistant"
-    assert assistant.tool_calls == [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "fake_tool", "arguments": '{"a": 1}'},
-        }
-    ]
+    assert assistant.tool_calls == [ToolCall("call_1", "fake_tool", '{"a": 1}')]
 
 
 def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> None:
@@ -329,8 +324,8 @@ def test_send_snapshots_conversation_for_undo() -> None:
     asyncio.run(collect(controller, "hello"))
 
     # Snapshot taken when the turn began: just the user message.
-    assert [m.role for m in controller.conversation.undo_snapshot] == ["user"]
-    assert controller.conversation.undo_snapshot[0].content == "hello"
+    assert controller.conversation.turn_start == 0
+    assert controller.conversation.messages[0].content == "hello"
     assert controller.conversation.messages[0].checkpoint_sha is None  # no git
 
 
@@ -533,7 +528,7 @@ def test_compact_then_undo_restores_messages_and_usage() -> None:
     # spend (the compact call, restored verbatim) stays until the turn is
     # undone.
     assert controller.usage_total == Usage(input_tokens=9, output_tokens=4)
-    assert controller.conversation.undo_snapshot is None
+    assert controller.conversation.turn_start is None
 
     # Second /undo: removes turn 2 normally.
     plan2 = controller.rollback_plan()
@@ -642,7 +637,7 @@ def test_save_interrupted_round_keeps_partial_answer() -> None:
     """An interrupted round is saved with the text and reasoning it managed
     to stream before the cancellation."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = (["thinking "], ["partial answer"], {}, [])
+    controller._partial_round = PartialRound(["thinking "], ["partial answer"])
     assert controller.save_interrupted_round() is True
     message = controller.conversation.messages[-1]
     assert message.role == "assistant"
@@ -655,7 +650,7 @@ def test_save_interrupted_round_keeps_partial_answer() -> None:
 def test_save_interrupted_round_drops_reasoning_only() -> None:
     """A round interrupted while still thinking (no answer text) saves nothing."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = (["just thinking"], [], {}, [])
+    controller._partial_round = PartialRound(["just thinking"], [])
     assert controller.save_interrupted_round() is False
     assert controller.conversation.messages == []
 
@@ -664,7 +659,7 @@ def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:
     """Half-streamed tool calls are dropped: they have no result to pair with,
     and an orphaned tool call would be rejected on the next request."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = ([], [], {"c1": {"name": "noop", "arguments": "{}"}}, ["c1"])
+    controller._partial_round = PartialRound([], [])
     assert controller.save_interrupted_round() is False
     assert controller.conversation.messages == []
 
