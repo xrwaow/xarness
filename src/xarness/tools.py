@@ -287,10 +287,10 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         output = "".join(contents.splitlines(keepends=True)[: end - start + 1])
 
         if end < total_lines:
-            output += (
-                f"\n[showing lines {start}-{end} of {total_lines}; pass "
-                "start_line/end_line for more]"
-            )
+            # The model already passed start_line/end_line, so there's no
+            # point hinting it should pass them again — keep just the
+            # position/truncation note.
+            output += f"\n[showing lines {start}-{end} of {total_lines}]"
         return ToolResult(ok=True, output=output, header=path)
 
     async def _outline_result(path: str, total_lines: int, contents: str) -> ToolResult:

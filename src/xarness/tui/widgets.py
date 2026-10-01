@@ -172,10 +172,14 @@ class ShimmerText(Static):
         label: str,
         base_color: str,
         peak_color: str,
+        suffix: str = "",
         **kwargs,
     ) -> None:
         super().__init__("", markup=False, **kwargs)
         self.label = label
+        # Static text appended (space-separated) after the animated part:
+        # the tool-call arguments/detail never shimmer.
+        self.suffix = suffix
         self.base_color = base_color
         self.peak_color = peak_color
         self._timer = None
@@ -194,10 +198,13 @@ class ShimmerText(Static):
         self.peak_color = peak_color
         self._render_frame()
 
-    def set_label(self, label: str) -> None:
+    def set_label(self, label: str, suffix: str | None = None) -> None:
         """Swap the text in place (ToolWritingIndicator follows whichever
-        tool call is currently streaming)."""
+        tool call is currently streaming). ``suffix`` replaces the static
+        detail when given, keeping it out of the animated band."""
         self.label = label
+        if suffix is not None:
+            self.suffix = suffix
         self._render_frame()
 
     def _tick(self) -> None:
@@ -216,6 +223,12 @@ class ShimmerText(Static):
             intensity = max(0.0, 1.0 - dist / half_band)
             color = _lerp_hex(self.base_color, self.peak_color, intensity)
             text.append(ch, style=Style(color=color, bold=intensity > 0.6))
+        if self.suffix:
+            # A space separates the animated label from the static args
+            # detail; the suffix sits above the base color, but well below
+            # the shimmer peak so it reads as secondary.
+            suffix_color = _lerp_hex(self.base_color, self.peak_color, 0.35)
+            text.append(" " + self.suffix, style=Style(color=suffix_color))
         self.update(text)
 
 
@@ -649,6 +662,14 @@ def _stream_label(tool_name: str, args_text: str) -> str:
     return tool_name
 
 
+def _stream_parts(tool_name: str, args_text: str) -> tuple[str, str]:
+    """Split the live stream label into the shimmering part (the tool name)
+    and the static detail (the arguments-derived part, '' when none yet)."""
+    label = _stream_label(tool_name, args_text)
+    detail = label[len(tool_name):].strip()
+    return tool_name, detail
+
+
 def _header_detail_text(tool_name: str, header: str) -> Text | None:
     """The stored header summary, laid out after the verb + tool name.
 
@@ -780,13 +801,15 @@ class ToolCallBlock(Vertical):
     def append_arguments(self, text: str) -> None:
         self.accumulated_arguments += text
         self._refresh_body()
-        # Once the arguments are known, the shimmer says the actual call —
-        # 'run_bash git status', 'write_file g.py +4 LOC' — not just the
-        # bare tool name.
+        # The shimmer animates only the tool name; the args-derived detail
+        # ('g.py +4 LOC', 'git status') renders statically after it.
         if self.is_mounted:
             try:
+                name, detail = _stream_parts(
+                    self.tool_name, self.accumulated_arguments
+                )
                 self.query_one(".toolcall-shimmer", ShimmerText).set_label(
-                    _stream_label(self.tool_name, self.accumulated_arguments)
+                    f"Running {name}", detail
                 )
             except NoMatches:
                 pass  # DOM pruned during app shutdown
@@ -863,7 +886,9 @@ class ToolCallBlock(Vertical):
             # show just the diff (or the error text when the edit failed).
             split = _split_tool_diff(self._output_text)
             if split is not None:
-                static.update(_render_diff(split[1]))
+                # The path is already in the summary row; skip the diff's
+                # own '── path' header line.
+                static.update(_render_diff(split[1], show_headers=False))
                 return
             static.update(self._output_text)
             return
@@ -900,10 +925,23 @@ class ToolCallBlock(Vertical):
                 return
         args = self.accumulated_arguments
         if self.tool_name == "run_bash":
-            # Show the command itself, not its JSON wrapper.
+            # Show the command itself, not its JSON wrapper — the command
+            # line reads in the normal text color (the body's default is
+            # the muted tool-output color); output stays muted.
             command = self._bash_command()
             if command:
-                args = command
+                rendered = Text(command, style=theme.PALETTE["text"])
+                if self._output_text:
+                    rendered.append("\n" + self._output_text, style=theme.PALETTE["muted"])
+                split = _split_tool_diff(
+                    command + ("\n" + self._output_text if self._output_text else "")
+                )
+                if split is None:
+                    static.update(rendered)
+                    return
+                rendered.append_text(_render_diff(split[1]))
+                static.update(rendered)
+                return
         body = args
         if self._output_text:
             body = f"{body}\n{self._output_text}" if body else self._output_text
@@ -978,7 +1016,7 @@ _DIFF_GIT_RE = re.compile(r"^diff --git ", re.MULTILINE)
 
 
 _SHOWING_LINES_RE = re.compile(
-    r"^\[showing lines \d+-\d+ of \d+;[^\]]*\]", re.MULTILINE
+    r"^\[showing lines \d+-\d+ of \d+(?:;[^\]]*)?\]", re.MULTILINE
 )
 
 
@@ -1007,14 +1045,16 @@ def _split_tool_diff(text: str) -> tuple[str, str] | None:
     return text[: match.start()], text[match.start() :]
 
 
-def _render_diff(text: str) -> Text:
+def _render_diff(text: str, show_headers: bool = True) -> Text:
     """Unified diff as GitHub-style rich text.
 
     Each file collapses to one `── path` header with new/deleted/renamed
     badges (the index/mode/---/+++ prologue is parsed and dropped, binary
     changes become a short notice); +/- lines get a full-line background
     tint from the theme's diff colors, with old/new line numbers in a
-    muted gutter. Plain stateful parse — no external diff library."""
+    muted gutter. ``show_headers=False`` drops the per-file header line —
+    used for edit_file, whose path is already in the summary row. Plain
+    stateful parse — no external diff library."""
     p = theme.PALETTE
     out = Text()
     header_path: str | None = None
@@ -1025,17 +1065,18 @@ def _render_diff(text: str) -> Text:
         nonlocal header_path, header_renamed
         if header_path is None:
             return
-        if out:
-            out.append("\n")  # blank separator between files
-        out.append("── ", style=p["border"])
-        out.append(header_path, style=f"bold {p['text']}")
-        if "new" in header_badges:
-            out.append("  new", style=f"italic {p['accent']}")
-        if "deleted" in header_badges:
-            out.append("  deleted", style=f"italic {p['error']}")
-        if header_renamed:
-            out.append("  renamed", style=f"italic {p['accent2']}")
-        out.append("\n")
+        if show_headers:
+            if out:
+                out.append("\n")  # blank separator between files
+            out.append("── ", style=p["border"])
+            out.append(header_path, style=f"bold {p['text']}")
+            if "new" in header_badges:
+                out.append("  new", style=f"italic {p['accent']}")
+            if "deleted" in header_badges:
+                out.append("  deleted", style=f"italic {p['error']}")
+            if header_renamed:
+                out.append("  renamed", style=f"italic {p['accent2']}")
+            out.append("\n")
         header_path = None
         header_badges.clear()
         header_renamed = False
@@ -1462,9 +1503,9 @@ class PendingIndicator(Horizontal):
 class ToolWritingIndicator(Horizontal):
     """Single amber-dot shimmer shown while tool-call arguments are still
     streaming — replaces the per-block 'Running [tool]' shinies, which only
-    make sense once a call actually executes. The label is the live call
-    itself, '<tool> <detail>', updated as each argument fragment arrives:
-    'write_file g.py +4 LOC', 'run_bash git stat…', and so on.
+    make sense once a call actually executes. The shimmer sweeps over the
+    tool name only; the arguments-derived detail ('write_file g.py +4 LOC',
+    'run_bash git stat…') is appended as static text as fragments arrive.
 
     Owns the streaming-arguments state itself: fragments are accumulated per
     call_id here (the only consumer), not mirrored through the turn driver.
@@ -1483,13 +1524,15 @@ class ToolWritingIndicator(Horizontal):
         # the same color so the text stays solidly yellow, with the shimmer
         # band showing as a bold sweep.
         yield ShimmerText(
-            self._label(), theme.PALETTE["warning"], theme.PALETTE["warning"],
+            self._label()[0], theme.PALETTE["warning"], theme.PALETTE["warning"],
+            suffix=self._label()[1],
             classes="toolwriting-shimmer",
         )
 
-    def _label(self) -> str:
+    def _label(self) -> tuple[str, str]:
+        """The animated tool name and the static args detail."""
         name = self._names.get(self._current or "", self.tool_name)
-        return _stream_label(name, self._args.get(self._current or "", ""))
+        return _stream_parts(name, self._args.get(self._current or "", ""))
 
     def set_tool(self, tool_name: str) -> None:
         """Follow the tool call that just started streaming."""
@@ -1517,7 +1560,10 @@ class ToolWritingIndicator(Horizontal):
         if not self.is_mounted:
             return
         try:
-            self.query_one(".toolwriting-shimmer", ShimmerText).set_label(self._label())
+            name, detail = self._label()
+            self.query_one(".toolwriting-shimmer", ShimmerText).set_label(
+                name, detail
+            )
         except NoMatches:
             pass  # DOM pruned during app shutdown
 

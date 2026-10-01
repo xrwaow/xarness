@@ -181,6 +181,10 @@ ToolCallBlock {
 .toolcall-row {
     height: auto;
     display: none;
+    /* The left bar lives on the row itself so it spans the full height of
+       the expanded body (the empty marker Static is only ever one line
+       tall, so its own border stopped after the first line). */
+    border-left: solid $c-border;
 }
 
 ToolCallBlock.expanded .toolcall-row {
@@ -188,8 +192,9 @@ ToolCallBlock.expanded .toolcall-row {
 }
 
 .toolcall-marker {
-    width: 2;
-    border-left: solid $c-border;
+    /* Pure spacing now — the vertical bar is the row's border-left. One
+       cell, so the body starts flush: '|output'. */
+    width: 1;
 }
 
 .toolcall-body {
@@ -391,6 +396,12 @@ DiffSummary:hover #diff-summary-row,
     text-style: underline;
 }
 
+/* Expanded: the whole bar (summary, file list, diff pane) sits on a
+   dimmed, elevated background — nothing else changes. */
+DiffSummary.expanded {
+    background: $c-surface;
+}
+
 AskBar {
     display: none;
     width: 1fr;
@@ -484,6 +495,8 @@ DiffSummary.expanded #diff-body {
        even with no horizontal overflow; diff lines wrap, so it is useless. */
     overflow-x: hidden;
     color: $c-text;
+    /* The open diff's code pane sits on the normal background, contrasting
+       with the dimmed expanded bar around it. */
     background: $c-bg;
     border-top: solid $c-border;
 }
