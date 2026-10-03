@@ -16,7 +16,6 @@ import time
 from typing import ClassVar, cast
 
 from rich.console import Group, RenderableType
-from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -28,7 +27,7 @@ from textual.highlight import highlight
 from textual.message import Message
 from textual.reactive import reactive
 from textual.timer import Timer
-from textual.widgets import OptionList, Static, TextArea
+from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.markdown import MarkdownFence
 from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
@@ -137,48 +136,30 @@ def highlight_code(code: str, path: str | None = None, language: str = "") -> Co
     )
 
 
-def _render_settled(text: str) -> RenderableType:
-    """Render a settled assistant chunk as a single Rich renderable.
+class SettledMarkdown(Markdown):
+    """One settled assistant chunk as a Textual Markdown widget.
 
-    Prose goes through rich.markdown; fenced code goes through the same
-    palette-driven highlighter the tool-call bodies use, so code blocks keep
-    their exact styling. The result is width-independent: the Static showing
-    it re-wraps on resize like any Static."""
-    parts: list[RenderableType] = []
-    pos = 0
+    Markdown renders its blocks as Content visuals, which carry the per-cell
+    offset metadata Textual's selection system needs — so a mouse drag
+    selects individual characters and ctrl+shift+c copies exactly what's
+    highlighted. (A Static rendering rich.markdown has no such metadata, so
+    selection degrades to whole-widget blocks.) Fenced code keeps the
+    palette-driven highlighter, and the widget sizes to its content inside
+    the scrolling chat log instead of claiming free height."""
 
-    def add_prose(chunk: str) -> None:
-        prose = chunk.strip("\n")
-        if prose.strip():
-            # rich.markdown collapses soft line breaks (single newlines) into
-            # spaces, so "line1\nline2" renders as one sentence. Convert
-            # single newlines to markdown hard breaks so they render as
-            # actual newlines, matching Textual's Markdown widget.
-            prose = re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
-            parts.append(RichMarkdown(prose))
-
-    for match in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
-        add_prose(text[pos : match.start()])
-        if parts:
-            parts.append(Content("\n"))
-        parts.append(highlight_code(match.group(2), language=match.group(1).strip()))
-        parts.append(Content("\n"))
-        pos = match.end()
-    add_prose(text[pos:])
-    if not parts:
-        parts.append(Content(""))
-    return Group(*parts) if len(parts) > 1 else parts[0]
-
-
-class SettledMarkdown(Static):
-    """One settled assistant chunk as a single cheap Static widget.
-
-    Replaces Textual's Markdown (which mounts a widget subtree per block and
-    makes every relayout of a long session touch all of them). The chunk is
-    display-only — it has no interactions, so a Static loses nothing."""
+    BLOCKS = {
+        **Markdown.BLOCKS,
+        "fence": PaletteFence,
+        "code_block": PaletteFence,
+    }
 
     def __init__(self, text: str) -> None:
-        super().__init__(_render_settled(text), classes="assistant-md", markup=False)
+        super().__init__(text, classes="assistant-md")
+
+    def on_mount(self) -> None:
+        self.styles.height = "auto"
+        self.styles.margin = 0
+        self.styles.padding = 0
 
 
 class ShimmerText(Static):

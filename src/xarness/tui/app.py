@@ -330,10 +330,6 @@ class AgentApp(App[None]):
         yield StatusBar(id="status-bar")
 
     async def on_mount(self) -> None:
-        # SettledMarkdown renders through rich.markdown, whose style names
-        # (markdown.* ) resolve against the console's rich theme — point them
-        # at the palette so its built-in cyan/magenta defaults never leak in.
-        self.console.push_theme(theme.rich_markdown_theme())
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_status()
         # Follow new output only while the user is parked at the bottom.
@@ -903,8 +899,6 @@ class AgentApp(App[None]):
         same theme set at startup."""
         theme.set_theme(name)
         self.refresh_css()
-        # Re-point rich.markdown's style names at the new palette.
-        self.console.push_theme(theme.rich_markdown_theme())
         self.query_one("#chat-input", ChatInput).apply_input_theme()
         for shimmer in self.query(ShimmerText):
             colors = (
