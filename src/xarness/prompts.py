@@ -16,7 +16,7 @@ if TYPE_CHECKING:  # annotation-only; avoids an import cycle at runtime
 GENERAL_SYSTEM_PROMPT = """You are a coding agent working inside a sandboxed workspace.
 Ground rules:
 - File paths in tool calls are relative to the workspace root.
-- Files under '.refs/' are read-only external references.
+- External references are read-only: address them as '.refs/<alias>' in tool calls; in shell commands they live at /tmp/refs/<alias>. Nothing is ever created in the worktree for them.
 - read_file returns a structural outline for large files; read specific sections of those with start_line/end_line instead of guessing at contents.
 - Use ask_user when you need a decision that cannot be infered from context.
 - Pipe search output (rg/find/grep) through '| head -n' so results stay sane.

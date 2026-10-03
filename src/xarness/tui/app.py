@@ -62,6 +62,10 @@ ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
 
+# Tools that modify workspace files — a successful call means a diff now
+# exists, so the pending-changes bar should surface above the input.
+_WRITING_TOOLS = frozenset({"write_file", "edit_file"})
+
 
 def _format_drift_detail(stat: DiffStat, limit: int = 6) -> str:
     """A short plain-text summary of drifted files for the confirm modal."""
@@ -162,6 +166,7 @@ class _RoundView:
                 await self.assistant.finalize()
             await self.chat.mount(ErrorLine(event.message))
             self.had_stream_error = True
+            self.app._clear_hint_lines()
 
     async def _hide_indicator(self) -> None:
         if self.indicator_live:
@@ -187,6 +192,7 @@ class _RoundView:
             # Interrupted rounds never reach TurnComplete/finalize: settle the
             # partial answer so it's selectable (and matches the /resume replay).
             await self.assistant.finalize()
+        self.app._clear_hint_lines()
         for block in self.tool_blocks.values():
             if block.status is ToolCallStatus.MAKING_CALL:
                 block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
@@ -966,15 +972,11 @@ class AgentApp(App[None]):
                 info = None
             if info is not None:
                 self._rebind_tracking(info)
-                notes.append(
-                    f"reconnected to change tracking for {info.agent_workspace} "
-                    "(direct edits; /diff shows pending changes, /undo reverts the last turn)"
-                )
+                notes.append(f"reconnected change tracking for {info.agent_workspace}")
             else:
                 # Session predates direct-write tracking (old worktree block).
                 notes.append(
-                    "note: this session used the old worktree isolation; "
-                    "switched to direct edits with fresh change tracking"
+                    "note: old worktree session; switched to direct edits with fresh tracking"
                 )
                 await self._setup_tracking_for_resume(name, notes, errors)
         elif self.sandbox is not None:
@@ -1388,7 +1390,9 @@ class AgentApp(App[None]):
                 # First esc only arms the interrupt, so a stray keypress can't
                 # kill a turn mid-flight.
                 self._interrupt_armed = True
-                self._post_line(MessageLine("press esc again to interrupt", kind="warn"))
+                self._post_line(
+                    MessageLine("press esc again to interrupt", kind="warn", hint=True)
+                )
                 self._interrupt_timer = self.set_timer(
                     INTERRUPT_ARM_SECONDS, self._disarm_interrupt
                 )
@@ -1481,6 +1485,7 @@ class AgentApp(App[None]):
 
                 # Execute the calls this round requested, in stream order.
                 turn_had_tools = True
+                round_wrote_files = False
                 for call_id, block in view.tool_blocks.items():
                     result = await self.tool_registry.call(
                         block.tool_name,
@@ -1497,6 +1502,13 @@ class AgentApp(App[None]):
                         status, output=result.output, error=result.error, header=result.header
                     )
                     self.controller.record_tool_result(call_id, result)
+                    if result.ok and block.tool_name in _WRITING_TOOLS:
+                        round_wrote_files = True
+                if round_wrote_files and self.git_info is not None:
+                    # The model just changed a file: surface the diff panel
+                    # (header only — the file list stays collapsed) above the
+                    # input without waiting for the turn to end.
+                    await self.refresh_diff_summary()
 
                 # Steer: anything typed while this round was streaming is
                 # injected here — after the tool answers, before the next
@@ -1621,6 +1633,17 @@ class AgentApp(App[None]):
             return
         self._post_compaction_notice("auto-compacted")
 
+    def _clear_hint_lines(self) -> None:
+        """Remove transient hint lines (e.g. 'press esc again to interrupt')
+        from the chat log. Called when the assistant's message settles, so
+        keypress coaching doesn't linger in the scrollback."""
+        try:
+            chat = self.query_one("#chat-log", VerticalScroll)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
+        for line in chat.query(".msg.hint"):
+            line.remove()
+
     async def _complete_round(
         self,
         event: TurnComplete,
@@ -1628,6 +1651,7 @@ class AgentApp(App[None]):
         assistant: AssistantMessage | None,
     ) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
+        self._clear_hint_lines()
         if assistant is not None:
             await assistant.finalize()
         elif thinking is None and not event.has_tool_calls:

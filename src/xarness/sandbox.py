@@ -28,9 +28,23 @@ from typing import Literal
 # Subdirectories of the persistent sandbox cache, created on demand.
 _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
 
-# Host paths bwrap creates as bind mountpoints inside the workspace (a ref's
-# target, or the .refs tmpfs anchor). They are empty; removed at exit so the
-# worktree looks untouched (git ignores empty dirs anyway, but ls doesn't).
+# Container path of the external-references area. It is a tmpfs nested under
+# the container-only /tmp tmpfs (mounted at the top of build_argv, before the
+# workspace bind), so bwrap creates its mountpoint — and every per-alias
+# mountpoint below it — inside that tmpfs. Nothing, not even an empty anchor
+# directory, ever appears in the host worktree. (An earlier design mounted
+# the anchor at <workspace>/.refs, which forced a transient .refs directory
+# into the real worktree on every run and failed outright in plan mode,
+# where the workspace bind is read-only.) Agent-facing tool paths keep the
+# workspace-relative '.refs/<alias>' spelling; this is where they land.
+REFS_ANCHOR = "/tmp/refs"
+_REFS_PREFIX = ".refs"
+
+# Host paths bwrap creates as bind mountpoints inside the workspace (a
+# custom ref's target, e.g. a dropped-in ``.venv``). They are empty; removed
+# at exit so the worktree looks untouched (git ignores empty dirs anyway,
+# but ls doesn't). The refs tmpfs anchor is not here: it lives under the
+# container-only /tmp tmpfs and never touches the host at all.
 _MOUNT_DIRS: set[Path] = set()
 _CLEANUP_REGISTERED = False
 
@@ -168,9 +182,9 @@ class ContainerRef:
     """One external path bound into the container.
 
     ``mount`` is relative to the tool root: ``.refs/<alias>`` (the read-only
-    references area the system prompt describes — the folder itself is a
-    tmpfs, never a directory in the worktree) or any workspace-relative path
-    (e.g. ``.venv``, to drop a host-built venv into the project)."""
+    references area the system prompt describes — a purely container-side
+    tmpfs, nothing is ever created in the worktree) or any workspace-relative
+    path (e.g. ``.venv``, to drop a host-built venv into the project)."""
 
     host: Path
     mount: str
@@ -249,7 +263,7 @@ class SandboxConfig:
         )
 
     def ref_path(self, alias: str) -> str:
-        return f"{self.tool_root}/.refs/{alias}"
+        return f"{REFS_ANCHOR}/{alias}"
 
     @property
     def mount_key(self) -> tuple:
@@ -375,6 +389,10 @@ class SandboxConfig:
         subtree session bwrap chdirs into the subtree, and tool paths are
         relative to it (see validate_relpath)."""
         norm = "." if path in ("", ".") else (path[2:] if path.startswith("./") else path)
+        if norm == _REFS_PREFIX or norm.startswith(_REFS_PREFIX + "/"):
+            # The references area lives at REFS_ANCHOR in the container, not
+            # under the workspace mount (see REFS_ANCHOR above).
+            return REFS_ANCHOR + norm[len(_REFS_PREFIX):]
         return f"{self.tool_root}/{norm}"
 
     def validate_relpath(self, path: str, mode: Literal["read", "write"] = "write") -> str | None:
@@ -589,25 +607,24 @@ class SandboxConfig:
         argv += self._cache_binds_and_env()
         refs_anchor = False
         for alias, ref in self.external_refs.items():
-            target = f"{self.tool_root}/{ref.mount}"
-            if ref.mount == ".refs" or ref.mount.startswith(".refs/"):
-                # The references area is a tmpfs mounted inside the workspace:
-                # aliases appear in-container under .refs/ without any
-                # per-alias directory in the worktree. bwrap still mkdirs the
-                # tmpfs anchor itself on the host, so note it for cleanup.
+            if ref.mount == _REFS_PREFIX or ref.mount.startswith(_REFS_PREFIX + "/"):
+                # The references area is a tmpfs nested under the
+                # container-only /tmp tmpfs (mounted at the top of this
+                # function — that ordering is what makes the anchor virtual:
+                # bwrap creates the mountpoint inside the tmpfs, so the host
+                # worktree is never touched, even transiently).
                 if not refs_anchor:
-                    argv += ["--tmpfs", f"{self.tool_root}/.refs"]
+                    argv += ["--tmpfs", REFS_ANCHOR]
                     refs_anchor = True
+                target = REFS_ANCHOR + ref.mount[len(_REFS_PREFIX):]
             else:
+                target = f"{self.tool_root}/{ref.mount}"
                 _note_mount_dir((self.workspace / self.subtree / ref.mount)
                                 if self.subtree else (self.workspace / ref.mount))
             # Plan mode forces every ref read-only, like the rest of the
             # workspace.
             argv += ["--ro-bind" if (ref.read_only or self.read_only) else "--bind",
                      str(ref.host), target]
-        if refs_anchor:
-            _note_mount_dir((self.workspace / self.subtree / ".refs")
-                            if self.subtree else (self.workspace / ".refs"))
         argv += ["--chdir", chdir, "--unshare-all"]
         if self.allow_network:
             argv += ["--share-net"]

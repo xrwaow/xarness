@@ -53,8 +53,8 @@ Everything the model can reach:
 | `.git` directory (same host path) | read-only | `git status`/`diff`/`log` work in the container; the harness does all git writes on the host |
 | `uv.lock` | read-only | `uv` may read it to build the project env, never rewrite it |
 | shared caches (`uv`, `pip`, `cargo`, `npm`) | read-write | offline installs from warm host caches; `~/.cargo`, `~/.rustup`, `~/.local` are bound read-only so PATH tools still resolve |
-| external refs → `.refs/<alias>` | read-only | the only bridge to host paths outside the workspace; writable mounts (e.g. a host-built `.venv`) are forced read-only in plan mode |
-| `.refs/` anchor | tmpfs | runtime-only inside the container, never a folder in your worktree |
+| external refs → `/tmp/refs/<alias>` | read-only | the only bridge to host paths outside the workspace; writable mounts (e.g. a host-built `.venv`) are forced read-only in plan mode |
+| `.refs/` anchor | tmpfs | purely container-side (nested under the container `/tmp` tmpfs) — nothing, not even an empty folder, ever appears in your worktree; tool paths use `.refs/<alias>`, shell uses `/tmp/refs/<alias>` |
 
 Everything else — the rest of `/`, `/home`, other users' files — does not
 exist as far as the model can tell. Stray writes outside the mounts land in
@@ -100,8 +100,8 @@ for change tracking is pinned at session start, so editing ignore files in
 the container cannot shift what `/diff` tracks.
 
 Expose external files read-only to the agent with `--ref ALIAS=PATH`
-(repeatable); they appear under `.refs/ALIAS` in the workspace and are
-read-only by convention.
+(repeatable); the model addresses them as `.refs/ALIAS` in tool calls (and
+`/tmp/refs/ALIAS` in shell commands) and they are read-only by convention.
 
 ## Change tracking and undo
 
@@ -262,8 +262,9 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
   - `auto_include_refs` — host paths bound into the container at runtime, so
     the model can consult (or reuse) material outside the workspace. Two
     entry forms:
-    - a plain path — bound **read-only** under `.refs/<alias>` (`.refs/` is a
-      runtime-only tmpfs in the container, never a folder in your worktree);
+    - a plain path — bound **read-only** under the container-only refs tmpfs
+      (addressed as `.refs/<alias>` in tool calls, `/tmp/refs/<alias>` in the
+      shell; nothing is ever created in your worktree);
     - an object `{"path", "mount", "read_only"}` — mount the host path at any
       workspace-relative `mount`, optionally writable (e.g. drop a host-built
       `.venv` into the project; writable mounts are forced read-only in plan

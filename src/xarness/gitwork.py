@@ -342,10 +342,7 @@ async def setup_tracking(
         baseline_tree=baseline,
         ignored_paths=ignored,
     )
-    notes.append(
-        f"the agent edits {info.agent_workspace} directly; changes are tracked "
-        "with git snapshots — /diff shows them, /undo reverts the last turn"
-    )
+    notes.append(f"tracking edits to {info.agent_workspace} with git snapshots")
     return info, notes
 
 

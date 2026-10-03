@@ -1706,9 +1706,12 @@ class MessageLine(Static):
 
     _GLYPHS = {"error": "✗ ", "warn": "! ", "success": "✓ "}
 
-    def __init__(self, message: str, kind: str = "notice") -> None:
+    def __init__(
+        self, message: str, kind: str = "notice", hint: bool = False
+    ) -> None:
         super().__init__(
-            Text(f"{self._GLYPHS.get(kind, '')}{message}"), classes=f"msg {kind}"
+            Text(f"{self._GLYPHS.get(kind, '')}{message}"),
+            classes=f"msg {kind}" + (" hint" if hint else ""),
         )
 
 

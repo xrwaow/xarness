@@ -217,7 +217,8 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     @tool(
         "read_file",
         "Read a file's contents. Paths are relative to the workspace root, "
-        "or '.refs/<alias>' for externally referenced files. Files over "
+        "or '.refs/<alias>' for externally referenced files (in shell "
+        "commands these live at /tmp/refs/<alias>). Files over "
         f"{OUTLINE_THRESHOLD} lines return a structural outline with line "
         "numbers instead of contents; read specific sections of those by "
         "passing start_line and end_line (1-based, inclusive).",

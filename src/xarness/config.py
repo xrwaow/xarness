@@ -89,8 +89,9 @@ class RefSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
-    # Container path relative to the workspace root ("" = ``.refs/<alias>``
-    # with the alias derived from the path's basename).
+    # Container path of the mount ("" = the container-only refs tmpfs,
+    # addressed as ``.refs/<alias>`` with the alias derived from the path's
+    # basename).
     mount: str | None = None
     read_only: bool = True
 
@@ -140,7 +141,8 @@ class ContainerSettings(BaseModel):
     # Host paths bound into the container at runtime, so the model can
     # consult (or, when writable, reuse) files that live outside the
     # workspace: specs, notes, other checkouts, prebuilt toolchains. Entries
-    # are plain paths (bound read-only at ``.refs/<alias>``) or RefSpec
+    # are plain paths (bound read-only under the container-only refs tmpfs,
+    # addressed as ``.refs/<alias>``) or RefSpec
     # objects with an explicit ``mount`` and ``read_only`` flag. The alias is
     # derived from the path (its basename, disambiguated with parent segments
     # when two paths share a basename).

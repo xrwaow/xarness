@@ -34,7 +34,7 @@ class SandboxSubtreeTest(unittest.TestCase):
         sub = argv.index("/workspace/f")
         assert argv[sub - 2:sub] == ["--bind", str(self.workspace / "f")]
         assert argv[argv.index("--chdir") + 1] == "/workspace/f"
-        assert config.ref_path("docs") == "/workspace/f/.refs/docs"
+        assert config.ref_path("docs") == "/tmp/refs/docs"
 
         # Tool paths anchor at the subtree: the agent's workspace IS the
         # --workspace dir, so any non-escaping relative path is valid and
@@ -42,6 +42,7 @@ class SandboxSubtreeTest(unittest.TestCase):
         # are always rejected.
         assert config.tool_root == "/workspace/f"
         assert config.tool_path("notes.txt") == "/workspace/f/notes.txt"
+        assert config.tool_path(".refs/docs") == "/tmp/refs/docs"
         assert config.tool_path("./notes.txt") == "/workspace/f/notes.txt"
         assert config.tool_path(".") == "/workspace/f/."
         assert config.validate_relpath("notes.txt") is None
@@ -64,9 +65,10 @@ class SandboxSubtreeTest(unittest.TestCase):
         bind = argv.index("--bind")
         assert argv[bind + 1:bind + 3] == [str(self.workspace), "/workspace"]
         assert argv[argv.index("--chdir") + 1] == "/workspace"
-        assert config.ref_path("docs") == "/workspace/.refs/docs"
+        assert config.ref_path("docs") == "/tmp/refs/docs"
         assert config.tool_root == "/workspace"
         assert config.tool_path("app.py") == "/workspace/app.py"
+        assert config.tool_path(".refs/docs") == "/tmp/refs/docs"
         assert config.validate_relpath("app.py") is None
 
 class SandboxSessionProtocolTest(unittest.TestCase):
@@ -258,15 +260,19 @@ class ContainerSettingsTest(unittest.TestCase):
             ),
         )
         argv = config.build_argv(["/bin/sh"])
-        # One tmpfs anchor for the .refs area (runtime-only: nothing per-alias
-        # lands in the worktree), then the binds on top of it. (bwrap's own
-        # /tmp tmpfs is separate.)
-        assert argv.count("--tmpfs") == 2
-        assert argv[argv.index("--tmpfs", argv.index("--tmpfs") + 1) + 1] == "/workspace/.refs"
-        i = argv.index("/workspace/.refs/spec.md")
+        # One tmpfs anchor for the refs area, nested under the container-only
+        # /tmp tmpfs: bwrap creates its mountpoint inside that tmpfs, so the
+        # host worktree is never touched (not even transiently).
+        tmpfs_targets = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+        # /tmp (container-only) first, the refs anchor nested inside it.
+        assert tmpfs_targets == ["/tmp", "/tmp/refs"]
+        i = argv.index("/tmp/refs/spec.md")
         assert argv[i - 2:i] == ["--ro-bind", str(self.workspace / "docs" / "spec.md")]
         i = argv.index("/workspace/.venv")
         assert argv[i - 2:i] == ["--bind", str(other)]
+        # Nothing in the argv asks bwrap to create anything under the
+        # workspace mount for refs.
+        assert not any(a.startswith("/workspace/.refs") for a in argv)
 
     def test_writable_ref_forced_read_only_in_plan_mode(self):
         (self.workspace / "docs").mkdir()
@@ -277,11 +283,11 @@ class ContainerSettingsTest(unittest.TestCase):
         )
         config.external_refs["spec.md"].read_only = False
         argv = config.build_argv(["/bin/sh"])
-        i = argv.index("/workspace/.refs/spec.md")
+        i = argv.index("/tmp/refs/spec.md")
         assert argv[i - 2] == "--bind"
         config.read_only = True
         argv = config.build_argv(["/bin/sh"])
-        i = argv.index("/workspace/.refs/spec.md")
+        i = argv.index("/tmp/refs/spec.md")
         assert argv[i - 2] == "--ro-bind"
 
     def test_mount_key_tracks_settings_and_refs(self):
