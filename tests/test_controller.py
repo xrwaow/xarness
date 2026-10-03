@@ -507,14 +507,21 @@ def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
     assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
 
 
-def test_rollback_plan_to_rejects_non_turns_and_the_latest() -> None:
+def test_rollback_plan_to_rejects_non_turns_allows_the_latest() -> None:
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     controller.conversation.add(Message(role="user", content="first"))
     controller.conversation.add(Message(role="assistant", content="one"))
     controller.conversation.add(Message(role="user", content="pending"))
     messages = controller.conversation.messages
     assert controller.rollback_plan_to(messages[1]) is None  # not a user turn
-    assert controller.rollback_plan_to(messages[2]) is None  # nothing after it yet
+    # The latest user message is still undoable: nothing to drop or revert,
+    # but the plan puts its text back in the input.
+    plan = controller.rollback_plan_to(messages[2])
+    assert plan is not None
+    assert plan.user_text == "pending"
+    assert plan.keep == messages[:2]
+    assert plan.dropped == [messages[2]]
+    assert plan.revert_turns == []
 
 
 def test_save_interrupted_round_keeps_partial_answer() -> None:

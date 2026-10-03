@@ -183,7 +183,18 @@ class ContainerSettingsTest(unittest.TestCase):
         # The ignored path exists in the container only as a shadow mount
         # target: an empty placeholder bind-mounted over it.
         i = argv.index("/workspace/secret")
-        assert argv[i - 2] == "--bind"
+        assert argv[i - 2] == "--ro-bind"
+
+    def test_gitignore_files_hidden_when_respected(self):
+        self._git_init()
+        (self.workspace / "sub").mkdir()
+        (self.workspace / "sub" / ".gitignore").write_text("*.tmp\n")
+        config = SandboxConfig(workspace=self.workspace)
+        assert ".gitignore" in config.hidden_paths
+        assert "sub/.gitignore" in config.hidden_paths
+        argv = config.build_argv(["/bin/sh"])
+        i = argv.index("/workspace/.gitignore")
+        assert argv[i - 2] == "--ro-bind"
 
     def test_respect_gitignore_false_keeps_ignored_visible(self):
         self._git_init()

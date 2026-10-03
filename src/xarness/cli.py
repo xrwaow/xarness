@@ -122,9 +122,13 @@ def _run_chat(args: argparse.Namespace) -> None:
     session: SandboxSession | None = None
     effective_workspace = workspace
     try:
+        # The agent's workspace is exactly the directory the user pointed at,
+        # even when it sits inside a bigger git repo. (gitwork still scopes
+        # snapshots/diffs/reverts to the repo-relative subtree of that
+        # directory — the rest of the repo just isn't mounted in-container.)
         sandbox = SandboxConfig(
-            workspace=git_info.workspace if git_info is not None else workspace,
-            subtree=git_info.subtree if git_info is not None else "",
+            workspace=workspace,
+            subtree="",
             allow_network=loaded.container.network_access,
             respect_gitignore=loaded.container.respect_gitignore,
             gpu_access=loaded.container.gpu_access,
@@ -134,7 +138,7 @@ def _run_chat(args: argparse.Namespace) -> None:
             git_dir=git_info.git_dir if git_info is not None else None,
         )
         session = SandboxSession(sandbox)
-        effective_workspace = git_info.agent_workspace if git_info is not None else workspace
+        effective_workspace = workspace
         if loaded.container.gpu_access:
             from . import sandbox as sandbox_mod
             probe = asyncio.run(sandbox_mod.probe_gpu_access(sandbox))

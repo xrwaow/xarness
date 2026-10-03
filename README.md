@@ -36,11 +36,68 @@ Switch between modes with `/mode`:
 ### Sandbox
 
 Filesystem and shell tools run inside [bubblewrap](https://github.com/containers/bubblewrap)
-(`bwrap`): the workspace is bound read-only or read-write depending on mode,
-network access is off, and nothing the model can reach gets a raw socket into
-the sandbox itself. Install `bwrap` first (e.g. `sudo dnf install bubblewrap`
-on Fedora); without it, filesystem/bash tools are disabled and the model just
+(`bwrap`): with Linux user/mount/PID namespaces the model gets a fresh,
+mostly-empty container root, and only what xarness explicitly mounts exists
+inside it. Install `bwrap` first (e.g. `sudo dnf install bubblewrap` on
+Fedora); without it, filesystem/bash tools are disabled and the model just
 chats. Disable them explicitly with `--no-fs-tools`.
+
+Everything the model can reach:
+
+| Mount | Mode | Purpose |
+| --- | --- | --- |
+| `/usr` (+ `/bin`, `/lib`, … symlinks) | read-only | toolchain binaries and libraries |
+| `/etc/resolv.conf`, `/etc/ssl` | read-only | DNS/TLS when network access is on |
+| `/proc`, `/dev`, `/tmp` | fresh/empty | isolated procfs, empty devtmpfs, tmpfs |
+| workspace → `/workspace` | read-write, or read-only in plan mode | your real directory, edited in place |
+| `.git` directory (same host path) | read-only | `git status`/`diff`/`log` work in the container; the harness does all git writes on the host |
+| `uv.lock` | read-only | `uv` may read it to build the project env, never rewrite it |
+| shared caches (`uv`, `pip`, `cargo`, `npm`) | read-write | offline installs from warm host caches; `~/.cargo`, `~/.rustup`, `~/.local` are bound read-only so PATH tools still resolve |
+| external refs → `.refs/<alias>` | read-only | the only bridge to host paths outside the workspace; writable mounts (e.g. a host-built `.venv`) are forced read-only in plan mode |
+| `.refs/` anchor | tmpfs | runtime-only inside the container, never a folder in your worktree |
+
+Everything else — the rest of `/`, `/home`, other users' files — does not
+exist as far as the model can tell. Stray writes outside the mounts land in
+an ephemeral container layer that dies with the process; they never reach
+the host.
+
+**Hidden paths.** When `respect_gitignore` is on, two categories of path are
+shadowed out of the container: whatever the repo's ignore rules flag
+(`.gitignore` / `.git/info/exclude`), and the `.gitignore` files themselves —
+an agent shouldn't see, let alone edit, the rules that decide what it can't
+see. bubblewrap can't remove a name from its parent directory's listing
+(that would need overlayfs/root), so "hidden" means **replaced**: an empty
+read-only placeholder is mounted over the path. The file still shows in
+`ls` (size 0), reads return emptiness, and writes fail with
+`read-only file system` — the real content is unreachable and untouched.
+Exceptions: `.git` stays visible (read-only), and `uv.lock` is never hidden
+(`uv` needs it to build the project env). The shadow set is computed when a
+session starts; files that become ignore-matched mid-session are shadowed at
+the next session (re)build.
+
+**Plan mode** is the same container with the workspace and every ref bound
+read-only, plus the editing tools removed from the tool set — so shell
+commands cannot change files either.
+
+**Live adjustments.** Everything mount-affecting (plan/write mode, network,
+gitignore shadowing, GPU access, refs) is fingerprinted; when a setting
+toggles at runtime (`/container`, `/mode`), the persistent shell restarts
+with the new mounts on its next command. Network access is off by default
+and only restored when you enable it. GPU access
+(re-binding `/dev/dri`, `/dev/kfd`, `/dev/nvidia*` and the sysfs/proc bits
+drivers need) is opt-in — see `gpu_access` under `container` above.
+
+**Git guard.** On top of the mounts, `run_bash` vetoes ref-identity
+git commands: `checkout <ref>`, `switch`, `worktree`, `rebase`,
+`reset --hard`, `branch -d/-m/-C`, `tag -d/-f`, `update-ref`, and
+`symbolic-ref` are rejected ("your branch and refs are the user's"), while
+read-only git (`status`, `diff`, `log`, `show`, `blame`) and `git add`/
+`commit` still work. This is a best-effort UX safety net, not a security
+boundary — the boundary is the mount namespace. All snapshots, diffs, and
+reverts run host-side through throwaway indexes: the user's index, HEAD, and
+refs are never written from inside the sandbox, and what counts as "ignored"
+for change tracking is pinned at session start, so editing ignore files in
+the container cannot shift what `/diff` tracks.
 
 Expose external files read-only to the agent with `--ref ALIAS=PATH`
 (repeatable); they appear under `.refs/ALIAS` in the workspace and are
@@ -93,11 +150,9 @@ made yourself — while keeping the conversation going so the agent sees the
 reverted files on its next turn.
 
 If your `--workspace` is a subdirectory of a bigger repo, the session is
-scoped to that subdirectory: the agent's tools (ls/glob/grep, read/edit, and
-the shell's start directory) are rooted at *your* directory — not the repo
-root — tool writes land only inside it, and diffs/reverts cover only it.
-The rest of the repo stays mounted read-only for context (and reachable via
-`run_bash`), but it is not the agent's workspace.
+scoped to that subdirectory: the agent's sandbox mounts *your* directory as
+its workspace root (`/workspace`) — the rest of the repo isn't mounted in
+the container at all — and diffs/reverts cover only your directory.
 
 ### Undo and retry
 
@@ -183,9 +238,13 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     connections (default `false`). With it off, installs still work offline
     from the shared caches (`uv`, `pip`, `cargo`, `npm`).
   - `respect_gitignore` — paths matched by `.gitignore` / `.git/info/exclude`
-    are hidden from every tool (they don't exist inside the sandbox), so the
-    model never reads your build outputs or `.venv`. Set to `false` to expose
-    ignored files (default `true`).
+    are hidden from every tool: replaced in the sandbox by an empty read-only
+    placeholder (they show as 0-byte files; reads give emptiness, writes
+    fail), so the model never reads your build outputs or `.venv`. The
+    `.gitignore` files themselves are hidden the same way. Set to `false` to
+    expose ignored files (default `true`) — changes to ignored files then
+    still never show in `/diff` or `/undo`, because tracking pins the
+    session-start ignore rules.
   - `gpu_access` — expose the host's GPU device nodes (`/dev/dri`, `/dev/kfd`,
     `/dev/nvidia*`, `/dev/nvidia-caps`) and driver sysfs/proc paths so
     CUDA/ROCm code can run in the container (default `false`). Driver

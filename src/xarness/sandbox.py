@@ -83,10 +83,10 @@ _SHADOW: tuple[str, str] | None = None
 
 
 def _shadow_placeholders() -> tuple[str, str]:
-    """Host paths of an empty file and an empty directory, bind-mounted over
-    hidden paths to make them vanish (empty and read-only: writes hit the
-    placeholder, never the underlying worktree). One set is reused for the
-    process lifetime and cleaned up at exit."""
+    """Host paths of an empty file and an empty directory, bind-mounted
+    (read-only) over hidden paths to make them vanish: reads see emptiness,
+    writes fail. One set is reused for the process lifetime and cleaned up
+    at exit."""
     global _SHADOW
     if _SHADOW is None:
         root = tempfile.mkdtemp(prefix="xarness-shadow-")
@@ -117,11 +117,31 @@ def _git_ignored_paths(workspace: Path) -> list[str]:
     return [line.rstrip("/") for line in res.stdout.splitlines() if line]
 
 
+def _gitignore_files(workspace: Path) -> list[str]:
+    """Workspace-relative paths of every ``.gitignore`` git knows of here
+    (tracked or not — ``--others`` without ``--exclude-standard`` lists the
+    ignored ones too). These are hidden from the container whenever ignore
+    rules are respected: an agent must not see (let alone edit) the rules
+    that decide what it can't see. Empty when git can't answer."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(workspace), "ls-files", "--cached", "--others",
+             "--", "*.gitignore"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if res.returncode != 0:
+        return []
+    return [line for line in res.stdout.splitlines() if line]
+
+
 def _hidden_paths(workspace: Path) -> list[str]:
-    """Workspace-relative paths to shadow out of the container: exactly what
-    the repo's ignore rules flag (``.gitignore`` + ``.git/info/exclude``),
-    nothing invented here. ".git" stays visible (read-only). Children of an
-    already-hidden directory are dropped — shadowing the parent suffices.
+    """Workspace-relative paths to shadow out of the container: what the
+    repo's ignore rules flag (``.gitignore`` + ``.git/info/exclude``), plus
+    the ``.gitignore`` files themselves. ".git" stays visible (read-only).
+    Children of an already-hidden directory are dropped — shadowing the
+    parent suffices.
     "uv.lock" is never hidden: uv needs it to build the project env, and an
     empty shadow placeholder parses as a corrupt lock ("missing field
     `version`").
@@ -132,7 +152,9 @@ def _hidden_paths(workspace: Path) -> list[str]:
     def buried(rel: str) -> bool:
         return any(rel == d or rel.startswith(d + "/") for d in seen_dirs)
 
-    for rel in _git_ignored_paths(workspace):
+    for rel in dict.fromkeys(
+        _git_ignored_paths(workspace) + _gitignore_files(workspace)
+    ):
         if rel == "uv.lock" or rel == ".git" or rel.startswith(".git/") or buried(rel):
             continue
         if (workspace / rel).is_dir():
@@ -183,8 +205,9 @@ class SandboxConfig:
     # host (gitwork), so only it touches the index and object store.
     git_dir: Path | None = None
     # Workspace-relative paths (files and directories) hidden from the
-    # container: exactly what the repo's ignore rules flag. Computed once at
-    # construction; each path is shadowed with an empty placeholder in
+    # container: what the repo's ignore rules flag, plus the .gitignore
+    # files themselves. Computed once at construction; each path is shadowed
+    # with an empty placeholder in
     # build_argv, so ignored content is not just filtered from tool output —
     # it does not exist as far as every tool (bash included) can tell.
     # ".git" is excluded: it stays visible, read-only.
@@ -537,7 +560,11 @@ class SandboxConfig:
         for rel in self.hidden_paths:
             host = self.workspace / rel
             is_dir = host.is_dir() and not host.is_symlink()
-            argv += ["--bind", empty_dir if is_dir else empty_file, f"/workspace/{rel}"]
+            # Read-only: a write to a shadowed path must fail loudly
+            # ("read-only file system"), not silently succeed against the
+            # (shared) placeholder.
+            argv += ["--ro-bind", empty_dir if is_dir else empty_file,
+                     f"/workspace/{rel}"]
         uv_lock = self.workspace / "uv.lock"
         if uv_lock.is_file():
             # Read-only: uv run may read the lock to build the project env
@@ -547,7 +574,18 @@ class SandboxConfig:
         if self.git_dir is not None:
             # Same path as on the host, so git inside the sandbox resolves
             # it unchanged. Read-only: the harness does all git writes.
-            argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
+            # Only bindable when it lives inside the mounted workspace (a
+            # standalone repo): when the workspace is a subtree of a bigger
+            # repo, the git dir is outside the mount — and useless to the
+            # agent anyway, since it isn't an ancestor of /workspace — so
+            # binding it at its host path would only create stray container
+            # directories. Skip it.
+            try:
+                self.git_dir.relative_to(self.workspace)
+            except ValueError:
+                pass
+            else:
+                argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
         argv += self._cache_binds_and_env()
         refs_anchor = False
         for alias, ref in self.external_refs.items():

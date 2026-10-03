@@ -23,7 +23,8 @@ workspace.
 
 Also home to ``check_blocked_git`` — the best-effort filter that keeps the
 agent's shell tool from rewriting the user's branch/refs (checkout/switch,
-reset --hard, branch deletion, worktree/rebase). It is a UX safety net, not
+reset --hard, branch deletion/renaming, tag deletion/forcing, update-ref,
+worktree/rebase). It is a UX safety net, not
 a security boundary: the user's history is theirs; the agent edits files,
 not refs.
 """
@@ -81,6 +82,12 @@ class GitInfo:
     # Tree sha of the workspace state at session start — the base /diff
     # measures against. A plain object-sha, not a ref or commit.
     baseline_tree: str = ""
+    # Repo-root-relative paths the repo's ignore rules flagged at session
+    # start. Snapshots exclude them as explicit pathspecs (not by re-reading
+    # the worktree's .gitignore), so what /diff and /undo track is pinned for
+    # the whole session — even when the agent can see and edit .gitignore
+    # files in the container ("respect_gitignore" off).
+    ignored_paths: tuple[str, ...] = ()
 
     @property
     def agent_workspace(self) -> Path:
@@ -91,7 +98,7 @@ class GitInfo:
     def to_block(self) -> dict:
         """JSON-safe dict for the session file (paths as strings)."""
         return {
-            k: str(v) if isinstance(v, Path) else v
+            k: list(v) if isinstance(v, tuple) else (str(v) if isinstance(v, Path) else v)
             for k, v in asdict(self).items()
         }
 
@@ -103,6 +110,7 @@ class GitInfo:
             git_dir=Path(block["git_dir"]),
             subtree=block.get("subtree", ""),
             baseline_tree=block.get("baseline_tree", ""),
+            ignored_paths=tuple(block.get("ignored_paths", ())),
         )
 
 
@@ -219,7 +227,22 @@ def _temp_index() -> str:
     return name
 
 
-async def snapshot_tree(root: Path, subtree: str = "") -> str:
+async def _git_ignored_paths(root: Path) -> tuple[str, ...]:
+    """Repo-root-relative paths the repo's ignore rules flag at a moment in
+    time (directories collapsed to single entries), for pinning snapshot
+    semantics in :class:`GitInfo`. Empty when git can't answer."""
+    rc, out, _ = await _run_git(
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+        cwd=root,
+    )
+    if rc != 0:
+        return ()
+    return tuple(line.rstrip("/") for line in out.splitlines() if line)
+
+
+async def snapshot_tree(
+    root: Path, subtree: str = "", exclude: Iterable[str] = ()
+) -> str:
     """Tree sha capturing the workspace's *current* state.
 
     Built with a throwaway index: ``git add -A`` stages tracked changes,
@@ -227,6 +250,12 @@ async def snapshot_tree(root: Path, subtree: str = "") -> str:
     (the user's real index is untouched), then ``write-tree`` records it as
     a tree object. Ignored files are excluded — they are not reverted by
     /undo and don't show in /diff, matching classic git semantics.
+
+    Exclusion is two-layered: git's own ignore rules apply as always, and
+    ``exclude`` (repo-root-relative paths captured at session start) is
+    passed as explicit negative pathspecs — so mid-session edits to
+    .gitignore files (possible in the container when "respect_gitignore" is
+    off) cannot change what snapshots track.
 
     With ``subtree`` (repo-root relative), only that subtree is captured;
     the resulting tree's paths are still repo-root relative.
@@ -236,8 +265,19 @@ async def snapshot_tree(root: Path, subtree: str = "") -> str:
     try:
         env = {**os.environ, "GIT_INDEX_FILE": index}
         args = ["add", "-A"]
+        pathspecs: list[str] = []
         if subtree:
-            args += ["--", subtree]
+            pathspecs.append(subtree)
+        # Exclusions are ``**/``-anchored glob pathspecs rather than plain
+        # ``:(exclude)<path>``: a literal pathspec that names an ignored path
+        # makes ``git add`` fail with "paths are ignored … use -f" (the very
+        # paths we are excluding). The ``**/`` form avoids that and matches
+        # the path at any depth.
+        for p in exclude:
+            kind = "/**" if (root / p).is_dir() and not (root / p).is_symlink() else ""
+            pathspecs.append(f":(exclude,glob)**/{p}{kind}")
+        if pathspecs:
+            args += ["--", *pathspecs]
         rc, _, err = await _run_git(args, cwd=root, env=env)
         if rc != 0:
             raise GitWorktreeError(f"could not snapshot the workspace: {err.strip()}")
@@ -285,16 +325,22 @@ async def setup_tracking(
         subtree = workspace.relative_to(repo.root).as_posix()
         notes.append(
             f"workspace is inside an existing repo — tracking is scoped to "
-            f"{subtree}/; the rest of the repo is visible to the agent but "
-            "read-only"
+            f"{subtree}/; the agent's workspace is exactly that directory "
+            "(the rest of the repo isn't mounted in the sandbox and is "
+            "never touched by diffs or reverts)"
         )
-    baseline = await snapshot_tree(repo.root, subtree)
+    # Pin what snapshots track up front: with "respect_gitignore" off the
+    # agent can edit .gitignore files in the container, so ignore rules must
+    # not be re-read per snapshot.
+    ignored = await _git_ignored_paths(repo.root)
+    baseline = await snapshot_tree(repo.root, subtree, exclude=ignored)
     info = GitInfo(
         session_id=session_id,
         workspace=repo.root,
         git_dir=repo.git_common_dir,
         subtree=subtree,
         baseline_tree=baseline,
+        ignored_paths=ignored,
     )
     notes.append(
         f"the agent edits {info.agent_workspace} directly; changes are tracked "
@@ -307,13 +353,19 @@ async def setup_tracking(
 # per-turn checkpoints + revert
 
 
+async def snapshot_state(info: GitInfo) -> str:
+    """:func:`snapshot_tree` for a session's workspace, with its pinned
+    ignore exclusions applied."""
+    return await snapshot_tree(info.workspace, info.subtree, exclude=info.ignored_paths)
+
+
 async def checkpoint(info: GitInfo) -> str:
     """Snapshot the workspace's current state as a tree sha.
 
     Used for both halves of a turn's checkpoint: the before-tree taken when
     its user message is sent, and the after-tree recorded once its edits
     finish. :func:`revert_turn` reverses the difference."""
-    return await snapshot_tree(info.workspace, info.subtree)
+    return await snapshot_state(info)
 
 
 async def accept_changes(info: GitInfo) -> str:
@@ -324,7 +376,7 @@ async def accept_changes(info: GitInfo) -> str:
     last accept), and /undo //retry can no longer revert file state past
     this point — earlier turns' checkpoints are rewritten to the accepted
     tree by the caller. Returns the accepted tree sha."""
-    sha = await snapshot_tree(info.workspace, info.subtree)
+    sha = await snapshot_state(info)
     info.baseline_tree = sha
     return sha
 
@@ -347,7 +399,7 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
     workspace (installs, background jobs, network calls) is not undone."""
     root = info.workspace
     if current is None:
-        current = await snapshot_tree(root, info.subtree)
+        current = await snapshot_state(info)
 
     # Paths present now but absent in the target: created since the
     # checkpoint. diff-tree current→tree reports them as deletions (D).
@@ -455,7 +507,7 @@ async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str |
         return None  # the turn made no edits — nothing to reverse
 
     root = info.workspace
-    current_tree = await snapshot_tree(root, info.subtree)
+    current_tree = await snapshot_state(info)
 
     base = await _wrap_commit(root, after_tree)     # state right after the turn
     theirs = await _wrap_commit(root, before_tree)  # target: state before the turn
@@ -543,7 +595,7 @@ async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra
 async def _diff_trees(info: GitInfo, *extra: str) -> str:
     """Diff the workspace's current state (tracked, uncommitted, and
     untracked-not-ignored files) against the session's baseline tree."""
-    current = await snapshot_tree(info.workspace, info.subtree)
+    current = await snapshot_state(info)
     return await _diff_tree_pair(info, info.baseline_tree, current, *extra)
 
 
@@ -624,9 +676,7 @@ async def diff_stat(info: GitInfo) -> DiffStat:
     """Per-file +/- line counts of everything that changed since the
     session's baseline. With a scoped subtree, limited to it, paths
     relative to it."""
-    return await tree_diff_stat(info, info.baseline_tree, await snapshot_tree(
-        info.workspace, info.subtree
-    ))
+    return await tree_diff_stat(info, info.baseline_tree, await snapshot_state(info))
 
 
 async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> DiffStat:
@@ -639,7 +689,7 @@ async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> Di
     agent-caused; anything else in the total is drift (made outside the
     session — manual edits, or edits from a prior harness run).
     """
-    current = await snapshot_tree(info.workspace, info.subtree)
+    current = await snapshot_state(info)
     total = await tree_diff_stat(info, info.baseline_tree, current)
 
     agent_touched: set[str] = set()
@@ -695,14 +745,14 @@ class DiffStat:
 
 _BLOCK_REASON = (
     "blocked: your branch and refs are the user's — git checkout <ref>, git "
-    "switch, git worktree, git branch -d/-D, git reset --hard, and git rebase "
-    "are not available in this shell. Continue editing files normally; "
-    "read-only git commands (status, diff, log, show, blame) and git "
-    "add/commit still work."
+    "switch, git worktree, git branch -d/-m, git tag -d/-f, git update-ref, "
+    "git reset --hard, and git rebase are not available in this shell. "
+    "Continue editing files normally; read-only git commands (status, diff, "
+    "log, show, blame) and git add/commit still work."
 )
 
 # Subcommands that always change identity — blocked outright.
-_BLOCKED_SUBCOMMANDS = {"switch", "worktree", "rebase"}
+_BLOCKED_SUBCOMMANDS = {"switch", "worktree", "rebase", "update-ref", "symbolic-ref"}
 # Global git flags that consume a following value.
 _GIT_VALUE_FLAGS = {
     "-C", "-c", "--git-dir", "--work-tree", "--namespace",
@@ -724,7 +774,14 @@ def _check_git_args(
 
     if sub in _BLOCKED_SUBCOMMANDS:
         return _BLOCK_REASON
-    if sub == "branch" and any(a in ("-d", "-D", "--delete") for a in rest):
+    # Renames/copies move or duplicate refs just like deletions do.
+    if sub == "branch" and any(
+        a in ("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy")
+        for a in rest
+    ):
+        return _BLOCK_REASON
+    # Forcing or deleting a tag rewrites a ref the user owns.
+    if sub == "tag" and any(a in ("-d", "-D", "--delete", "-f", "--force") for a in rest):
         return _BLOCK_REASON
     if sub == "reset" and "--hard" in rest:
         return _BLOCK_REASON

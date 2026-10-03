@@ -330,15 +330,18 @@ class ChatController:
         Handles messages the last compaction summarized away too — the
         pre-compaction snapshot is restored first, then truncated at the
         clicked turn. Returns None when the message is not a user turn in this
-        conversation, or is the latest one (nothing after it to drop).
+        conversation. Even with nothing to drop (no later messages, no file
+        edits) the plan is still produced so the message's text is put back
+        in the input.
         """
         if message.role != "user":
             return None
         messages = self.conversation.messages
         index = next((i for i, m in enumerate(messages) if m is message), None)
         if index is not None:
-            if index == len(messages) - 1:
-                return None  # nothing after it yet
+            # Even when the message is the latest one (nothing after it to
+            # drop) we still produce a plan: the text goes back into the
+            # input, with empty drop/revert lists.
             keep = list(messages[:index])
             dropped = list(messages[index:])
             clears = not any(_is_summary(m) for m in keep)

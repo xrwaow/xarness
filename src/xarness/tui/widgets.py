@@ -413,6 +413,7 @@ class AssistantMessage(Vertical):
         super().__init__(classes="msg assistant")
         self._live_text = ""
         self._has_settled = False
+        self._finalized = False
         self._live_dirty = False
         self._flush_timer: Timer | None = None
 
@@ -454,7 +455,14 @@ class AssistantMessage(Vertical):
         await content.mount(SettledMarkdown(chunk), before=live)
 
     async def finalize(self) -> None:
-        """Settle whatever's left in the live tail; drop the now-empty Static."""
+        """Settle whatever's left in the live tail; drop the now-empty Static.
+
+        Idempotent: also called after stream errors and interrupts (paths
+        that never see TurnComplete) so the streamed text always ends up in
+        selectable SettledMarkdown rather than the plain live Static."""
+        if self._finalized:
+            return
+        self._finalized = True
         if self._flush_timer is not None:
             self._flush_timer.stop()
             self._flush_timer = None
@@ -660,14 +668,23 @@ def _partial_string(args_text: str, key: str, unescape: bool = False) -> str | N
 def _write_file_loc(args_text: str) -> int | None:
     """Best-effort line count of write_file's ``content`` argument while its
     JSON is still streaming. Complete JSON counts exactly; a partial one
-    counts the escaped ``\\n`` sequences after the "content" key."""
+    counts the escaped ``\\n`` sequences after the "content" key. A
+    trailing newline doesn't start a new line."""
     content = _json_tool_args(args_text).get("content")
     if isinstance(content, str):
-        return content.count("\n") + 1 if content else 0
+        return _line_count(content)
     raw = _partial_string(args_text, "content")
     if raw is None:
         return None
-    return raw.count("\\n") + 1 if raw else 0
+    return _line_count(raw.replace("\\\\", "").replace("\\n", "\n"))
+
+
+def _line_count(text: str) -> int:
+    """Number of lines in ``text``; a trailing newline ends a line, not
+    starts one (so "a\\nb\\n" is 2 lines, "a\\nb\\nc" is 3)."""
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
 def _live_edit_counts(args_text: str) -> str | None:
@@ -700,7 +717,7 @@ def _live_edit_counts(args_text: str) -> str | None:
 
 def _stream_label(tool_name: str, args_text: str) -> str:
     """Live one-line label for a call whose arguments are streaming or that
-    is executing: '<tool> <detail>', e.g. 'write_file g.py +4 LOC',
+    is executing: '<tool> <detail>', e.g. 'write_file +4 g.py',
     'run_bash git status', 'edit_file +2 -1 app.py'. Falls back to the bare
     tool name until enough of the arguments has arrived."""
     args = _json_tool_args(args_text)
@@ -711,7 +728,7 @@ def _stream_label(tool_name: str, args_text: str) -> str:
     if tool_name == "write_file":
         loc = _write_file_loc(args_text)
         detail = " ".join(
-            part for part in (path, f"+{loc} LOC" if loc is not None else None) if part
+            part for part in (f"+{loc}" if loc is not None else None, path) if part
         )
         return f"write_file {detail}".rstrip()
     if tool_name == "edit_file":
@@ -759,6 +776,19 @@ def _header_detail_text(tool_name: str, header: str) -> Text | None:
             detail.append(adds, style=theme.PALETTE["diff_add"])
             detail.append(" ", style=muted)
             detail.append(dels, style=theme.PALETTE["diff_del"])
+            detail.append(f" {path}", style=muted)
+        else:
+            detail.append(header, style=muted)
+        return detail
+    if tool_name == "write_file":
+        # The tool's header is "+N path"; the count gets the diff's add
+        # color so it reads at a glance, path stays dimmed. Older sessions
+        # stored just the path — fall back to plain dimmed.
+        detail = Text(" ", style=muted)
+        counts = re.match(r"^(\+\d+) (.+)$", header)
+        if counts:
+            loc, path = counts.groups()
+            detail.append(loc, style=theme.PALETTE["diff_add"])
             detail.append(f" {path}", style=muted)
         else:
             detail.append(header, style=muted)
@@ -877,7 +907,7 @@ class ToolCallBlock(Vertical):
         if self.has_class("expanded"):
             self._refresh_body()
         # The shimmer animates only the tool name; the args-derived detail
-        # ('g.py +4 LOC', 'git status') renders statically after it.
+        # ('g.py +4', 'git status') renders statically after it.
         if self.is_mounted:
             try:
                 name, detail = _stream_parts(
@@ -1439,15 +1469,13 @@ class DiffSummary(Vertical):
         add_w = max(len(f"+{f.additions}") for f in stat.files)
         del_w = max(len(f"-{f.deletions}") for f in stat.files)
         for f in stat.files:
-            # Row layout: name  dir/  [new]  +N -M — the whole row is
-            # clickable and requests that file's unified diff. The "new"
-            # badge gets its own column so it never wraps the file name.
+            # Row layout: name  [new]  +N -M — the whole row is clickable
+            # and requests that file's unified diff. The "new" badge gets
+            # its own column so it never wraps the file name.
             row = Horizontal(classes="diff-file-row")
             row.diff_key = f.path  # type: ignore[attr-defined]
             await files.mount(row)
             row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
-            directory = f.path.rsplit("/", 1)[0] + "/" if "/" in f.path else ""
-            row.mount(Static(Text(directory), classes="diff-file-dir", markup=False))
             # Source tag: "agent" for a turn's edits, "drift" for changes
             # made outside the session.
             source_class = "drift" if "drift" in f.source else "agent"
@@ -1602,7 +1630,7 @@ class ToolWritingIndicator(Horizontal):
     """Single amber-dot shimmer shown while tool-call arguments are still
     streaming — replaces the per-block 'Running [tool]' shinies, which only
     make sense once a call actually executes. The shimmer sweeps over the
-    tool name only; the arguments-derived detail ('write_file g.py +4 LOC',
+    tool name only; the arguments-derived detail ('write_file g.py +4',
     'run_bash git stat…') is appended as static text as fragments arrive.
 
     Owns the streaming-arguments state itself: fragments are accumulated per

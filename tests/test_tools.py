@@ -249,11 +249,13 @@ def test_write_file_creates_then_overwrites(tmp_path) -> None:
     ))
     assert first.ok
     assert first.output.startswith("created ")
+    assert first.header == "+1 new.txt"
     second = asyncio.run(registry.call(
         "write_file", '{"path": "new.txt", "content": "bye\\n"}'
     ))
     assert second.ok
     assert second.output.startswith("overwrote ")
+    assert second.header == "+1 new.txt"
     assert (tmp_path / "new.txt").read_text() == "bye\n"
 
 

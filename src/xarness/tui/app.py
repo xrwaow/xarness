@@ -156,6 +156,10 @@ class _RoundView:
             await self.app._complete_round(event, self.thinking, self.assistant)
         elif isinstance(event, StreamError):
             await self._hide_indicator()
+            if self.assistant is not None:
+                # No TurnComplete follows an error: settle the streamed text
+                # here, or it stays in the unselectable live Static.
+                await self.assistant.finalize()
             await self.chat.mount(ErrorLine(event.message))
             self.had_stream_error = True
 
@@ -179,6 +183,10 @@ class _RoundView:
             await self.app._dismiss_indicator(self.indicator)
         if self.thinking is not None and not self.thinking.done:
             self.thinking.finish(duration=None)
+        if self.assistant is not None:
+            # Interrupted rounds never reach TurnComplete/finalize: settle the
+            # partial answer so it's selectable (and matches the /resume replay).
+            await self.assistant.finalize()
         for block in self.tool_blocks.values():
             if block.status is ToolCallStatus.MAKING_CALL:
                 block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
@@ -190,34 +198,19 @@ SLASH_COMMANDS = [
     ("sessions", "resume a previous session"),
     ("mode", "switch between plan (read-only) and write mode"),
     ("container", (
-        "container settings: network access, .gitignore shadowing, external "
+        "network access, .gitignore shadowing, external "
         "references; save as defaults writes them to the config"
     )),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
-    ("delete", (
-        "delete the current session: remove the saved session file and start "
-        "a fresh chat (your files are left exactly as they are)"
-    )),
-    ("auto_compact", (
-        "toggle automatic compaction when the context window is {pct} full "
-        "(checked after each turn)"
-    )),
+    ("delete", "delete the current session and start a new one (your files are left exactly as they are)"),
+    ("auto_compact", "toggle automatic compaction when the context window is {pct} full"),
     ("diff", "show pending changes (optionally: /diff <path>)"),
-    ("output_limit", (
-        "show or set the per-tool output cap in chars — tool results longer "
-        "than this are truncated before reaching the model (/output_limit <chars>)"
-    )),
+    ("output_limit", "show or set the per-tool output cap in chars"),
     ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
     ("reject", "discard all changes made since the last /accept"),
-    ("undo", (
-        "drop the last turn: revert its file edits, put your message back "
-        "in the input (run_bash side effects are not undone)"
-    )),
-    ("retry", (
-        "revert the last turn's file edits and resend your message "
-        "(run_bash side effects are not undone)"
-    )),
+    ("undo", "drop the last turn and revert its file edits"),
+    ("retry", "revert the last turn's file edits and resend your message"),
 ]
 
 

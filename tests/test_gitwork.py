@@ -524,7 +524,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
         block = info.to_block()
-        assert all(isinstance(v, (str, int)) for v in block.values())
+        assert all(
+            isinstance(v, (str, int, list)) for v in block.values()
+        )
         restored = GitInfo.from_block(block)
         assert restored == info
 
@@ -565,6 +567,19 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert self.guard("git reset --hard") is not None
         assert self.guard("git rebase main") is not None
 
+    def test_blocks_ref_mutation_plumbing(self):
+        assert self.guard("git branch -m main other") is not None
+        assert self.guard("git branch --move main other") is not None
+        assert self.guard("git branch -C a b") is not None
+        assert self.guard("git update-ref -d refs/heads/main") is not None
+        assert self.guard("git update-ref refs/heads/main HEAD~1") is not None
+        assert self.guard("git symbolic-ref HEAD refs/heads/other") is not None
+        assert self.guard("git tag -d v1") is not None
+        assert self.guard("git tag -f v1 HEAD~1") is not None
+        # Creating a branch or a new tag is additive — allowed.
+        assert self.guard("git branch feature") is None
+        assert self.guard("git tag v1") is None
+
     def test_blocks_through_shell_operators_and_env_prefixes(self):
         assert self.guard("echo hi && git reset --hard") is not None
         assert self.guard("FOO=1 git reset --hard") is not None
@@ -572,6 +587,30 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
 
     def test_filter_blocks_even_without_branch_info(self):
         assert check_blocked_git("git reset --hard", None, None) is not None
+
+    # ------------------------------------------------------------------
+    # pinned ignore exclusions (snapshots ignore .gitignore edits)
+
+    async def test_snapshots_exclude_pinned_ignored_paths(self):
+        repo = self.make_repo()
+        (repo / ".gitignore").write_text("junk.log\n")
+        (repo / "keep.txt").write_text("k\n")
+        (repo / "junk.log").write_text("noise\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        info, _ = await setup_tracking(repo, "sess")
+        assert "junk.log" in info.ignored_paths
+
+        # The agent edits an ignored file and strips the ignore rule —
+        # neither may show up in snapshots/diffs.
+        (repo / "junk.log").write_text("agent noise\n")
+        (repo / ".gitignore").write_text("")
+        (repo / "new.txt").write_text("n\n")
+        stat = await diff_stat(info)
+        paths = {f.path for f in stat.files}
+        # junk.log's contents stay untracked; the .gitignore edit itself is
+        # a normal tracked change.
+        assert paths == {"new.txt", ".gitignore"}
 
 
 if __name__ == "__main__":  # pragma: no cover

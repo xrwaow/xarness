@@ -426,9 +426,10 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(body, Text)
             self.assertNotIn('{"path": "f.py"}', body.plain)
             self.assertNotIn("applied edit to f.py", body.plain)
-            # The diff is rendered (file header + hunk, changed lines included),
-            # not dumped as raw `diff --git`/`---`/`+++` text.
-            self.assertIn("── f.py", body.plain)
+            # The diff is rendered (hunk + changed lines, no per-file header
+            # — the path is already in the block's summary row), not dumped
+            # as raw `diff --git`/`---`/`+++` text.
+            self.assertNotIn("── f.py", body.plain)
             self.assertIn("@@ -1,2 +1,2 @@", body.plain)
             self.assertIn("old_line()", body.plain)
             self.assertIn("new_line()", body.plain)
@@ -562,29 +563,31 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(ToolCallBlock)), 1)
             self.assertEqual(len(app.query(ToolWritingIndicator)), 1)
             # The label names the call still being written (call_2).
-            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "noop")
+            self.assertEqual(
+                " ".join(app.query(ToolWritingIndicator)[0]._label()).rstrip(), "noop"
+            )
 
             await wait_until_idle(app)
             # Indicator gone; both blocks settled.
             self.assertEqual(len(app.query(ToolWritingIndicator)), 0)
             self.assertEqual(len(app.query(ToolCallBlock)), 2)
 
-    async def test_write_file_loc_counts_partial_content(self) -> None:
-        """write_file's +LOC counts complete JSON exactly and partial JSON
+    async def test_write_file_count_counts_partial_content(self) -> None:
+        """write_file's +count totals complete JSON exactly and partial JSON
         (mid-stream) from the escaped newlines seen so far."""
         from xarness.tui.widgets import _write_file_loc
 
         self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb\\nc"}'), 3)
         self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb"}'), 2)
-        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb\\n'), 3)
+        self.assertEqual(_write_file_loc('{"path": "g.py", "content": "a\\nb\\n'), 2)
         self.assertEqual(_write_file_loc('{"path": "g.py", "content": "'), 0)
         self.assertEqual(_write_file_loc('{"path": "g.py"}'), None)
         # An escaped quote inside content doesn't end the string early.
         self.assertEqual(_write_file_loc('{"content": "a\\"b\\nc"}'), 2)
 
-    async def test_write_file_streams_loc_in_writing_indicator(self) -> None:
+    async def test_write_file_streams_count_in_writing_indicator(self) -> None:
         """While write_file's content streams, the shared indicator grows a
-        live '+LOC' count; the label follows the next tool call after it."""
+        live '+count'; the label follows the next tool call after it."""
         app, client = make_app(
             [
                 ToolCallStarted("call_1", "write_file"),
@@ -603,13 +606,27 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             app._submit("go")
 
-            # Wait for the first content fragment: 2 escaped newlines so far.
+            # Wait for the first content fragment: "a\nb\n" = 2 lines so far.
             for _ in range(100):
                 await asyncio.sleep(0.05)
                 indicators = app.query(ToolWritingIndicator)
-                if indicators and "+3 LOC" in indicators[0]._label():
+                if indicators and "+2" in " ".join(indicators[0]._label()):
                     break
-            self.assertEqual(app.query(ToolWritingIndicator)[0]._label(), "write_file g.py +3 LOC")
+            self.assertEqual(
+                " ".join(app.query(ToolWritingIndicator)[0]._label()),
+                "write_file +2 g.py",
+            )
+
+            # The second fragment completes the JSON: "a\nb\nc\nd" = 4 lines.
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                indicators = app.query(ToolWritingIndicator)
+                if indicators and "+4" in " ".join(indicators[0]._label()):
+                    break
+            self.assertEqual(
+                " ".join(app.query(ToolWritingIndicator)[0]._label()),
+                "write_file +4 g.py",
+            )
 
             await wait_until_idle(app)
             self.assertEqual(len(app.query(ToolWritingIndicator)), 0)
@@ -637,6 +654,20 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             spans = {(detail.plain[s.start:s.end], str(s.style)) for s in detail.spans}
             self.assertIn(("+3", theme.PALETTE["diff_add"]), spans)
             self.assertIn(("-1", theme.PALETTE["diff_del"]), spans)
+
+    async def test_write_file_header_shows_line_count(self) -> None:
+        """Settled write_file blocks read 'write_file +N path' with the count
+        in the diff-add color; a legacy path-only header stays dimmed."""
+        from xarness import theme
+        from xarness.tui.widgets import _header_detail_text
+
+        detail = _header_detail_text("write_file", "+4 src/g.py")
+        self.assertEqual(detail.plain, " +4 src/g.py")
+        spans = {(detail.plain[s.start:s.end], str(s.style)) for s in detail.spans}
+        self.assertIn(("+4", theme.PALETTE["diff_add"]), spans)
+
+        legacy = _header_detail_text("write_file", "src/g.py")
+        self.assertEqual(legacy.plain, " src/g.py")
 
     async def test_auto_compact_uses_configured_threshold(self) -> None:
         """_maybe_auto_compact fires at the profile's auto_compact_threshold

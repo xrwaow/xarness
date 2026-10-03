@@ -355,7 +355,13 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         if write_result.exit_code != 0:
             return _exec_error(write_result, "write failed")
         verb = "created" if created else "overwrote"
-        return ToolResult(ok=True, output=f"{verb} {path} ({len(content)} bytes)", header=path)
+        loc = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        return ToolResult(
+            ok=True,
+            output=f"{verb} {path} ({len(content)} bytes)",
+            # Mirrors edit_file's '+N -M path': counts first, path last.
+            header=f"+{loc} {path}",
+        )
 
     return write_file
 

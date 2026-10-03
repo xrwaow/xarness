@@ -439,15 +439,9 @@ DiffSummary.expanded #diff-body {
 }
 
 .diff-file-name {
-    width: 26;
+    width: 1fr;
     text-overflow: ellipsis;
     color: $c-text;
-}
-
-.diff-file-dir {
-    width: 1fr;
-    color: $c-muted;
-    text-overflow: ellipsis;
 }
 
 .diff-file-new {
