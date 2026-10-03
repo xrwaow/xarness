@@ -411,11 +411,13 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"auto-compact {state}"))
             self._save_preference(auto_compact=self.auto_compact, profile=self.profile.name)
         elif cmd == "accept":
-            if self._git_action_preflight("accept") is not None:
-                self._start_accept()
+            preflight = self._git_action_preflight("accept")
+            if preflight is not None:
+                self._start_accept(*preflight)
         elif cmd == "reject":
-            if self._git_action_preflight("reject") is not None:
-                self._start_reject()
+            preflight = self._git_action_preflight("reject")
+            if preflight is not None:
+                self._start_reject(*preflight)
         elif cmd == "diff":
             arg = parts[1].strip() if len(parts) > 1 else ""
             self._show_diff_command(arg)
@@ -758,8 +760,13 @@ class AgentApp(App[None]):
                     message.checkpoint_sha = sha
                     message.after_tree = sha
 
-    def _git_action_preflight(self, label: str) -> GitInfo | None:
-        """Shared /accept //reject guards; mounts an error line if blocked."""
+    def _git_action_preflight(self, label: str) -> tuple[GitInfo, bool] | None:
+        """Shared /accept //reject guards; mounts an error line if blocked.
+
+        Returns the git info plus whether a turn is still generating — these
+        are allowed mid-turn (snapshots use throwaway indexes and the running
+        turn's checkpoint is rewritten like any other), the caller just warns
+        that the agent may keep editing."""
         info = self.git_info
         if info is None:
             self._post_line(ErrorLine(
@@ -767,18 +774,16 @@ class AgentApp(App[None]):
                 "isn't a git repo, or tracking setup failed)"
             ))
             return None
-        if self._turn_busy or self._compacting:
-            self._post_line(ErrorLine(f"/{label}: wait for the current turn or compaction to finish first"))
-            return None
-        return info
+        return info, self._turn_busy or self._compacting
 
     @work(group="git-action", exclusive=True)
-    async def _start_accept(self) -> None:
+    async def _start_accept(self, info: GitInfo, mid_turn: bool = False) -> None:
         """Lock in the changes made so far: they become the new baseline —
         off /diff's radar and out of /undo's reach. Work continues from
-        here, change-per-feature. (Guarding happens synchronously in the
-        slash-command handler; the worker assumes it passed.)"""
-        info = self.git_info
+        here, change-per-feature. Allowed mid-turn: the running turn's
+        checkpoint is rewritten along with the rest, so its eventual
+        after-tree measures from the accepted baseline too. (Guarding
+        happens synchronously in the slash-command handler.)"""
         if info is None:
             return
         try:
@@ -793,6 +798,11 @@ class AgentApp(App[None]):
         self._rewrite_checkpoints(sha)
         self._persist_git_state()
         await self.refresh_diff_summary()
+        if mid_turn:
+            self._post_line(NoticeLine(
+                "note: the current turn is still generating — it may keep "
+                "editing files on top of the accepted state"
+            ))
         if stat is None or not stat.files:
             self._post_line(NoticeLine(
                 "accepted: no pending changes — baseline reset; /diff and /undo "
@@ -805,11 +815,12 @@ class AgentApp(App[None]):
             ))
 
     @work(group="git-action", exclusive=True)
-    async def _start_reject(self) -> None:
+    async def _start_reject(self, info: GitInfo, mid_turn: bool = False) -> None:
         """Discard every change made since the last /accept: the workspace is
         restored to the accepted baseline. The conversation keeps going (the
-        agent sees the reverted files on its next turn)."""
-        info = self.git_info
+        agent sees the reverted files on its next turn). Allowed mid-turn —
+        the generating turn simply keeps working from the reverted files.
+        (Guarding happens synchronously in the slash-command handler.)"""
         if info is None:
             return
         try:
@@ -821,6 +832,11 @@ class AgentApp(App[None]):
         self._rewrite_checkpoints(info.baseline_tree)
         self._persist_git_state()
         await self.refresh_diff_summary()
+        if mid_turn:
+            self._post_line(NoticeLine(
+                "note: the current turn is still generating — it may keep "
+                "editing files on top of the reverted state"
+            ))
         if not stat.files:
             self._post_line(NoticeLine("rejected: nothing to discard"))
         else:

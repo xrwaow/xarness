@@ -440,6 +440,108 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("/accept: no change tracking" in e for e in errors))
             self.assertTrue(any("/reject: no change tracking" in e for e in errors))
 
+    async def test_accept_during_generation(self):
+        """/accept works mid-turn: the changes made so far become the new
+        baseline immediately, and the still-generating turn continues from
+        the accepted state (a warning says so)."""
+        script = [
+            ToolCallStarted("c1", "slow"),
+            ToolCallArgumentsDone("c1", "slow", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        app, info = await self.make_git_app(script)
+
+        async def slow(args: dict[str, Any]) -> ToolResult:
+            started.set()
+            await gate.wait()
+            (info.workspace / "app.py").write_text("post-accept edit\n")
+            return ToolResult(ok=True, output="ok")
+
+        app.tool_registry.register(Tool(
+            name="slow", description="", parameters_schema={}, handler=slow
+        ))
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await self.wait_until(lambda: app._turn_busy)
+            await self.wait_until(lambda: started.is_set())
+
+            # Accept while the tool is still blocked mid-turn.
+            app._handle_slash_command("/accept")
+            await self.wait_until(
+                lambda: any("accepted:" in str(n.content) for n in app.query(NoticeLine))
+            )
+            await self.wait_until(
+                lambda: any("still generating" in str(n.content) for n in app.query(NoticeLine))
+            )
+
+            # The turn resumes, editing on top of the accepted baseline.
+            gate.set()
+            await self.wait_until(lambda: not app._turn_busy)
+            stat = await diff_stat(info)
+            self.assertEqual({f.path for f in stat.files}, {"app.py"})
+
+            # The mid-turn accept rewrote every checkpoint so far — including
+            # the running turn's — so /undo drops the turn's messages without
+            # touching the accepted state. The edit made *after* the accept
+            # is still the running turn's own diff, so it reverts with it.
+            app._handle_slash_command("/undo")
+            await self.wait_until(lambda: app.query_one(ChatInput).text == "hi")
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+
+    async def test_reject_during_generation(self):
+        """/reject works mid-turn: the workspace is restored to the baseline
+        while the turn is still generating, which then keeps working from the
+        reverted files."""
+        script = [
+            ToolCallStarted("c1", "slow"),
+            ToolCallArgumentsDone("c1", "slow", "{}"),
+            TurnComplete(has_tool_calls=True),
+        ]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        app, info = await self.make_git_app(script)
+
+        async def slow(args: dict[str, Any]) -> ToolResult:
+            started.set()
+            await gate.wait()
+            (info.workspace / "app.py").write_text("post-reject edit\n")
+            return ToolResult(ok=True, output="ok")
+
+        app.tool_registry.register(Tool(
+            name="slow", description="", parameters_schema={}, handler=slow
+        ))
+        client = app.controller._client
+        client.next_scripts = [[ContentDelta("done"), TurnComplete(usage=None)]]
+        async with app.run_test() as pilot:
+            await pilot.press("h", "i", "enter")
+            await self.wait_until(lambda: app._turn_busy)
+            await self.wait_until(lambda: started.is_set())
+
+            # An un-accepted change lands while the tool is blocked.
+            (info.workspace / "app.py").write_text("un-accepted edit\n")
+            (info.workspace / "created.txt").write_text("new\n")
+
+            app._handle_slash_command("/reject")
+            await self.wait_until(
+                lambda: any("rejected: 2 file(s)" in str(n.content) for n in app.query(NoticeLine))
+            )
+            await self.wait_until(
+                lambda: any("still generating" in str(n.content) for n in app.query(NoticeLine))
+            )
+            self.assertEqual((info.workspace / "app.py").read_text(), "line1\nline2\n")
+            self.assertFalse((info.workspace / "created.txt").exists())
+
+            # The turn resumes and edits on top of the reverted state.
+            gate.set()
+            await self.wait_until(lambda: not app._turn_busy)
+            self.assertEqual((info.workspace / "app.py").read_text(), "post-reject edit\n")
+            stat = await diff_stat(info)
+            self.assertEqual({f.path for f in stat.files}, {"app.py"})
+
     async def test_delete_leaves_workspace_untouched(self):
         """Slash /delete is pure bookkeeping: it removes the saved session file
         and starts a fresh session, but never touches workspace files."""
