@@ -15,7 +15,8 @@ import re
 import time
 from typing import ClassVar, cast
 
-from rich.console import RenderableType
+from rich.console import Group, RenderableType
+from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -26,7 +27,8 @@ from textual.css.query import NoMatches
 from textual.highlight import highlight
 from textual.message import Message
 from textual.reactive import reactive
-from textual.widgets import Markdown, OptionList, Static, TextArea
+from textual.timer import Timer
+from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.markdown import MarkdownFence
 from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
@@ -113,7 +115,7 @@ class PaletteFence(MarkdownFence):
         return highlight(code, language=language or None, path=path, theme=theme.CodeHighlightTheme)
 
 
-def highlight_code(code: str, path: str | None = None) -> Content:
+def highlight_code(code: str, path: str | None = None, language: str = "") -> Content:
     """Highlight a code block the same way assistant-message fences do.
 
     Tool-call bodies (read_file/write_file) must match the LLM message
@@ -128,33 +130,55 @@ def highlight_code(code: str, path: str | None = None) -> Content:
     app = active_app.get()
     return PaletteFence.highlight(
         code,
-        language="",
+        language=language or None,
         ansi=app.native_ansi_color,
         dark=app.current_theme.dark,
         path=path,
     )
 
 
-class InlineMarkdown(Markdown):
-    """Markdown that sizes to its content instead of claiming free space.
+def _render_settled(text: str) -> RenderableType:
+    """Render a settled assistant chunk as a single Rich renderable.
 
-    Textual's Markdown is internally scroll-container-based and defaults to
-    height: 1fr — fine standalone, wrong when nested inside our own
-    scrolling chat log. Kept as a safety net even though the height bug we
-    actually hit turned out to be ThinkingBlock, not this — a long enough
-    assistant response could still exercise this path.
-    """
+    Prose goes through rich.markdown; fenced code goes through the same
+    palette-driven highlighter the tool-call bodies use, so code blocks keep
+    their exact styling. The result is width-independent: the Static showing
+    it re-wraps on resize like any Static."""
+    parts: list[RenderableType] = []
+    pos = 0
 
-    BLOCKS = {
-        **Markdown.BLOCKS,
-        "fence": PaletteFence,
-        "code_block": PaletteFence,
-    }
+    def add_prose(chunk: str) -> None:
+        prose = chunk.strip("\n")
+        if prose.strip():
+            # rich.markdown collapses soft line breaks (single newlines) into
+            # spaces, so "line1\nline2" renders as one sentence. Convert
+            # single newlines to markdown hard breaks so they render as
+            # actual newlines, matching Textual's Markdown widget.
+            prose = re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
+            parts.append(RichMarkdown(prose))
 
-    def on_mount(self) -> None:
-        self.styles.height = "auto"
-        self.styles.margin = 0
-        self.styles.padding = 0
+    for match in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
+        add_prose(text[pos : match.start()])
+        if parts:
+            parts.append(Content("\n"))
+        parts.append(highlight_code(match.group(2), language=match.group(1).strip()))
+        parts.append(Content("\n"))
+        pos = match.end()
+    add_prose(text[pos:])
+    if not parts:
+        parts.append(Content(""))
+    return Group(*parts) if len(parts) > 1 else parts[0]
+
+
+class SettledMarkdown(Static):
+    """One settled assistant chunk as a single cheap Static widget.
+
+    Replaces Textual's Markdown (which mounts a widget subtree per block and
+    makes every relayout of a long session touch all of them). The chunk is
+    display-only — it has no interactions, so a Static loses nothing."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(_render_settled(text), classes="assistant-md", markup=False)
 
 
 class ShimmerText(Static):
@@ -394,23 +418,31 @@ class AssistantMessage(Vertical):
     """Streams the answer, settling each closed code fence as it completes.
 
     ``.assistant-content`` holds an ordered stack: zero or more finalized
-    InlineMarkdown widgets (rendered once a fence closes, never re-rendered)
-    followed by exactly one live Static showing the still-streaming tail.
+    SettledMarkdown widgets (rendered once a fence closes, never re-rendered,
+    one cheap Static per chunk) followed by exactly one live Static showing the still-streaming tail.
     finalize() runs the same settle logic once more against any leftover
     text at turn-end, so there's a single code path for "this chunk is done,
     render it" whether it happens mid-stream or at the very end.
     """
 
+    # Coalesced live-tail rendering: re-render at a fixed rate, not per token.
+    _FLUSH_INTERVAL = 0.05
+
     def __init__(self) -> None:
         super().__init__(classes="msg assistant")
         self._live_text = ""
         self._has_settled = False
+        self._live_dirty = False
+        self._flush_timer: Timer | None = None
 
     def compose(self):
         with Horizontal(classes="assistant-row"):
             yield Static("•", classes="assistant-marker", markup=False)
             with Vertical(classes="assistant-content"):
                 yield Static("", classes="assistant-live", markup=False)
+
+    def on_mount(self) -> None:
+        self._live = self.query_one(".assistant-live", Static)
 
     async def append_delta(self, text: str) -> None:
         self._live_text += text
@@ -422,24 +454,38 @@ class AssistantMessage(Vertical):
         # before requesting tool calls, and the raw live tail renders them as
         # a blank gap until finalize() swaps in Markdown (which strips them).
         # _live_text itself stays intact for the fence-settling logic above.
-        self.query_one(".assistant-live", Static).update(self._live_text.rstrip())
+        self._live_dirty = True
+        if self._flush_timer is None:
+            self._flush_timer = self.set_timer(self._FLUSH_INTERVAL, self._flush)
+
+    def _flush(self) -> None:
+        """Coalesced live-tail re-render: at most ~20 Hz instead of per token."""
+        self._flush_timer = None
+        if not self._live_dirty or not self.is_mounted:
+            return
+        self._live_dirty = False
+        self._live.update(self._live_text.rstrip())
 
     async def _settle(self, chunk: str) -> None:
         self._has_settled = True
         content = self.query_one(".assistant-content", Vertical)
         live = content.query_one(".assistant-live", Static)
-        await content.mount(InlineMarkdown(chunk, classes="assistant-md"), before=live)
+        await content.mount(SettledMarkdown(chunk), before=live)
 
     async def finalize(self) -> None:
         """Settle whatever's left in the live tail; drop the now-empty Static."""
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        self._live_dirty = False
         content = self.query_one(".assistant-content", Vertical)
         live = content.query_one(".assistant-live", Static)
         tail = self._live_text
         await live.remove()
         if tail.strip():
-            await content.mount(InlineMarkdown(tail, classes="assistant-md"))
+            await content.mount(SettledMarkdown(tail))
         elif not self._has_settled:
-            await content.mount(InlineMarkdown("(no output)", classes="assistant-md"))
+            await content.mount(SettledMarkdown("(no output)"))
 
 
 class ThinkingBlock(Vertical):
@@ -455,13 +501,23 @@ class ThinkingBlock(Vertical):
     scrolls up the log stays where they put it.
     """
 
+    # Coalesced rendering: deltas accumulate and the text re-renders at a
+    # fixed rate instead of once per token.
+    _FLUSH_INTERVAL = 0.05
+
     def __init__(self) -> None:
         super().__init__(classes="msg thinking expanded")  # open while streaming
-        self._reasoning = ""
+        self._reasoning_parts: list[str] = []
+        self._text_dirty = False
+        self._flush_timer: Timer | None = None
         self._duration: float | None = None
         self._done = False
         self._start = time.monotonic()
         self.summary_text = "Thinking"
+
+    @property
+    def reasoning(self) -> str:
+        return "".join(self._reasoning_parts)
 
     def compose(self):
         with Horizontal(classes="thinking-summary"):
@@ -479,8 +535,23 @@ class ThinkingBlock(Vertical):
         return self._done
 
     def append_reasoning(self, text: str) -> None:
-        self._reasoning += text
-        self._refresh_text()
+        self._reasoning_parts.append(text)
+        self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        """Coalesce rapid deltas into one re-render per flush interval."""
+        self._text_dirty = True
+        if self._flush_timer is None and self.is_mounted:
+            self._flush_timer = self.set_timer(self._FLUSH_INTERVAL, self._flush)
+
+    def _flush(self) -> None:
+        self._flush_timer = None
+        if self._text_dirty and self.is_mounted:
+            self._text_dirty = False
+            self._refresh_text()
+
+    def _visible_reasoning(self) -> str:
+        return self.reasoning
 
     def finish(self, duration: float | None, estimate_if_unknown: bool = True) -> None:
         """Collapse to a static summary. First call wins.
@@ -499,6 +570,7 @@ class ThinkingBlock(Vertical):
         else:
             self._duration = None
         self.remove_class("expanded")  # shrink once finished
+        self._drop_text()
         self._swap_to_static_summary()
 
     def finish_unknown(self) -> None:
@@ -509,21 +581,37 @@ class ThinkingBlock(Vertical):
         self._done = True
         self._duration = None
         self.remove_class("expanded")
+        self._drop_text()
         self._swap_to_static_summary()
 
     def toggle(self) -> None:
         if self.has_class("expanded"):
             self.remove_class("expanded")
+            self._drop_text()
         else:
             self.add_class("expanded")
+            self._refresh_text()
 
     def on_click(self, event: events.Click) -> None:
         self.toggle()
         event.stop()
 
+    def _drop_text(self) -> None:
+        """Release the rendered reasoning (collapsed blocks show nothing;
+        the raw text stays in _reasoning_parts for re-expansion)."""
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        self._text_dirty = False
+        if self.is_mounted:
+            try:
+                self.query_one(".thinking-text", Static).update("")
+            except NoMatches:
+                pass  # DOM pruned during app shutdown
+
     def _refresh_text(self) -> None:
         if self.is_mounted:
-            self.query_one(".thinking-text", Static).update(self._reasoning)
+            self.query_one(".thinking-text", Static).update(self._visible_reasoning())
 
     def _swap_to_static_summary(self) -> None:
         summary_row = self.query_one(".thinking-summary", Horizontal)
@@ -785,6 +873,8 @@ class ToolCallBlock(Vertical):
         self._header = ""
         self._status = ToolCallStatus.MAKING_CALL
         self._output_text = ""
+        self._body_dirty = False
+        self._body_timer: Timer | None = None
 
     def compose(self):
         with Horizontal(classes="toolcall-summary"):
@@ -800,7 +890,11 @@ class ToolCallBlock(Vertical):
 
     def append_arguments(self, text: str) -> None:
         self.accumulated_arguments += text
-        self._refresh_body()
+        # Arguments can stream in large chunks (write_file bodies); the body
+        # is only visible when expanded, so skip re-rendering while collapsed
+        # and render once on expand instead.
+        if self.has_class("expanded"):
+            self._refresh_body()
         # The shimmer animates only the tool name; the args-derived detail
         # ('g.py +4 LOC', 'git status') renders statically after it.
         if self.is_mounted:
@@ -820,6 +914,15 @@ class ToolCallBlock(Vertical):
         final result replaces it via set_result anyway)."""
         self._output_text += text
         if self.is_mounted and self.has_class("expanded"):
+            self._body_dirty = True
+            if self._body_timer is None:
+                self._body_timer = self.set_timer(0.05, self._flush_body)
+
+    def _flush_body(self) -> None:
+        """Coalesced body re-render while output streams in."""
+        self._body_timer = None
+        if self._body_dirty and self.is_mounted and self.has_class("expanded"):
+            self._body_dirty = False
             self._refresh_body()
 
     def set_result(
@@ -839,18 +942,30 @@ class ToolCallBlock(Vertical):
         self._output_text = output or error
         self._header = header
         self._refresh_dot()
-        self._refresh_body()
+        self._refresh_body(force=True)
         self._render_summary()
 
     def toggle(self) -> None:
         if self.has_class("expanded"):
             self.remove_class("expanded")
+            self._clear_body()
         else:
             self.add_class("expanded")
-        # Body may have accumulated while collapsed (args streamed in,
-        # run_bash output arrived) — render it on expand.
-        self._refresh_body()
+            self._refresh_body(force=True)
         self._render_summary()
+
+    def _clear_body(self) -> None:
+        """Drop the rendered body on collapse; the raw args/output text stays
+        in memory and is re-rendered on the next expand."""
+        if self._body_timer is not None:
+            self._body_timer.stop()
+            self._body_timer = None
+        self._body_dirty = False
+        if self.is_mounted:
+            try:
+                self.query_one(".toolcall-body", Static).update("")
+            except NoMatches:
+                pass  # DOM pruned during app shutdown
 
     def on_click(self, event: events.Click) -> None:
         self.toggle()
@@ -874,9 +989,11 @@ class ToolCallBlock(Vertical):
             except NoMatches:
                 pass  # DOM pruned during app shutdown
 
-    def _refresh_body(self) -> None:
+    def _refresh_body(self, force: bool = False) -> None:
         if not self.is_mounted:
             return
+        if not force and not self.has_class("expanded"):
+            return  # collapsed: body isn't visible; rendered on expand
         try:
             static = self.query_one(".toolcall-body", Static)
         except NoMatches:

@@ -8,6 +8,8 @@ is sufficient — no threading a theme object through every widget.
 
 from __future__ import annotations
 
+import rich.theme as rich_theme
+
 from pygments.token import Token
 from textual.highlight import HighlightTheme, TokenType
 
@@ -109,6 +111,56 @@ def set_theme(name: str) -> None:
     # Compaction gets the accent color so it reads as a distinct, "shinier"
     # event than the neutral Processing/Thinking shimmers.
     SHIMMER_COMPACTING = (PALETTE["muted"], PALETTE["accent"])
+
+
+def _blend_hex(fg: str, bg: str, alpha: float) -> str:
+    """Composite fg over bg at the given opacity; returns a #rrggbb string."""
+    f = fg.lstrip("#")
+    b = bg.lstrip("#")
+    fr, fg_, fb = (int(f[i : i + 2], 16) for i in (0, 2, 4))
+    br, bg_, bb = (int(b[i : i + 2], 16) for i in (0, 2, 4))
+    mix = lambda a, b: round(a * alpha + b * (1 - alpha))
+    return "#{:02x}{:02x}{:02x}".format(
+        mix(fr, br), mix(fg_, bg_), mix(fb, bb)
+    )
+
+
+def rich_markdown_theme() -> "rich.theme.Theme":
+    """A rich Theme mapping rich.markdown's ``markdown.*`` style names onto
+    the active palette.
+
+    SettledMarkdown renders prose with rich.markdown, whose built-in styles
+    hardcode cyan/magenta-on-black — they ignore both the terminal palette
+    and the app theme. Pushing this theme onto the app console makes rich
+    resolve those names to palette colors instead. Mirrors the styling
+    Textual's own Markdown widget applies (theme-variable driven): headings
+    in the status/accent blue, bullets and links matching, inline code as
+    amber-on-amber-tint.
+    """
+    p = PALETTE
+    return rich_theme.Theme({
+        "markdown.paragraph": "",
+        "markdown.h1": f"bold underline {p['status']}",
+        "markdown.h2": f"bold underline {p['status']}",
+        "markdown.h3": f"bold {p['status']}",
+        "markdown.h4": f"italic bold {p['status']}",
+        "markdown.h5": f"italic {p['status']}",
+        "markdown.h6": f"{p['muted']}",
+        "markdown.h1.border": p["status"],
+        "markdown.code": f"bold {_blend_hex(p['warning'], p['bg'], 0.95)}",
+        "markdown.code_block": p["text"],
+        "markdown.item": "",
+        "markdown.item.bullet": "",
+        "markdown.item.number": "",
+        "markdown.link": p["status"],
+        "markdown.link_url": f"underline {p['status']}",
+        "markdown.block_quote": f"italic {p['muted']}",
+        "markdown.hr": p["border"],
+        "markdown.s": "strike",
+        "markdown.table.border": p["border"],
+        "markdown.table.header": f"bold {p['text']}",
+        "markdown.kbd": f"bold {p['accent2']}",
+    })
 
 
 set_theme(DEFAULT_THEME)

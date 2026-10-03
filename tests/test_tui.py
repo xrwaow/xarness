@@ -1143,17 +1143,23 @@ class TestChatScroll(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)):
             chat = app.query_one("#chat-log", VerticalScroll)
             app._submit("hi")
-            await wait_for(lambda: chat.max_scroll_y > 20)
+            # The live tail's rendered height is capped, so the log grows
+            # only a little mid-stream; wait for it to become scrollable.
+            await wait_for(lambda: chat.max_scroll_y > 2)
 
-            self._wheel_up(chat, times=5)
+            self._wheel_up(chat, times=2)
             parked = chat.scroll_y
-            grown_from = chat.max_scroll_y
 
-            # Still streaming: the log grew, but the viewport stays put.
+            # Still streaming: the viewport stays put while the live tail
+            # keeps receiving text (growth shows up in content, not height).
+            live = app.query_one(".assistant-live", Static)
+            seen = {str(live.content)}
             for _ in range(10):
                 await asyncio.sleep(0.02)
                 self.assertEqual(chat.scroll_y, parked)
-            self.assertGreater(chat.max_scroll_y, grown_from)
+                seen.add(str(live.content))
+            self.assertGreater(len(seen), 1)
+            self.assertLess(chat.scroll_y, chat.max_scroll_y)
             self.assertTrue(chat._anchor_released)
             await wait_until_idle(app)
 
