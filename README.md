@@ -165,6 +165,60 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
 - `default_theme` — startup color theme; optional, defaults to `ayu-darker`.
   Options: `"ayu-darker"`, `"one-light"`; `/theme` switches it
   live.
+- `container` — sandbox settings for the tools the model runs (all optional):
+
+  ```json
+  "container": {
+    "network_access": false,
+    "respect_gitignore": true,
+    "gpu_access": false,
+    "auto_include_refs": [
+      "docs/spec.md",
+      {"path": "~/prebuilt/venv", "mount": ".venv", "read_only": false}
+    ]
+  }
+  ```
+
+  - `network_access` — let tool commands inside the sandbox open network
+    connections (default `false`). With it off, installs still work offline
+    from the shared caches (`uv`, `pip`, `cargo`, `npm`).
+  - `respect_gitignore` — paths matched by `.gitignore` / `.git/info/exclude`
+    are hidden from every tool (they don't exist inside the sandbox), so the
+    model never reads your build outputs or `.venv`. Set to `false` to expose
+    ignored files (default `true`).
+  - `gpu_access` — expose the host's GPU device nodes (`/dev/dri`, `/dev/kfd`,
+    `/dev/nvidia*`, `/dev/nvidia-caps`) and driver sysfs/proc paths so
+    CUDA/ROCm code can run in the container (default `false`). Driver
+    userland comes from the read-only `/usr` bind; toggle it live with
+    `/container`. When enabled, a one-shot probe (`nvidia-smi -L` inside the
+    container) runs at startup and on toggle, and reports precisely why GPU
+    access fails if it does: a startup notice warning is your friend here.
+    Known nested-container pitfall: for **non-root** users NVML requires the
+    NVIDIA capability device nodes (`/dev/nvidia-caps/nvidia-cap1`,
+    `nvidia-cap2`); if the parent container passes `/dev/nvidia-caps` as an
+    empty directory (or not at all), `nvidia-smi` fails with "GPU access
+    blocked by the operating system" even though the plain `/dev/nvidia*`
+    nodes open fine. Pass the cap nodes through (or run the parent as root,
+    which bypasses the caps path) — no setting inside xarness can fix it.
+  - `auto_include_refs` — host paths bound into the container at runtime, so
+    the model can consult (or reuse) material outside the workspace. Two
+    entry forms:
+    - a plain path — bound **read-only** under `.refs/<alias>` (`.refs/` is a
+      runtime-only tmpfs in the container, never a folder in your worktree);
+    - an object `{"path", "mount", "read_only"}` — mount the host path at any
+      workspace-relative `mount`, optionally writable (e.g. drop a host-built
+      `.venv` into the project; writable mounts are forced read-only in plan
+      mode).
+
+    Paths may be absolute, `~`-expanded, or workspace-relative. The alias is
+    the path's basename; two same-named files from different paths are
+    disambiguated by prepending parent segments (`docs/spec.md` and
+    `~/notes/spec.md` become `.refs/spec.md` and `.refs/notes-spec.md`).
+    Missing paths are skipped.
+
+  Everything here is also adjustable per session with `/container` in the
+  TUI (settings popup); "save as defaults" there writes the current state
+  back into the config. The config values are the startup defaults.
 - `profiles` — list of profiles; switch with `--profile` (or `/model` in the
   TUI, which also sets reasoning effort). Each profile needs a unique `name`
   plus:
@@ -221,6 +275,7 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/model` | Choose the model and reasoning effort |
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
+| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references; "save as defaults" writes them to the config |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |

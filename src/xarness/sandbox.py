@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +27,39 @@ from typing import Literal
 
 # Subdirectories of the persistent sandbox cache, created on demand.
 _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
+
+# Host paths bwrap creates as bind mountpoints inside the workspace (a ref's
+# target, or the .refs tmpfs anchor). They are empty; removed at exit so the
+# worktree looks untouched (git ignores empty dirs anyway, but ls doesn't).
+_MOUNT_DIRS: set[Path] = set()
+_CLEANUP_REGISTERED = False
+
+
+def _note_mount_dir(path: Path) -> None:
+    global _CLEANUP_REGISTERED
+    if path.exists():
+        return  # pre-existing content — never touch it
+    _MOUNT_DIRS.add(path)
+    if not _CLEANUP_REGISTERED:
+        atexit.register(_cleanup_mount_dirs)
+        _CLEANUP_REGISTERED = True
+
+
+def _cleanup_mount_dirs() -> None:
+    for p in list(_MOUNT_DIRS):
+        try:
+            if p.is_dir():
+                p.rmdir()  # raises if it has (or gained) content
+            elif p.is_file() and p.stat().st_size == 0:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def cleanup_mount_dirs_now() -> None:
+    """Best-effort removal of the empty mountpoint dirs a session created
+    (called when a sandbox session closes; leftovers retry at exit)."""
+    _cleanup_mount_dirs()
 
 
 def sandbox_cache_root() -> Path:
@@ -109,6 +142,20 @@ def _hidden_paths(workspace: Path) -> list[str]:
 
 
 @dataclass(slots=True)
+class ContainerRef:
+    """One external path bound into the container.
+
+    ``mount`` is relative to the tool root: ``.refs/<alias>`` (the read-only
+    references area the system prompt describes — the folder itself is a
+    tmpfs, never a directory in the worktree) or any workspace-relative path
+    (e.g. ``.venv``, to drop a host-built venv into the project)."""
+
+    host: Path
+    mount: str
+    read_only: bool = True
+
+
+@dataclass(slots=True)
 class SandboxConfig:
     """Paths and policy for one sandboxed session."""
 
@@ -122,8 +169,13 @@ class SandboxConfig:
     # read-only, including any scoped subtree. Flipped by build_registry per
     # mode; a persistent SandboxSession restarts its shell when this changes.
     read_only: bool = False
-    external_refs: dict[str, Path] = field(default_factory=dict)
+    external_refs: dict[str, ContainerRef] = field(default_factory=dict)
     allow_network: bool = False
+    # Expose the host's GPU device nodes (/dev/dri, /dev/kfd, /dev/nvidia*)
+    # and the sysfs/proc bits drivers enumerate through, so CUDA/ROCm work
+    # inside the container. Off by default; driver userland ships in
+    # /usr/lib(64), which is already bound read-only.
+    gpu_access: bool = False
     timeout_seconds: float = 120.0
     # Host path of the repo's .git dir. Bound into the sandbox at its real
     # path so git reads (status/diff/log) work inside the sandbox. Bound
@@ -137,6 +189,10 @@ class SandboxConfig:
     # it does not exist as far as every tool (bash included) can tell.
     # ".git" is excluded: it stays visible, read-only.
     hidden_paths: tuple[str, ...] = ()
+    # When false (config "container": {"respect_gitignore": false}), ignored
+    # files stay visible in the container — hidden_paths is left empty instead
+    # of computed from the repo's ignore rules.
+    respect_gitignore: bool = True
 
     def __post_init__(self) -> None:
         if shutil.which("bwrap") is None:
@@ -159,13 +215,129 @@ class SandboxConfig:
                 )
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
-        self.hidden_paths = tuple(
+        self.hidden_paths = (
+            self._compute_hidden_paths() if self.respect_gitignore else ()
+        )
+
+    def _compute_hidden_paths(self) -> tuple[str, ...]:
+        return tuple(
             p for p in _hidden_paths(self.workspace)
             if not self.subtree or not (self.subtree == p or self.subtree.startswith(p + "/"))
         )
 
     def ref_path(self, alias: str) -> str:
         return f"{self.tool_root}/.refs/{alias}"
+
+    @property
+    def mount_key(self) -> tuple:
+        """Identity of everything that changes the container's mounts. A
+        persistent SandboxSession compares this before each command and
+        restarts its shell when it differs, so runtime adjustments (settings
+        popup, plan/write flips) take effect without losing the shell more
+        often than necessary."""
+        return (
+            self.read_only,
+            self.allow_network,
+            self.respect_gitignore,
+            self.gpu_access,
+            tuple(sorted(
+                (alias, str(ref.host), ref.mount, ref.read_only)
+                for alias, ref in self.external_refs.items()
+            )),
+            self.hidden_paths,
+        )
+
+    # ------------------------------------------------------------------
+    # Runtime adjustments (the TUI settings popup calls these; the shell
+    # restarts on the next command via mount_key).
+
+    def set_network_access(self, allow: bool) -> None:
+        self.allow_network = bool(allow)
+
+    def set_gpu_access(self, allow: bool) -> None:
+        self.gpu_access = bool(allow)
+
+    def set_respect_gitignore(self, respect: bool) -> None:
+        self.respect_gitignore = bool(respect)
+        self.hidden_paths = self._compute_hidden_paths() if respect else ()
+
+    def add_ref(
+        self,
+        host: str | Path,
+        *,
+        alias: str | None = None,
+        mount: str | None = None,
+        read_only: bool = True,
+    ) -> ContainerRef:
+        """Bind a host path into the container; returns the (possibly
+        disambiguated) entry. ``mount`` defaults to ``.refs/<alias>`` with
+        the alias from the path's basename; duplicate basenames prepend
+        parent segments until unique."""
+        host_path = Path(host).expanduser()
+        host_path = host_path if host_path.is_absolute() else self.workspace / host_path
+        host_path = host_path.resolve()
+        if not host_path.exists():
+            raise FileNotFoundError(f"no such path: {host_path}")
+        if alias is None:
+            alias = host_path.name
+            for depth in range(2, len(host_path.parts) + 1):
+                existing = self.external_refs.get(alias)
+                if existing is None or existing.host == host_path:
+                    break
+                alias = "-".join(host_path.parts[-depth:])
+        if mount is None:
+            mount = f".refs/{alias}"
+        mount = mount.strip("/")
+        if not mount or ".." in Path(mount).parts:
+            raise SandboxUnavailable(f"invalid ref mount point: {mount!r}")
+        ref = ContainerRef(host=host_path, mount=mount, read_only=read_only)
+        self.external_refs[alias] = ref
+        return ref
+
+    def remove_ref(self, alias: str) -> bool:
+        return self.external_refs.pop(alias, None) is not None
+
+    def ref_summary(self) -> list[tuple[str, str, bool]]:
+        """(alias, mount, read_only) for the settings UI and status lines."""
+        return [
+            (alias, ref.mount, ref.read_only)
+            for alias, ref in sorted(self.external_refs.items())
+        ]
+
+    @staticmethod
+    def resolve_auto_refs(
+        workspace: Path,
+        specs: Iterable[str | object],
+        external: dict[str, ContainerRef] | None = None,
+    ) -> dict[str, ContainerRef]:
+        """Turn config ``auto_include_refs`` entries (plain path strings or
+        ``RefSpec`` objects with ``path``/``mount``/``read_only``) into the
+        alias → ContainerRef map bound into the container.
+
+        Entries may be absolute (or ``~``-expanded) host paths or
+        workspace-relative paths. The alias is the path's basename,
+        disambiguated with parent segments when two paths share one (so
+        ``docs/spec.md`` and ``~/notes/spec.md`` become ``spec.md`` and
+        ``notes-spec.md``). Missing paths are skipped — refs are
+        conveniences, not hard requirements."""
+        resolved: dict[str, ContainerRef] = dict(external or {})
+        probe = SandboxConfig.__new__(SandboxConfig)  # add_ref without __post_init__
+        probe.workspace = Path(workspace).resolve()
+        probe.external_refs = resolved
+        for spec in specs:
+            if isinstance(spec, dict):
+                path = spec.get("path", "")
+                mount = spec.get("mount")
+                ro = spec.get("read_only", True)
+            else:
+                path = getattr(spec, "path", spec)
+                mount = getattr(spec, "mount", None)
+                ro = getattr(spec, "read_only", True)
+            try:
+                probe.add_ref(path, mount=mount, read_only=bool(ro))
+            except FileNotFoundError:
+                continue
+        return resolved
 
     @property
     def tool_root(self) -> str:
@@ -290,6 +462,54 @@ class SandboxConfig:
         argv = ["bwrap"]
         argv += self._system_ro_binds()
         argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+        if self.gpu_access:
+            # GPU compute: --dev above created an empty /dev, so bind the
+            # host's render/compute nodes back in (dev-bind: devices need
+            # more than read access). NVIDIA userland lives in /usr/lib(64),
+            # already bound read-only by _system_ro_binds.
+            gpu_devs = [
+                "/dev/dri", "/dev/kfd",
+                "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
+                "/dev/nvidia-modeset",
+                # Capability device nodes (nvidia-cap<N>): as a non-root user
+                # NVML is forced onto the caps path (/proc/driver/nvidia/
+                # capabilities → /dev/nvidia-caps/nvidia-cap<N>) and reports
+                # "GPU access blocked by the operating system" without them,
+                # even when the plain device nodes open fine.
+                "/dev/nvidia-caps",
+            ]
+            gpu_devs += sorted(str(p) for p in Path("/dev").glob("nvidia[0-9]*"))
+            for dev in gpu_devs:
+                p = Path(dev)
+                if p.is_dir():
+                    if any(p.iterdir()):
+                        argv += ["--dev-bind", dev, dev]
+                elif p.exists():
+                    argv += ["--dev-bind", dev, dev]
+            # Driver enumeration paths (nvidia management, PCI/DRM topology
+            # walks by torch and friends). Read-only; missing ones skipped.
+            for sys_path in (
+                "/proc/driver/nvidia",
+                "/sys/bus/pci", "/sys/class/drm", "/sys/devices",
+            ):
+                if Path(sys_path).exists():
+                    argv += ["--ro-bind", sys_path, sys_path]
+            # CUDA (cuInit) hard-requires the kernel modules' sysfs state
+            # files: without /sys/module/nvidia/initstate it aborts with
+            # CUDA_ERROR_OS (304); without nvidia_uvm's, with UNKNOWN (999)
+            # — even though every device ioctl succeeds. Bind every nvidia*
+            # module dir the parent exposes.
+            for mod in sorted(Path("/sys/module").glob("nvidia*")):
+                if mod.is_dir():
+                    argv += ["--ro-bind", str(mod), str(mod)]
+            if _caps_unusable():
+                # NVML prefers the capability path (caps files →
+                # /dev/nvidia-caps/nvidia-cap<N>) and fails hard when those
+                # nodes are missing/unreadable. Shadow the caps directory so
+                # NVML falls back to direct device access, like on hosts
+                # without exposed caps — direct ioctls are unaffected.
+                empty_file, empty_dir = _shadow_placeholders()
+                argv += ["--bind", empty_dir, "/proc/driver/nvidia/capabilities"]
         chdir = "/workspace"
         if self.subtree:
             # Whole workspace read-only — git keeps working (the .git file at
@@ -329,8 +549,27 @@ class SandboxConfig:
             # it unchanged. Read-only: the harness does all git writes.
             argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
         argv += self._cache_binds_and_env()
-        for alias, host_path in self.external_refs.items():
-            argv += ["--ro-bind", str(host_path.resolve()), self.ref_path(alias)]
+        refs_anchor = False
+        for alias, ref in self.external_refs.items():
+            target = f"{self.tool_root}/{ref.mount}"
+            if ref.mount == ".refs" or ref.mount.startswith(".refs/"):
+                # The references area is a tmpfs mounted inside the workspace:
+                # aliases appear in-container under .refs/ without any
+                # per-alias directory in the worktree. bwrap still mkdirs the
+                # tmpfs anchor itself on the host, so note it for cleanup.
+                if not refs_anchor:
+                    argv += ["--tmpfs", f"{self.tool_root}/.refs"]
+                    refs_anchor = True
+            else:
+                _note_mount_dir((self.workspace / self.subtree / ref.mount)
+                                if self.subtree else (self.workspace / ref.mount))
+            # Plan mode forces every ref read-only, like the rest of the
+            # workspace.
+            argv += ["--ro-bind" if (ref.read_only or self.read_only) else "--bind",
+                     str(ref.host), target]
+        if refs_anchor:
+            _note_mount_dir((self.workspace / self.subtree / ".refs")
+                            if self.subtree else (self.workspace / ".refs"))
         argv += ["--chdir", chdir, "--unshare-all"]
         if self.allow_network:
             argv += ["--share-net"]
@@ -344,6 +583,117 @@ class SandboxResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+
+
+GPU_PROBE_DEVICES = (
+    "/dev/nvidiactl", "/dev/dri", "/dev/kfd",
+)
+
+
+def _gpu_nodes_present() -> bool:
+    """Whether any GPU device node exists on the host (probe prerequisite)."""
+    return any(Path(p).exists() for p in GPU_PROBE_DEVICES)
+
+
+def _caps_unusable() -> bool:
+    """True when the driver exposes MIG capability files but the matching
+    /dev/nvidia-caps/nvidia-cap<N> nodes are absent OR not readable by this
+    user (e.g. nvidia-cap1 is cr-------- owned by another uid) — non-root
+    NVML then refuses GPU access outright with "GPU access blocked by the
+    operating system" before ever touching the real device."""
+    if not Path("/proc/driver/nvidia/capabilities/mig/config").exists():
+        return False
+    nodes = list(Path("/dev/nvidia-caps").glob("nvidia-cap*"))
+    if not nodes:
+        return True
+    return not all(os.access(p, os.R_OK) for p in nodes)
+
+
+def _module_sysfs_present(module: str = "nvidia") -> bool:
+    """Whether /sys/module/<module> is visible (CUDA init requires it)."""
+    return Path(f"/sys/module/{module}").is_dir()
+
+
+async def probe_gpu_access(config: SandboxConfig) -> tuple[str, str] | None:
+    """Verify GPU usability once ``gpu_access`` is on: run ``nvidia-smi -L``
+    inside a gpu-enabled sandbox.
+
+    bwrap can bind the device nodes, but a parent container's device cgroup
+    can still deny access (nested Docker/Podman without ``--gpus``); that
+    fails at ioctl time, so surface it up front instead of letting the
+    model's first CUDA call die mysteriously.
+
+    Returns (severity, message) — ``("info", ...)`` when CUDA answers,
+    ``("warn", ...)`` when nodes are bound but unusable — or None when there
+    is nothing to probe (no NVIDIA nodes, so nothing was bound)."""
+    if not _gpu_nodes_present():
+        return None
+    probe_config = SandboxConfig(
+        workspace=config.workspace,
+        subtree=config.subtree,
+        read_only=True,
+        gpu_access=True,
+        respect_gitignore=config.respect_gitignore,
+    )
+    result = await run_in_sandbox(probe_config, ["nvidia-smi", "-L"])
+    output = (result.stderr or result.stdout).strip().splitlines()
+    detail = output[0].strip() if output else ""
+    if result.timed_out:
+        return ("warn", "GPU probe timed out (nvidia-smi hung inside the container)")
+    if detail.startswith("bwrap:"):
+        # The probe sandbox itself failed to start (mounting /proc, etc.) —
+        # not a GPU problem; report it verbatim so it's not confused with a
+        # driver issue.
+        return ("warn", f"GPU probe sandbox failed to start: {detail}")
+    if result.exit_code == 0:
+        nvml_ok = "GPU access verified: " + (detail or "nvidia-smi -L ok")
+        # nvidia-smi passing doesn't guarantee CUDA: cuInit needs the
+        # modules' sysfs state files (nvidia_uvm's included). Verify the
+        # compute path too so a green probe means green CUDA.
+        cuda = await run_in_sandbox(
+            probe_config,
+            ["python3", "-c",
+             "import ctypes,sys;c=ctypes.CDLL('libcuda.so.1');"
+             "c.cuInit.argtypes=[ctypes.c_int];"
+             "rc=c.cuInit(0);print('cuInit',rc);sys.exit(0 if rc==0 else 4)"],
+        )
+        cuda_out = (cuda.stderr or cuda.stdout).strip().splitlines()
+        if cuda.exit_code == 0:
+            return ("info", nvml_ok)
+        if not _module_sysfs_present("nvidia_uvm"):
+            return ("warn",
+                    "nvidia-smi works but CUDA init fails: "
+                    "/sys/module/nvidia_uvm is not visible to the parent "
+                    "container (cuInit aborts with CUDA_ERROR_UNKNOWN/304 "
+                    "without it). The parent must pass /sys/module read-only "
+                    "(e.g. -v /sys/module:/sys/module:ro)")
+        return ("warn", f"{nvml_ok}; but CUDA init failed "
+                        f"({'; '.join(cuda_out) or 'cuInit nonzero'})")
+    if _caps_unusable():
+        # Non-root NVML is forced onto the capability path: the caps files
+        # name device minors under /dev/nvidia-caps, and without (readable)
+        # nodes it bails with "GPU access blocked by the operating system"
+        # before ever touching the real device.
+        return ("warn",
+                "NVIDIA capability device nodes are missing or not readable "
+                "by this user: NVML requires readable "
+                "/dev/nvidia-caps/nvidia-cap<N> nodes, otherwise it refuses "
+                "GPU access. Fix on the host/parent: chmod a+r "
+                "/dev/nvidia-caps/nvidia-cap1 (nvidia-cap2 is usually "
+                "already readable) or run the parent container as root, "
+                "which bypasses the caps path")
+    if "blocked" in detail or "cgroup" in detail:
+        return ("warn",
+                "GPU nodes are bound but access is denied by the OS (device "
+                "cgroup) — is xarness running nested in a container? The "
+                "parent needs the GPU passed through (--gpus all / --device)")
+    if not _module_sysfs_present():
+        return ("warn",
+                "CUDA driver sysfs is not visible: /sys/module/nvidia is "
+                "missing, so cuInit/nvidia-smi abort with CUDA_ERROR_OS (304) "
+                "even though the device nodes work. The parent container must "
+                "pass /sys/module (or run xarness outside the container)")
+    return ("warn", f"GPU probe failed (nvidia-smi exit {result.exit_code}): {detail}")
 
 
 async def run_in_sandbox(
@@ -385,17 +735,21 @@ class SandboxSession:
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
         self._read_only = config.read_only
+        self._mount_key: tuple | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
 
     async def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
-            # A read_only flip (plan/write mode switch) changes the mount
+            # Any change to the container's mounts (plan/write flip, runtime
+            # settings changes: network, .gitignore, refs) alters the mount
             # argv; the running shell was started under the old mounts, so
-            # restart it to pick up the new read-only (or read-write) view.
-            if self._read_only == self._config.read_only:
+            # restart it to pick up the new view.
+            key = self._config.mount_key
+            if self._mount_key == key:
                 return
             await self.close()
+        self._mount_key = self._config.mount_key
         self._read_only = self._config.read_only
         argv = self._config.build_argv(["/bin/sh"])
         self._proc = await asyncio.create_subprocess_exec(
@@ -485,6 +839,7 @@ class SandboxSession:
 
     async def close(self) -> None:
         if self._proc is None:
+            cleanup_mount_dirs_now()
             return
         try:
             if self._proc.stdin:
@@ -495,3 +850,6 @@ class SandboxSession:
             await self._proc.wait()
         finally:
             self._proc = None
+            # bwrap has torn down its tmpfs/bind mounts by now; drop the
+            # empty mountpoint dirs it created in the worktree.
+            cleanup_mount_dirs_now()

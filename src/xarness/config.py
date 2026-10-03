@@ -78,6 +78,94 @@ class ProviderProfile(BaseModel):
         return self.shown_name or self.model_id
 
 
+class RefSpec(BaseModel):
+    """One ``auto_include_refs`` entry with an explicit mount point.
+
+    Plain string entries mean "bind at ``.refs/<alias>``"; a RefSpec can
+    instead mount the host path anywhere workspace-relative (e.g. ``mount:
+    ".venv"`` to drop a host-built venv into the project) and mark it
+    writable."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    # Container path relative to the workspace root ("" = ``.refs/<alias>``
+    # with the alias derived from the path's basename).
+    mount: str | None = None
+    read_only: bool = True
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("path must be a non-empty host path")
+        if ".." in Path(value).parts:
+            raise ValueError(f"path must not contain '..': {value!r}")
+        return value
+
+    @field_validator("mount")
+    @classmethod
+    def _validate_mount(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().strip("/")
+        if not value:
+            return None
+        if ".." in Path(value).parts or value.startswith(".git"):
+            raise ValueError(f"mount must be a relative workspace path without '..': {value!r}")
+        return value
+
+
+class ContainerSettings(BaseModel):
+    """Sandbox/container knobs, top-level "container" section of the config.
+
+    Applies to the one sandbox all tools run in (see ``sandbox.py``);
+    independent of which profile is selected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Let tools inside the sandbox open network connections (bwrap
+    # --share-net). Off by default: cached installs and offline work cover
+    # most sessions, and the default blocks every raw socket.
+    network_access: bool = False
+    # Shadow paths flagged by .gitignore/.git/info/exclude out of the
+    # container (the default). Set false to expose ignored files (build
+    # outputs, .venv, ...) to the tools.
+    respect_gitignore: bool = True
+    # Expose the host's GPU device nodes (/dev/dri, /dev/kfd, /dev/nvidia*)
+    # plus driver sysfs/proc paths, so CUDA/ROCm code can run inside the
+    # container. Off by default.
+    gpu_access: bool = False
+    # Host paths bound into the container at runtime, so the model can
+    # consult (or, when writable, reuse) files that live outside the
+    # workspace: specs, notes, other checkouts, prebuilt toolchains. Entries
+    # are plain paths (bound read-only at ``.refs/<alias>``) or RefSpec
+    # objects with an explicit ``mount`` and ``read_only`` flag. The alias is
+    # derived from the path (its basename, disambiguated with parent segments
+    # when two paths share a basename).
+    auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
+
+    @field_validator("auto_include_refs", mode="before")
+    @classmethod
+    def _coerce_refs(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        out: list[str | dict[str, Any]] = []
+        for entry in value:
+            if isinstance(entry, str):
+                if not entry.strip():
+                    raise ValueError("auto_include_refs entries must be non-empty paths")
+                if ".." in Path(entry.strip()).parts:
+                    raise ValueError(f"auto_include_refs entry must not contain '..': {entry!r}")
+                out.append(entry.strip())
+            elif isinstance(entry, dict):
+                out.append(entry)
+            else:
+                out.append(entry)
+        return out
+
+
 @dataclass(frozen=True)
 class LoadedConfig:
     """Everything load_config derives from one config file read."""
@@ -88,6 +176,9 @@ class LoadedConfig:
     # All profile names in the file ([] for the flat form).
     profile_names: list[str]
     default_theme: str
+    # Container settings (sandbox policy); defaults when the config omits
+    # the "container" section.
+    container: ContainerSettings = Field(default_factory=ContainerSettings)
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -121,7 +212,8 @@ def _validate(path: Path, model: Any, data: Any) -> Any:
 
 def _named_profiles(path: Path, data: dict[str, Any]) -> list[ProviderProfile]:
     """Validate the named-profile form, returning its profiles."""
-    stray = [key for key in data if key not in ("default_profile", "default_theme", "profiles")]
+    stray = [key for key in data
+             if key not in ("default_profile", "default_theme", "profiles", "container")]
     if stray:
         raise ConfigError(
             f"{path} mixes a 'profiles' section with top-level fields {stray}; use one style or the other"
@@ -148,7 +240,7 @@ def _normalize(path: Path, data: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(f"'default_profile' in {path} is only meaningful alongside a 'profiles' section")
     fields = dict(data["provider"]) if "provider" in data else {
         key: value for key, value in data.items()
-        if key not in ("default_profile", "default_theme", "profiles", "provider")
+        if key not in ("default_profile", "default_theme", "profiles", "provider", "container")
     }
     return {**data, "profiles": [{"name": "default", **fields}], "default_profile": "default"}
 
@@ -179,9 +271,11 @@ def load_config(path: Path, profile_name: str | None = None) -> LoadedConfig:
             f"no profile named {selected!r} in {path}; available profiles: {', '.join(names)}"
         )
     by_name = {p.name: p for p in profiles}
+    container = _validate(path, ContainerSettings | None, data.get("container"))
     return LoadedConfig(
         by_name[selected], selected, names if isinstance(data.get("profiles"), list) else [],
         data.get("default_theme") or DEFAULT_THEME,
+        container or ContainerSettings(),
     )
 
 
@@ -191,6 +285,18 @@ def list_profile_names(path: Path) -> list[str]:
     if not isinstance(data.get("profiles"), list):
         return []
     return [p.name for p in _validate(path, list[ProviderProfile], _normalize(path, data)["profiles"])]
+
+
+def save_container_settings(path: Path, container: ContainerSettings) -> None:
+    """Persist the container settings as the file's global defaults (the TUI
+    settings popup's "save as defaults"). Written to the top-level
+    "container" section, in both config shapes."""
+    data = _read(path)
+    data["container"] = container.model_dump(mode="json", exclude_none=True)
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not write {path}: {exc}") from exc
 
 
 def save_preferences(

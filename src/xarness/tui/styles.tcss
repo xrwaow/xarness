@@ -577,16 +577,240 @@ DiffSummary.expanded #diff-body {
     color: $c-bg;
 }
 
-ResumeScreen, PickerScreen, ConfirmScreen {
+ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
     align: center middle;
 }
 
-#resume-modal, #picker-modal {
+#resume-modal, #picker-modal, #container-modal {
     width: 64;
     height: auto;
     max-height: 20;
     background: $c-surface;
     padding: 1 2;
+}
+
+#container-modal {
+    max-height: 30;
+}
+
+/* TabbedContent's tabs: recolor to the palette (default is Textual blue). */
+#container-tabs {
+    height: auto;
+}
+
+#container-tabs Tabs {
+    background: $c-surface;
+    border-bottom: hidden;
+    height: 1;
+}
+
+#container-tabs TabsTab {
+    background: transparent;
+    color: $c-muted;
+    padding: 0 2;
+    border: none;
+    height: 1;
+    text-style: none;
+}
+
+#container-tabs TabsTab.-active {
+    color: $c-accent;
+    background: $c-surface;
+    text-style: bold;
+}
+
+#container-tabs TabsTab:hover {
+    color: $c-text;
+    background: transparent;
+    text-style: none;
+}
+
+#container-tabs TabsTab.-active:hover {
+    color: $c-accent2;
+    text-style: bold;
+}
+
+#container-tabs Tabs .underline--bar {
+    color: $c-accent;      /* highlight segment */
+    background: $c-border; /* track */
+}
+
+#container-tabs TabPane {
+    background: $c-surface;
+    padding: 0;
+}
+
+#container-title {
+    color: $c-text;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.container-row {
+    height: 1;
+}
+
+.container-label {
+    width: 1fr;
+    color: $c-text;
+}
+
+/* Textual's Switch ships blue/green $panel shades; the slider is a component
+   class ("switch--slider"). One color per state, no focus/hover variation:
+   muted track when off, accent when on. No default border or focus tint. */
+#container-modal Switch {
+    border: none;
+    background: transparent;
+    background-tint: transparent;
+    padding: 0;
+}
+
+#container-modal Switch .switch--slider {
+    color: $c-muted;
+    background: $c-border;
+}
+
+#container-modal Switch.-on .switch--slider {
+    color: $c-accent;
+    background: $c-border;
+}
+
+#container-refs-title,
+#defaults-refs-title {
+    color: $c-muted;
+    margin-top: 1;
+    margin-bottom: 1;
+}
+
+#container-refs,
+#defaults-refs {
+    height: auto;
+    max-height: 8;
+    background: $c-surface;
+    border: none;
+    padding: 0;
+    margin-bottom: 1;
+}
+
+#container-refs > ListItem,
+#defaults-refs > ListItem {
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    height: auto;
+}
+
+/* One ref row: full host path on top, mount + rw switch + ✕ beneath. */
+.container-ref-item {
+    height: auto;
+}
+
+.container-ref-path {
+    color: $c-text;
+    width: 1fr;
+}
+
+.container-ref-mount {
+    color: $c-muted;
+    width: 1fr;
+}
+
+.container-ref-controls {
+    height: 1;
+}
+
+.container-ref-controls > Switch {
+    border: none;
+    background: transparent;
+    background-tint: transparent;
+    padding: 0;
+}
+
+.container-ref-controls > Switch .switch--slider {
+    color: $c-muted;
+    background: $c-border;
+}
+
+.container-ref-controls > Switch.-on .switch--slider {
+    color: $c-success;
+    background: $c-border;
+}
+
+.container-rm {
+    min-width: 3;
+    width: auto;
+    height: 1;
+    border: none;
+    background: transparent;
+    color: $c-muted;
+    padding: 0 1;
+}
+
+.container-rm:hover,
+.container-rm:focus {
+    background: $c-error;
+    color: $c-bg;
+    text-style: bold;
+}
+
+/* The add-ref bar: same shape as the /sessions search input — full width,
+   borderless, surface background; Enter adds the ref. */
+#container-ref-input,
+#defaults-ref-input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+}
+
+#container-ref-input:focus,
+#defaults-ref-input:focus {
+    background-tint: transparent;
+}
+
+#container-ref-input > .input--placeholder,
+#defaults-ref-input > .input--placeholder {
+    color: $c-muted;
+}
+
+#container-buttons {
+    height: auto;
+    align-horizontal: right;
+}
+
+/* Same recolor as the confirm modal: kill Textual's blue default buttons.
+   "Save as defaults" is the primary (accent) action. */
+#container-buttons > Button {
+    width: auto;
+    min-width: 8;
+    margin-left: 2;
+    padding: 0 2;
+    border: none;
+    background: $c-border;
+    color: $c-text;
+}
+
+#container-buttons > Button:hover,
+#container-buttons > Button:focus,
+#container-buttons > Button.-active {
+    background: $c-highlight;
+    color: $c-bg;
+    text-style: bold;
+}
+
+#container-buttons > Button#container-save {
+    background: $c-accent;
+    color: $c-bg;
+    text-style: bold;
+}
+
+#container-buttons > Button#container-save:hover,
+#container-buttons > Button#container-save:focus,
+#container-buttons > Button#container-save.-active {
+    background: $c-accent2;
+    color: $c-bg;
 }
 
 #resume-title, #picker-title {

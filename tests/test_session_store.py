@@ -78,3 +78,24 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
 async def _send(controller: ChatController, text: str) -> None:
     async for _ in controller.send(text):
         pass
+
+
+def test_load_drops_unknown_message_fields(tmp_path, monkeypatch) -> None:
+    """Stray keys in saved messages (older builds wrote e.g. a message-level
+    'kind') are dropped on load instead of raising TypeError in /sessions."""
+    import json
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    (tmp_path / "old-session.json").write_text(json.dumps({
+        "messages": [
+            {"role": "user", "content": "hi", "kind": "job_notification",
+             "some_future_field": 1},
+            {"role": "assistant", "content": "ho",
+             "usage": {"input_tokens": 1, "output_tokens": 2}},
+        ],
+        "turn_start": 0,
+    }), encoding="utf-8")
+
+    loaded = session_store.load_session("old-session")
+    assert [m.content for m in loaded.messages] == ["hi", "ho"]
+    assert loaded.messages[1].usage == Usage(1, 2)

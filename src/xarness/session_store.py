@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,14 @@ class SessionState:
     updated_at: str | None = None
 
 
+# Message's persisted fields; anything else in a saved file (stray keys
+# written by older builds, e.g. a message-level "kind") is dropped on load
+# instead of raising TypeError deep inside /sessions.
+_MESSAGE_FIELDS = {f.name for f in fields(Message)}
+
+
 def _message_from(raw: dict) -> Message:
+    raw = {k: v for k, v in raw.items() if k in _MESSAGE_FIELDS}
     if isinstance(raw.get("usage"), dict):
         raw["usage"] = Usage(**raw["usage"])
     if isinstance(raw.get("tool_calls"), list):

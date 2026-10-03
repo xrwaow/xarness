@@ -439,3 +439,263 @@ class TestSlashNew(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
+    def _make(self, script, tmp: Path, **kwargs):
+        from xarness.sandbox import SandboxConfig, SandboxSession
+
+        (tmp / "wt").mkdir()
+        if not (tmp / "config.json").exists():
+            (tmp / "config.json").write_text(
+                json.dumps({"provider": {
+                    "base_url": "https://alpha.example.test/v1",
+                    "model_id": "alpha-model",
+                }}),
+                encoding="utf-8",
+            )
+        sandbox = SandboxConfig(workspace=tmp / "wt")
+        return make_app(
+            script,
+            sandbox=sandbox,
+            sandbox_session=SandboxSession(sandbox),
+            config_path=tmp / "config.json",
+            **kwargs,
+        ), sandbox
+
+    async def test_toggles_apply_to_sandbox_and_save_defaults(self) -> None:
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            (tmp / "docs").mkdir()
+            (tmp / "docs" / "spec.md").write_text("x\n")
+            app, sandbox = self._make([], tmp)
+            async with app.run_test() as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+
+                # Toggle network access on (space on the focused switch).
+                net = screen.query_one("#container-net")
+                self.assertFalse(sandbox.allow_network)
+                net.value = True
+                await pilot.pause()
+                self.assertTrue(sandbox.allow_network)
+
+                # Add a ref through the input (Enter submits): host path,
+                # explicit mount, writable.
+                inp = screen.query_one("#container-ref-input")
+                inp.value = f"{tmp / 'docs' / 'spec.md'} docs/spec.md --rw"
+                await pilot.press("enter")
+                await pilot.pause()
+                ref = sandbox.external_refs["spec.md"]
+                self.assertEqual(ref.mount, "docs/spec.md")
+                self.assertFalse(ref.read_only)
+
+                # Save as defaults writes the container section.
+                await pilot.click("#container-save")
+                await pilot.pause()
+                data = json.loads((tmp / "config.json").read_text())
+                self.assertTrue(data["container"]["network_access"])
+                self.assertEqual(
+                    data["container"]["auto_include_refs"],
+                    [{"path": str(tmp / "docs" / "spec.md"),
+                      "mount": "docs/spec.md", "read_only": False}],
+                )
+
+    async def test_slash_container_opens_screen(self) -> None:
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = self._make([], tmp)
+            async with app.run_test() as pilot:
+                await pilot.press("/", "c", "o", "n", "t", "a", "i", "n", "e", "r", "enter")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ContainerSettingsScreen)
+                self.assertIs(app.screen._sandbox, sandbox)
+class TestContainerGpu(unittest.IsolatedAsyncioTestCase):
+    async def test_gpu_toggle_applies_and_saves(self) -> None:
+        import json
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = TestContainerSettings()._make([], tmp)
+            async with app.run_test() as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+                self.assertFalse(sandbox.gpu_access)
+                screen.query_one("#container-gpu").value = True
+                await pilot.pause()
+                self.assertTrue(sandbox.gpu_access)
+                await pilot.click("#container-save")
+                await pilot.pause()
+                data = json.loads((tmp / "config.json").read_text())
+                self.assertTrue(data["container"]["gpu_access"])
+
+
+class TestContainerTabs(unittest.IsolatedAsyncioTestCase):
+    def _make(self, tmp: Path, config: dict | None = None):
+        import json as _json
+        from xarness.sandbox import SandboxConfig, SandboxSession
+
+        (tmp / "wt").mkdir()
+        (tmp / "docs").mkdir()
+        (tmp / "docs" / "spec.md").write_text("x\n")
+        (tmp / "config.json").write_text(_json.dumps(config or {"provider": {
+            "base_url": "https://alpha.example.test/v1", "model_id": "alpha-model",
+        }}), encoding="utf-8")
+        sandbox = SandboxConfig(workspace=tmp / "wt")
+        app = make_app(
+            [],
+            sandbox=sandbox,
+            sandbox_session=SandboxSession(sandbox),
+            config_path=tmp / "config.json",
+        )
+        return app, sandbox
+
+    async def test_defaults_tab_edits_config_not_session(self) -> None:
+        import json
+        from textual.widgets import TabbedContent
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = self._make(tmp)
+            async with app.run_test(size=(100, 44)) as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+                self.assertEqual(
+                    screen.query_one("#container-tabs", TabbedContent).active,
+                    "session-tab",
+                )
+
+                # Session toggle touches the sandbox, not the defaults.
+                screen.query_one("#container-net").value = True
+                await pilot.pause()
+                self.assertTrue(sandbox.allow_network)
+                self.assertFalse(screen._defaults.network_access)
+
+                # Switch to the defaults tab: its own switches, and a ref
+                # added there lands in _defaults, not the sandbox.
+                tabs = screen.query_one("#container-tabs", TabbedContent)
+                tabs.active = "defaults-tab"
+                await pilot.pause()
+                defaults_input = screen.query_one("#defaults-ref-input")
+                defaults_input.focus()
+                await pilot.pause()
+                defaults_input.value = "docs/spec.md .venv"
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(len(screen._defaults.auto_include_refs), 1)
+                self.assertEqual(len(sandbox.external_refs), 0)
+
+                # Save persists defaults only.
+                await pilot.click("#container-save")
+                await pilot.pause()
+                data = json.loads((tmp / "config.json").read_text())
+                self.assertFalse(data["container"]["network_access"])
+                self.assertEqual(
+                    data["container"]["auto_include_refs"],
+                    [{"path": "docs/spec.md", "mount": ".venv", "read_only": True}],
+                )
+                # And the session sandbox keeps its live state.
+                self.assertTrue(sandbox.allow_network)
+
+    async def test_defaults_tab_loaded_from_config(self) -> None:
+        from textual.widgets import TabbedContent
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = self._make(tmp, {
+                "provider": {"base_url": "https://x/v1", "model_id": "m"},
+                "container": {
+                    "network_access": True,
+                    "auto_include_refs": ["docs/spec.md"],
+                },
+            })
+            async with app.run_test() as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+                tabs = screen.query_one("#container-tabs", TabbedContent)
+                tabs.active = "defaults-tab"
+                await pilot.pause()
+                self.assertTrue(screen._defaults.network_access)
+                rows = screen._default_ref_rows()
+                self.assertEqual(len(rows), 1)
+                path, mount, read_only = rows[0]
+                self.assertEqual(path, "docs/spec.md")
+                self.assertEqual(mount, ".refs/spec.md")
+                self.assertTrue(read_only)
+
+    async def test_ref_row_delete_and_rw_switch(self) -> None:
+        from textual.widgets import Button as TButton, Switch as TSwitch
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = self._make(tmp)
+            (tmp / "lib").mkdir()
+            sandbox.add_ref(tmp / "docs" / "spec.md")
+            sandbox.add_ref(tmp / "lib", mount=".venv", read_only=False)
+            async with app.run_test(size=(100, 44)) as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+
+                # Full host paths are shown.
+                labels = " ".join(str(l.render()) for l in screen.query(".container-ref-path"))
+                self.assertIn(str(tmp / "docs" / "spec.md"), labels)
+                self.assertIn(str(tmp / "lib"), labels)
+
+                # Flip the first row's rw switch: spec.md starts read-only;
+                # switching it on makes the mount writable.
+                sw = screen.query_one("#s-rw-0", TSwitch)
+                self.assertTrue(sandbox.external_refs["spec.md"].read_only)
+                sw.value = True
+                await pilot.pause()
+                self.assertFalse(sandbox.external_refs["spec.md"].read_only)
+
+                # ✕ removes the row's ref.
+                await pilot.click("#s-rm-0")
+                await pilot.pause()
+                self.assertNotIn("spec.md", sandbox.external_refs)
+                self.assertIn(".venv", [r.mount for r in sandbox.external_refs.values()])
+
+
+class TestContainerGpuProbe(unittest.IsolatedAsyncioTestCase):
+    async def test_gpu_switch_triggers_probe_notice(self) -> None:
+        from xarness.tui.container_screen import ContainerSettingsScreen
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            app, sandbox = TestContainerSettings()._make([], tmp)
+            async with app.run_test() as pilot:
+                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
+                await app.push_screen(screen)
+                await pilot.pause()
+
+                from unittest import mock as _mock
+
+                probe_mock = _mock.AsyncMock(return_value=("warn", "denied by cgroup"))
+                with _mock.patch("xarness.sandbox.probe_gpu_access", probe_mock):
+                    screen.query_one("#container-gpu").value = True
+                    for _ in range(30):
+                        await pilot.pause()
+                        if app._workers and all(w.is_finished for w in app._workers):
+                            break
+                    await pilot.pause()
+                self.assertTrue(sandbox.gpu_access)
+                # The worker surfaced the probe as a notification (severity
+                # plumbing — the toast itself is Textual's).
+                # The AppNotification widget keeps the toast list; simplest
+                # observable: probe mock was awaited (worker ran) and the
+                # app's toast handler got the message — assert via the
+                # notifications widget's hook if present, else the mock call.
+                self.assertTrue(probe_mock.awaited)

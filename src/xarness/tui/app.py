@@ -42,6 +42,7 @@ from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
 from .confirm_screen import ConfirmScreen
+from .container_screen import ContainerSettingsScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -188,6 +189,10 @@ SLASH_COMMANDS = [
     ("model", "choose what model and reasoning effort to use"),
     ("sessions", "resume a previous session"),
     ("mode", "switch between plan (read-only) and write mode"),
+    ("container", (
+        "container settings: network access, .gitignore shadowing, external "
+        "references; save as defaults writes them to the config"
+    )),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
     ("delete", (
@@ -440,6 +445,14 @@ class AgentApp(App[None]):
             )
         elif cmd == "mode":
             self._switch_mode()
+        elif cmd == "container":
+            if self.sandbox is None:
+                self._post_line(ErrorLine(
+                    "/container unavailable: filesystem/bash tools are disabled "
+                    "(bubblewrap missing), so there is no container to configure"
+                ))
+            else:
+                self.push_screen(ContainerSettingsScreen(self.sandbox, self.config_path))
         elif cmd == "output_limit":
             self._handle_output_limit(parts[1].strip() if len(parts) > 1 else "")
         elif cmd == "undo":

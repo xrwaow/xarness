@@ -125,11 +125,24 @@ def _run_chat(args: argparse.Namespace) -> None:
         sandbox = SandboxConfig(
             workspace=git_info.workspace if git_info is not None else workspace,
             subtree=git_info.subtree if git_info is not None else "",
-            external_refs={},
+            allow_network=loaded.container.network_access,
+            respect_gitignore=loaded.container.respect_gitignore,
+            gpu_access=loaded.container.gpu_access,
+            external_refs=SandboxConfig.resolve_auto_refs(
+                workspace, loaded.container.auto_include_refs,
+            ),
             git_dir=git_info.git_dir if git_info is not None else None,
         )
         session = SandboxSession(sandbox)
         effective_workspace = git_info.agent_workspace if git_info is not None else workspace
+        if loaded.container.gpu_access:
+            from . import sandbox as sandbox_mod
+            probe = asyncio.run(sandbox_mod.probe_gpu_access(sandbox))
+            if probe is not None:
+                level, message = probe
+                git_notices.append(
+                    message if level == "info" else f"warning: {message}"
+                )
     except SandboxUnavailable as exc:
         print(f"warning: filesystem/bash tools disabled: {exc}", file=sys.stderr)
         sandbox = session = None

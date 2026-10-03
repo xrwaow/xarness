@@ -308,3 +308,130 @@ def test_bad_auto_compact_threshold_rejected(tmp_path: Path, threshold: float) -
     )
     with pytest.raises(ConfigError, match="auto_compact_threshold"):
         load_config(path)
+
+
+def test_container_defaults(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {"provider": {"base_url": "https://api.openai.com/v1", "model_id": "gpt-4.1"}},
+    )
+    c = load_config(path).container
+    assert c.network_access is False
+    assert c.respect_gitignore is True
+    assert c.auto_include_refs == []
+
+
+def test_container_section_parsed(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "container": {
+                "network_access": True,
+                "respect_gitignore": False,
+                "auto_include_refs": ["docs/spec.md"],
+            },
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "gpt-4.1"},
+        },
+    )
+    c = load_config(path).container
+    assert c.network_access is True
+    assert c.respect_gitignore is False
+    assert c.auto_include_refs == ["docs/spec.md"]
+
+
+def test_container_named_profiles_form(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "default_profile": "a",
+            "container": {"network_access": True},
+            "profiles": [
+                {"name": "a", "base_url": "https://api.openai.com/v1", "model_id": "m"},
+                {"name": "b", "base_url": "https://api.openai.com/v1", "model_id": "m"},
+            ],
+        },
+    )
+    assert load_config(path).container.network_access is True
+
+
+def test_container_unknown_key_rejected(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "container": {"netwrok": True},
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
+        },
+    )
+    with pytest.raises(ConfigError, match="netwrok"):
+        load_config(path)
+
+
+def test_container_ref_with_dotdot_rejected(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "container": {"auto_include_refs": ["../escape"]},
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
+        },
+    )
+    with pytest.raises(ConfigError, match=r"\.\."):
+        load_config(path)
+
+
+def test_ref_spec_entries(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "container": {
+                "auto_include_refs": [
+                    "~/notes/api.md",
+                    {"path": "docs/spec.md", "mount": ".venv", "read_only": False},
+                ],
+            },
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
+        },
+    )
+    c = load_config(path).container
+    assert c.auto_include_refs[0] == "~/notes/api.md"
+    spec = c.auto_include_refs[1]
+    assert spec.path == "docs/spec.md"
+    assert spec.mount == ".venv"
+    assert spec.read_only is False
+
+
+def test_ref_spec_bad_mount_rejected(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {
+            "container": {
+                "auto_include_refs": [{"path": "x", "mount": "../escape"}],
+            },
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
+        },
+    )
+    with pytest.raises(ConfigError, match="mount"):
+        load_config(path)
+
+
+def test_save_container_settings_round_trip(tmp_path: Path) -> None:
+    from xarness.config import ContainerSettings, RefSpec, save_container_settings
+
+    path = write(
+        tmp_path,
+        {
+            "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
+        },
+    )
+    settings = ContainerSettings(
+        network_access=True,
+        respect_gitignore=False,
+        auto_include_refs=[
+            "docs/spec.md",
+            RefSpec(path="~/lib", mount=".venv", read_only=False),
+        ],
+    )
+    save_container_settings(path, settings)
+    data = json.loads(path.read_text())
+    assert data["container"]["network_access"] is True
+    loaded = load_config(path).container
+    assert loaded == settings

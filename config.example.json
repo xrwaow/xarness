@@ -1,6 +1,15 @@
 {
   "default_profile": "openai",
   "default_theme": "ayu-darker",
+  "container": {
+    "network_access": false,
+    "respect_gitignore": true,
+    "gpu_access": false,
+    "auto_include_refs": [
+      "docs/spec.md",
+      {"path": "~/prebuilt/venv", "mount": ".venv", "read_only": false}
+    ]
+  },
   "profiles": [
     {
       "name": "openai",
