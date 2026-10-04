@@ -1,10 +1,11 @@
 """Container settings popup, two tabs:
 
-- **Session** (default): live-mutates the running SandboxConfig — network
+- **Workspace** (default): live-mutates the running SandboxConfig — network
   access, .gitignore shadowing, GPU access, external references — plus the
-  session's auto-compact flag and per-tool output cap. The persistent shell
-  restarts on its next command via the sandbox's mount key; changes die with
-  the chat session.
+  auto-compact flag and per-tool output cap. Changes are persisted per
+  *workspace* (not per session), so every session launched in the same
+  workspace starts with them; the persistent shell restarts on its next
+  command via the sandbox's mount key.
 - **Global**: edits the same settings as they will be written to the config
   file's top-level ``container`` section (plus the profile's auto-compact
   default). Every change is persisted automatically; it becomes the startup
@@ -49,12 +50,12 @@ class ContainerSettingsScreen(ModalScreen[None]):
         profile_name: str | None = None,
         on_auto_compact: Callable[[bool], None] | None = None,
         on_output_limit: Callable[[int], None] | None = None,
-        session_name: str | None = None,
+        workspace: str | None = None,
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
         self._config_path = config_path
-        self._session_name = session_name
+        self._workspace = workspace
         self._session_auto_compact = session_auto_compact
         self._session_output_limit = session_output_limit
         self._default_auto_compact = default_auto_compact
@@ -80,7 +81,7 @@ class ContainerSettingsScreen(ModalScreen[None]):
         with Vertical(id="container-modal"):
             yield Label("Container settings", id="container-title")
             with TabbedContent(initial="session-tab", id="container-tabs"):
-                with TabPane("Session", id="session-tab"):
+                with TabPane("Workspace", id="session-tab"):
                     yield from self._pane(self._sandbox is not None)
                 with TabPane("Global", id="defaults-tab"):
                     yield from self._pane_defaults()
@@ -399,19 +400,19 @@ class ContainerSettingsScreen(ModalScreen[None]):
     def _persist(self) -> None:
         """Auto-save the active tab's settings immediately.
 
-        Session-tab changes are saved per-session (in the session file) so
-        they survive a resume without leaking into the global config
-        defaults; defaults-tab changes write the config file."""
+        Workspace-tab changes are saved per-workspace (shared by every
+        session launched in that workspace) without leaking into the global
+        config defaults; defaults-tab changes write the config file."""
         if self._active_defaults:
             settings = self._defaults
         elif self._sandbox is not None:
-            if self._session_name is None:
-                # --no-session: nothing to persist to; the change is
-                # in-memory only for this run.
+            if self._workspace is None:
+                # No workspace (e.g. started with --no-workspace): the change
+                # is in-memory only for this run.
                 return
-            from ..session_store import update_session_container
+            from ..session_store import save_workspace_container
 
-            update_session_container(self._session_name, self._sandbox.session_settings(
+            save_workspace_container(self._workspace, self._sandbox.session_settings(
                 tool_output_limit=self._session_output_limit,
                 auto_compact=self._session_auto_compact,
             ))

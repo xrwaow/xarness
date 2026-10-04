@@ -247,6 +247,30 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("enter")
                     self.assertEqual(results, ["alpha-chat"])
 
+    async def test_resume_screen_filters_by_workspace(self) -> None:
+        from xarness.conversation import Conversation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            with patch.object(session_store, "SESSIONS_DIR", tmp):
+                here = Path(tmp) / "wt"
+                here.mkdir()
+                session_store.save_session(
+                    "here-chat", "alpha-model", Conversation(), workspace=str(here),
+                )
+                session_store.save_session(
+                    "there-chat", "alpha-model", Conversation(), workspace=str(tmp / "other"),
+                )
+                session_store.save_session("nowhere-chat", "alpha-model", Conversation())
+                app = make_app([], workspace=here)
+                results: list[str | None] = []
+                async with app.run_test() as pilot:
+                    screen = ResumeScreen(workspace=str(here))
+                    await app.push_screen(screen, results.append)
+                    await pilot.pause()
+                    names = [item.session_name for item in screen.query(ListItem)]
+                    self.assertEqual(names, ["here-chat"])
+
     async def test_slash_resume_loads_session_and_replays(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(session_store, "SESSIONS_DIR", Path(tmp)):
@@ -471,14 +495,13 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
             tmp = Path(tmpd)
             (tmp / "docs").mkdir()
             (tmp / "docs" / "spec.md").write_text("x\n")
-            sessions_dir = tmp / "sessions"
-            sessions_dir.mkdir()
-            with patch.object(session_store, "SESSIONS_DIR", sessions_dir):
-                session_store.save_session("s1", "m", self._conversation())
+            workspaces_dir = tmp / "workspaces"
+            workspaces_dir.mkdir()
+            with patch.object(session_store, "WORKSPACES_DIR", workspaces_dir):
                 app, sandbox = self._make([], tmp)
                 async with app.run_test() as pilot:
                     screen = ContainerSettingsScreen(
-                        sandbox, tmp / "config.json", session_name="s1",
+                        sandbox, tmp / "config.json", workspace=str(tmp / "wt"),
                     )
                     await app.push_screen(screen)
                     await pilot.pause()
@@ -502,11 +525,10 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(ref.mount, "docs/spec.md")
                     self.assertFalse(ref.read_only)
 
-                    # Changes persist per-session (not as config defaults).
+                    # Changes persist per-workspace (not as config defaults).
                     await pilot.pause()
                     self.assertNotIn("container", json.loads((tmp / "config.json").read_text()))
-                    state = session_store.load_state("s1")
-                    block = state.container
+                    block = session_store.load_workspace_container(str(tmp / "wt"))
                     self.assertTrue(block["network_access"])
                     self.assertEqual(
                         block["auto_include_refs"],
@@ -538,14 +560,13 @@ class TestContainerGpu(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
-            sessions_dir = tmp / "sessions"
-            sessions_dir.mkdir()
-            with patch.object(session_store, "SESSIONS_DIR", sessions_dir):
-                session_store.save_session("s1", "m", TestContainerSettings._conversation())
+            workspaces_dir = tmp / "workspaces"
+            workspaces_dir.mkdir()
+            with patch.object(session_store, "WORKSPACES_DIR", workspaces_dir):
                 app, sandbox = TestContainerSettings()._make([], tmp)
                 async with app.run_test() as pilot:
                     screen = ContainerSettingsScreen(
-                        sandbox, tmp / "config.json", session_name="s1",
+                        sandbox, tmp / "config.json", workspace=str(tmp / "wt"),
                     )
                     await app.push_screen(screen)
                     await pilot.pause()
@@ -557,7 +578,7 @@ class TestContainerGpu(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(
                         "container", json.loads((tmp / "config.json").read_text()),
                     )
-                    self.assertTrue(session_store.load_state("s1").container["gpu_access"])
+                    self.assertTrue(session_store.load_workspace_container(str(tmp / "wt"))["gpu_access"])
 
 
 class TestContainerTabs(unittest.IsolatedAsyncioTestCase):

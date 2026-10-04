@@ -3,10 +3,15 @@
 :class:`SessionState` is the whole persisted shape (profile, workspace,
 messages, turn marker, git block) in memory; :func:`load_state` parses the
 file once and returns it, so callers never re-read per field.
+
+Container settings are not part of a session: they live per workspace (see
+:func:`load_workspace_container`). Old session files that still carry a
+``container`` key are accepted, but the key is dropped on load.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass, fields
@@ -19,6 +24,7 @@ from .events import Usage
 from .images import ImageAttachment
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
+WORKSPACES_DIR = Path("~/.local/share/xarness/workspaces").expanduser()
 
 
 def session_path(name: str) -> Path:
@@ -39,9 +45,6 @@ class SessionState:
     workspace: str | None = None
     # Change-tracking block (see gitwork.GitInfo.to_block); None drops it.
     git: dict | None = None
-    # Per-session container settings (see SandboxConfig.session_settings);
-    # None = no saved overrides (defaults apply).
-    container: dict | None = None
     updated_at: str | None = None
 
 
@@ -111,8 +114,6 @@ def save_state(name: str, state: SessionState) -> None:
         data["compact_snapshot"] = [_message_dump(m) for m in conversation.compact_snapshot]
     if state.git is not None:
         data["git"] = state.git
-    if state.container is not None:
-        data["container"] = state.container
     session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -122,10 +123,9 @@ def save_session(
     conversation: Conversation,
     git: dict | None = None,
     workspace: str | None = None,
-    container: dict | None = None,
 ) -> None:
     """Persist a session (convenience wrapper around :func:`save_state`)."""
-    save_state(name, SessionState(conversation, profile_name, workspace, git, container))
+    save_state(name, SessionState(conversation, profile_name, workspace, git))
 
 
 def load_state(name: str) -> SessionState:
@@ -136,22 +136,8 @@ def load_state(name: str) -> SessionState:
         profile=data.get("profile"),
         workspace=data.get("workspace"),
         git=data.get("git") if isinstance(data.get("git"), dict) else None,
-        container=data.get("container") if isinstance(data.get("container"), dict) else None,
         updated_at=data.get("updated_at"),
     )
-
-
-def update_session_container(name: str, container: dict | None) -> None:
-    """Write the per-session container settings without touching messages.
-
-    Used by the container settings popup: session-tab changes must not leak
-    into the global config defaults."""
-    try:
-        state = load_state(name)
-    except (OSError, json.JSONDecodeError, KeyError):
-        return
-    state.container = container
-    save_state(name, state)
 
 
 def load_session(name: str) -> Conversation:
@@ -164,6 +150,39 @@ def load_git_block(name: str) -> dict | None:
         return load_state(name).git
     except (OSError, json.JSONDecodeError, KeyError):
         return None
+
+
+def _workspace_key(workspace: str) -> str:
+    """Stable file key for a workspace path (resolved, so symlinks and
+    trailing slashes don't fork the settings)."""
+    return hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:16]
+
+
+def _workspace_path(key: str) -> Path:
+    return WORKSPACES_DIR / f"{key}.json"
+
+
+def load_workspace_container(workspace: str) -> dict | None:
+    """The container settings saved for this workspace, or None."""
+    try:
+        data = json.loads(_workspace_path(_workspace_key(workspace)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("container") if isinstance(data.get("container"), dict) else None
+
+
+def save_workspace_container(workspace: str, container: dict | None) -> None:
+    """Persist container settings for a workspace (shared by every session
+    launched in it). ``None`` drops any saved settings."""
+    key = _workspace_key(workspace)
+    path = _workspace_path(key)
+    if container is None:
+        path.unlink(missing_ok=True)
+        return
+    WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {"workspace": str(workspace), "container": container}, indent=2,
+    ), encoding="utf-8")
 
 
 def list_sessions() -> list[str]:

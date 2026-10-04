@@ -9,9 +9,9 @@ from textual import events
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView
+from pathlib import Path
 
 from .. import session_store
-from .widgets import crop_path
 
 
 def _relative_time(iso: str | None) -> str:
@@ -35,15 +35,32 @@ def _relative_time(iso: str | None) -> str:
     return f"{hours // 24}d"
 
 
+def _same_path(a: str, b: Path) -> bool:
+    """True when saved workspace ``a`` resolves to the same directory as ``b``."""
+    try:
+        return Path(a).resolve() == b
+    except OSError:
+        return False
+
+
 class ResumeScreen(ModalScreen[str | None]):
     """Filterable list of saved sessions; dismisses with the chosen name or None."""
 
     BINDINGS = [("escape", "dismiss_none", "Cancel")]
 
-    def __init__(self) -> None:
+    def __init__(self, workspace: str | None = None) -> None:
         super().__init__()
+        self._workspace = Path(workspace).resolve() if workspace else None
         names = session_store.list_sessions()
-        self._entries = [(name, session_store.session_meta(name)) for name in names]
+        entries = [(name, session_store.session_meta(name)) for name in names]
+        if self._workspace is not None:
+            # Only sessions launched in this workspace.
+            entries = [
+                (name, meta) for name, meta in entries
+                if meta.get("workspace")
+                and _same_path(meta["workspace"], self._workspace)
+            ]
+        self._entries = entries
         self._entries.sort(key=lambda e: e[1].get("updated_at") or "", reverse=True)
         self._filtered = self._entries
 
@@ -57,11 +74,7 @@ class ResumeScreen(ModalScreen[str | None]):
         items = []
         for name, meta in entries:
             age = _relative_time(meta.get("updated_at"))
-            workspace = meta.get("workspace")
-            label = f"{escape(name)}  [dim]{age}"
-            if workspace:
-                label += f" · {escape(crop_path(workspace))}"
-            label += "[/]"
+            label = f"{escape(name)}  [dim]{age}[/]"
             item = ListItem(Label(label))
             item.session_name = name
             items.append(item)
@@ -91,8 +104,7 @@ class ResumeScreen(ModalScreen[str | None]):
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.lower()
         self._filtered = [
-            (n, m) for n, m in self._entries
-            if query in n.lower() or query in (m.get("workspace") or "").lower()
+            (n, m) for n, m in self._entries if query in n.lower()
         ]
         listview = self.query_one("#resume-list", ListView)
         listview.clear()
