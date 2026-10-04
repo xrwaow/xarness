@@ -38,6 +38,9 @@ class SessionState:
     workspace: str | None = None
     # Change-tracking block (see gitwork.GitInfo.to_block); None drops it.
     git: dict | None = None
+    # Per-session container settings (see SandboxConfig.session_settings);
+    # None = no saved overrides (defaults apply).
+    container: dict | None = None
     updated_at: str | None = None
 
 
@@ -103,6 +106,8 @@ def save_state(name: str, state: SessionState) -> None:
         data["compact_snapshot"] = [_message_dump(m) for m in conversation.compact_snapshot]
     if state.git is not None:
         data["git"] = state.git
+    if state.container is not None:
+        data["container"] = state.container
     session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -112,9 +117,10 @@ def save_session(
     conversation: Conversation,
     git: dict | None = None,
     workspace: str | None = None,
+    container: dict | None = None,
 ) -> None:
     """Persist a session (convenience wrapper around :func:`save_state`)."""
-    save_state(name, SessionState(conversation, profile_name, workspace, git))
+    save_state(name, SessionState(conversation, profile_name, workspace, git, container))
 
 
 def load_state(name: str) -> SessionState:
@@ -125,8 +131,22 @@ def load_state(name: str) -> SessionState:
         profile=data.get("profile"),
         workspace=data.get("workspace"),
         git=data.get("git") if isinstance(data.get("git"), dict) else None,
+        container=data.get("container") if isinstance(data.get("container"), dict) else None,
         updated_at=data.get("updated_at"),
     )
+
+
+def update_session_container(name: str, container: dict | None) -> None:
+    """Write the per-session container settings without touching messages.
+
+    Used by the container settings popup: session-tab changes must not leak
+    into the global config defaults."""
+    try:
+        state = load_state(name)
+    except (OSError, json.JSONDecodeError, KeyError):
+        return
+    state.container = container
+    save_state(name, state)
 
 
 def load_session(name: str) -> Conversation:

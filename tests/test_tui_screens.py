@@ -463,48 +463,61 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         ), sandbox
 
-    async def test_toggles_apply_to_sandbox_and_save_defaults(self) -> None:
+    async def test_toggles_apply_to_sandbox_and_save_session(self) -> None:
+        from xarness import session_store
         from xarness.tui.container_screen import ContainerSettingsScreen
 
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
             (tmp / "docs").mkdir()
             (tmp / "docs" / "spec.md").write_text("x\n")
-            app, sandbox = self._make([], tmp)
-            async with app.run_test() as pilot:
-                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
-                await app.push_screen(screen)
-                await pilot.pause()
+            sessions_dir = tmp / "sessions"
+            sessions_dir.mkdir()
+            with patch.object(session_store, "SESSIONS_DIR", sessions_dir):
+                session_store.save_session("s1", "m", self._conversation())
+                app, sandbox = self._make([], tmp)
+                async with app.run_test() as pilot:
+                    screen = ContainerSettingsScreen(
+                        sandbox, tmp / "config.json", session_name="s1",
+                    )
+                    await app.push_screen(screen)
+                    await pilot.pause()
 
-                # Toggle network access on (button press).
-                net = screen.query_one("#container-net")
-                self.assertFalse(sandbox.allow_network)
-                net.press()
-                await pilot.pause()
-                self.assertTrue(sandbox.allow_network)
-                self.assertEqual(net.label, "on")
-                self.assertTrue(net.has_class("is-on"))
+                    # Toggle network access on (button press).
+                    net = screen.query_one("#container-net")
+                    self.assertFalse(sandbox.allow_network)
+                    net.press()
+                    await pilot.pause()
+                    self.assertTrue(sandbox.allow_network)
+                    self.assertEqual(net.label, "on")
+                    self.assertTrue(net.has_class("is-on"))
 
-                # Add a ref through the input (Enter submits): host path,
-                # explicit mount, writable.
-                inp = screen.query_one("#container-ref-input")
-                inp.value = f"{tmp / 'docs' / 'spec.md'} docs/spec.md --rw"
-                await pilot.press("enter")
-                await pilot.pause()
-                ref = sandbox.external_refs["spec.md"]
-                self.assertEqual(ref.mount, "docs/spec.md")
-                self.assertFalse(ref.read_only)
+                    # Add a ref through the input (Enter submits): host path,
+                    # explicit mount, writable.
+                    inp = screen.query_one("#container-ref-input")
+                    inp.value = f"{tmp / 'docs' / 'spec.md'} docs/spec.md --rw"
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    ref = sandbox.external_refs["spec.md"]
+                    self.assertEqual(ref.mount, "docs/spec.md")
+                    self.assertFalse(ref.read_only)
 
-                # Changes persist automatically (session snapshot written
-                # as defaults).
-                await pilot.pause()
-                data = json.loads((tmp / "config.json").read_text())
-                self.assertTrue(data["container"]["network_access"])
-                self.assertEqual(
-                    data["container"]["auto_include_refs"],
-                    [{"path": str(tmp / "docs" / "spec.md"),
-                      "mount": "docs/spec.md", "read_only": False}],
-                )
+                    # Changes persist per-session (not as config defaults).
+                    await pilot.pause()
+                    self.assertNotIn("container", json.loads((tmp / "config.json").read_text()))
+                    state = session_store.load_state("s1")
+                    block = state.container
+                    self.assertTrue(block["network_access"])
+                    self.assertEqual(
+                        block["auto_include_refs"],
+                        [{"path": str(tmp / "docs" / "spec.md"),
+                          "mount": "docs/spec.md", "read_only": False}],
+                    )
+
+    @staticmethod
+    def _conversation():
+        from xarness.conversation import Conversation
+        return Conversation()
 
     async def test_slash_container_opens_screen(self) -> None:
         from xarness.tui.container_screen import ContainerSettingsScreen
@@ -520,22 +533,31 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
 class TestContainerGpu(unittest.IsolatedAsyncioTestCase):
     async def test_gpu_toggle_applies_and_saves(self) -> None:
         import json
+        from xarness import session_store
         from xarness.tui.container_screen import ContainerSettingsScreen
 
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
-            app, sandbox = TestContainerSettings()._make([], tmp)
-            async with app.run_test() as pilot:
-                screen = ContainerSettingsScreen(sandbox, tmp / "config.json")
-                await app.push_screen(screen)
-                await pilot.pause()
-                self.assertFalse(sandbox.gpu_access)
-                screen.query_one("#container-gpu").press()
-                await pilot.pause()
-                self.assertTrue(sandbox.gpu_access)
-                await pilot.pause()
-                data = json.loads((tmp / "config.json").read_text())
-                self.assertTrue(data["container"]["gpu_access"])
+            sessions_dir = tmp / "sessions"
+            sessions_dir.mkdir()
+            with patch.object(session_store, "SESSIONS_DIR", sessions_dir):
+                session_store.save_session("s1", "m", TestContainerSettings._conversation())
+                app, sandbox = TestContainerSettings()._make([], tmp)
+                async with app.run_test() as pilot:
+                    screen = ContainerSettingsScreen(
+                        sandbox, tmp / "config.json", session_name="s1",
+                    )
+                    await app.push_screen(screen)
+                    await pilot.pause()
+                    self.assertFalse(sandbox.gpu_access)
+                    screen.query_one("#container-gpu").press()
+                    await pilot.pause()
+                    self.assertTrue(sandbox.gpu_access)
+                    await pilot.pause()
+                    self.assertNotIn(
+                        "container", json.loads((tmp / "config.json").read_text()),
+                    )
+                    self.assertTrue(session_store.load_state("s1").container["gpu_access"])
 
 
 class TestContainerTabs(unittest.IsolatedAsyncioTestCase):

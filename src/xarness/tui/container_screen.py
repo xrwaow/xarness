@@ -20,40 +20,14 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from rich.segment import Segment
 from textual import on
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.strip import Strip
 from textual.widgets import Button, Input, Label, ListItem, ListView, Switch, TabbedContent, TabPane
 
 from ..config import ConfigError, ContainerSettings, RefSpec, save_container_settings, save_preferences
 from ..sandbox import SandboxConfig, SandboxUnavailable
 from ..tools import DEFAULT_OUTPUT_LIMIT
-
-
-class RightAlignedInput(Input):
-    """An Input whose value hugs the right edge.
-
-    Textual's Input hard-codes left-aligned rendering (it ignores the CSS
-    ``text-align`` property entirely), so right-alignment is done here by
-    shifting the rendered strip right. Only applies while the value fits —
-    once it overflows, scrolling behaves like a normal left-aligned Input.
-    """
-
-    def render_line(self, y: int) -> Strip:
-        strip = super().render_line(y)
-        if y != 0 or not self.value:
-            return strip
-        width = self.scrollable_content_region.width
-        # The base strip carries the value plus one cell for the cursor when
-        # it sits at the end (focused); account for that so the last value
-        # cell lands on the right edge.
-        extra = 1 if self.has_focus and self.cursor_at_end else 0
-        pad = width - len(self.value) - extra
-        if pad <= 0:
-            return strip
-        return Strip([Segment(" " * pad, style=self.rich_style), *strip])
 
 
 class ContainerSettingsScreen(ModalScreen[None]):
@@ -75,10 +49,12 @@ class ContainerSettingsScreen(ModalScreen[None]):
         profile_name: str | None = None,
         on_auto_compact: Callable[[bool], None] | None = None,
         on_output_limit: Callable[[int], None] | None = None,
+        session_name: str | None = None,
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
         self._config_path = config_path
+        self._session_name = session_name
         self._session_auto_compact = session_auto_compact
         self._session_output_limit = session_output_limit
         self._default_auto_compact = default_auto_compact
@@ -148,7 +124,7 @@ class ContainerSettingsScreen(ModalScreen[None]):
     def _limit_row(input_id: str, value: int):
         with Horizontal(classes="container-row"):
             yield Label("Tool output limit", classes="container-label")
-            yield RightAlignedInput(str(value), id=input_id, classes="container-limit-input")
+            yield Input(str(value), id=input_id, classes="container-limit-input")
 
     def _pane_defaults(self):
         yield from self._switch_row("Network access", self._defaults.network_access, "defaults-net")
@@ -421,24 +397,25 @@ class ContainerSettingsScreen(ModalScreen[None]):
         self.dismiss(None)
 
     def _persist(self) -> None:
-        """Auto-save: any change writes the active tab's settings to the
-        config file immediately (session tab snapshots the sandbox as the
-        new defaults; defaults tab writes what it edits)."""
+        """Auto-save the active tab's settings immediately.
+
+        Session-tab changes are saved per-session (in the session file) so
+        they survive a resume without leaking into the global config
+        defaults; defaults-tab changes write the config file."""
         if self._active_defaults:
             settings = self._defaults
         elif self._sandbox is not None:
-            settings = ContainerSettings(
-                network_access=self._sandbox.allow_network,
-                respect_gitignore=self._sandbox.respect_gitignore,
-                gpu_access=self._sandbox.gpu_access,
-                # The global output-limit default is not a sandbox knob;
-                # carry it over so a session-tab save doesn't erase it.
-                tool_output_limit=self._defaults.tool_output_limit,
-                auto_include_refs=[
-                    RefSpec(path=str(ref.host), mount=ref.mount, read_only=ref.read_only)
-                    for ref in self._sandbox.external_refs.values()
-                ],
-            )
+            if self._session_name is None:
+                # --no-session: nothing to persist to; the change is
+                # in-memory only for this run.
+                return
+            from ..session_store import update_session_container
+
+            update_session_container(self._session_name, self._sandbox.session_settings(
+                tool_output_limit=self._session_output_limit,
+                auto_compact=self._session_auto_compact,
+            ))
+            return
         else:
             self.app.notify("no container running; nothing to save", severity="warning")
             return

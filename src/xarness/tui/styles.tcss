@@ -576,7 +576,7 @@ ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
 }
 
 #resume-modal, #picker-modal, #container-modal {
-    width: 64;
+    width: 52;
     height: auto;
     max-height: 20;
     background: $c-surface;
@@ -697,17 +697,24 @@ ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
 }
 
 .container-limit-input {
-    width: 10;
+    width: 12;
     height: 1;
     border: none;
     background: $c-surface;
     color: $c-text;
-    padding: 0 1;
+    padding: 0;
+    margin-left: 1;
 }
 
+/* Table layout: fixed-width name column, values left-aligned in a fixed
+   column so on/off and numbers line up instead of hugging the right edge. */
 .container-label {
-    width: 1fr;
+    width: 20;
     color: $c-text;
+}
+
+.container-toggle {
+    margin-left: 1;
 }
 
 /* Textual's Switch ships blue/green $panel shades; the slider is a component
@@ -733,6 +740,8 @@ ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
 #container-refs-title,
 #defaults-refs-title {
     color: $c-muted;
+    width: 100%;
+    height: auto;
     margin-top: 1;
     margin-bottom: 1;
 }

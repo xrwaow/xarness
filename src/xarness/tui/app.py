@@ -461,6 +461,7 @@ class AgentApp(App[None]):
                     profile_name=self.profile_name,
                     on_auto_compact=self._set_auto_compact,
                     on_output_limit=self._set_output_limit,
+                    session_name=self.session_name,
                 ))
         elif cmd == "undo":
             self._run_undo(resend=False)
@@ -522,10 +523,11 @@ class AgentApp(App[None]):
         return self._last_usage().output_tokens if self._last_usage() else 0
 
     def _set_auto_compact(self, value: bool) -> None:
-        """Container popup, session tab: flip the live auto-compact flag and
-        persist it as the profile default."""
+        """Container popup, session tab: flip the live auto-compact flag.
+
+        Session-only: it is persisted in the session file (see
+        ``_container_block``), never as the global profile default."""
         self.auto_compact = value
-        self._save_preference(auto_compact=value, profile=self.profile.name)
 
     def _set_output_limit(self, limit: int) -> None:
         """Container popup, session tab: per-tool output cap for this session."""
@@ -738,6 +740,16 @@ class AgentApp(App[None]):
         self.git_info = info
         self.controller.git_info = info
 
+    def _container_block(self) -> dict | None:
+        """Per-session container settings snapshot for the session file, or
+        None when there is no sandbox."""
+        if self.sandbox is None:
+            return None
+        return self.sandbox.session_settings(
+            tool_output_limit=self.tool_registry.max_output_chars,
+            auto_compact=self.auto_compact,
+        )
+
     def _persist_git_state(self) -> None:
         if self.session_name:
             from ..session_store import save_session
@@ -745,6 +757,7 @@ class AgentApp(App[None]):
                 self.session_name, self.profile.model_id, self.controller.conversation,
                 git=self.git_info.to_block() if self.git_info else None,
                 workspace=str(self.workspace) if self.workspace else None,
+                container=self._container_block(),
             )
 
     def _rewrite_checkpoints(self, sha: str) -> None:
@@ -946,6 +959,18 @@ class AgentApp(App[None]):
         chat.anchor()
         self._refresh_status()
 
+    def _restore_session_container(self, block: dict | None) -> None:
+        """Reapply a session's saved container settings on resume."""
+        if not isinstance(block, dict):
+            return
+        if self.sandbox is not None:
+            self.sandbox.apply_session_settings(block)
+        limit = block.get("tool_output_limit")
+        if isinstance(limit, int) and limit > 0:
+            self._set_output_limit(limit)
+        if isinstance(block.get("auto_compact"), bool):
+            self.auto_compact = block["auto_compact"]
+
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
             return
@@ -954,6 +979,7 @@ class AgentApp(App[None]):
         state = load_state(name)
         self.controller.conversation = state.conversation
         self.session_name = name
+        self._restore_session_container(state.container)
         self.ensure_system_message()
         # Per-message usage is persisted: restore the status-bar totals.
         self._refresh_status()
@@ -1660,6 +1686,7 @@ class AgentApp(App[None]):
                 self.session_name, self.profile.model_id, self.controller.conversation,
                 git=self.git_info.to_block() if self.git_info else None,
                 workspace=str(self.workspace) if self.workspace else None,
+                container=self._container_block(),
             )
 
     def action_toggle_thoughts(self) -> None:

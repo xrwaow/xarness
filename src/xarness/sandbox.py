@@ -334,6 +334,59 @@ class SandboxConfig:
     def remove_ref(self, alias: str) -> bool:
         return self.external_refs.pop(alias, None) is not None
 
+    # ------------------------------------------------------------------
+    # Per-session settings (saved in the session file, not the config)
+
+    def session_settings(
+        self, *, tool_output_limit: int | None = None,
+        auto_compact: bool | None = None,
+    ) -> dict:
+        """Snapshot the live session-only container settings.
+
+        Saved in the session file so /sessions resume restores them; never
+        written to the global config defaults."""
+        from .config import RefSpec
+
+        block: dict = {
+            "network_access": self.allow_network,
+            "respect_gitignore": self.respect_gitignore,
+            "gpu_access": self.gpu_access,
+            "auto_include_refs": [
+                RefSpec(path=str(ref.host), mount=ref.mount, read_only=ref.read_only)
+                .model_dump(mode="json")
+                for ref in self.external_refs.values()
+            ],
+        }
+        if tool_output_limit is not None:
+            block["tool_output_limit"] = tool_output_limit
+        if auto_compact is not None:
+            block["auto_compact"] = auto_compact
+        return block
+
+    def apply_session_settings(self, block: dict) -> None:
+        """Restore a snapshot from :meth:`session_settings` onto this sandbox
+        (used when a saved session is resumed). Unknown/missing keys keep
+        the current values; refs whose host path has vanished are skipped."""
+        if "network_access" in block:
+            self.allow_network = bool(block["network_access"])
+        if "gpu_access" in block:
+            self.gpu_access = bool(block["gpu_access"])
+        if "respect_gitignore" in block:
+            self.set_respect_gitignore(bool(block["respect_gitignore"]))
+        refs = block.get("auto_include_refs")
+        if isinstance(refs, list):
+            self.external_refs.clear()
+            for ref in refs:
+                if not isinstance(ref, dict) or "path" not in ref:
+                    continue
+                try:
+                    self.add_ref(
+                        ref["path"], mount=ref.get("mount"),
+                        read_only=bool(ref.get("read_only", True)),
+                    )
+                except (FileNotFoundError, SandboxUnavailable):
+                    pass
+
     def ref_summary(self) -> list[tuple[str, str, bool]]:
         """(alias, mount, read_only) for the settings UI and status lines."""
         return [
