@@ -295,6 +295,12 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
   - `cot_strength` — reasoning effort: `off`, `low`, `medium`, or `high`.
   - `keep_reasoning` — send assistant reasoning back to the model on later
     rounds (default `true`).
+  - `supports_vision` — the model accepts image attachments (default
+    `false`). When `true`, you can attach images by pasting an image file
+    path into the input or `@`-mentioning it: each image becomes a
+    `[🖼 name W×H]` token in the text (deletable as one unit), and the
+    content parts are sent in token order. Images are downsampled to at
+    most 1 megapixel and sent as base64 on every round.
   - `auto_compact` — compact automatically after each turn once the context
     estimate passes `auto_compact_threshold` of `max_context` (default
     `false`; the /container popup's "Auto-compact" toggle changes it).

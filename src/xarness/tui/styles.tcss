@@ -60,6 +60,16 @@ UserMessage {
     color: $c-text;
 }
 
+/* Image attachment chip: dimmed background so it reads as metadata, not
+   message text. One chip per attached image, on its own line. */
+.user-image-chip {
+    width: auto;
+    margin-left: 2;
+    padding: 0 1;
+    background: $c-border;
+    color: $c-muted;
+}
+
 /* Click-to-undo affordance: hidden until the message is clicked. Sized to
    its text (not the full line) so only the label itself is clickable. */
 .user-undo {

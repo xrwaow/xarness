@@ -11,13 +11,19 @@ usage never reaches the wire.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from .events import Usage
+from .images import ImageAttachment
 
 # Prefix of the summary user message compaction leaves behind. Identifying
 # it by content (not identity) keeps working across a session save/load.
 SUMMARY_PREFIX = "[earlier conversation, summarized]"
+
+# The placeholder tokens attached images leave in user text (see
+# images.token_text); matches are replaced by image content parts on the wire.
+_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
 
 
 @dataclass(slots=True)
@@ -71,6 +77,9 @@ class Message:
     # only) — computed by the tool, persisted so /resume renders the same
     # headers. Never sent over the wire.
     header: str | None = None
+    # Images attached to a user message (persisted; sent over the wire as
+    # base64 ``image_url`` content parts on every round). None = text only.
+    images: list[ImageAttachment] | None = None
 
     def to_wire(self, include_reasoning: bool = False) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}
@@ -78,6 +87,38 @@ class Message:
         # content entirely — some providers reject an empty string there.
         if self.content or self.role != "assistant" or not self.tool_calls:
             message["content"] = self.content
+        if self.role == "user" and self.images:
+            # Multipart content. The text may carry image placeholder tokens
+            # ("[🖼 name W×H]") marking where each image belongs; content
+            # parts are emitted in that order so "compare [img1] with
+            # [img2]" stays meaningful to the model. Tokens without a
+            # matching attachment (or images without a token) still come
+            # through: text parts first, unmatched images appended at the end.
+            parts: list[dict[str, Any]] = []
+            last = 0
+            index = 0
+            for match in _TOKEN_RE.finditer(self.content):
+                chunk = self.content[last:match.start()]
+                if chunk:
+                    parts.append({"type": "text", "text": chunk})
+                if index < len(self.images):
+                    image = self.images[index]
+                    index += 1
+                    parts.append(
+                        {"type": "image_url", "image_url": {"url": image.data_url()}}
+                    )
+                else:
+                    # More tokens than attachments: keep the marker text.
+                    parts.append({"type": "text", "text": match.group(0)})
+                last = match.end()
+            chunk = self.content[last:]
+            if chunk:
+                parts.append({"type": "text", "text": chunk})
+            parts.extend(
+                {"type": "image_url", "image_url": {"url": image.data_url()}}
+                for image in self.images[index:]
+            )
+            message["content"] = parts
         if include_reasoning and self.role == "assistant" and self.reasoning is not None:
             # DeepSeek-style field name; providers that don't know it ignore it.
             message["reasoning_content"] = self.reasoning

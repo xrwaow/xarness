@@ -30,12 +30,14 @@ from textual.timer import Timer
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.markdown import MarkdownFence
 from textual.widgets.option_list import Option
-from textual.widgets.text_area import TextAreaTheme
+from textual.widgets.text_area import Selection, TextAreaTheme
 
+from .. import images
 from .. import theme
 from ..conversation import Message as ConversationMessage
 from ..events import ToolCallStatus
 from ..gitwork import DiffStat
+from ..images import ImageAttachment, ImageError, token_text
 
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -286,9 +288,10 @@ class UserMessage(Vertical):
             super().__init__()
             self.user_message = user_message
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, images: list[ImageAttachment] | None = None) -> None:
         super().__init__(classes="msg user")
         self._text = text
+        self._images = images or []
         self._suffix = ""
         # The conversation message this widget renders, bound by the app once
         # the turn is under way (live) or when replaying history. Click-to-undo
@@ -299,10 +302,24 @@ class UserMessage(Vertical):
         with Horizontal(classes="user-row"):
             yield Static("›", classes="user-marker", markup=False)
             yield Static(self._build_content(), classes="user-content", markup=False)
+        for image in self._images:
+            if token_text(image) in self._text:
+                continue  # the token itself already shows the attachment
+            yield Static(
+                token_text(image),
+                classes="user-image-chip",
+                markup=False,
+            )
         yield _UndoButton(self)
 
     def _build_content(self) -> Text:
         line = Text(self._text)
+        # Image tokens read as chips in the message too: dimmed background
+        # over the whole token, brackets included (Rich styles by codepoint,
+        # so no byte math here).
+        token_style = Style(bgcolor=theme.PALETTE["border"], color=theme.PALETTE["muted"])
+        for match in images._IMAGE_TOKEN_RE.finditer(self._text):
+            line.stylize(token_style, match.start(), match.end())
         if self._suffix:
             line.append(self._suffix, style=theme.PALETTE["muted"])
         return line
@@ -1811,8 +1828,10 @@ class ChatInput(TextArea):
     """
 
     class ChatSubmitted(Message):
-        def __init__(self, text: str) -> None:
+        def __init__(self, text: str, images: list[ImageAttachment] | None = None) -> None:
             self.text = text
+            # Attached images in the order their tokens appear in the text.
+            self.images = images or []
             super().__init__()
 
     class SlashQuery(Message):
@@ -1851,9 +1870,34 @@ class ChatInput(TextArea):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.popup_active: str | None = None
+        # Attached images, kept in token order (the editor's image segments).
+        # Synced against the document on every edit: deleting a token drops
+        # its attachment.
+        self.attachments: list[ImageAttachment] = []
 
     def on_mount(self) -> None:
         self.apply_input_theme()
+        self._refresh_token_highlights()
+
+    def _refresh_token_highlights(self) -> None:
+        """Paint image tokens with the ``image-token`` style.
+
+        TextArea draws per-range highlights from its internal map (normally
+        fed by tree-sitter); with no language set we own that map. Ranges
+        are byte offsets into the line (the renderer maps them back to
+        codepoints), which matters because 🖼 is multi-byte. Tokens never
+        span lines, so per-line scanning is enough."""
+        self._highlights.clear()
+        for row in range(self.document.line_count):
+            line = self.document.get_line(row)
+            for match in images._IMAGE_TOKEN_RE.finditer(line):
+                self._highlights[row].append(
+                    (
+                        len(line[: match.start()].encode("utf-8")),
+                        len(line[: match.end()].encode("utf-8")),
+                        "image-token",
+                    )
+                )
 
     def apply_input_theme(self) -> None:
         """(Re)build the TextArea theme from the current palette.
@@ -1871,7 +1915,12 @@ class ChatInput(TextArea):
             cursor_line_gutter_style=base.cursor_line_gutter_style,
             bracket_matching_style=base.bracket_matching_style,
             selection_style=Style(bgcolor=theme.PALETTE["highlight"], color=theme.PALETTE["bg"]),
-            syntax_styles=base.syntax_styles,
+            syntax_styles={
+                **base.syntax_styles,
+                # Image attachment tokens ([🖼 name W×H]) get a dimmed chip
+                # look, matching .user-image-chip in the transcript.
+                "image-token": Style(bgcolor=theme.PALETTE["border"], color=theme.PALETTE["muted"]),
+            },
         )
         self.register_theme(no_line_highlight)
         # Assigning the same name wouldn't re-run the theme watcher, so bounce
@@ -1881,6 +1930,8 @@ class ChatInput(TextArea):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         self._check_triggers()
+        self._sync_attachments()
+        self._refresh_token_highlights()
 
     def _check_triggers(self) -> None:
         text = self.text
@@ -1921,6 +1972,102 @@ class ChatInput(TextArea):
         # TextArea._on_key via the MRO; calling it manually creates an
         # un-awaited coroutine (RuntimeWarning) with no extra effect.
 
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def action_toggle_mode(self) -> None:
+        self.post_message(self.ModeToggle())
+
+    def _on_paste(self, event: events.Paste) -> None:
+        """A pasted path or ``file://`` URI naming an image attaches it.
+
+        Terminals (kitty, iTerm2, ...) paste a clipboard image as a file
+        URI or path; the image becomes a ``[🖼 name W×H]`` token in the text
+        (deletable as one unit). Raw image bytes cannot cross a plain
+        terminal, so there is nothing to intercept when the paste event
+        never fires.
+        """
+        if "\n" in event.text:
+            return
+        path = images.parse_image_path(event.text)
+        if path is None or not images.is_image_path(path) or not path.is_file():
+            return
+        try:
+            attachment = images.load_image(path)
+        except ImageError:
+            return  # not a decodable image: paste the text as-is
+        event.prevent_default()
+        event.stop()
+        self.insert_image(attachment)
+
+    def insert_image(self, attachment: ImageAttachment) -> None:
+        """Attach an image and insert its placeholder token at the cursor."""
+        if attachment not in self.attachments:
+            self.attachments.append(attachment)
+        self.insert(token_text(attachment))
+
+    def _sync_attachments(self) -> None:
+        """Drop attachments whose token is no longer in the document."""
+        text = self.text
+        self.attachments = [
+            attachment for attachment in self.attachments
+            if token_text(attachment) in text
+        ]
+
+    def _ordered_attachments(self) -> list[ImageAttachment]:
+        """Attachments in the order their tokens appear in the text."""
+        by_token: dict[str, ImageAttachment] = {}
+        for attachment in self.attachments:
+            by_token.setdefault(token_text(attachment), attachment)
+        return [
+            by_token[token] for token in images.find_image_tokens(self.text)
+            if token in by_token
+        ]
+
+    # -- atomic image tokens -------------------------------------------
+
+    def _plain_cursor_offset(self) -> int:
+        """The cursor as a plain-text offset into the document."""
+        row, col = self.cursor_location
+        return sum(len(self.document.get_line(r)) + 1 for r in range(row)) + col
+
+    def _offset_to_location(self, offset: int) -> tuple[int, int]:
+        for row in range(self.document.line_count):
+            line_len = len(self.document.get_line(row))
+            if offset <= line_len:
+                return (row, offset)
+            offset -= line_len + 1
+        return self.document.end
+
+    def _delete_token_at_cursor(self, direction: int) -> bool:
+        """Backspace/Delete at an image token's edge: remove the whole token
+        (and its attachment) as if it were one character."""
+        if self.selected_text:
+            return False
+        offset = self._plain_cursor_offset()
+        for match in images._IMAGE_TOKEN_RE.finditer(self.text):
+            start, end = match.span()
+            hit = start < offset <= end if direction < 0 else start <= offset < end
+            if not hit:
+                continue
+            start_loc = self._offset_to_location(start)
+            end_loc = self._offset_to_location(end)
+            self.delete(start_loc, end_loc, maintain_selection_offset=False)
+            self.selection = Selection(start_loc, start_loc)
+            self._sync_attachments()
+            return True
+        return False
+
+    def action_delete_left(self) -> None:
+        if self._delete_token_at_cursor(-1):
+            return
+        super().action_delete_left()
+
+    def action_delete_right(self) -> None:
+        if self._delete_token_at_cursor(1):
+            return
+        super().action_delete_right()
+
     def action_submit(self) -> None:
         if self.popup_active is not None:
             self.post_message(self.PopupConfirm())
@@ -1931,16 +2078,20 @@ class ChatInput(TextArea):
             # a message that is queued behind a running turn.
             self.post_message(self.ChatSubmitted(""))
             return
+        images_out = self._ordered_attachments()
         self.load_text("")
-        self.post_message(self.ChatSubmitted(text))
-
-    def action_newline(self) -> None:
-        self.insert("\n")
-
-    def action_toggle_mode(self) -> None:
-        self.post_message(self.ModeToggle())
+        self.attachments = []
+        self.post_message(self.ChatSubmitted(text, images_out))
 
     def insert_mention(self, value: str) -> None:
+        """Complete an @-mention. Image files are attached instead: their
+        token replaces the typed ``@query``."""
+        attachment = self._try_load_mention_image(value)
+        if attachment is not None:
+            self.attachments.append(attachment)
+            self.insert(token_text(attachment))
+            self.popup_active = None
+            return
         row, col = self.cursor_location
         line = self.document.get_line(row)
         prefix = line[:col]
@@ -1949,3 +2100,15 @@ class ChatInput(TextArea):
             return
         self.replace(f"@{value} ", (row, at_col), (row, col))
         self.popup_active = None
+
+    def _try_load_mention_image(self, value: str) -> ImageAttachment | None:
+        path = images.parse_image_path(value)
+        if path is None or not images.is_image_path(path) or not path.is_file():
+            return None
+        try:
+            attachment = images.load_image(path)
+        except ImageError:
+            return None
+        if attachment in self.attachments:
+            return None  # already attached: let the plain @-mention go out
+        return attachment

@@ -25,6 +25,7 @@ from xarness.events import (
     Usage,
 )
 from xarness.tools import Tool, ToolRegistry, ToolResult, build_registry
+from xarness import images as images_mod
 from xarness.tui.app import AgentApp
 from xarness.tui.widgets import (
     AskBar,
@@ -232,7 +233,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
 
             # Submit again while the first turn is still running.
             await pilot.press("b", "enter")
-            self.assertEqual(app._queued, ["b"])
+            self.assertEqual(app._queued, [("b", None)])
 
             client.gate.set()
             await wait_until_idle(app)
@@ -279,7 +280,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
 
             # Queue while the tool round is in flight.
             await pilot.press("b", "enter")
-            self.assertEqual(app._queued, ["b"])
+            self.assertEqual(app._queued, [("b", None)])
             # The send hint lives in the steer bar above the input now.
             hints = app.query_one("#steer-queue-bar").query(".steer-hint")
             self.assertEqual(len(hints), 1)
@@ -326,7 +327,7 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
             await wait_for(lambda: app._turn_busy)
 
             await pilot.press("b", "enter")
-            self.assertEqual(app._queued, ["b"])
+            self.assertEqual(app._queued, [("b", None)])
 
             # Empty input + Enter: send now, don't wait for the turn to end.
             await pilot.press("enter")
@@ -1211,6 +1212,164 @@ class TestChatScroll(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.02)
                 self.assertEqual(chat.scroll_y, chat.max_scroll_y)
             await wait_until_idle(app)
+
+
+class TestImageAttachments(unittest.IsolatedAsyncioTestCase):
+    async def test_at_mention_image_attaches_and_gate_blocks(self) -> None:
+        """A non-vision profile refuses image sends; with supports_vision the
+        image is loaded, attached to the conversation message, and rendered
+        as a chip."""
+        import tempfile
+        from io import BytesIO
+        from pathlib import Path
+
+        from PIL import Image
+
+        def _png(w: int, h: int) -> bytes:
+            buf = BytesIO()
+            Image.new("RGB", (w, h)).save(buf, "PNG")
+            return buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "shot.png").write_bytes(_png(4, 4))
+            app, client = make_app([
+                ContentDelta("ok"),
+                TurnComplete(usage=Usage(input_tokens=1, output_tokens=1)),
+            ])
+            app.workspace = str(workdir)
+            async with app.run_test() as pilot:
+                await pilot.press("h", "i")
+                app.query_one("#chat-input", ChatInput).insert(" @shot.png")
+                await pilot.press("enter")
+                await wait_until_idle(app)
+
+                # Default profile has no vision: nothing sent.
+                self.assertFalse(app.controller.profile.supports_vision)
+                self.assertEqual(
+                    [m.role for m in app.controller.conversation.messages if m.role == "user"],
+                    [],
+                )
+
+                profile = PROFILE.model_copy(update={"supports_vision": True})
+                app.controller.switch_profile(profile, "k")
+                app.profile = profile
+                await pilot.press("enter")
+                await wait_until_idle(app)
+
+                user = next(
+                    m for m in app.controller.conversation.messages if m.role == "user"
+                )
+                self.assertEqual(user.content, "hi @shot.png")
+                self.assertEqual(len(user.images or []), 1)
+                self.assertEqual(user.images[0].name, "shot.png")
+
+                # And the transcript shows a chip.
+                chips = app.query(".user-image-chip")
+                self.assertEqual(len(chips), 1)
+                self.assertIn("shot.png", str(chips.first().render()))
+
+    async def test_paste_inserts_atomic_token_and_delete_removes_it(self) -> None:
+        """Pasting a file URI inserts the [🖼 ...] token; backspace deletes
+        the whole token (and its attachment) in one step."""
+        import tempfile
+        from io import BytesIO
+        from pathlib import Path
+
+        from PIL import Image
+        from textual import events
+        from textual.widgets.text_area import Selection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png_path = Path(tmp) / "pic.png"
+            buf = BytesIO()
+            Image.new("RGB", (10, 10)).save(buf, "PNG")
+            png_path.write_bytes(buf.getvalue())
+
+            app, _client = make_app([ContentDelta("ok"), TurnComplete()])
+            async with app.run_test() as pilot:
+                chat_input = app.query_one("#chat-input", ChatInput)
+                chat_input.post_message(events.Paste(f"file://{png_path}"))
+                await pilot.pause()
+
+                token = f"[🖼 pic.png 10×10]"
+                self.assertIn(token, chat_input.text)
+                self.assertEqual(len(chat_input.attachments), 1)
+                # The token is painted with the chip style, brackets included
+                # (ranges are byte offsets; 🖼 is multi-byte).
+                token_bytes = len(token.encode("utf-8"))
+                self.assertIn(
+                    (0, token_bytes, "image-token"),
+                    chat_input._highlights[0],
+                )
+
+                # The cursor sits after the token: one backspace removes the
+                # whole token (not just its last character) and the attachment.
+                await pilot.press("backspace")
+                await pilot.pause()
+                self.assertNotIn("🖼", chat_input.text)
+                self.assertEqual(chat_input.attachments, [])
+
+                # Delete (forward) at the token's start also removes it whole.
+                attachment = images_mod.load_image(png_path)
+                chat_input.insert_image(attachment)
+                await pilot.pause()
+                self.assertIn("🖼", chat_input.text)
+                # Move cursor to the token start, then forward-delete it whole.
+                start = chat_input.text.index("[🖼")
+                chat_input.selection = Selection((0, start), (0, start))
+                await pilot.press("delete")
+                await pilot.pause()
+                self.assertNotIn("🖼", chat_input.text)
+                self.assertEqual(chat_input.attachments, [])
+
+    async def test_submit_orders_images_by_token_position(self) -> None:
+        """Tokens submitted with the text carry their document order into the
+        conversation message."""
+        import tempfile
+        from io import BytesIO
+        from pathlib import Path
+
+        from PIL import Image
+
+        profile = PROFILE.model_copy(update={"supports_vision": True})
+        app, client = make_app([ContentDelta("ok"), TurnComplete()])
+        app.controller.switch_profile(profile, "k")
+        app.profile = profile
+        with tempfile.TemporaryDirectory() as tmp:
+            a_path = Path(tmp) / "a.png"
+            b_path = Path(tmp) / "b.png"
+            for path in (a_path, b_path):
+                buf = BytesIO()
+                Image.new("RGB", (4, 4)).save(buf, "PNG")
+                path.write_bytes(buf.getvalue())
+            async with app.run_test() as pilot:
+                chat_input = app.query_one("#chat-input", ChatInput)
+                first = images_mod.load_image(a_path)
+                second = images_mod.load_image(b_path)
+                chat_input.insert("look ")
+                chat_input.insert_image(second)
+                chat_input.insert(" then ")
+                chat_input.insert_image(first)
+                await pilot.press("enter")
+                await wait_until_idle(app)
+
+                user = next(
+                    m for m in app.controller.conversation.messages if m.role == "user"
+                )
+                # Attachment order follows token position: second then first.
+                self.assertEqual([i.name for i in user.images], ["b.png", "a.png"])
+                self.assertIn("[🖼 b.png 4×4] then [🖼 a.png 4×4]", user.content)
+
+                # The transcript paints the tokens as chips too.
+                widget = next(
+                    w for w in app.query(UserMessage) if w.message is user
+                )
+                built = widget._build_content()
+                chip_spans = [
+                    (s.start, s.end) for s in built.spans if s.style.bgcolor is not None
+                ]
+                self.assertIn((5, 5 + len("[🖼 b.png 4×4]")), chip_spans)
 
 
 if __name__ == "__main__":

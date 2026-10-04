@@ -21,6 +21,7 @@
       "max_context": 128000,
       "cot_strength": "medium",
       "keep_reasoning": true,
+      "supports_vision": true,
       "auto_compact": true,
       "auto_compact_threshold": 0.9
     },

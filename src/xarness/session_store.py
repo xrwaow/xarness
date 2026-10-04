@@ -16,6 +16,7 @@ from typing import Any
 
 from .conversation import Conversation, Message, ToolCall
 from .events import Usage
+from .images import ImageAttachment
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
 
@@ -56,6 +57,10 @@ def _message_from(raw: dict) -> Message:
         raw["usage"] = Usage(**raw["usage"])
     if isinstance(raw.get("tool_calls"), list):
         raw["tool_calls"] = [c if isinstance(c, ToolCall) else ToolCall.from_wire(c) for c in raw["tool_calls"]]
+    if isinstance(raw.get("images"), list):
+        raw["images"] = [
+            i if isinstance(i, ImageAttachment) else ImageAttachment(**i) for i in raw["images"]
+        ]
     return Message(**raw)
 
 

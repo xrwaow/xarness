@@ -39,6 +39,7 @@ from .events import (
     Usage,
 )
 from .gitwork import GitInfo, GitWorktreeError, RevertConflict, TurnCheckpoint
+from .images import ImageAttachment
 from .gitwork import checkpoint as git_checkpoint
 from .gitwork import revert_turns
 from .tools import ToolRegistry, ToolResult
@@ -161,10 +162,18 @@ class ChatController:
         # completes; read by save_interrupted_round() when a turn is cancelled.
         self._partial_round: PartialRound | None = None
 
-    async def send(self, user_text: str) -> AsyncIterator[StreamEvent]:
-        """Send a user message, streaming the first round."""
+    async def send(self, user_text: str, images: list[ImageAttachment] | None = None) -> AsyncIterator[StreamEvent]:
+        """Send a user message, streaming the first round.
+
+        ``images`` are base64 attachments carried on the user message and
+        resent with the history on every round."""
         self.conversation.add(
-            Message(role="user", content=user_text, checkpoint_sha=await self._take_checkpoint())
+            Message(
+                role="user",
+                content=user_text,
+                images=images or None,
+                checkpoint_sha=await self._take_checkpoint(),
+            )
         )
         # Snapshot marker for /undo //retry: the index of this turn's user
         # message. The turn snapshot is the messages[:turn_start + 1] prefix,
@@ -222,7 +231,7 @@ class ChatController:
         )
         return True
 
-    def inject_user_message(self, text: str) -> None:
+    def inject_user_message(self, text: str, images: list[ImageAttachment] | None = None) -> None:
         """Add a user message mid-turn (steering).
 
         Called at a round boundary — after tool results are recorded, before
@@ -231,7 +240,7 @@ class ChatController:
         end. No checkpoint of its own: it belongs to the turn that is already
         running, whose snapshot /undo restores anyway.
         """
-        self.conversation.add(Message(role="user", content=text))
+        self.conversation.add(Message(role="user", content=text, images=images or None))
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Point the session at a new provider profile.

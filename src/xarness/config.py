@@ -50,6 +50,9 @@ class ProviderProfile(BaseModel):
     cot_strength: CotStrength = CotStrength.MEDIUM
     # Send assistant reasoning back to the model on later rounds.
     keep_reasoning: bool = True
+    # The model accepts image content parts (vision). Off by default; when
+    # False the TUI refuses to attach images to messages.
+    supports_vision: bool = False
     # Auto-compact after each turn once the context estimate passes
     # auto_compact_threshold of max_context (0.9 = 90% full).
     auto_compact: bool = False

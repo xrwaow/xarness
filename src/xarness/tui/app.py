@@ -8,6 +8,7 @@ streaming — are driven by stream events, never by timers.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -33,6 +34,8 @@ from ..events import (
     ToolCallArgumentsDone, ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
 )
 from ..file_search import search_files
+from .. import images as image_loader
+from ..images import ImageAttachment, ImageError
 from ..gitwork import (
     DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
     attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
@@ -58,6 +61,14 @@ INPUT_PLACEHOLDER = (
     "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
+
+# An @-mention token that resolves to an image file attaches it (its literal
+# text still goes to the model). A quoted form (@"path with spaces.png")
+# covers paths pasted from terminals; plain tokens may not contain spaces.
+_IMAGE_TOKEN_RE = re.compile(
+    r'@("[^"\n]+\.(?:png|jpe?g|webp|gif|bmp)"|[^\s@]+\.(?:png|jpe?g|webp|gif|bmp))\b',
+    re.IGNORECASE,
+)
 
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
@@ -287,7 +298,7 @@ class AgentApp(App[None]):
         # queue (like a busy turn) instead of racing the rewrite. Auto-
         # compaction runs at the end of a turn; /new //delete wait it out.
         self._compacting = False
-        self._queued: list[str] = []
+        self._queued: list[tuple[str, list[ImageAttachment] | None]] = []
         self._ask_future: asyncio.Future[str | None] | None = None
         self._last_thinking: ThinkingBlock | None = None
         self._worker: Worker | None = None
@@ -396,7 +407,7 @@ class AgentApp(App[None]):
         if text.startswith("/"):
             self._handle_slash_command(text)
             return
-        self._submit(text)
+        self._submit(text, event.images)
 
     def _handle_slash_command(self, text: str) -> None:
         parts = text[1:].split(maxsplit=1)
@@ -1170,7 +1181,7 @@ class AgentApp(App[None]):
                     message.content.removeprefix(SUMMARY_PREFIX).strip()
                 ))
             else:
-                widget = UserMessage(message.content)
+                widget = UserMessage(message.content, message.images)
                 widget.message = message
                 await chat.mount(widget)
         elif message.role == "assistant":
@@ -1314,18 +1325,66 @@ class AgentApp(App[None]):
             bar = self.query_one("#steer-queue-bar", SteerQueueBar)
         except NoMatches:
             return  # app shutting down
-        bar.update_items(self._queued)
+        bar.update_items([text for text, _ in self._queued])
 
-    def _submit(self, text: str) -> None:
+    def _extract_images(self, text: str) -> list[ImageAttachment]:
+        """Load every ``@path`` token in ``text`` that names an image file.
+
+        The token itself stays in the message text (the model reads
+        ``@file.png`` literally); the image rides along as an attachment.
+        Duplicates resolve once; unreadable files are reported and skipped.
+        """
+        images: list[ImageAttachment] = []
+        seen: set[str] = set()
+        root = self.workspace or Path.cwd()
+        for match in _IMAGE_TOKEN_RE.finditer(text):
+            raw = match.group(1)
+            path = image_loader.parse_image_path(raw)
+            if path is None or not image_loader.is_image_path(path):
+                continue
+            if not path.is_absolute():
+                path = root / path
+            try:
+                resolved = str(path.resolve())
+            except OSError:
+                continue
+            if resolved in seen or not path.is_file():
+                continue
+            seen.add(resolved)
+            try:
+                images.append(image_loader.load_image(path))
+            except ImageError as exc:
+                self._post_line(ErrorLine(str(exc)))
+        return images
+
+    def _check_vision(self, images: list[ImageAttachment]) -> bool:
+        """True when the current profile can take images (or there are none)."""
+        if not images or self.controller.profile.supports_vision:
+            return True
+        self._post_line(ErrorLine(
+            f"{self.controller.profile.display_name} is not configured with "
+            "supports_vision: true — image attachments were not sent"
+        ))
+        return False
+
+    def _submit(self, text: str, images: list[ImageAttachment] | None = None) -> None:
         chat = self.query_one("#chat-log", VerticalScroll)
+        # Editor tokens come pre-ordered from the input; @-mentioned paths
+        # typed manually are scanned out of the text and appended.
+        all_images = list(images or [])
+        for scanned in self._extract_images(text):
+            if scanned not in all_images:
+                all_images.append(scanned)
+        if not self._check_vision(all_images):
+            return
         if self._turn_busy or self._compacting:
             # Queued: shown in the steer bar above the input until sent.
-            self._queued.append(text)
+            self._queued.append((text, all_images or None))
             self._refresh_steer_bar()
             return
-        user_message = UserMessage(text)
+        user_message = UserMessage(text, all_images or None)
         chat.mount(user_message)
-        self._worker = self._run_turn(text, user_message)
+        self._worker = self._run_turn(text, user_message, all_images or None)
 
     def _flush_queued_now(self) -> None:
         """Enter on an empty input while messages are queued: send now.
@@ -1451,7 +1510,12 @@ class AgentApp(App[None]):
             chat_input.placeholder = INPUT_PLACEHOLDER
 
     @work(group="turn")
-    async def _run_turn(self, text: str, user_widget: UserMessage | None = None) -> None:
+    async def _run_turn(
+        self,
+        text: str,
+        user_widget: UserMessage | None = None,
+        images: list[ImageAttachment] | None = None,
+    ) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tool calls).
 
         Each round streams one model response; its widgets are owned by a
@@ -1468,7 +1532,7 @@ class AgentApp(App[None]):
         turn_had_tools = False
         view = _RoundView(self, chat)
 
-        stream = self.controller.send(text)
+        stream = self.controller.send(text, images)
         try:
             while True:
                 view = _RoundView(self, chat)
@@ -1534,14 +1598,14 @@ class AgentApp(App[None]):
                 # LLM call — so the model sees it right away instead of the
                 # queued message waiting for the whole turn to end.
                 if self._queued:
-                    for queued_text in self._queued:
-                        self.controller.inject_user_message(queued_text)
+                    for queued_text, queued_images in self._queued:
+                        self.controller.inject_user_message(queued_text, queued_images)
                     injected = self.controller.conversation.messages[-len(self._queued):]
                     chat = self.query_one("#chat-log", VerticalScroll)
-                    for queued_text, message in zip(self._queued, injected):
+                    for (queued_text, queued_images), message in zip(self._queued, injected):
                         # Land the message in the transcript only now — after
                         # the round's answer/tool calls it follows.
-                        widget = UserMessage(queued_text)
+                        widget = UserMessage(queued_text, queued_images)
                         widget.message = message
                         widget.mark_sent()
                         chat.mount(widget)
@@ -1578,11 +1642,11 @@ class AgentApp(App[None]):
                 await self.refresh_diff_summary()
             self._disarm_interrupt()
             if self._queued:
-                queued_text = self._queued.pop(0)
-                widget = UserMessage(queued_text)
+                queued_text, queued_images = self._queued.pop(0)
+                widget = UserMessage(queued_text, queued_images)
                 self.query_one("#chat-log", VerticalScroll).mount(widget)
                 self._refresh_steer_bar()
-                self._worker = self._run_turn(queued_text, widget)
+                self._worker = self._run_turn(queued_text, widget, queued_images)
 
     async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
         if indicator is not None and indicator.is_mounted:
