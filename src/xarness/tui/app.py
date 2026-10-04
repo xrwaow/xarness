@@ -205,7 +205,7 @@ SLASH_COMMANDS = [
     ("mode", "switch between plan (read-only) and write mode"),
     ("container", (
         "network access, .gitignore shadowing, external "
-        "references; save as defaults writes them to the config"
+        "references; changes are saved to the config automatically"
     )),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),

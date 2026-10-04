@@ -476,12 +476,14 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
                 await app.push_screen(screen)
                 await pilot.pause()
 
-                # Toggle network access on (space on the focused switch).
+                # Toggle network access on (button press).
                 net = screen.query_one("#container-net")
                 self.assertFalse(sandbox.allow_network)
-                net.value = True
+                net.press()
                 await pilot.pause()
                 self.assertTrue(sandbox.allow_network)
+                self.assertEqual(net.label, "on")
+                self.assertTrue(net.has_class("is-on"))
 
                 # Add a ref through the input (Enter submits): host path,
                 # explicit mount, writable.
@@ -493,8 +495,8 @@ class TestContainerSettings(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ref.mount, "docs/spec.md")
                 self.assertFalse(ref.read_only)
 
-                # Save as defaults writes the container section.
-                await pilot.click("#container-save")
+                # Changes persist automatically (session snapshot written
+                # as defaults).
                 await pilot.pause()
                 data = json.loads((tmp / "config.json").read_text())
                 self.assertTrue(data["container"]["network_access"])
@@ -528,10 +530,9 @@ class TestContainerGpu(unittest.IsolatedAsyncioTestCase):
                 await app.push_screen(screen)
                 await pilot.pause()
                 self.assertFalse(sandbox.gpu_access)
-                screen.query_one("#container-gpu").value = True
+                screen.query_one("#container-gpu").press()
                 await pilot.pause()
                 self.assertTrue(sandbox.gpu_access)
-                await pilot.click("#container-save")
                 await pilot.pause()
                 data = json.loads((tmp / "config.json").read_text())
                 self.assertTrue(data["container"]["gpu_access"])
@@ -575,7 +576,7 @@ class TestContainerTabs(unittest.IsolatedAsyncioTestCase):
                 )
 
                 # Session toggle touches the sandbox, not the defaults.
-                screen.query_one("#container-net").value = True
+                screen.query_one("#container-net").press()
                 await pilot.pause()
                 self.assertTrue(sandbox.allow_network)
                 self.assertFalse(screen._defaults.network_access)
@@ -594,8 +595,7 @@ class TestContainerTabs(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(screen._defaults.auto_include_refs), 1)
                 self.assertEqual(len(sandbox.external_refs), 0)
 
-                # Save persists defaults only.
-                await pilot.click("#container-save")
+                # Auto-save persists defaults only.
                 await pilot.pause()
                 data = json.loads((tmp / "config.json").read_text())
                 self.assertFalse(data["container"]["network_access"])
@@ -685,7 +685,8 @@ class TestContainerGpuProbe(unittest.IsolatedAsyncioTestCase):
 
                 probe_mock = _mock.AsyncMock(return_value=("warn", "denied by cgroup"))
                 with _mock.patch("xarness.sandbox.probe_gpu_access", probe_mock):
-                    screen.query_one("#container-gpu").value = True
+                    screen.query_one("#container-gpu").press()
+                    await pilot.pause()
                     for _ in range(30):
                         await pilot.pause()
                         if app._workers and all(w.is_finished for w in app._workers):

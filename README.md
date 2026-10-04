@@ -277,8 +277,8 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     Missing paths are skipped.
 
   Everything here is also adjustable per session with `/container` in the
-  TUI (settings popup); "save as defaults" there writes the current state
-  back into the config. The config values are the startup defaults.
+  TUI (settings popup); changes there are written back into the config
+  automatically. The config values are the startup defaults.
 - `profiles` — list of profiles; switch with `--profile` (or `/model` in the
   TUI, which also sets reasoning effort). Each profile needs a unique `name`
   plus:
@@ -335,7 +335,7 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/model` | Choose the model and reasoning effort |
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
-| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references; "save as defaults" writes them to the config |
+| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references; changes are saved to the config automatically |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |

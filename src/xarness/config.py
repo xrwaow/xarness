@@ -291,7 +291,7 @@ def list_profile_names(path: Path) -> list[str]:
 
 def save_container_settings(path: Path, container: ContainerSettings) -> None:
     """Persist the container settings as the file's global defaults (the TUI
-    settings popup's "save as defaults"). Written to the top-level
+    settings popup). Written to the top-level
     "container" section, in both config shapes."""
     data = _read(path)
     data["container"] = container.model_dump(mode="json", exclude_none=True)

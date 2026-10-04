@@ -4,9 +4,9 @@
   access, .gitignore shadowing, GPU access, external references. The
   persistent shell restarts on its next command via the sandbox's mount key;
   changes die with the chat session.
-- **Global defaults**: edits the same settings as they will be written to the
-  config file's top-level ``container`` section. Nothing applies until
-  "save"; it becomes the startup default for new sessions.
+- **Global**: edits the same settings as they will be written to the
+  config file's top-level ``container`` section. Every change is persisted
+  automatically; it becomes the startup default for new sessions.
 
 Ref rows show the full host path plus mount point, a read-only/writable
 switch, and a ✕ button to remove.
@@ -63,16 +63,22 @@ class ContainerSettingsScreen(ModalScreen[None]):
             with TabbedContent(initial="session-tab", id="container-tabs"):
                 with TabPane("Session", id="session-tab"):
                     yield from self._pane(self._sandbox is not None)
-                with TabPane("Global defaults", id="defaults-tab"):
+                with TabPane("Global", id="defaults-tab"):
                     yield from self._pane_defaults()
-            with Horizontal(id="container-buttons"):
-                yield Button("Close", id="container-close")
-                yield Button("Save as defaults", id="container-save")
 
     def _switch_row(self, label: str, value: bool, switch_id: str):
         with Horizontal(classes="container-row"):
             yield Label(label, classes="container-label")
-            yield Switch(value, id=switch_id)
+            yield self._toggle(value, switch_id)
+
+    @staticmethod
+    def _toggle(value: bool, button_id: str) -> Button:
+        """A toggle button instead of a slider switch: dimmed when off,
+        accent when on."""
+        button = Button("on" if value else "off", id=button_id, classes="container-toggle")
+        if value:
+            button.add_class("is-on")
+        return button
 
     def _pane(self, session: bool):
         yield from self._switch_row("Network access", session and self._sandbox.allow_network, "container-net")
@@ -181,22 +187,28 @@ class ContainerSettingsScreen(ModalScreen[None]):
     # ------------------------------------------------------------------
     # Policy switches
 
-    @on(Switch.Changed, "#container-net")
-    def _net_changed(self, event: Switch.Changed) -> None:
+    @on(Button.Pressed, "#container-net")
+    def _net_changed(self, event: Button.Pressed) -> None:
         if self._sandbox is not None:
-            self._sandbox.set_network_access(event.value)
+            self._sandbox.set_network_access(not self._sandbox.allow_network)
+            self._sync_toggle(event.button, self._sandbox.allow_network)
+            self._persist()
 
-    @on(Switch.Changed, "#container-gitignore")
-    def _gitignore_changed(self, event: Switch.Changed) -> None:
+    @on(Button.Pressed, "#container-gitignore")
+    def _gitignore_changed(self, event: Button.Pressed) -> None:
         if self._sandbox is not None:
-            self._sandbox.set_respect_gitignore(event.value)
+            self._sandbox.set_respect_gitignore(not self._sandbox.respect_gitignore)
+            self._sync_toggle(event.button, self._sandbox.respect_gitignore)
+            self._persist()
 
-    @on(Switch.Changed, "#container-gpu")
-    def _gpu_changed(self, event: Switch.Changed) -> None:
+    @on(Button.Pressed, "#container-gpu")
+    def _gpu_changed(self, event: Button.Pressed) -> None:
         if self._sandbox is not None:
-            self._sandbox.set_gpu_access(event.value)
-            if event.value:
+            self._sandbox.set_gpu_access(not self._sandbox.gpu_access)
+            self._sync_toggle(event.button, self._sandbox.gpu_access)
+            if self._sandbox.gpu_access:
                 self.run_worker(self._gpu_probe(), exclusive=True)
+            self._persist()
 
     async def _gpu_probe(self) -> None:
         from ..sandbox import probe_gpu_access
@@ -208,17 +220,28 @@ class ContainerSettingsScreen(ModalScreen[None]):
         self.app.notify(message, severity="warning" if level == "warn" else "information",
                         title="GPU access")
 
-    @on(Switch.Changed, "#defaults-net")
-    def _defaults_net(self, event: Switch.Changed) -> None:
-        self._defaults.network_access = event.value
+    @on(Button.Pressed, "#defaults-net")
+    def _defaults_net(self, event: Button.Pressed) -> None:
+        self._defaults.network_access = not self._defaults.network_access
+        self._sync_toggle(event.button, self._defaults.network_access)
+        self._persist()
 
-    @on(Switch.Changed, "#defaults-gitignore")
-    def _defaults_gitignore(self, event: Switch.Changed) -> None:
-        self._defaults.respect_gitignore = event.value
+    @on(Button.Pressed, "#defaults-gitignore")
+    def _defaults_gitignore(self, event: Button.Pressed) -> None:
+        self._defaults.respect_gitignore = not self._defaults.respect_gitignore
+        self._sync_toggle(event.button, self._defaults.respect_gitignore)
+        self._persist()
 
-    @on(Switch.Changed, "#defaults-gpu")
-    def _defaults_gpu(self, event: Switch.Changed) -> None:
-        self._defaults.gpu_access = event.value
+    @on(Button.Pressed, "#defaults-gpu")
+    def _defaults_gpu(self, event: Button.Pressed) -> None:
+        self._defaults.gpu_access = not self._defaults.gpu_access
+        self._sync_toggle(event.button, self._defaults.gpu_access)
+        self._persist()
+
+    @staticmethod
+    def _sync_toggle(button: Button, value: bool) -> None:
+        button.label = "on" if value else "off"
+        button.set_class(value, "is-on")
 
     # ------------------------------------------------------------------
     # Ref rows: writable switch + remove button
@@ -249,6 +272,7 @@ class ContainerSettingsScreen(ModalScreen[None]):
             alias = list(self._sandbox.external_refs)[idx]
             self._sandbox.remove_ref(alias)
         self._refresh_refs()
+        self._persist()
 
     # ------------------------------------------------------------------
     # Add / remove via keyboard
@@ -274,6 +298,7 @@ class ContainerSettingsScreen(ModalScreen[None]):
                 return
         input_widget.value = ""
         self._refresh_refs()
+        self._persist()
         self.app.notify(f"mounted {path} at {mount or '.refs/<alias>'}")
 
     def action_remove_ref(self) -> None:
@@ -288,16 +313,19 @@ class ContainerSettingsScreen(ModalScreen[None]):
             alias = list(self._sandbox.external_refs)[idx]
             self._sandbox.remove_ref(alias)
         self._refresh_refs()
+        self._persist()
 
     # ------------------------------------------------------------------
     # Footer
 
-    @on(Button.Pressed, "#container-close")
     def action_cancel(self) -> None:
+        """Escape closes the popup (see BINDINGS)."""
         self.dismiss(None)
 
-    @on(Button.Pressed, "#container-save")
-    def _save_defaults(self) -> None:
+    def _persist(self) -> None:
+        """Auto-save: any change writes the active tab's settings to the
+        config file immediately (session tab snapshots the sandbox as the
+        new defaults; defaults tab writes what it edits)."""
         if self._active_defaults:
             settings = self._defaults
         elif self._sandbox is not None:
@@ -320,9 +348,6 @@ class ContainerSettingsScreen(ModalScreen[None]):
             save_container_settings(self._config_path, settings)
         except ConfigError as exc:
             self.app.notify(f"save failed: {exc}", severity="error")
-            return
-        self._defaults = settings
-        self.app.notify(f"saved as defaults in {self._config_path}")
 
 
 def _parse_ref_input(text: str) -> tuple[str, str | None, bool]:
