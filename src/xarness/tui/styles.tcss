@@ -696,6 +696,15 @@ ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
     height: 1;
 }
 
+.container-limit-input {
+    width: 10;
+    height: 1;
+    border: none;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+}
+
 .container-label {
     width: 1fr;
     color: $c-text;

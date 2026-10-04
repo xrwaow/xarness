@@ -76,15 +76,16 @@ def tool(name: str, description: str, required: tuple[str, ...] = (), **params: 
     return deco
 
 
-# Per-tool cap on the text sent back to the model (adjustable with
-# /output_limit in the TUI). Applies to every tool via ToolRegistry.call.
+# Per-tool cap on the text sent back to the model (see the "Tool output
+# limit" row of the TUI's /container popup). Applies to every tool via
+# ToolRegistry.call.
 DEFAULT_OUTPUT_LIMIT = 32768
 
 
 def _truncate_output(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    note = f"\n[output truncated at {limit} chars — raise the cap with /output_limit <chars>]"
+    note = f"\n[output truncated at {limit} chars — raise the cap in /container]"
     return text[: max(limit - len(note), 0)] + note
 
 
@@ -120,7 +121,7 @@ class ToolRegistry:
     """Named tool set exposed to the model.
 
     ``max_output_chars`` caps the text of every tool result before it goes
-    on the wire (see _truncate_output); the TUI's /output_limit command
+    on the wire (see _truncate_output); the TUI's /container popup
     mutates it live.
     """
 

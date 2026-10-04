@@ -5,6 +5,7 @@
     "network_access": false,
     "respect_gitignore": true,
     "gpu_access": false,
+    "tool_output_limit": 32768,
     "auto_include_refs": [
       "docs/spec.md",
       {"path": "~/prebuilt/venv", "mount": ".venv", "read_only": false}

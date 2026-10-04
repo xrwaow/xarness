@@ -204,15 +204,14 @@ SLASH_COMMANDS = [
     ("sessions", "resume a previous session"),
     ("mode", "switch between plan (read-only) and write mode"),
     ("container", (
-        "network access, .gitignore shadowing, external "
-        "references; changes are saved to the config automatically"
+        "network access, .gitignore shadowing, external references, "
+        "auto-compact, tool output limit; changes are saved to the config "
+        "automatically"
     )),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
     ("delete", "delete the current session and start a new one (your files are left exactly as they are)"),
-    ("auto_compact", "toggle automatic compaction when the context window is {pct} full"),
     ("diff", "show pending changes (optionally: /diff <path>)"),
-    ("output_limit", "show or set the per-tool output cap in chars"),
     ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
     ("reject", "discard all changes made since the last /accept"),
     ("undo", "drop the last turn and revert its file edits"),
@@ -243,6 +242,7 @@ class AgentApp(App[None]):
         profile_name: str | None = None,
         sandbox: SandboxConfig | None = None,
         sandbox_session: SandboxSession | None = None,
+        tool_output_limit: int | None = None,
         git_info: GitInfo | None = None,
         startup_notices: list[str] | None = None,
     ) -> None:
@@ -257,11 +257,17 @@ class AgentApp(App[None]):
         # The app owns the sandbox's mode (build_registry doesn't mutate it).
         if sandbox is not None:
             sandbox.read_only = self.mode != "write"
+        # Auto-compact: run compaction automatically when the context window
+        # passes the profile's auto_compact_threshold (checked at the end of
+        # each turn). Off unless the config enables it; /container toggles.
+        self.auto_compact = self.profile.auto_compact
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
+        if tool_output_limit is not None:
+            self.tool_registry.max_output_chars = tool_output_limit
         self.controller = controller or ChatController(
             profile, api_key, tool_registry=self.tool_registry
         )
@@ -410,12 +416,6 @@ class AgentApp(App[None]):
                 self._post_line(ErrorLine("/delete: wait for the current turn or compaction to finish first"))
             else:
                 self._start_delete()
-        elif cmd == "auto_compact":
-            self.auto_compact = not self.auto_compact
-            pct = f"{self.profile.auto_compact_threshold:.0%}"
-            state = f"on — compaction runs at {pct} context" if self.auto_compact else "off"
-            self._post_line(NoticeLine(f"auto-compact {state}"))
-            self._save_preference(auto_compact=self.auto_compact, profile=self.profile.name)
         elif cmd == "accept":
             preflight = self._git_action_preflight("accept")
             if preflight is not None:
@@ -453,9 +453,15 @@ class AgentApp(App[None]):
                     "(bubblewrap missing), so there is no container to configure"
                 ))
             else:
-                self.push_screen(ContainerSettingsScreen(self.sandbox, self.config_path))
-        elif cmd == "output_limit":
-            self._handle_output_limit(parts[1].strip() if len(parts) > 1 else "")
+                self.push_screen(ContainerSettingsScreen(
+                    self.sandbox, self.config_path,
+                    session_auto_compact=self.auto_compact,
+                    session_output_limit=self.tool_registry.max_output_chars,
+                    default_auto_compact=self.profile.auto_compact,
+                    profile_name=self.profile_name,
+                    on_auto_compact=self._set_auto_compact,
+                    on_output_limit=self._set_output_limit,
+                ))
         elif cmd == "undo":
             self._run_undo(resend=False)
         elif cmd == "retry":
@@ -515,25 +521,15 @@ class AgentApp(App[None]):
     def last_out(self) -> int:
         return self._last_usage().output_tokens if self._last_usage() else 0
 
-    def _handle_output_limit(self, arg: str) -> None:
-        """Show or set the per-tool output cap the model receives."""
-        registry = self.tool_registry
-        if not arg:
-            self._post_line(NoticeLine(
-                f"tool output limit: {registry.max_output_chars:,} chars "
-                "(set with /output_limit <chars>)"
-            ))
-            return
-        try:
-            limit = int(arg)
-        except ValueError:
-            self._post_line(ErrorLine(f"/output_limit: not a number: {arg}"))
-            return
-        if limit < 256:
-            self._post_line(ErrorLine("/output_limit: must be at least 256"))
-            return
-        registry.max_output_chars = limit
-        self._post_line(NoticeLine(f"tool output limit set to {limit:,} chars"))
+    def _set_auto_compact(self, value: bool) -> None:
+        """Container popup, session tab: flip the live auto-compact flag and
+        persist it as the profile default."""
+        self.auto_compact = value
+        self._save_preference(auto_compact=value, profile=self.profile.name)
+
+    def _set_output_limit(self, limit: int) -> None:
+        """Container popup, session tab: per-tool output cap for this session."""
+        self.tool_registry.max_output_chars = limit
 
     @work(group="undo", exclusive=True)
     async def _run_undo(self, resend: bool) -> None:
@@ -1189,13 +1185,10 @@ class AgentApp(App[None]):
         # Table-style rows: commands padded to a shared column, descriptions
         # dimmed — same layout language as the session list.
         width = max(len(name) for name, _ in SLASH_COMMANDS)
-        # {pct} in a description is the profile's auto-compact threshold,
-        # interpolated here since SLASH_COMMANDS is profile-independent.
-        pct = f"{self.profile.auto_compact_threshold:.0%}"
         matches = [
             (
                 name,
-                f"/{name:<{width}}  [dim]{desc.format(pct=pct) if '{pct}' in desc else desc}[/]",
+                f"/{name:<{width}}  [dim]{desc}[/]",
             )
             for name, desc in SLASH_COMMANDS
             if name.startswith(q)
@@ -1617,8 +1610,8 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"{label}: {counts}"))
 
     async def _maybe_auto_compact(self) -> None:
-        """End-of-turn hook for /auto_compact: compact at the profile's
-        auto_compact_threshold of the context window.
+        """End-of-turn hook for /container's auto-compact: compact at the
+        profile's auto_compact_threshold of the context window.
 
         Runs only at a turn boundary, so there are no pending tool calls to
         break pairing. The context estimate matches the status bar's

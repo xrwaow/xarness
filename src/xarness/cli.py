@@ -163,6 +163,7 @@ def _run_chat(args: argparse.Namespace) -> None:
         profile_name=loaded.profile_name,
         sandbox=sandbox,
         sandbox_session=session,
+        tool_output_limit=loaded.container.tool_output_limit,
         git_info=git_info,
         startup_notices=git_notices,
     )

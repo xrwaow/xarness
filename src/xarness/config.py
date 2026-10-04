@@ -148,6 +148,11 @@ class ContainerSettings(BaseModel):
     # when two paths share a basename).
     auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
 
+    # Per-tool output cap (chars) the model receives — the "Tool output
+    # limit" row of the /container popup. None = the built-in default
+    # (tools.DEFAULT_OUTPUT_LIMIT).
+    tool_output_limit: int | None = Field(default=None, ge=256)
+
     @field_validator("auto_include_refs", mode="before")
     @classmethod
     def _coerce_refs(cls, value: Any) -> Any:

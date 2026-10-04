@@ -275,6 +275,9 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     disambiguated by prepending parent segments (`docs/spec.md` and
     `~/notes/spec.md` become `.refs/spec.md` and `.refs/notes-spec.md`).
     Missing paths are skipped.
+  - `tool_output_limit` — per-tool output cap in chars the model receives
+    (default 32768; must be at least 256). Also the "Tool output limit" row
+    of the /container popup.
 
   Everything here is also adjustable per session with `/container` in the
   TUI (settings popup); changes there are written back into the config
@@ -294,7 +297,7 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     rounds (default `true`).
   - `auto_compact` — compact automatically after each turn once the context
     estimate passes `auto_compact_threshold` of `max_context` (default
-    `false`; `/auto_compact` toggles it at runtime).
+    `false`; the /container popup's "Auto-compact" toggle changes it).
   - `auto_compact_threshold` — fraction of the context window that triggers
     auto-compaction, e.g. `0.9` = 90% full; must be in (0, 1]
     (default `0.9`).
@@ -335,11 +338,10 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/model` | Choose the model and reasoning effort |
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
-| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references; changes are saved to the config automatically |
+| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references, auto-compact, tool output limit; changes are saved to the config automatically |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
-| `/auto_compact` | Toggle automatic compaction when the context window passes the profile's `auto_compact_threshold` (checked after each turn) |
 | `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |

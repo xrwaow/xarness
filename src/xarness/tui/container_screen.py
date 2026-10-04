@@ -1,12 +1,14 @@
 """Container settings popup, two tabs:
 
 - **Session** (default): live-mutates the running SandboxConfig — network
-  access, .gitignore shadowing, GPU access, external references. The
-  persistent shell restarts on its next command via the sandbox's mount key;
-  changes die with the chat session.
-- **Global**: edits the same settings as they will be written to the
-  config file's top-level ``container`` section. Every change is persisted
-  automatically; it becomes the startup default for new sessions.
+  access, .gitignore shadowing, GPU access, external references — plus the
+  session's auto-compact flag and per-tool output cap. The persistent shell
+  restarts on its next command via the sandbox's mount key; changes die with
+  the chat session.
+- **Global**: edits the same settings as they will be written to the config
+  file's top-level ``container`` section (plus the profile's auto-compact
+  default). Every change is persisted automatically; it becomes the startup
+  default for new sessions.
 
 Ref rows show the full host path plus mount point, a read-only/writable
 switch, and a ✕ button to remove.
@@ -15,15 +17,43 @@ switch, and a ✕ button to remove.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
+from rich.segment import Segment
 from textual import on
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widgets import Button, Input, Label, ListItem, ListView, Switch, TabbedContent, TabPane
 
-from ..config import ConfigError, ContainerSettings, RefSpec, save_container_settings
+from ..config import ConfigError, ContainerSettings, RefSpec, save_container_settings, save_preferences
 from ..sandbox import SandboxConfig, SandboxUnavailable
+from ..tools import DEFAULT_OUTPUT_LIMIT
+
+
+class RightAlignedInput(Input):
+    """An Input whose value hugs the right edge.
+
+    Textual's Input hard-codes left-aligned rendering (it ignores the CSS
+    ``text-align`` property entirely), so right-alignment is done here by
+    shifting the rendered strip right. Only applies while the value fits —
+    once it overflows, scrolling behaves like a normal left-aligned Input.
+    """
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        if y != 0 or not self.value:
+            return strip
+        width = self.scrollable_content_region.width
+        # The base strip carries the value plus one cell for the cursor when
+        # it sits at the end (focused); account for that so the last value
+        # cell lands on the right edge.
+        extra = 1 if self.has_focus and self.cursor_at_end else 0
+        pad = width - len(self.value) - extra
+        if pad <= 0:
+            return strip
+        return Strip([Segment(" " * pad, style=self.rich_style), *strip])
 
 
 class ContainerSettingsScreen(ModalScreen[None]):
@@ -38,10 +68,23 @@ class ContainerSettingsScreen(ModalScreen[None]):
         self,
         sandbox: SandboxConfig | None,
         config_path: Path | None = None,
+        *,
+        session_auto_compact: bool = False,
+        session_output_limit: int = DEFAULT_OUTPUT_LIMIT,
+        default_auto_compact: bool = False,
+        profile_name: str | None = None,
+        on_auto_compact: Callable[[bool], None] | None = None,
+        on_output_limit: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
         self._config_path = config_path
+        self._session_auto_compact = session_auto_compact
+        self._session_output_limit = session_output_limit
+        self._default_auto_compact = default_auto_compact
+        self._profile_name = profile_name
+        self._on_auto_compact = on_auto_compact
+        self._on_output_limit = on_output_limit
         self._defaults = self._load_defaults()
 
     def _load_defaults(self) -> ContainerSettings:
@@ -86,6 +129,10 @@ class ContainerSettingsScreen(ModalScreen[None]):
             "Respect .gitignore", session and self._sandbox.respect_gitignore, "container-gitignore",
         )
         yield from self._switch_row("GPU access", session and self._sandbox.gpu_access, "container-gpu")
+        yield from self._switch_row(
+            "Auto-compact", self._session_auto_compact, "container-autocompact",
+        )
+        yield from self._limit_row("container-output-limit", self._session_output_limit)
         yield Label(
             "External references — ✕ removes, switch flips read-only/writable",
             id="container-refs-title",
@@ -97,12 +144,24 @@ class ContainerSettingsScreen(ModalScreen[None]):
             id="container-ref-input",
         )
 
+    @staticmethod
+    def _limit_row(input_id: str, value: int):
+        with Horizontal(classes="container-row"):
+            yield Label("Tool output limit", classes="container-label")
+            yield RightAlignedInput(str(value), id=input_id, classes="container-limit-input")
+
     def _pane_defaults(self):
         yield from self._switch_row("Network access", self._defaults.network_access, "defaults-net")
         yield from self._switch_row(
             "Respect .gitignore", self._defaults.respect_gitignore, "defaults-gitignore",
         )
         yield from self._switch_row("GPU access", self._defaults.gpu_access, "defaults-gpu")
+        yield from self._switch_row(
+            "Auto-compact", self._default_auto_compact, "defaults-autocompact",
+        )
+        yield from self._limit_row(
+            "defaults-output-limit", self._defaults.tool_output_limit or DEFAULT_OUTPUT_LIMIT,
+        )
         yield Label(
             "External references — ✕ removes, switch flips read-only/writable",
             id="defaults-refs-title",
@@ -220,6 +279,45 @@ class ContainerSettingsScreen(ModalScreen[None]):
         self.app.notify(message, severity="warning" if level == "warn" else "information",
                         title="GPU access")
 
+    @on(Button.Pressed, "#container-autocompact, #defaults-autocompact")
+    def _autocompact_changed(self, event: Button.Pressed) -> None:
+        defaults = self._active_defaults
+        value = not (self._default_auto_compact if defaults else self._session_auto_compact)
+        if defaults:
+            self._default_auto_compact = value
+        else:
+            self._session_auto_compact = value
+        self._sync_toggle(event.button, value)
+        if defaults:
+            if self._config_path is None:
+                self.app.notify("no config path known; cannot save default", severity="warning")
+                return
+            try:
+                save_preferences(
+                    self._config_path, auto_compact=value, profile=self._profile_name,
+                )
+            except ConfigError as exc:
+                self.app.notify(f"save failed: {exc}", severity="error")
+        elif self._on_auto_compact is not None:
+            self._on_auto_compact(value)
+
+    @on(Input.Submitted, "#container-output-limit, #defaults-output-limit")
+    def _output_limit_changed(self, event: Input.Submitted) -> None:
+        limit = _parse_output_limit(event.input.value)
+        if isinstance(limit, str):
+            self.app.notify(f"output limit not set: {limit}", severity="warning")
+            return
+        event.input.value = str(limit)
+        if self._active_defaults:
+            self._defaults.tool_output_limit = limit
+            self._persist()
+            self.app.notify(f"tool output limit default set to {limit:,} chars")
+        else:
+            self._session_output_limit = limit
+            if self._on_output_limit is not None:
+                self._on_output_limit(limit)
+            self.app.notify(f"tool output limit set to {limit:,} chars")
+
     @on(Button.Pressed, "#defaults-net")
     def _defaults_net(self, event: Button.Pressed) -> None:
         self._defaults.network_access = not self._defaults.network_access
@@ -333,6 +431,9 @@ class ContainerSettingsScreen(ModalScreen[None]):
                 network_access=self._sandbox.allow_network,
                 respect_gitignore=self._sandbox.respect_gitignore,
                 gpu_access=self._sandbox.gpu_access,
+                # The global output-limit default is not a sandbox knob;
+                # carry it over so a session-tab save doesn't erase it.
+                tool_output_limit=self._defaults.tool_output_limit,
                 auto_include_refs=[
                     RefSpec(path=str(ref.host), mount=ref.mount, read_only=ref.read_only)
                     for ref in self._sandbox.external_refs.values()
@@ -348,6 +449,17 @@ class ContainerSettingsScreen(ModalScreen[None]):
             save_container_settings(self._config_path, settings)
         except ConfigError as exc:
             self.app.notify(f"save failed: {exc}", severity="error")
+
+
+def _parse_output_limit(text: str) -> int | str:
+    """Parse the output-limit input; returns the limit or an error message."""
+    try:
+        limit = int(text.strip())
+    except ValueError:
+        return f"not a number: {text.strip()}"
+    if limit < 256:
+        return "must be at least 256"
+    return limit
 
 
 def _parse_ref_input(text: str) -> tuple[str, str | None, bool]:
