@@ -974,6 +974,9 @@ class AgentApp(App[None]):
             return
         if self.sandbox is not None:
             self.sandbox.apply_session_settings(block)
+            # apply_session_settings may have flipped respect_gitignore, which
+            # changes the system prompt (gitignored-files clause).
+            self.ensure_system_message()
         limit = block.get("tool_output_limit")
         if isinstance(limit, int) and limit > 0:
             self._set_output_limit(limit)

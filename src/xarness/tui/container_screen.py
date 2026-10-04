@@ -235,6 +235,11 @@ class ContainerSettingsScreen(ModalScreen[None]):
         if self._sandbox is not None:
             self._sandbox.set_respect_gitignore(not self._sandbox.respect_gitignore)
             self._sync_toggle(event.button, self._sandbox.respect_gitignore)
+            # The system prompt mentions 0-byte gitignored placeholders only
+            # when ignore rules are respected — refresh it for the next turn.
+            app = self.app
+            if hasattr(app, "ensure_system_message"):
+                app.ensure_system_message()
             self._persist()
 
     @on(Button.Pressed, "#container-gpu")
