@@ -52,10 +52,15 @@ from .widgets import (
     AskBar, AssistantMessage, ChatInput, CompactionSummary, DiffSummary,
     ErrorLine, GeneratingBar,
     MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
+    crop_path,
     SteerQueueBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
     ToolWritingIndicator, UserMessage, _format_duration,
 )
 
+
+# Max characters of the workspace path shown in the terminal title —
+# matches the status bar's crop_path default.
+_TITLE_PATH_LEN = 16
 
 INPUT_PLACEHOLDER = (
     "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
@@ -348,6 +353,7 @@ class AgentApp(App[None]):
     async def on_mount(self) -> None:
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_status()
+        self._set_default_title()
         # Follow new output only while the user is parked at the bottom.
         # Textual's anchor does exactly that: the log stays pinned to the end as
         # content streams, the anchor is released the moment the user scrolls up
@@ -373,6 +379,26 @@ class AgentApp(App[None]):
         drift = await self._detect_resume_drift()
         if drift is not None and self.git_info is not None:
             self._prompt_resume_drift(self.git_info, drift[0], drift[1])
+
+    # ------------------------------------------------------------------
+    # Terminal title
+
+    def _set_terminal_title(self, title: str) -> None:
+        """Write an OSC 0 sequence so the terminal tab/window shows `title`."""
+        driver = self._driver
+        if driver is None:
+            return
+        driver.write(f"\x1b]0;{title}\x07")
+        driver.flush()
+
+    def _set_default_title(self) -> None:
+        """Default title: `xarness <workdir>`, path cropped like the status
+        bar (tail kept, whole components) but without the leading `...`."""
+        path = str(self.workspace or Path.cwd())
+        cropped = crop_path(path, _TITLE_PATH_LEN)
+        if cropped.startswith(".../"):
+            cropped = cropped[4:]
+        self._set_terminal_title(f"xarness {cropped}")
 
     # ------------------------------------------------------------------
     # Status bar
@@ -1499,6 +1525,7 @@ class AgentApp(App[None]):
             for index, question in enumerate(questions):
                 ask_bar.show_question(f"Question {index + 1}/{len(questions)}: {question}")
                 chat_input.placeholder = ASK_PLACEHOLDER
+                self._set_terminal_title("xarness - ask")
                 chat_input.focus()
                 future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
                 self._ask_future = future
@@ -1511,6 +1538,7 @@ class AgentApp(App[None]):
             self._ask_future = None
             ask_bar.hide()
             chat_input.placeholder = INPUT_PLACEHOLDER
+            self._set_default_title()
 
     @work(group="turn")
     async def _run_turn(
@@ -1528,6 +1556,7 @@ class AgentApp(App[None]):
         with no tool calls.
         """
         self._turn_busy = True
+        self._set_default_title()
         chat = self.query_one("#chat-log", VerticalScroll)
         gen_bar = self.query_one("#generating-bar", GeneratingBar)
         gen_bar.add_class("active")
@@ -1638,6 +1667,7 @@ class AgentApp(App[None]):
             self._persist_git_state()
             gen_bar.remove_class("active")
             self._turn_busy = False
+            self._set_terminal_title("xarness - finished")
             self._worker = None
             # Cheapest correct trigger for the diff summary: after any turn
             # that ran tools, recompute once — not per keystroke or per round.

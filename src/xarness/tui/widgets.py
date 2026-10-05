@@ -1601,7 +1601,7 @@ class GeneratingBar(Static):
         top = self.LEVELS - 1
         for i in range(self.WIDTH):
             self._cols[i] = max(0, min(top, self._cols[i] + random.choice((-1, 0, 1))))
-        line = Text("  ")
+        line = Text(" ")
         for level in self._cols:
             line.append(self.GLYPH, style=self._level_color(level))
         self.update(line)
