@@ -22,6 +22,32 @@ DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
 
 DEFAULT_THEME = "ayu-darker"
 
+# Config written on first run (no file at DEFAULT_CONFIG_PATH yet): one
+# OpenAI-shaped profile using the built-in defaults for everything else.
+STARTER_CONFIG: dict[str, Any] = {
+    "default_profile": "openai",
+    "profiles": [
+        {
+            "name": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "model_id": "gpt-4.1",
+        }
+    ],
+}
+
+# Optional per-profile keys the starter config leaves at their defaults.
+PROFILE_OPTIONAL_DEFAULTS: dict[str, Any] = {
+    "api_key_env": "OPENAI_API_KEY",
+    "shown_name": None,
+    "max_context": 128_000,
+    "cot_strength": "medium",
+    "keep_reasoning": True,
+    "supports_vision": False,
+    "auto_compact": False,
+    "auto_compact_threshold": 0.9,
+}
+
 
 class ConfigError(Exception):
     """Raised when the config file is missing, malformed, or invalid."""
@@ -125,22 +151,13 @@ class ContainerSettings(BaseModel):
     """Sandbox/container knobs, top-level "container" section of the config.
 
     Applies to the one sandbox all tools run in (see ``sandbox.py``);
-    independent of which profile is selected."""
+    independent of which profile is selected.
+
+    Network and GPU access are launch-time CLI flags (``--network``,
+    ``--gpu``), not config settings."""
 
     model_config = ConfigDict(extra="forbid")
 
-    # Let tools inside the sandbox open network connections (bwrap
-    # --share-net). Off by default: cached installs and offline work cover
-    # most sessions, and the default blocks every raw socket.
-    network_access: bool = False
-    # Shadow paths flagged by .gitignore/.git/info/exclude out of the
-    # container (the default). Set false to expose ignored files (build
-    # outputs, .venv, ...) to the tools.
-    respect_gitignore: bool = True
-    # Expose the host's GPU device nodes (/dev/dri, /dev/kfd, /dev/nvidia*)
-    # plus driver sysfs/proc paths, so CUDA/ROCm code can run inside the
-    # container. Off by default.
-    gpu_access: bool = False
     # Host paths bound into the container at runtime, so the model can
     # consult (or, when writable, reuse) files that live outside the
     # workspace: specs, notes, other checkouts, prebuilt toolchains. Entries
@@ -151,9 +168,8 @@ class ContainerSettings(BaseModel):
     # when two paths share a basename).
     auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
 
-    # Per-tool output cap (chars) the model receives — the "Tool output
-    # limit" row of the /container popup. None = the built-in default
-    # (tools.DEFAULT_OUTPUT_LIMIT).
+    # Per-tool output cap (chars) the model receives. None = the built-in
+    # default (tools.DEFAULT_OUTPUT_LIMIT).
     tool_output_limit: int | None = Field(default=None, ge=256)
 
     @field_validator("auto_include_refs", mode="before")
@@ -194,10 +210,7 @@ class LoadedConfig:
 def _read(path: Path) -> dict[str, Any]:
     """Read and parse the config file into a top-level object."""
     if not path.exists():
-        raise ConfigError(
-            f"config file not found: {path}\n"
-            "  copy config.example.json from the repo there to get started"
-        )
+        raise ConfigError(f"config file not found: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -207,6 +220,52 @@ def _read(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a JSON object at the top level")
     return data
+
+
+def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> list[str]:
+    """Single startup check for the config file.
+
+    Missing file: create one from the starter config. Existing file: report
+    (as returned notices) the optional values it omits so the user knows the
+    built-in defaults are in effect. Malformed/invalid files are left alone —
+    load_config reports them properly."""
+    if not path.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(STARTER_CONFIG, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"could not create {path}: {exc}") from exc
+        return [
+            f"created starter config at {path} — edit it to point at your provider"
+        ]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []  # load_config reports the problem
+    if not isinstance(data, dict):
+        return []
+    missing: list[str] = []
+    if "default_theme" not in data:
+        missing.append("default_theme (= ayu-darker)")
+    if "container" not in data:
+        missing.append("container (= built-in defaults)")
+    profiles = data.get("profiles")
+    profiles = profiles if isinstance(profiles, list) else [
+        data.get("provider") if isinstance(data.get("provider"), dict) else data,
+    ]
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        name = profile.get("name") or "default"
+        absent = [key for key in PROFILE_OPTIONAL_DEFAULTS if key not in profile]
+        if absent:
+            missing.append(f"{name}: {', '.join(absent)} (= built-in defaults)")
+    if not missing:
+        return []
+    return [
+        f"{path} is missing some optional values; the built-in defaults apply: "
+        + "; ".join(missing)
+    ]
 
 
 def _validate(path: Path, model: Any, data: Any) -> Any:
@@ -295,18 +354,6 @@ def list_profile_names(path: Path) -> list[str]:
     if not isinstance(data.get("profiles"), list):
         return []
     return [p.name for p in _validate(path, list[ProviderProfile], _normalize(path, data)["profiles"])]
-
-
-def save_container_settings(path: Path, container: ContainerSettings) -> None:
-    """Persist the container settings as the file's global defaults (the TUI
-    settings popup). Written to the top-level
-    "container" section, in both config shapes."""
-    data = _read(path)
-    data["container"] = container.model_dump(mode="json", exclude_none=True)
-    try:
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError(f"could not write {path}: {exc}") from exc
 
 
 def save_preferences(

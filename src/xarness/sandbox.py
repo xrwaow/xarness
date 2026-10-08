@@ -113,70 +113,6 @@ def _shadow_placeholders() -> tuple[str, str]:
     return _SHADOW
 
 
-def _git_ignored_paths(workspace: Path) -> list[str]:
-    """Workspace-relative paths the repo's ignore rules flag, directories
-    collapsed to single entries (``--directory``). Empty when git can't
-    answer (no repo, git failed) — the default walk still covers its own
-    noise."""
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(workspace), "ls-files", "--others", "--ignored",
-             "--exclude-standard", "--directory"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if res.returncode != 0:
-        return []
-    return [line.rstrip("/") for line in res.stdout.splitlines() if line]
-
-
-def _gitignore_files(workspace: Path) -> list[str]:
-    """Workspace-relative paths of every ``.gitignore`` git knows of here
-    (tracked or not — ``--others`` without ``--exclude-standard`` lists the
-    ignored ones too). These are hidden from the container whenever ignore
-    rules are respected: an agent must not see (let alone edit) the rules
-    that decide what it can't see. Empty when git can't answer."""
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(workspace), "ls-files", "--cached", "--others",
-             "--", "*.gitignore"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if res.returncode != 0:
-        return []
-    return [line for line in res.stdout.splitlines() if line]
-
-
-def _hidden_paths(workspace: Path) -> list[str]:
-    """Workspace-relative paths to shadow out of the container: what the
-    repo's ignore rules flag (``.gitignore`` + ``.git/info/exclude``), plus
-    the ``.gitignore`` files themselves. ".git" stays visible (read-only).
-    Children of an already-hidden directory are dropped — shadowing the
-    parent suffices.
-    "uv.lock" is never hidden: uv needs it to build the project env, and an
-    empty shadow placeholder parses as a corrupt lock ("missing field
-    `version`").
-    Empty when git can't answer (no repo, failed)."""
-    hidden: list[str] = []
-    seen_dirs: list[str] = []
-
-    def buried(rel: str) -> bool:
-        return any(rel == d or rel.startswith(d + "/") for d in seen_dirs)
-
-    for rel in dict.fromkeys(
-        _git_ignored_paths(workspace) + _gitignore_files(workspace)
-    ):
-        if rel == "uv.lock" or rel == ".git" or rel.startswith(".git/") or buried(rel):
-            continue
-        if (workspace / rel).is_dir():
-            seen_dirs.append(rel)
-        hidden.append(rel)
-    return hidden
-
-
 @dataclass(slots=True)
 class ContainerRef:
     """One external path bound into the container.
@@ -218,18 +154,6 @@ class SandboxConfig:
     # read-only: the agent never commits — the harness checkpoints on the
     # host (gitwork), so only it touches the index and object store.
     git_dir: Path | None = None
-    # Workspace-relative paths (files and directories) hidden from the
-    # container: what the repo's ignore rules flag, plus the .gitignore
-    # files themselves. Computed once at construction; each path is shadowed
-    # with an empty placeholder in
-    # build_argv, so ignored content is not just filtered from tool output —
-    # it does not exist as far as every tool (bash included) can tell.
-    # ".git" is excluded: it stays visible, read-only.
-    hidden_paths: tuple[str, ...] = ()
-    # When false (config "container": {"respect_gitignore": false}), ignored
-    # files stay visible in the container — hidden_paths is left empty instead
-    # of computed from the repo's ignore rules.
-    respect_gitignore: bool = True
 
     def __post_init__(self) -> None:
         if shutil.which("bwrap") is None:
@@ -252,16 +176,6 @@ class SandboxConfig:
                 )
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
-        self.hidden_paths = (
-            self._compute_hidden_paths() if self.respect_gitignore else ()
-        )
-
-    def _compute_hidden_paths(self) -> tuple[str, ...]:
-        return tuple(
-            p for p in _hidden_paths(self.workspace)
-            if not self.subtree or not (self.subtree == p or self.subtree.startswith(p + "/"))
-        )
-
     def ref_path(self, alias: str) -> str:
         return f"{REFS_ANCHOR}/{alias}"
 
@@ -269,34 +183,21 @@ class SandboxConfig:
     def mount_key(self) -> tuple:
         """Identity of everything that changes the container's mounts. A
         persistent SandboxSession compares this before each command and
-        restarts its shell when it differs, so runtime adjustments (settings
-        popup, plan/write flips) take effect without losing the shell more
-        often than necessary."""
+        restarts its shell when it differs, so runtime changes (mode flips,
+        ref edits) take effect without losing the shell more often than
+        necessary."""
         return (
             self.read_only,
             self.allow_network,
-            self.respect_gitignore,
             self.gpu_access,
             tuple(sorted(
                 (alias, str(ref.host), ref.mount, ref.read_only)
                 for alias, ref in self.external_refs.items()
             )),
-            self.hidden_paths,
         )
 
     # ------------------------------------------------------------------
-    # Runtime adjustments (the TUI settings popup calls these; the shell
-    # restarts on the next command via mount_key).
-
-    def set_network_access(self, allow: bool) -> None:
-        self.allow_network = bool(allow)
-
-    def set_gpu_access(self, allow: bool) -> None:
-        self.gpu_access = bool(allow)
-
-    def set_respect_gitignore(self, respect: bool) -> None:
-        self.respect_gitignore = bool(respect)
-        self.hidden_paths = self._compute_hidden_paths() if respect else ()
+    # External references
 
     def add_ref(
         self,
@@ -335,64 +236,7 @@ class SandboxConfig:
         return self.external_refs.pop(alias, None) is not None
 
     # ------------------------------------------------------------------
-    # Per-session settings (saved in the session file, not the config)
-
-    def session_settings(
-        self, *, tool_output_limit: int | None = None,
-        auto_compact: bool | None = None,
-    ) -> dict:
-        """Snapshot the live session-only container settings.
-
-        Saved in the session file so /sessions resume restores them; never
-        written to the global config defaults."""
-        from .config import RefSpec
-
-        block: dict = {
-            "network_access": self.allow_network,
-            "respect_gitignore": self.respect_gitignore,
-            "gpu_access": self.gpu_access,
-            "auto_include_refs": [
-                RefSpec(path=str(ref.host), mount=ref.mount, read_only=ref.read_only)
-                .model_dump(mode="json")
-                for ref in self.external_refs.values()
-            ],
-        }
-        if tool_output_limit is not None:
-            block["tool_output_limit"] = tool_output_limit
-        if auto_compact is not None:
-            block["auto_compact"] = auto_compact
-        return block
-
-    def apply_session_settings(self, block: dict) -> None:
-        """Restore a snapshot from :meth:`session_settings` onto this sandbox
-        (used when a saved session is resumed). Unknown/missing keys keep
-        the current values; refs whose host path has vanished are skipped."""
-        if "network_access" in block:
-            self.allow_network = bool(block["network_access"])
-        if "gpu_access" in block:
-            self.gpu_access = bool(block["gpu_access"])
-        if "respect_gitignore" in block:
-            self.set_respect_gitignore(bool(block["respect_gitignore"]))
-        refs = block.get("auto_include_refs")
-        if isinstance(refs, list):
-            self.external_refs.clear()
-            for ref in refs:
-                if not isinstance(ref, dict) or "path" not in ref:
-                    continue
-                try:
-                    self.add_ref(
-                        ref["path"], mount=ref.get("mount"),
-                        read_only=bool(ref.get("read_only", True)),
-                    )
-                except (FileNotFoundError, SandboxUnavailable):
-                    pass
-
-    def ref_summary(self) -> list[tuple[str, str, bool]]:
-        """(alias, mount, read_only) for the settings UI and status lines."""
-        return [
-            (alias, ref.mount, ref.read_only)
-            for alias, ref in sorted(self.external_refs.items())
-        ]
+    # External references
 
     @staticmethod
     def resolve_auto_refs(
@@ -609,10 +453,7 @@ class SandboxConfig:
             # Whole workspace read-only — git keeps working (the .git file at
             # the worktree root stays reachable) and the agent can read the
             # surrounding project — with the session's subtree re-bound
-            # read-write on top (later binds shadow earlier ones). Hidden
-            # paths are shadowed before that re-bind, so the subtree itself
-            # is never hidden from the agent; everything else ignores apply
-            # to the surrounding repo too.
+            # read-write on top (later binds shadow earlier ones).
             argv += ["--ro-bind", str(self.workspace), "/workspace"]
         else:
             argv += ["--ro-bind" if self.read_only else "--bind",
@@ -623,19 +464,6 @@ class SandboxConfig:
                 str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
             ]
             chdir = f"/workspace/{self.subtree}"
-        # Shadow hidden paths last: the subtree re-bind above restores the
-        # agent's own tree wholesale, so shadows must land after it to stick
-        # (ancestors of the subtree were filtered out at construction —
-        # shadowing one would bury the re-bind beneath it).
-        empty_file, empty_dir = _shadow_placeholders()
-        for rel in self.hidden_paths:
-            host = self.workspace / rel
-            is_dir = host.is_dir() and not host.is_symlink()
-            # Read-only: a write to a shadowed path must fail loudly
-            # ("read-only file system"), not silently succeed against the
-            # (shared) placeholder.
-            argv += ["--ro-bind", empty_dir if is_dir else empty_file,
-                     f"/workspace/{rel}"]
         uv_lock = self.workspace / "uv.lock"
         if uv_lock.is_file():
             # Read-only: uv run may read the lock to build the project env
@@ -741,7 +569,6 @@ async def probe_gpu_access(config: SandboxConfig) -> tuple[str, str] | None:
         subtree=config.subtree,
         read_only=True,
         gpu_access=True,
-        respect_gitignore=config.respect_gitignore,
     )
     result = await run_in_sandbox(probe_config, ["nvidia-smi", "-L"])
     output = (result.stderr or result.stdout).strip().splitlines()
@@ -849,8 +676,8 @@ class SandboxSession:
 
     async def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
-            # Any change to the container's mounts (plan/write flip, runtime
-            # settings changes: network, .gitignore, refs) alters the mount
+            # Any change to the container's mounts (plan/write flip, ref
+            # changes) alters the mount
             # argv; the running shell was started under the old mounts, so
             # restart it to pick up the new view.
             key = self._config.mount_key

@@ -61,31 +61,16 @@ exist as far as the model can tell. Stray writes outside the mounts land in
 an ephemeral container layer that dies with the process; they never reach
 the host.
 
-**Hidden paths.** When `respect_gitignore` is on, two categories of path are
-shadowed out of the container: whatever the repo's ignore rules flag
-(`.gitignore` / `.git/info/exclude`), and the `.gitignore` files themselves —
-an agent shouldn't see, let alone edit, the rules that decide what it can't
-see. bubblewrap can't remove a name from its parent directory's listing
-(that would need overlayfs/root), so "hidden" means **replaced**: an empty
-read-only placeholder is mounted over the path. The file still shows in
-`ls` (size 0), reads return emptiness, and writes fail with
-`read-only file system` — the real content is unreachable and untouched.
-Exceptions: `.git` stays visible (read-only), and `uv.lock` is never hidden
-(`uv` needs it to build the project env). The shadow set is computed when a
-session starts; files that become ignore-matched mid-session are shadowed at
-the next session (re)build.
-
 **Plan mode** is the same container with the workspace and every ref bound
 read-only, plus the editing tools removed from the tool set — so shell
 commands cannot change files either.
 
-**Live adjustments.** Everything mount-affecting (plan/write mode, network,
-gitignore shadowing, GPU access, refs) is fingerprinted; when a setting
-toggles at runtime (`/container`, `/mode`), the persistent shell restarts
-with the new mounts on its next command. Network access is off by default
-and only restored when you enable it. GPU access
-(re-binding `/dev/dri`, `/dev/kfd`, `/dev/nvidia*` and the sysfs/proc bits
-drivers need) is opt-in — see `gpu_access` under `container` above.
+**Live adjustments.** Everything mount-affecting (plan/write mode, refs) is
+fingerprinted; when a setting changes at runtime (`/mode`),
+the persistent shell restarts with the new mounts on its next command.
+Network and GPU access are fixed at launch: `xarness --network false --gpu
+false` runs the sandbox fully offline and without device access (both
+default to `true`).
 
 **Git guard.** On top of the mounts, `run_bash` vetoes ref-identity
 git commands: `checkout <ref>`, `switch`, `worktree`, `rebase`,
@@ -204,13 +189,16 @@ pip install -e .
 
 ## Configure
 
-Copy the sample config and set your API key:
+Set your API key:
 
 ```sh
-mkdir -p ~/.config/xarness
-cp config.example.json ~/.config/xarness/config.json
 export OPENAI_API_KEY=sk-...
 ```
+
+On first run xarness autogenerates a starter config at
+`~/.config/xarness/config.json` (one OpenAI-shaped profile using the built-in
+defaults) — edit it to point at your provider. If an existing config omits
+optional values, xarness notes which defaults apply at startup.
 
 Config is JSON at `~/.config/xarness/config.json` by default; override with
 `--config`. Fields:
@@ -220,13 +208,11 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
 - `default_theme` — startup color theme; optional, defaults to `ayu-darker`.
   Options: `"ayu-darker"`, `"one-light"`; `/theme` switches it
   live.
-- `container` — sandbox settings for the tools the model runs (all optional):
+- `container` — sandbox settings for the tools the model runs, read from
+  the config at startup (all optional; there is no runtime popup):
 
   ```json
   "container": {
-    "network_access": false,
-    "respect_gitignore": true,
-    "gpu_access": false,
     "auto_include_refs": [
       "docs/spec.md",
       {"path": "~/prebuilt/venv", "mount": ".venv", "read_only": false}
@@ -234,31 +220,6 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
   }
   ```
 
-  - `network_access` — let tool commands inside the sandbox open network
-    connections (default `false`). With it off, installs still work offline
-    from the shared caches (`uv`, `pip`, `cargo`, `npm`).
-  - `respect_gitignore` — paths matched by `.gitignore` / `.git/info/exclude`
-    are hidden from every tool: replaced in the sandbox by an empty read-only
-    placeholder (they show as 0-byte files; reads give emptiness, writes
-    fail), so the model never reads your build outputs or `.venv`. The
-    `.gitignore` files themselves are hidden the same way. Set to `false` to
-    expose ignored files (default `true`) — changes to ignored files then
-    still never show in `/diff` or `/undo`, because tracking pins the
-    session-start ignore rules.
-  - `gpu_access` — expose the host's GPU device nodes (`/dev/dri`, `/dev/kfd`,
-    `/dev/nvidia*`, `/dev/nvidia-caps`) and driver sysfs/proc paths so
-    CUDA/ROCm code can run in the container (default `false`). Driver
-    userland comes from the read-only `/usr` bind; toggle it live with
-    `/container`. When enabled, a one-shot probe (`nvidia-smi -L` inside the
-    container) runs at startup and on toggle, and reports precisely why GPU
-    access fails if it does: a startup notice warning is your friend here.
-    Known nested-container pitfall: for **non-root** users NVML requires the
-    NVIDIA capability device nodes (`/dev/nvidia-caps/nvidia-cap1`,
-    `nvidia-cap2`); if the parent container passes `/dev/nvidia-caps` as an
-    empty directory (or not at all), `nvidia-smi` fails with "GPU access
-    blocked by the operating system" even though the plain `/dev/nvidia*`
-    nodes open fine. Pass the cap nodes through (or run the parent as root,
-    which bypasses the caps path) — no setting inside xarness can fix it.
   - `auto_include_refs` — host paths bound into the container at runtime, so
     the model can consult (or reuse) material outside the workspace. Two
     entry forms:
@@ -276,12 +237,7 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     `~/notes/spec.md` become `.refs/spec.md` and `.refs/notes-spec.md`).
     Missing paths are skipped.
   - `tool_output_limit` — per-tool output cap in chars the model receives
-    (default 32768; must be at least 256). Also the "Tool output limit" row
-    of the /container popup.
-
-  Everything here is also adjustable per session with `/container` in the
-  TUI (settings popup); changes there are written back into the config
-  automatically. The config values are the startup defaults.
+    (default 32768; must be at least 256).
 - `profiles` — list of profiles; switch with `--profile` (or `/model` in the
   TUI, which also sets reasoning effort). Each profile needs a unique `name`
   plus:
@@ -303,7 +259,7 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
     most 1 megapixel and sent as base64 on every round.
   - `auto_compact` — compact automatically after each turn once the context
     estimate passes `auto_compact_threshold` of `max_context` (default
-    `false`; the /container popup's "Auto-compact" toggle changes it).
+    `false`).
   - `auto_compact_threshold` — fraction of the context window that triggers
     auto-compaction, e.g. `0.9` = 90% full; must be in (0, 1]
     (default `0.9`).
@@ -334,6 +290,7 @@ works:
 xarness                    # default profile
 xarness --profile deepseek
 xarness --workspace ./some-project    # sandbox root (default: cwd)
+xarness --network false --gpu false  # fully offline, no device access
 ```
 
 ## Slash commands
@@ -344,7 +301,6 @@ xarness --workspace ./some-project    # sandbox root (default: cwd)
 | `/model` | Choose the model and reasoning effort |
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
-| `/container` | Container settings popup: network access, `.gitignore` shadowing, external references, auto-compact, tool output limit; changes are saved to the config automatically |
 | `/theme` | Choose a color theme |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |

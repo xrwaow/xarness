@@ -4,14 +4,13 @@
 messages, turn marker, git block) in memory; :func:`load_state` parses the
 file once and returns it, so callers never re-read per field.
 
-Container settings are not part of a session: they live per workspace (see
-:func:`load_workspace_container`). Old session files that still carry a
-``container`` key are accepted, but the key is dropped on load.
+Container settings are not part of a session: they come from the global
+config only. Old session files that still carry a ``container`` key are
+accepted, but the key is dropped on load.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass, fields
@@ -24,7 +23,6 @@ from .events import Usage
 from .images import ImageAttachment
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
-WORKSPACES_DIR = Path("~/.local/share/xarness/workspaces").expanduser()
 
 
 def session_path(name: str) -> Path:
@@ -150,39 +148,6 @@ def load_git_block(name: str) -> dict | None:
         return load_state(name).git
     except (OSError, json.JSONDecodeError, KeyError):
         return None
-
-
-def _workspace_key(workspace: str) -> str:
-    """Stable file key for a workspace path (resolved, so symlinks and
-    trailing slashes don't fork the settings)."""
-    return hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:16]
-
-
-def _workspace_path(key: str) -> Path:
-    return WORKSPACES_DIR / f"{key}.json"
-
-
-def load_workspace_container(workspace: str) -> dict | None:
-    """The container settings saved for this workspace, or None."""
-    try:
-        data = json.loads(_workspace_path(_workspace_key(workspace)).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data.get("container") if isinstance(data.get("container"), dict) else None
-
-
-def save_workspace_container(workspace: str, container: dict | None) -> None:
-    """Persist container settings for a workspace (shared by every session
-    launched in it). ``None`` drops any saved settings."""
-    key = _workspace_key(workspace)
-    path = _workspace_path(key)
-    if container is None:
-        path.unlink(missing_ok=True)
-        return
-    WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(
-        {"workspace": str(workspace), "container": container}, indent=2,
-    ), encoding="utf-8")
 
 
 def list_sessions() -> list[str]:

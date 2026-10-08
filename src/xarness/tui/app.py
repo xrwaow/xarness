@@ -45,7 +45,7 @@ from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from ..sandbox import SandboxConfig, SandboxSession
 from ..tools import ToolRegistry, build_registry
 from .confirm_screen import ConfirmScreen
-from .container_screen import ContainerSettingsScreen
+
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -219,11 +219,6 @@ SLASH_COMMANDS = [
     ("model", "choose what model and reasoning effort to use"),
     ("sessions", "resume a previous session"),
     ("mode", "switch between plan (read-only) and write mode"),
-    ("container", (
-        "network access, .gitignore shadowing, external references, "
-        "auto-compact, tool output limit; changes are saved to the config "
-        "automatically"
-    )),
     ("theme", "choose a color theme"),
     ("new", "start a new chat"),
     ("delete", "delete the current session and start a new one (your files are left exactly as they are)"),
@@ -244,6 +239,7 @@ class AgentApp(App[None]):
         Binding("ctrl+c", "copy_or_quit", "Copy / Quit", priority=True),
         Binding("ctrl+shift+c", "copy_selection", "Copy", priority=True),
         Binding("escape", "interrupt", "Interrupt", priority=True),
+        Binding("ctrl+shift+backspace", "steer_discard", "Discard queued", priority=True),
     ]
 
     def __init__(
@@ -273,10 +269,6 @@ class AgentApp(App[None]):
         # The app owns the sandbox's mode (build_registry doesn't mutate it).
         if sandbox is not None:
             sandbox.read_only = self.mode != "write"
-        # Auto-compact: run compaction automatically when the context window
-        # passes the profile's auto_compact_threshold (checked at the end of
-        # each turn). Off unless the config enables it; /container toggles.
-        self.auto_compact = self.profile.auto_compact
         self.tool_registry = tool_registry or build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
@@ -295,9 +287,9 @@ class AgentApp(App[None]):
         self.git_info = git_info
         self.startup_notices = startup_notices or []
         self._turn_busy = False
-        # /auto_compact: run compaction automatically when the context window
+        # Auto-compact: run compaction automatically when the context window
         # passes the profile's auto_compact_threshold (checked at the end of
-        # each turn). Off unless the config enables it; /auto_compact toggles.
+        # each turn). Off unless the profile's config enables it.
         self.auto_compact = self.profile.auto_compact
         # True while a compaction is rewriting the history: submissions
         # queue (like a busy turn) instead of racing the rewrite. Auto-
@@ -360,11 +352,6 @@ class AgentApp(App[None]):
         # (so nothing yanks the viewport back), and it re-arms once they scroll
         # down to the bottom again.
         self.query_one("#chat-log", VerticalScroll).anchor()
-        # Container settings live per workspace now: apply whatever this
-        # workspace has saved before any turn runs.
-        if self.workspace is not None:
-            from ..session_store import load_workspace_container
-            self._restore_session_container(load_workspace_container(str(self.workspace)))
         # A conversation loaded before mount (e.g. `--session <name>` resume
         # in cli.py) has never been rendered — replay it into the chat log.
         if any(m.role != "system" for m in self.controller.conversation.messages):
@@ -491,23 +478,6 @@ class AgentApp(App[None]):
             )
         elif cmd == "mode":
             self._switch_mode()
-        elif cmd == "container":
-            if self.sandbox is None:
-                self._post_line(ErrorLine(
-                    "/container unavailable: filesystem/bash tools are disabled "
-                    "(bubblewrap missing), so there is no container to configure"
-                ))
-            else:
-                self.push_screen(ContainerSettingsScreen(
-                    self.sandbox, self.config_path,
-                    session_auto_compact=self.auto_compact,
-                    session_output_limit=self.tool_registry.max_output_chars,
-                    default_auto_compact=self.profile.auto_compact,
-                    profile_name=self.profile_name,
-                    on_auto_compact=self._set_auto_compact,
-                    on_output_limit=self._set_output_limit,
-                    workspace=str(self.workspace) if self.workspace else None,
-                ))
         elif cmd == "undo":
             self._run_undo(resend=False)
         elif cmd == "retry":
@@ -566,18 +536,6 @@ class AgentApp(App[None]):
     @property
     def last_out(self) -> int:
         return self._last_usage().output_tokens if self._last_usage() else 0
-
-    def _set_auto_compact(self, value: bool) -> None:
-        """Container popup, workspace tab: flip the live auto-compact flag.
-
-        It is persisted per workspace (see the workspace store), never as the
-        global profile default."""
-        self.auto_compact = value
-
-    def _set_output_limit(self, limit: int) -> None:
-        """Container popup, workspace tab: per-tool output cap for this
-        workspace."""
-        self.tool_registry.max_output_chars = limit
 
     @work(group="undo", exclusive=True)
     async def _run_undo(self, resend: bool) -> None:
@@ -994,21 +952,6 @@ class AgentApp(App[None]):
         chat.anchor()
         self._refresh_status()
 
-    def _restore_session_container(self, block: dict | None) -> None:
-        """Reapply a session's saved container settings on resume."""
-        if not isinstance(block, dict):
-            return
-        if self.sandbox is not None:
-            self.sandbox.apply_session_settings(block)
-            # apply_session_settings may have flipped respect_gitignore, which
-            # changes the system prompt (gitignored-files clause).
-            self.ensure_system_message()
-        limit = block.get("tool_output_limit")
-        if isinstance(limit, int) and limit > 0:
-            self._set_output_limit(limit)
-        if isinstance(block.get("auto_compact"), bool):
-            self.auto_compact = block["auto_compact"]
-
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
             return
@@ -1017,9 +960,6 @@ class AgentApp(App[None]):
         state = load_state(name)
         self.controller.conversation = state.conversation
         self.session_name = name
-        if self.workspace is not None:
-            from ..session_store import load_workspace_container
-            self._restore_session_container(load_workspace_container(str(self.workspace)))
         self.ensure_system_message()
         # Per-message usage is persisted: restore the status-bar totals.
         self._refresh_status()
@@ -1415,6 +1355,13 @@ class AgentApp(App[None]):
         chat.mount(user_message)
         self._worker = self._run_turn(text, user_message, all_images or None)
 
+    def action_steer_discard(self) -> None:
+        """ctrl+shift+backspace: discard the oldest queued steer message."""
+        if not self._queued:
+            return
+        self._queued.pop(0)
+        self._refresh_steer_bar()
+
     def _flush_queued_now(self) -> None:
         """Enter on an empty input while messages are queued: send now.
 
@@ -1733,7 +1680,7 @@ class AgentApp(App[None]):
             self._post_line(NoticeLine(f"{label}: {counts}"))
 
     async def _maybe_auto_compact(self) -> None:
-        """End-of-turn hook for /container's auto-compact: compact at the
+        """End-of-turn hook for the profile's auto-compact: compact at the
         profile's auto_compact_threshold of the context window.
 
         Runs only at a turn boundary, so there are no pending tool calls to

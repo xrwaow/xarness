@@ -116,6 +116,20 @@ AssistantMessage {
     color: $c-text;
     margin: 0;
     overflow-y: hidden;
+    /* Links are inert here (see SettledMarkdown): no hover highlight at
+       all — text looks exactly the same whether or not it's under the
+       mouse, so model-emitted file refs don't look clickable. The hover
+       style is read off each rendered child block, so this must match
+       descendants too, not just the Markdown widget itself. */
+    link-background-hover: transparent;
+    link-color-hover: $c-text;
+    link-style-hover: underline;
+}
+
+.assistant-md * {
+    link-background-hover: transparent;
+    link-color-hover: $c-text;
+    link-style-hover: underline;
 }
 
 .assistant-content {
@@ -581,11 +595,11 @@ DiffSummary.expanded #diff-body {
     color: $c-bg;
 }
 
-ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
+ResumeScreen, PickerScreen, ConfirmScreen {
     align: center middle;
 }
 
-#resume-modal, #picker-modal, #container-modal {
+#resume-modal, #picker-modal {
     width: 52;
     height: auto;
     max-height: 20;
@@ -593,261 +607,6 @@ ResumeScreen, PickerScreen, ConfirmScreen, ContainerSettingsScreen {
     padding: 1 2;
 }
 
-#container-modal {
-    max-height: 30;
-}
-
-/* TabbedContent's tabs: recolor to the palette (default is Textual blue). */
-#container-tabs {
-    height: auto;
-    padding: 0;
-}
-
-#container-tabs Tabs {
-    background: $c-surface;
-    border-bottom: hidden;
-    height: 1;
-    padding: 0;
-}
-
-#container-tabs ContentTab {
-    background: $c-border;
-    color: $c-muted;
-    padding: 0 1 0 0;
-    border: none;
-    height: 1;
-    text-style: not dim;
-    &:ansi {
-        text-style: not dim;
-    }
-}
-
-#container-tabs ContentTab.-active {
-    color: $c-accent;
-    background: $c-border;
-    text-style: not dim bold;
-    &:ansi {
-        text-style: not dim bold;
-    }
-}
-
-#container-tabs ContentTab:hover {
-    color: $c-accent;
-    background: $c-border;
-    text-style: not dim;
-    &:ansi {
-        text-style: not dim;
-    }
-}
-
-#container-tabs ContentTab.-active:hover {
-    color: $c-accent;
-    background: $c-border;
-    text-style: not dim bold;
-    &:ansi {
-        text-style: not dim bold;
-    }
-}
-
-/* Kill Textual's default blue block-cursor look when the tab strip has
-   focus (it kicks in on click): keep the palette's muted/accent scheme. */
-#container-tabs Tabs:focus ContentTab.-active {
-    color: $c-accent;
-    background: $c-border;
-    text-style: not dim bold;
-    &:ansi {
-        text-style: not dim bold;
-    }
-}
-
-#container-tabs Tabs:focus .underline--bar {
-    background: $c-border;
-}
-
-/* Policy toggles: one button per row — dimmed when off, accent when on. */
-.container-toggle {
-    height: 1;
-    min-width: 4;
-    border: none;
-    background: transparent;
-    color: $c-muted;
-    text-style: none;
-}
-
-.container-toggle:hover,
-.container-toggle:focus {
-    background: transparent;
-    color: $c-text;
-    text-style: none;
-}
-
-.container-toggle.is-on {
-    color: $c-accent;
-    text-style: bold;
-}
-
-#container-tabs Tabs .underline--bar {
-    color: $c-accent;      /* highlight segment */
-    background: $c-border; /* track */
-}
-
-#container-tabs TabPane {
-    background: $c-surface;
-    padding: 0;
-}
-
-#container-title {
-    color: $c-text;
-    text-style: bold;
-    margin-bottom: 1;
-}
-
-.container-row {
-    height: 1;
-}
-
-.container-limit-input {
-    width: 12;
-    height: 1;
-    border: none;
-    background: $c-surface;
-    color: $c-text;
-    padding: 0;
-    margin-left: 1;
-}
-
-/* Table layout: fixed-width name column, values left-aligned in a fixed
-   column so on/off and numbers line up instead of hugging the right edge. */
-.container-label {
-    width: 20;
-    color: $c-text;
-}
-
-.container-toggle {
-    margin-left: 1;
-}
-
-/* Textual's Switch ships blue/green $panel shades; the slider is a component
-   class ("switch--slider"). One color per state, no focus/hover variation:
-   muted track when off, accent when on. No default border or focus tint. */
-#container-modal Switch {
-    border: none;
-    background: transparent;
-    background-tint: transparent;
-    padding: 0;
-}
-
-#container-modal Switch .switch--slider {
-    color: $c-muted;
-    background: $c-border;
-}
-
-#container-modal Switch.-on .switch--slider {
-    color: $c-accent;
-    background: $c-border;
-}
-
-#container-refs-title,
-#defaults-refs-title {
-    color: $c-muted;
-    width: 100%;
-    height: auto;
-    margin-top: 1;
-    margin-bottom: 1;
-}
-
-#container-refs,
-#defaults-refs {
-    height: auto;
-    max-height: 8;
-    background: $c-surface;
-    border: none;
-    padding: 0;
-    margin-bottom: 1;
-}
-
-#container-refs > ListItem,
-#defaults-refs > ListItem {
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-    height: auto;
-}
-
-/* One ref row: full host path on top, mount + rw switch + ✕ beneath. */
-.container-ref-item {
-    height: auto;
-}
-
-.container-ref-path {
-    color: $c-text;
-    width: 1fr;
-}
-
-.container-ref-mount {
-    color: $c-muted;
-    width: 1fr;
-}
-
-.container-ref-controls {
-    height: 1;
-}
-
-.container-ref-controls > Switch {
-    border: none;
-    background: transparent;
-    background-tint: transparent;
-    padding: 0;
-}
-
-.container-ref-controls > Switch .switch--slider {
-    color: $c-muted;
-    background: $c-border;
-}
-
-.container-ref-controls > Switch.-on .switch--slider {
-    color: $c-success;
-    background: $c-border;
-}
-
-.container-rm {
-    min-width: 3;
-    width: auto;
-    height: 1;
-    border: none;
-    background: transparent;
-    color: $c-muted;
-    padding: 0 1;
-}
-
-.container-rm:hover,
-.container-rm:focus {
-    background: $c-error;
-    color: $c-bg;
-    text-style: bold;
-}
-
-/* The add-ref bar: same shape as the /sessions search input — full width,
-   borderless, surface background; Enter adds the ref. */
-#container-ref-input,
-#defaults-ref-input {
-    width: 1fr;
-    height: 1;
-    border: none;
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-}
-
-#container-ref-input:focus,
-#defaults-ref-input:focus {
-    background-tint: transparent;
-}
-
-#container-ref-input > .input--placeholder,
-#defaults-ref-input > .input--placeholder {
-    color: $c-muted;
-}
 
 #resume-title, #picker-title {
     color: $c-muted;

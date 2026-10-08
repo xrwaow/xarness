@@ -85,8 +85,7 @@ class GitInfo:
     # Repo-root-relative paths the repo's ignore rules flagged at session
     # start. Snapshots exclude them as explicit pathspecs (not by re-reading
     # the worktree's .gitignore), so what /diff and /undo track is pinned for
-    # the whole session — even when the agent can see and edit .gitignore
-    # files in the container ("respect_gitignore" off).
+    # the whole session.
     ignored_paths: tuple[str, ...] = ()
 
     @property
@@ -254,8 +253,7 @@ async def snapshot_tree(
     Exclusion is two-layered: git's own ignore rules apply as always, and
     ``exclude`` (repo-root-relative paths captured at session start) is
     passed as explicit negative pathspecs — so mid-session edits to
-    .gitignore files (possible in the container when "respect_gitignore" is
-    off) cannot change what snapshots track.
+    .gitignore files cannot change what snapshots track.
 
     With ``subtree`` (repo-root relative), only that subtree is captured;
     the resulting tree's paths are still repo-root relative.
@@ -329,9 +327,8 @@ async def setup_tracking(
             "(the rest of the repo isn't mounted in the sandbox and is "
             "never touched by diffs or reverts)"
         )
-    # Pin what snapshots track up front: with "respect_gitignore" off the
-    # agent can edit .gitignore files in the container, so ignore rules must
-    # not be re-read per snapshot.
+    # Pin what snapshots track up front so ignore rules are not re-read
+    # per snapshot (mid-session .gitignore edits stay out of the picture).
     ignored = await _git_ignored_paths(repo.root)
     baseline = await snapshot_tree(repo.root, subtree, exclude=ignored)
     info = GitInfo(

@@ -31,20 +31,13 @@ MODE_CLAUSE = {
 }
 
 
-GITIGNORE_CLAUSE = """- Gitignored files (and paths in .git/info/exclude) show up as 0-byte empty files.
-"""
-
-
 def system_prompt_for(base: str, mode: str, sandbox: "SandboxConfig | None" = None) -> str:
     """Assemble the full system prompt for the given mode.
 
     With a sandbox, append the working-directory facts: where the sandboxed
-    tools are rooted. When ignore rules are respected, mention that
-    gitignored files appear as 0-byte placeholders.
+    tools are rooted.
     """
     prompt = f"{base}\n\n{MODE_CLAUSE[mode]}"
-    if sandbox is not None and sandbox.respect_gitignore:
-        prompt += f"\n\n{GITIGNORE_CLAUSE.rstrip()}"
     if sandbox is not None:
         prompt += (
             "\n\nRunning tests and project tooling:\n"

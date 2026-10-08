@@ -76,8 +76,8 @@ def tool(name: str, description: str, required: tuple[str, ...] = (), **params: 
     return deco
 
 
-# Per-tool cap on the text sent back to the model (see the "Tool output
-# limit" row of the TUI's /container popup). Applies to every tool via
+# Per-tool cap on the text sent back to the model (config key
+# "container"."tool_output_limit"). Applies to every tool via
 # ToolRegistry.call.
 DEFAULT_OUTPUT_LIMIT = 32768
 
@@ -85,7 +85,7 @@ DEFAULT_OUTPUT_LIMIT = 32768
 def _truncate_output(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    note = f"\n[output truncated at {limit} chars — raise the cap in /container]"
+    note = f"\n[output truncated at {limit} chars — raise tool_output_limit in the config]"
     return text[: max(limit - len(note), 0)] + note
 
 
@@ -121,8 +121,8 @@ class ToolRegistry:
     """Named tool set exposed to the model.
 
     ``max_output_chars`` caps the text of every tool result before it goes
-    on the wire (see _truncate_output); the TUI's /container popup
-    mutates it live.
+    on the wire (see _truncate_output); set from the config's
+    "container"."tool_output_limit".
     """
 
     max_output_chars: int = DEFAULT_OUTPUT_LIMIT
@@ -635,9 +635,6 @@ def _make_ask_user_tool(
 
 # ---------------------------------------------------------------------------
 # read-only exploration: ls / glob / grep (plan mode only)
-# Ignore rules are NOT applied here: ignored paths (gitignored + default
-# noise) are shadowed out of the sandbox at mount time, so every tool —
-# bash included — simply cannot see them.
 
 def build_registry(
     sandbox: SandboxConfig | None,

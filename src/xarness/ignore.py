@@ -1,10 +1,4 @@
-"""Glob-to-regex translation for file matching (the glob tool).
-
-No ignore rules live here anymore: ignored paths (whatever the user's
-``.gitignore``/``.git/info/exclude`` say) are shadowed out of the sandbox at
-mount time — see ``sandbox._hidden_paths`` — so no tool-side filtering is
-needed.
-"""
+"""Glob-to-regex translation for file matching (the glob tool)."""
 
 from __future__ import annotations
 

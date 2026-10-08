@@ -156,12 +156,23 @@ class SettledMarkdown(Markdown):
     }
 
     def __init__(self, text: str) -> None:
-        super().__init__(text, classes="assistant-md")
+        # open_links=False: model text can carry links whose targets are file
+        # paths (or otherwise non-URLs), and the default handler would pass
+        # those to webbrowser.open and raise. on_markdown_link_clicked below
+        # decides what is actually openable.
+        super().__init__(text, classes="assistant-md", open_links=False)
 
     def on_mount(self) -> None:
         self.styles.height = "auto"
         self.styles.margin = 0
         self.styles.padding = 0
+
+    def on_markdown_link_clicked(self, event: Markdown.LinkClicked) -> None:
+        """Open real web links, ignore everything else (file refs, fragments,
+        mailto, …) — clicking a model-emitted file path must be a no-op, not
+        a browser error."""
+        if event.href.startswith(("http://", "https://")):
+            self.app.open_url(event.href)
 
 
 class ShimmerText(Static):
@@ -394,8 +405,13 @@ class SteerQueueBar(Vertical):
             self.mount(Static(f"› {text}", classes="steer-item", markup=False))
         if texts:
             self.add_class("visible")
-            # Only the oldest message is "first in line" — enter sends it.
-            self.mount(Static("↵ enter to send now", classes="steer-hint", markup=False))
+            # Only the oldest message is "first in line" — enter sends it;
+            # ctrl+shift+backspace discards it.
+            self.mount(Static(
+                "↵ enter to send now   ctrl+shift+backspace to discard",
+                classes="steer-hint",
+                markup=False,
+            ))
         else:
             self.remove_class("visible")
 
@@ -1486,21 +1502,21 @@ class DiffSummary(Vertical):
         add_w = max(len(f"+{f.additions}") for f in stat.files)
         del_w = max(len(f"-{f.deletions}") for f in stat.files)
         for f in stat.files:
-            # Row layout: name  [new]  +N -M — the whole row is clickable
+            # Row layout: name  [new]  {source}  +N -M — the whole row is
             # and requests that file's unified diff. The "new" badge gets
             # its own column so it never wraps the file name.
             row = Horizontal(classes="diff-file-row")
             row.diff_key = f.path  # type: ignore[attr-defined]
             await files.mount(row)
             row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
+            if f.is_new:
+                row.mount(Static(Text("new"), classes="diff-file-new", markup=False))
             # Source tag: "agent" for a turn's edits, "drift" for changes
             # made outside the session.
             source_class = "drift" if "drift" in f.source else "agent"
             row.mount(Static(
                 Text(f.source), classes=f"diff-file-source {source_class}", markup=False,
             ))
-            if f.is_new:
-                row.mount(Static(Text("new"), classes="diff-file-new", markup=False))
             row.mount(Static(
                 Text(f"+{f.additions}".rjust(add_w)), classes="diff-file-add", markup=False,
             ))

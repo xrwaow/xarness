@@ -166,9 +166,6 @@ class ContainerSettingsTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.workspace = Path(self._tmp.name) / "wt"
         self.workspace.mkdir()
-        (self.workspace / ".gitignore").write_text("secret/\n")
-        (self.workspace / "secret").mkdir()
-        (self.workspace / "secret" / "x.txt").write_text("s\n")
         patcher = mock.patch("shutil.which", return_value="/usr/bin/bwrap")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -176,35 +173,6 @@ class ContainerSettingsTest(unittest.TestCase):
     def _git_init(self) -> None:
         import subprocess
         subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
-
-    def test_gitignored_hidden_by_default(self):
-        self._git_init()
-        config = SandboxConfig(workspace=self.workspace)
-        assert "secret" in config.hidden_paths
-        argv = config.build_argv(["/bin/sh"])
-        # The ignored path exists in the container only as a shadow mount
-        # target: an empty placeholder bind-mounted over it.
-        i = argv.index("/workspace/secret")
-        assert argv[i - 2] == "--ro-bind"
-
-    def test_gitignore_files_hidden_when_respected(self):
-        self._git_init()
-        (self.workspace / "sub").mkdir()
-        (self.workspace / "sub" / ".gitignore").write_text("*.tmp\n")
-        config = SandboxConfig(workspace=self.workspace)
-        assert ".gitignore" in config.hidden_paths
-        assert "sub/.gitignore" in config.hidden_paths
-        argv = config.build_argv(["/bin/sh"])
-        i = argv.index("/workspace/.gitignore")
-        assert argv[i - 2] == "--ro-bind"
-
-    def test_respect_gitignore_false_keeps_ignored_visible(self):
-        self._git_init()
-        config = SandboxConfig(workspace=self.workspace, respect_gitignore=False)
-        assert config.hidden_paths == ()
-        argv = config.build_argv(["/bin/sh"])
-        # No shadow bind for the ignored dir; the workspace stays one bind.
-        assert "/workspace/secret" not in argv
 
     def test_resolve_auto_refs_workspace_relative_and_missing(self):
         (self.workspace / "docs").mkdir()
@@ -294,20 +262,8 @@ class ContainerSettingsTest(unittest.TestCase):
         config = SandboxConfig(workspace=self.workspace)
         key = config.mount_key
         assert config.mount_key == key
-        config.set_network_access(True)
+        config.allow_network = True
         assert config.mount_key != key
-        key = config.mount_key
-        config.set_respect_gitignore(False)
-        assert config.mount_key != key
-
-    def test_set_respect_gitignore_recomputes(self):
-        self._git_init()
-        config = SandboxConfig(workspace=self.workspace)
-        assert "secret" in config.hidden_paths
-        config.set_respect_gitignore(False)
-        assert config.hidden_paths == ()
-        config.set_respect_gitignore(True)
-        assert "secret" in config.hidden_paths
 
     def test_session_restarts_on_mount_key_change(self):
         self._git_init()
@@ -323,7 +279,7 @@ class ContainerSettingsTest(unittest.TestCase):
                 self.skipTest("bwrap cannot start in this environment")
             assert first.exit_code == 0
             pid_one = session._proc.pid
-            config.set_network_access(True)
+            config.allow_network = True
             second = await session.run("echo two")
             assert second.exit_code == 0
             assert session._proc.pid != pid_one
@@ -345,7 +301,7 @@ class ContainerSettingsTest(unittest.TestCase):
         config = SandboxConfig(workspace=self.workspace)
         argv = config.build_argv(["/bin/sh"])
         self.assertNotIn("--dev-bind", argv)
-        config.set_gpu_access(True)
+        config.gpu_access = True
         argv = config.build_argv(["/bin/sh"])
         assert "--dev-bind" in argv
         # Every existing GPU node is dev-bound at its real path; /dev itself

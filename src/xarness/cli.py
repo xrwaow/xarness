@@ -8,7 +8,10 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, LoadedConfig, load_config, resolve_api_key
+from .config import (
+    DEFAULT_CONFIG_PATH, ConfigError, LoadedConfig, ensure_config,
+    load_config, resolve_api_key,
+)
 from .gitwork import GitInfo
 from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
 
@@ -51,7 +54,27 @@ def build_parser() -> argparse.ArgumentParser:
         dest="keep_reasoning",
         help="Drop reasoning at end-of-turn, even if the profile enables it.",
     )
+    parser.add_argument(
+        "--network", action="append", default=[], metavar="BOOL",
+        help="Network access for sandboxed tool commands, true or false "
+        "(default: true). The last occurrence wins.",
+    )
+    parser.add_argument(
+        "--gpu", action="append", default=[], metavar="BOOL",
+        help="Expose the host's GPU device nodes to sandboxed tool commands, "
+        "true or false (default: true). The last occurrence wins.",
+    )
     return parser
+
+
+def _flag_value(values: list[str]) -> bool:
+    """Collapse a list of "true"/"false" flag values into one bool.
+
+    Empty list (flag not given) defaults to True; the last occurrence wins;
+    anything but "false"/"0"/"no" is treated as true."""
+    if not values:
+        return True
+    return values[-1].strip().lower() not in {"false", "0", "no"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -91,6 +114,9 @@ def _prepare_git(workspace: Path, allow_init: bool) -> tuple[GitInfo | None, lis
 def _run_chat(args: argparse.Namespace) -> None:
     loaded: LoadedConfig
     try:
+        # One startup check: autogenerate the config on first run; on later
+        # runs, note any optional values the file leaves at their defaults.
+        config_notices = ensure_config(DEFAULT_CONFIG_PATH)
         loaded = load_config(DEFAULT_CONFIG_PATH, args.profile)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -115,8 +141,12 @@ def _run_chat(args: argparse.Namespace) -> None:
     session_name = None if args.no_session else session_store.new_session_name()
 
     git_info: GitInfo | None = None
-    git_notices: list[str] = []
-    git_info, git_notices = _prepare_git(workspace, allow_init=not args.no_init_repo)
+    git_notices: list[str] = config_notices
+    git_info, git_git_notices = _prepare_git(workspace, allow_init=not args.no_init_repo)
+    git_notices.extend(git_git_notices)
+
+    allow_network = _flag_value(args.network)
+    gpu_access = _flag_value(args.gpu)
 
     sandbox: SandboxConfig | None = None
     session: SandboxSession | None = None
@@ -129,9 +159,8 @@ def _run_chat(args: argparse.Namespace) -> None:
         sandbox = SandboxConfig(
             workspace=workspace,
             subtree="",
-            allow_network=loaded.container.network_access,
-            respect_gitignore=loaded.container.respect_gitignore,
-            gpu_access=loaded.container.gpu_access,
+            allow_network=allow_network,
+            gpu_access=gpu_access,
             external_refs=SandboxConfig.resolve_auto_refs(
                 workspace, loaded.container.auto_include_refs,
             ),
@@ -139,7 +168,7 @@ def _run_chat(args: argparse.Namespace) -> None:
         )
         session = SandboxSession(sandbox)
         effective_workspace = workspace
-        if loaded.container.gpu_access:
+        if gpu_access:
             from . import sandbox as sandbox_mod
             probe = asyncio.run(sandbox_mod.probe_gpu_access(sandbox))
             if probe is not None:

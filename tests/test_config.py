@@ -316,8 +316,6 @@ def test_container_defaults(tmp_path: Path) -> None:
         {"provider": {"base_url": "https://api.openai.com/v1", "model_id": "gpt-4.1"}},
     )
     c = load_config(path).container
-    assert c.network_access is False
-    assert c.respect_gitignore is True
     assert c.auto_include_refs == []
 
 
@@ -326,16 +324,12 @@ def test_container_section_parsed(tmp_path: Path) -> None:
         tmp_path,
         {
             "container": {
-                "network_access": True,
-                "respect_gitignore": False,
                 "auto_include_refs": ["docs/spec.md"],
             },
             "provider": {"base_url": "https://api.openai.com/v1", "model_id": "gpt-4.1"},
         },
     )
     c = load_config(path).container
-    assert c.network_access is True
-    assert c.respect_gitignore is False
     assert c.auto_include_refs == ["docs/spec.md"]
 
 
@@ -344,14 +338,14 @@ def test_container_named_profiles_form(tmp_path: Path) -> None:
         tmp_path,
         {
             "default_profile": "a",
-            "container": {"network_access": True},
+            "container": {"tool_output_limit": 4096},
             "profiles": [
                 {"name": "a", "base_url": "https://api.openai.com/v1", "model_id": "m"},
                 {"name": "b", "base_url": "https://api.openai.com/v1", "model_id": "m"},
             ],
         },
     )
-    assert load_config(path).container.network_access is True
+    assert load_config(path).container.tool_output_limit == 4096
 
 
 def test_container_unknown_key_rejected(tmp_path: Path) -> None:
@@ -413,25 +407,22 @@ def test_ref_spec_bad_mount_rejected(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_save_container_settings_round_trip(tmp_path: Path) -> None:
-    from xarness.config import ContainerSettings, RefSpec, save_container_settings
-
+def test_container_section_round_trips(tmp_path: Path) -> None:
     path = write(
         tmp_path,
         {
+            "container": {
+                "tool_output_limit": 4096,
+                "auto_include_refs": [
+                    "docs/spec.md",
+                    {"path": "~/lib", "mount": ".venv", "read_only": False},
+                ],
+            },
             "provider": {"base_url": "https://api.openai.com/v1", "model_id": "m"},
         },
     )
-    settings = ContainerSettings(
-        network_access=True,
-        respect_gitignore=False,
-        auto_include_refs=[
-            "docs/spec.md",
-            RefSpec(path="~/lib", mount=".venv", read_only=False),
-        ],
-    )
-    save_container_settings(path, settings)
-    data = json.loads(path.read_text())
-    assert data["container"]["network_access"] is True
-    loaded = load_config(path).container
-    assert loaded == settings
+    container = load_config(path).container
+    assert container.tool_output_limit == 4096
+    assert [r if isinstance(r, str) else r.mount for r in container.auto_include_refs] == [
+        "docs/spec.md", ".venv",
+    ]
