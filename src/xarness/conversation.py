@@ -152,4 +152,29 @@ class Conversation:
         return message
 
     def to_wire(self, keep_reasoning: bool = False) -> list[dict[str, Any]]:
-        return [message.to_wire(include_reasoning=keep_reasoning) for message in self.messages]
+        answered = {
+            m.tool_call_id for m in self.messages if m.role == "tool" and m.tool_call_id
+        }
+        wire: list[dict[str, Any]] = []
+        for message in self.messages:
+            orphaned = (
+                message.role == "assistant"
+                and message.tool_calls
+                and any(c.call_id not in answered for c in message.tool_calls)
+            )
+            if not orphaned:
+                wire.append(message.to_wire(include_reasoning=keep_reasoning))
+                continue
+            # A call without a result (turn interrupted mid-execution, session
+            # saved) would be rejected as an unpaired tool call: send only the
+            # answered ones, or drop the message when none remain and it
+            # carries no text.
+            paired = [c for c in message.tool_calls if c.call_id in answered]
+            if paired or message.content:
+                wire_message = message.to_wire(include_reasoning=keep_reasoning)
+                if paired:
+                    wire_message["tool_calls"] = [c.to_wire() for c in paired]
+                else:
+                    del wire_message["tool_calls"]
+                wire.append(wire_message)
+        return wire

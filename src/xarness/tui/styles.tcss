@@ -30,11 +30,14 @@ Screen {
     margin-bottom: 0;
 }
 
-/* A cot/assistant message that directly follows tool call blocks still
-   gets a separating blank line (added by app.py when mounting). */
+/* A cot/assistant/user message that directly follows tool call blocks still
+   gets a separating blank line (added by app.py when mounting). Note: set
+   both edges here — a margin-top rule replaces the whole margin in TCSS,
+   which would drop the .msg margin-bottom below the widget. */
 AssistantMessage.after-tools,
-ThinkingBlock.after-tools {
-    margin-top: 1;
+ThinkingBlock.after-tools,
+UserMessage.after-tools {
+    margin: 1 0;
 }
 
 UserMessage {

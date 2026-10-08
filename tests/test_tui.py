@@ -10,7 +10,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from xarness.config import CotStrength, ProviderProfile
-from xarness.conversation import Message
+from xarness.conversation import Message, ToolCall
 from xarness.controller import ChatController
 from xarness.events import (
     ContentDelta,
@@ -978,6 +978,54 @@ class TestChatLoop(unittest.IsolatedAsyncioTestCase):
                 [m.role for m in app.controller.conversation.messages], ["system"]
             )
             self.assertEqual(len(app.query(UserMessage)), 0)
+
+    async def test_undo_trims_the_transcript_instead_of_rerendering(self) -> None:
+        """Undo removes only the widgets from the undo point on; the widgets
+        above it keep their identity (no full chat re-render)."""
+        app, client = make_app([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+        client.next_scripts = [
+            [ContentDelta("two"), TurnComplete(usage=Usage(6, 4))],
+        ]
+        async with app.run_test() as pilot:
+            for key in ("a", "b"):
+                await pilot.press(key, "enter")
+                await wait_until_idle(app)
+
+            first_widget = app.query(UserMessage).first()
+            second_widget = app.query(UserMessage).last()
+
+            app._handle_slash_command("/undo")
+            await wait_for(lambda: app.query_one(ChatInput).text == "b")
+            await wait_for(lambda: second_widget not in list(app.query(UserMessage)))
+            await pilot.pause()
+
+            # The second turn is gone from the DOM; the first turn's widgets
+            # are the very same objects as before (not re-created).
+            self.assertEqual(len(app.query(UserMessage)), 1)
+            self.assertIs(app.query(UserMessage).first(), first_widget)
+            self.assertEqual(first_widget.text, "a")
+
+    async def test_resume_renders_an_unresulted_tool_call_as_interrupted(self):
+        """A turn interrupted while a tool ran persists the call without a
+        result; replaying the session must show it failed, not shimmering
+        as 'Running …' forever."""
+        app, _client = make_app([ContentDelta("x"), TurnComplete(usage=Usage(1, 1))])
+        async with app.run_test() as pilot:
+            conversation = app.controller.conversation
+            conversation.add(Message(role="user", content="run it"))
+            conversation.add(Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall("call_1", "run_bash", "{\"command\": \"sleep 100\"}")],
+            ))
+
+            await app._render_history()
+            await pilot.pause()
+
+            block = app.query_one(ToolCallBlock)
+            self.assertEqual(block.status, ToolCallStatus.CALL_FAILED)
+            # No shimmer anywhere in the replayed transcript.
+            self.assertEqual(len(app.query(ShimmerText)), 0)
 
     async def test_compaction_shows_a_shimmering_indicator(self) -> None:
         """While the summarizer runs, a shimmering "Compacting" line stands in

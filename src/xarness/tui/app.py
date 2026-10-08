@@ -121,9 +121,12 @@ class _RoundView:
         self.tool_blocks: dict[str, ToolCallBlock] = {}
         self.round_has_tools = False
         self.had_stream_error = False
+        # Set by cancel(): indicators mounted afterwards (a mount cancelled
+        # mid-flight still lands its widget) remove themselves on_mount.
+        self.cancelled = False
 
     async def mount(self) -> None:
-        self.indicator = PendingIndicator()
+        self.indicator = PendingIndicator(cancelled=lambda: self.cancelled)
         self.indicator_live = True
         await self.chat.mount(self.indicator)
 
@@ -152,7 +155,9 @@ class _RoundView:
             # appear once args are complete.
             self.pending_writes += 1
             if self.writing is None:
-                self.writing = ToolWritingIndicator(event.name)
+                self.writing = ToolWritingIndicator(
+                    event.name, cancelled=lambda: self.cancelled
+                )
                 await self.chat.mount(self.writing)
             else:
                 self.writing.set_tool(event.name)
@@ -198,6 +203,9 @@ class _RoundView:
 
     async def cancel(self) -> None:
         """Settle the round's widgets for an interrupted turn."""
+        # Flip first: any indicator whose mount was cancelled mid-flight (and
+        # so still lands after this method returns) removes itself on_mount.
+        self.cancelled = True
         if self.writing is not None and self.writing.is_mounted:
             await self.writing.remove()
         if self.indicator is not None and self.indicator_live:
@@ -618,7 +626,11 @@ class AgentApp(App[None]):
             self._post_line(ErrorLine(f"/{label} failed: {exc}"))
             return
         self.controller.apply_rollback(plan)
-        await self._render_history()
+        # Trim the transcript instead of re-rendering it: an undo only removes
+        # widgets from the end, so everything above the undo point (settled
+        # markdown, diffs, tool output) stays exactly as it was rendered.
+        if not await self._trim_history(plan.dropped):
+            await self._render_history()
         self._refresh_status()
         await self.refresh_diff_summary()
         if self.git_info is None:
@@ -1094,15 +1106,56 @@ class AgentApp(App[None]):
     async def _mount_spaced(
         self,
         chat: "VerticalScroll",
-        widget: "ThinkingBlock | AssistantMessage",
+        widget: "ThinkingBlock | AssistantMessage | UserMessage",
     ) -> None:
-        """Mount a cot/assistant block, keeping a blank line above it when it
-        directly follows tool call blocks (which carry no spacing of their
+        """Mount a cot/assistant/user block, keeping a blank line above it when
+        it directly follows tool call blocks (which carry no spacing of their
         own)."""
         children = chat.children
         if children and isinstance(children[-1], ToolCallBlock):
             widget.add_class("after-tools")
         await chat.mount(widget)
+
+    async def _trim_history(self, dropped: list[Message]) -> bool:
+        """Remove the rendered widgets for `dropped` messages and everything
+        after them, keeping the rest of the transcript untouched.
+
+        Returns False — the caller falls back to a full _render_history —
+        when no rendered widget matches (e.g. a conversation loaded but never
+        rendered, or a widget without a message binding)."""
+        chat = self.query_one("#chat-log", VerticalScroll)
+        dropped_ids = {id(m) for m in dropped}
+        children = list(chat.children)
+        cut = next(
+            (
+                i
+                for i, widget in enumerate(children)
+                if getattr(widget, "message", None) is not None
+                and id(widget.message) in dropped_ids
+            ),
+            None,
+        )
+        if cut is None:
+            return False
+        for widget in children[cut:]:
+            await widget.remove()
+        if self.controller.conversation.compact_snapshot is None:
+            # The undo point is before the compaction: the snapshot was
+            # dropped, so its divider must go too (it sits right before the
+            # summary, which the trim above already removed).
+            divider = next(
+                (
+                    widget
+                    for widget in chat.children
+                    if isinstance(widget, NoticeLine)
+                    and widget.content.plain == COMPACTED_DIVIDER
+                ),
+                None,
+            )
+            if divider is not None:
+                await divider.remove()
+        chat.scroll_end(animate=False)
+        return True
 
     async def _render_history(self) -> None:
         """Rebuild #chat-log from the conversation.
@@ -1146,13 +1199,15 @@ class AgentApp(App[None]):
             if message.content.startswith(SUMMARY_PREFIX):
                 # The handoff an auto-compaction left behind: padded and
                 # accent-colored, not a plain user message.
-                await chat.mount(CompactionSummary(
+                summary = CompactionSummary(
                     message.content.removeprefix(SUMMARY_PREFIX).strip()
-                ))
+                )
+                summary.message = message
+                await chat.mount(summary)
             else:
                 widget = UserMessage(message.content, message.images)
                 widget.message = message
-                await chat.mount(widget)
+                await self._mount_spaced(chat, widget)
         elif message.role == "assistant":
             if message.reasoning:
                 thinking = ThinkingBlock()
@@ -1182,6 +1237,12 @@ class AgentApp(App[None]):
                         error=result.content[len("error: "):] if is_error else "",
                         header=result.header or "",
                     )
+                else:
+                    # The call never produced a result: the turn was
+                    # interrupted mid-execution and the session was saved.
+                    # It can never complete now — render it as failed instead
+                    # of an eternally shimmering "Running …".
+                    block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
 
     def on_chat_input_mode_toggle(self, event: ChatInput.ModeToggle) -> None:
         self._switch_mode()
@@ -1587,7 +1648,7 @@ class AgentApp(App[None]):
                         widget = UserMessage(queued_text, queued_images)
                         widget.message = message
                         widget.mark_sent()
-                        chat.mount(widget)
+                        await self._mount_spaced(chat, widget)
                     self._queued.clear()
                     self._refresh_steer_bar()
 
@@ -1624,7 +1685,7 @@ class AgentApp(App[None]):
             if self._queued:
                 queued_text, queued_images = self._queued.pop(0)
                 widget = UserMessage(queued_text, queued_images)
-                self.query_one("#chat-log", VerticalScroll).mount(widget)
+                await self._mount_spaced(chat, widget)
                 self._refresh_steer_bar()
                 self._worker = self._run_turn(queued_text, widget, queued_images)
 
@@ -1657,9 +1718,11 @@ class AgentApp(App[None]):
         self._post_line(NoticeLine(COMPACTED_DIVIDER))
         for message in self.controller.conversation.messages:
             if message.role == "user" and message.content.startswith(SUMMARY_PREFIX):
-                await chat.mount(CompactionSummary(
+                summary_widget = CompactionSummary(
                     message.content.removeprefix(SUMMARY_PREFIX).strip()
-                ))
+                )
+                summary_widget.message = message
+                await chat.mount(summary_widget)
                 break
         counts = self._compaction_counts()
         return f"compacted: {counts}\n{summary}" if counts else summary

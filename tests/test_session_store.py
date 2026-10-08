@@ -3,7 +3,7 @@
 import asyncio
 
 from xarness import session_store
-from xarness.conversation import Conversation, Message
+from xarness.conversation import Conversation, Message, ToolCall
 from xarness.events import ContentDelta, TurnComplete, Usage
 from xarness.controller import ChatController
 from xarness.config import CotStrength, ProviderProfile
@@ -46,6 +46,52 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
         "usage" not in m and "checkpoint_sha" not in m and "after_tree" not in m
         for m in loaded.to_wire()
     )
+
+
+def test_to_wire_drops_unpaired_tool_calls() -> None:
+    """A tool call without a recorded result (turn interrupted mid-execution,
+    session saved) must not reach the wire: providers reject unpaired calls."""
+
+    def make_conversation(content, calls, results):
+        conversation = Conversation()
+        conversation.add(Message(role="user", content="go"))
+        conversation.add(Message(role="assistant", content=content, tool_calls=calls))
+        for call_id, output in results:
+            conversation.add(Message(role="tool", content=output, tool_call_id=call_id))
+        return conversation
+
+    # Two calls, one answered: the round stays valid with only the answered
+    # call; the orphaned call is gone.
+    wire = make_conversation(
+        "",
+        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [("call_1", "ok")],
+    ).to_wire()
+    assert [m["role"] for m in wire] == ["user", "assistant", "tool"]
+    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1"]
+
+    # Text plus the answered call both survive.
+    wire = make_conversation(
+        "let me check",
+        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [("call_1", "ok")],
+    ).to_wire()
+    assert wire[1]["content"] == "let me check"
+    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1"]
+
+    # No answered calls and no content: the round is dropped entirely.
+    wire = make_conversation(
+        "", [ToolCall("call_1", "run_bash", "{}")], []
+    ).to_wire()
+    assert [m["role"] for m in wire] == ["user"]
+
+    # Fully answered calls are untouched.
+    wire = make_conversation(
+        "",
+        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [("call_1", "ok"), ("call_2", "ok")],
+    ).to_wire()
+    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1", "call_2"]
 
 
 def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:

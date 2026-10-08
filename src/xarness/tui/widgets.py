@@ -13,7 +13,7 @@ import json
 import random
 import re
 import time
-from typing import ClassVar, cast
+from typing import Callable, ClassVar, cast
 
 from rich.console import Group, RenderableType
 from rich.style import Style
@@ -1634,18 +1634,24 @@ class PendingIndicator(Horizontal):
         label: str = "Processing",
         colors: tuple[str, str] | None = None,
         hint: str = "esc to interrupt",
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(classes="msg pending")
         self._label = label
         self._colors = colors or theme.SHIMMER_PROCESSING
         self._hint = hint
         self._start = time.monotonic()
+        self._cancelled = cancelled
 
     def compose(self):
         yield ShimmerText(self._label, *self._colors, id="pending-shimmer")
         yield Static("", id="pending-elapsed", classes="pending-elapsed", markup=False)
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
+        # A mount cancelled mid-flight still lands its widget: self-remove
+        # instead of shimmering forever (see _RoundView.cancel).
+        if self._cancelled is not None and self._cancelled():
+            return await self.remove()
         self.set_interval(0.2, self._tick)
         self._tick()
 
@@ -1670,12 +1676,17 @@ class ToolWritingIndicator(Horizontal):
     call_id here (the only consumer), not mirrored through the turn driver.
     The label follows the most recently updated call when several stream."""
 
-    def __init__(self, tool_name: str) -> None:
+    def __init__(self, tool_name: str, cancelled: Callable[[], bool] | None = None) -> None:
         super().__init__(classes="msg toolwriting")
         self.tool_name = tool_name
         self._names: dict[str, str] = {}
         self._args: dict[str, str] = {}
         self._current: str | None = None
+        self._cancelled = cancelled
+
+    async def on_mount(self) -> None:
+        if self._cancelled is not None and self._cancelled():
+            return await self.remove()
 
     def compose(self):
         yield Static(Text("•", style=theme.PALETTE["warning"]), classes="toolcall-dot", markup=False)
