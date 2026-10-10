@@ -738,15 +738,23 @@ class DiffStat:
 
 
 _BLOCK_REASON = (
-    "blocked: your branch and refs are the user's — git checkout <ref>, git "
-    "switch, git worktree, git branch -d/-m, git tag -d/-f, git update-ref, "
-    "git reset --hard, and git rebase are not available in this shell. "
-    "Continue editing files normally; read-only git commands (status, diff, "
-    "log, show, blame) and git add/commit still work."
+    "blocked: git in this shell is read-only — only inspection commands "
+    "(status, log, diff, show, blame, grep, ls-files, rev-parse, …) and "
+    "git config --get/--list are available. Anything that mutates the repo, "
+    "refs, or config is not. Continue editing files normally."
 )
 
-# Subcommands that always change identity — blocked outright.
-_BLOCKED_SUBCOMMANDS = {"switch", "worktree", "rebase", "update-ref", "symbolic-ref"}
+# Deny by default: git in the shell is strictly read-only — only these
+# inspection subcommands pass. Everything else (add, commit, checkout,
+# branch, tag, reset, switch, rebase, stash, clean, push, config writes,
+# update-ref, …) is blocked.
+_ALLOWED_SUBCOMMANDS = {
+    "status", "log", "diff", "show", "blame", "grep", "shortlog",
+    "whatchanged", "rev-parse", "rev-list", "ls-files", "ls-tree",
+    "ls-remote", "cat-file", "describe", "merge-base", "name-rev",
+    "reflog", "var", "version",
+}
+_CONFIG_READ_FLAGS = {"--get", "--get-all", "--get-regexp", "--list", "-l"}
 # Global git flags that consume a following value.
 _GIT_VALUE_FLAGS = {
     "-C", "-c", "--git-dir", "--work-tree", "--namespace",
@@ -766,43 +774,11 @@ def _check_git_args(
         return None
     sub, rest = args[i], args[i + 1:]
 
-    if sub in _BLOCKED_SUBCOMMANDS:
-        return _BLOCK_REASON
-    # Renames/copies move or duplicate refs just like deletions do.
-    if sub == "branch" and any(
-        a in ("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy")
-        for a in rest
-    ):
-        return _BLOCK_REASON
-    # Forcing or deleting a tag rewrites a ref the user owns.
-    if sub == "tag" and any(a in ("-d", "-D", "--delete", "-f", "--force") for a in rest):
-        return _BLOCK_REASON
-    if sub == "reset" and "--hard" in rest:
-        return _BLOCK_REASON
-    if sub == "checkout":
-        # `git checkout -- file` (or any pathspec after --) restores files
-        # within the current branch: always allowed.
-        target: str | None = None
-        for arg in rest:
-            if arg == "--":
-                return None
-            if arg.startswith("-"):
-                # These flags create/switch/detach branches.
-                if arg in ("-b", "-B", "-t", "--track", "--orphan", "--detach", "-d"):
-                    return _BLOCK_REASON
-                continue
-            target = arg
-            break
-        if target is None:
-            return None
-        if target == current_branch or target == "HEAD":
-            return None
-        # A bare word that names an existing path is a file restore, not a
-        # ref switch (don't false-positive on files named like branches).
-        if worktree_root is not None and (worktree_root / target).exists():
-            return None
-        return _BLOCK_REASON
-    return None
+    if sub in _ALLOWED_SUBCOMMANDS:
+        return None
+    if sub == "config" and any(a in _CONFIG_READ_FLAGS for a in rest):
+        return None
+    return _BLOCK_REASON
 
 
 def check_blocked_git(

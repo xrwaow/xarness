@@ -547,40 +547,44 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
     def guard(self, cmd: str) -> str | None:
         return check_blocked_git(cmd, "main", self.base)
 
-    def test_blocks_branch_switching(self):
+    def test_blocks_any_git_mutation(self):
         assert self.guard("git checkout other-branch") is not None
         assert self.guard("git switch main") is not None
         assert self.guard("git checkout -b new") is not None
+        assert self.guard("git checkout -- file.txt") is not None
+        assert self.guard("git branch feature") is not None
+        assert self.guard("git branch -D agent/x") is not None
+        assert self.guard("git tag v1") is not None
+        assert self.guard("git tag -d v1") is not None
+        assert self.guard("git reset --hard") is not None
+        assert self.guard("git reset HEAD~1") is not None
+        assert self.guard("git rebase main") is not None
+        assert self.guard("git worktree add ../wt") is not None
+        assert self.guard("git update-ref refs/heads/main HEAD~1") is not None
+        assert self.guard("git symbolic-ref HEAD refs/heads/other") is not None
+        assert self.guard("git stash") is not None
+        assert self.guard("git clean -fd") is not None
+        assert self.guard("git merge main") is not None
+        assert self.guard("git push") is not None
+        assert self.guard("git pull") is not None
+        assert self.guard("git commit --amend") is not None
+        assert self.guard("git config user.email a@b.c") is not None
+        assert self.guard("git config user.email") is not None
 
-    def test_allows_file_restore_and_readonly_git(self):
-        (self.base / "file.txt").write_text("x\n")
-        assert self.guard("git checkout -- file.txt") is None
-        assert self.guard("git checkout file.txt") is None
+    def test_allows_readonly_git(self):
         assert self.guard("git status") is None
         assert self.guard("git diff HEAD") is None
         assert self.guard("git log --oneline") is None
-        assert self.guard("git add -A && git commit -m msg") is None
-
-    def test_blocks_worktree_and_destructive_ops(self):
-        assert self.guard("git worktree add ../wt") is not None
-        assert self.guard("git branch -D agent/x") is not None
-        assert self.guard("git reset --hard") is not None
-        assert self.guard("git rebase main") is not None
-
-    def test_blocks_ref_mutation_plumbing(self):
-        assert self.guard("git branch -m main other") is not None
-        assert self.guard("git branch --move main other") is not None
-        assert self.guard("git branch -C a b") is not None
-        assert self.guard("git update-ref -d refs/heads/main") is not None
-        assert self.guard("git update-ref refs/heads/main HEAD~1") is not None
-        assert self.guard("git symbolic-ref HEAD refs/heads/other") is not None
-        assert self.guard("git tag -d v1") is not None
-        assert self.guard("git tag -f v1 HEAD~1") is not None
-        # Creating a branch or a new tag is additive — allowed.
-        assert self.guard("git branch feature") is None
-        assert self.guard("git tag v1") is None
+        assert self.guard("git blame file.txt") is None
+        assert self.guard("git show HEAD") is None
+        assert self.guard("git rev-parse HEAD") is None
+        assert self.guard("git config --get user.name") is None
+        assert self.guard("git config --list") is None
 
     def test_blocks_through_shell_operators_and_env_prefixes(self):
+        assert self.guard("echo hi && git status") is None
+        assert self.guard("FOO=1 git log") is None
+        assert self.guard("sh -c 'git status'") is None
         assert self.guard("echo hi && git reset --hard") is not None
         assert self.guard("FOO=1 git reset --hard") is not None
         assert self.guard("sh -c 'git reset --hard'") is not None
