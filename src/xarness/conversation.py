@@ -10,12 +10,20 @@ usage never reaches the wire.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .events import Usage
 from .images import ImageAttachment
+
+
+def _utcnow_iso() -> str:
+    """Wall-clock UTC timestamp (ISO 8601) for the message stamp fields."""
+    return datetime.now(timezone.utc).isoformat()
+
 
 # Prefix of the summary user message compaction leaves behind. Identifying
 # it by content (not identity) keeps working across a session save/load.
@@ -54,6 +62,20 @@ class Message:
 
     role: str  # "user" | "assistant" | "system" | "tool"
     content: str = ""
+    # Stable id (uuid4), persisted; assigned on load for old sessions.
+    # Click-to-undo addresses messages by id, not object identity.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Wall-clock UTC ISO 8601 stamps (None for old sessions). User messages
+    # carry send_time (steering: when the client sent it, not when it was
+    # injected); assistant messages start_time/end_time around the request,
+    # reasoning_start/reasoning_end for the chain of thought; tool result
+    # messages start_time/end_time for the call's execution. Never sent to
+    # the provider (to_wire does not include them).
+    send_time: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    reasoning_start: str | None = None
+    reasoning_end: str | None = None
     # Local-only: reasoning-channel text for assistant messages.
     reasoning: str | None = None
     # Local-only: seconds spent in the reasoning channel (None if unknown).

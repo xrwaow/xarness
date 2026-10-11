@@ -149,6 +149,20 @@ class SandboxConfig:
     # /usr/lib(64), which is already bound read-only.
     gpu_access: bool = False
     timeout_seconds: float = 120.0
+    # False = tools run as a user-level stateful bash on the host (an
+    # unsandboxed mode): no bwrap container, no mount isolation. Documented
+    # in the config; the TUI shows a visible marker when it is off.
+    # NOTE: with use_container=False the mount-isolation settings are
+    # IGNORED — filter_list (no mounts to exclude), allow_network (nothing
+    # blocks network on the host) and gpu_access (all devices are already
+    # reachable) have no effect. Plan mode therefore refuses run_bash in
+    # this mode (see tools.build_registry): there is no read-only mount to
+    # enforce it with.
+    use_container: bool = True
+    # Workspace-root-relative paths excluded from the container's mounts
+    # (a mount exclusion, not a gitignore). Part of mount_key, so changing
+    # it restarts the persistent shell.
+    filter_list: list[str] = field(default_factory=list)
     # Host path of the repo's .git dir. Bound into the sandbox at its real
     # path so git reads (status/diff/log) work inside the sandbox. Bound
     # read-only: the agent never commits — the harness checkpoints on the
@@ -156,7 +170,7 @@ class SandboxConfig:
     git_dir: Path | None = None
 
     def __post_init__(self) -> None:
-        if shutil.which("bwrap") is None:
+        if self.use_container and shutil.which("bwrap") is None:
             raise SandboxUnavailable(
                 "bwrap (bubblewrap) not found on PATH; install it "
                 "(e.g. `sudo dnf install bubblewrap` on Fedora) "
@@ -190,6 +204,8 @@ class SandboxConfig:
             self.read_only,
             self.allow_network,
             self.gpu_access,
+            self.use_container,
+            tuple(sorted(self.filter_list)),
             tuple(sorted(
                 (alias, str(ref.host), ref.mount, ref.read_only)
                 for alias, ref in self.external_refs.items()
@@ -284,8 +300,14 @@ class SandboxConfig:
         """Anchor a validated agent-workspace-relative path at its sandbox
         mount point. Commands must not rely on the process cwd: with a
         subtree session bwrap chdirs into the subtree, and tool paths are
-        relative to it (see validate_relpath)."""
+        relative to it (see validate_relpath).
+
+        Unsandboxed mode (use_container=False) has no container mount: paths
+        resolve to the real workspace on the host."""
         norm = "." if path in ("", ".") else (path[2:] if path.startswith("./") else path)
+        if not self.use_container:
+            resolved = self.workspace if norm == "." else self.workspace / norm
+            return str(resolved)
         if norm == _REFS_PREFIX or norm.startswith(_REFS_PREFIX + "/"):
             # The references area lives at REFS_ANCHOR in the container, not
             # under the workspace mount (see REFS_ANCHOR above).
@@ -397,6 +419,11 @@ class SandboxConfig:
         return argv
 
     def build_argv(self, command: list[str]) -> list[str]:
+        if not self.use_container:
+            # Unsandboxed mode: a user-level stateful shell on the host —
+            # no bwrap, no mount isolation. The persistent shell starts in
+            # the workspace (see SandboxSession._ensure_started).
+            return list(command)
         argv = ["bwrap"]
         argv += self._system_ro_binds()
         argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
@@ -464,6 +491,25 @@ class SandboxConfig:
                 str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
             ]
             chdir = f"/workspace/{self.subtree}"
+        for rel in self.filter_list:
+            # Mount exclusions: shadowed with an existing host placeholder
+            # (empty file over files, empty dir over directories), so the
+            # path is simply not visible in the container (a mount exclusion,
+            # not a gitignore). No tmpfs: its mountpoint would be created
+            # inside the workspace bind, i.e. in the user's worktree. With
+            # tracking on, .git is always mounted and cannot be filtered.
+            # Paths that do not exist in the workspace are skipped: bwrap
+            # needs the mountpoint to exist, and creating one here would put
+            # a stray path in the user's worktree.
+            rel_path = self.workspace / rel.strip("/")
+            if not rel_path.exists():
+                continue
+            empty_file, empty_dir = _shadow_placeholders()
+            target = f"/workspace/{rel.strip('/')}"
+            if rel_path.is_dir():
+                argv += ["--ro-bind", empty_dir, target]
+            else:
+                argv += ["--ro-bind", empty_file, target]
         uv_lock = self.workspace / "uv.lock"
         if uv_lock.is_file():
             # Read-only: uv run may read the lock to build the project env
@@ -692,6 +738,8 @@ class SandboxSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Unsandboxed mode: the host shell starts in the workspace.
+            cwd=str(self._config.workspace) if not self._config.use_container else None,
             # readline's default 64 KiB line limit raises ValueError on
             # longer lines (minified bundles), which surfaces as a confusing
             # tool error — allow chunky single lines instead.

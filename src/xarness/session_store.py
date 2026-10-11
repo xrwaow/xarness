@@ -12,6 +12,7 @@ accepted, but the key is dropped on load.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -44,6 +45,10 @@ class SessionState:
     # Change-tracking block (see gitwork.GitInfo.to_block); None drops it.
     git: dict | None = None
     updated_at: str | None = None
+    # Per-session sandbox settings (resolved at creation from the config's
+    # sandbox profiles; fixed except via /sandbox or /filter).
+    sandbox_name: str | None = None
+    sandbox_settings: dict | None = None
 
 
 # Message's persisted fields; anything else in a saved file (stray keys
@@ -96,8 +101,35 @@ def _conversation_from(data: dict[str, Any]) -> Conversation:
     return conversation
 
 
+def _meta_block(
+    conversation: Conversation,
+    *, profile: str | None, workspace: str | None, updated_at: str,
+    sandbox_name: str | None, tracking: bool,
+) -> dict[str, Any]:
+    """The small summary block listing and last-used lookups read: no
+    conversation parsing needed on those paths."""
+    last_user = max(
+        (m.send_time for m in conversation.messages
+         if m.role == "user" and m.send_time),
+        default=None,
+    )
+    return {
+        "profile": profile,
+        "workspace": workspace,
+        "updated_at": updated_at,
+        "sandbox_name": sandbox_name,
+        "message_count": len(conversation.messages),
+        "last_user_message_at": last_user,
+        "tracking": tracking,
+    }
+
+
 def save_state(name: str, state: SessionState) -> None:
-    """Persist a session state as one JSON file."""
+    """Persist a session state as one JSON file, atomically.
+
+    Written to a temp file in the same directory, fsynced, then ``os.replace``d
+    over the target, so a crash mid-write never leaves a truncated session
+    file behind (a reader would see either the old or the new state)."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     conversation = state.conversation
     data: dict[str, Any] = {
@@ -112,7 +144,25 @@ def save_state(name: str, state: SessionState) -> None:
         data["compact_snapshot"] = [_message_dump(m) for m in conversation.compact_snapshot]
     if state.git is not None:
         data["git"] = state.git
-    session_path(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    if state.sandbox_name is not None:
+        data["sandbox_name"] = state.sandbox_name
+    if state.sandbox_settings is not None:
+        data["sandbox_settings"] = state.sandbox_settings
+    data["meta"] = _meta_block(
+        conversation,
+        profile=state.profile,
+        workspace=state.workspace,
+        updated_at=data["updated_at"],
+        sandbox_name=state.sandbox_name,
+        tracking=state.git is not None,
+    )
+    target = session_path(name)
+    tmp = target.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
 
 
 def save_session(
@@ -135,6 +185,9 @@ def load_state(name: str) -> SessionState:
         workspace=data.get("workspace"),
         git=data.get("git") if isinstance(data.get("git"), dict) else None,
         updated_at=data.get("updated_at"),
+        sandbox_name=data.get("sandbox_name"),
+        sandbox_settings=data.get("sandbox_settings")
+        if isinstance(data.get("sandbox_settings"), dict) else None,
     )
 
 
@@ -156,13 +209,59 @@ def list_sessions() -> list[str]:
     return sorted(p.stem for p in SESSIONS_DIR.glob("*.json"))
 
 
-def session_meta(name: str) -> dict:
-    state = load_state(name)
+def _meta_from_data(data: dict[str, Any]) -> dict[str, Any]:
+    """The meta block, or (old session files) the same fields derived from
+    the raw JSON without building Conversation/Message objects."""
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    messages = data.get("messages") or []
     return {
-        "updated_at": state.updated_at,
-        "message_count": len(state.conversation.messages),
-        "workspace": state.workspace,
+        "profile": data.get("profile"),
+        "workspace": data.get("workspace"),
+        "updated_at": data.get("updated_at"),
+        "sandbox_name": data.get("sandbox_name"),
+        "message_count": len(messages),
+        "last_user_message_at": max(
+            (m.get("send_time") for m in messages
+             if isinstance(m, dict) and m.get("role") == "user"
+             and m.get("send_time")),
+            default=None,
+        ),
+        "tracking": isinstance(data.get("git"), dict),
     }
+
+
+def load_meta(name: str) -> dict[str, Any] | None:
+    """The saved session's small meta block (no conversation parsing).
+
+    Old session files that predate the meta block get it backfilled on
+    first read: the derived block is written into the file (atomic
+    replace, best-effort) so later reads — and other host processes —
+    see a proper meta block."""
+    path = session_path(name)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("meta"), dict):
+        data["meta"] = _meta_from_data(data)
+        try:
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            pass  # read-only media or a race: the derived value still works
+    return data["meta"]
+
+
+def session_meta(name: str) -> dict:
+    return load_meta(name) or {}
 
 
 def delete_session(name: str) -> bool:

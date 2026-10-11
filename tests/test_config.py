@@ -426,3 +426,49 @@ def test_container_section_round_trips(tmp_path: Path) -> None:
     assert [r if isinstance(r, str) else r.mount for r in container.auto_include_refs] == [
         "docs/spec.md", ".venv",
     ]
+
+
+def test_sandbox_settings_defaults_are_secure() -> None:
+    from xarness.config import SandboxSettings
+
+    settings = SandboxSettings()
+    assert settings.allow_network is False
+    assert settings.gpu_access is False
+
+
+def test_save_preferences_writes_defaults_preset_or_preset_model(tmp_path: Path) -> None:
+    from xarness.config import load_sectioned
+
+    # A preset already carries the chosen model: defaults.preset points at it.
+    path = write(tmp_path, {
+        "models": {"a": {"base_url": "https://api.example.test/v1", "model_id": "a"},
+                   "b": {"base_url": "https://api.example.test/v1", "model_id": "b"}},
+        "presets": {"default": {"model": "a"}, "fast": {"model": "b"}},
+        "defaults": {"preset": "default"},
+    })
+    save_preferences(path, default_profile="b")
+    data = json.loads(path.read_text())
+    assert data["defaults"]["preset"] == "fast"
+    assert load_sectioned(path).default_preset_model() == "b"
+
+    # No preset carries it: the default preset's model is updated.
+    path2 = write(tmp_path, {
+        "models": {"a": {"base_url": "https://api.example.test/v1", "model_id": "a"},
+                   "c": {"base_url": "https://api.example.test/v1", "model_id": "c"}},
+        "presets": {"default": {"model": "a"}},
+    })
+    save_preferences(path2, default_profile="c")
+    sectioned = load_sectioned(path2)
+    assert sectioned.resolve_model(None)[0] == "c"
+
+
+def test_resolve_sandbox_error_says_none_when_no_profiles() -> None:
+    from xarness.config import SectionedConfig, ServerSettings
+
+    sectioned = SectionedConfig(
+        models={}, sandboxes={}, presets={}, theme="", default_preset="default",
+        server=ServerSettings(), notices=[],
+    )
+    with pytest.raises(ConfigError) as exc:
+        sectioned.resolve_sandbox(None)
+    assert "available: none" in str(exc.value)

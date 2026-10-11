@@ -36,7 +36,7 @@ from .. import images
 from .. import theme
 from ..conversation import Message as ConversationMessage
 from ..events import ToolCallStatus
-from ..gitwork import DiffStat
+from ..protocol import DiffInfo as DiffStat  # same shape as gitwork.DiffStat
 from ..images import ImageAttachment, ImageError, token_text
 
 
@@ -450,6 +450,10 @@ class AssistantMessage(Vertical):
         self._live_dirty = False
         self._flush_timer: Timer | None = None
 
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
+
     def compose(self):
         with Horizontal(classes="assistant-row"):
             yield Static("•", classes="assistant-marker", markup=False)
@@ -533,6 +537,7 @@ class ThinkingBlock(Vertical):
         self._text_dirty = False
         self._flush_timer: Timer | None = None
         self._duration: float | None = None
+        self._estimated = False
         self._done = False
         self._start = time.monotonic()
         self.summary_text = "Thinking"
@@ -581,16 +586,30 @@ class ThinkingBlock(Vertical):
         When duration is None: if estimate_if_unknown (the live-streaming
         case), fall back to elapsed-since-start. If not (history replay,
         where "elapsed since start" would be meaningless), show "…" instead.
-        """
+
+        An estimated duration (live path) is provisional: a later finish
+        with the session-recorded seconds (TurnComplete.reasoning_seconds)
+        overrides it, so every client shows the same time regardless of
+        when it attached."""
         if self._done:
+            if duration is not None and self._estimated:
+                self._duration = duration
+                self._estimated = False
+                if self.is_mounted:
+                    self._refresh_summary_color()
             return
         self._done = True
         if duration is not None:
             self._duration = duration
+            self._estimated = False
         elif estimate_if_unknown:
             self._duration = time.monotonic() - self._start
+            self._estimated = True
         else:
             self._duration = None
+            # Unknown ("…") is provisional too: a later finish with the
+            # backend-recorded seconds fills it in.
+            self._estimated = True
         self.remove_class("expanded")  # shrink once finished
         self._drop_text()
         self._swap_to_static_summary()
@@ -1432,13 +1451,20 @@ class DiffSummary(Vertical):
 
     def on_click(self, event: events.Click) -> None:
         # Rows carry a ``diff_key`` attribute; clicks on anything else toggle
-        # the expanded file list.
+        # the expanded file list — except clicks inside the open diff pane,
+        # which only minimize the diff (the file list and its highlight stay
+        # up, same as esc), not collapse the whole panel.
         node = event.widget
         while node is not None and node is not self:
             diff_key = getattr(node, "diff_key", _NO_DIFF)
             if diff_key is not _NO_DIFF:
                 event.stop()
                 self.post_message(self.DiffRequested(cast("str | None", diff_key)))
+                return
+            if node.id == "diff-content":
+                event.stop()
+                if self.diff_shown:
+                    self.minimize_diff()
                 return
             node = node.parent
         self.toggle()
@@ -1614,6 +1640,8 @@ class GeneratingBar(Static):
     def _tick(self) -> None:
         if not self.is_mounted:
             return
+        if not self.has_class("active"):
+            return  # hidden: don't churn repaints while the user scrolls
         top = self.LEVELS - 1
         for i in range(self.WIDTH):
             self._cols[i] = max(0, min(top, self._cols[i] + random.choice((-1, 0, 1))))

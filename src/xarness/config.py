@@ -207,6 +207,175 @@ class LoadedConfig:
     container: ContainerSettings = Field(default_factory=ContainerSettings)
 
 
+# ----------------------------------------------------------------------
+# sectioned layout (models / sandboxes / presets / ui / defaults / server)
+
+
+class SandboxSettings(BaseModel):
+    """One named sandbox profile (the "sandboxes" config section).
+
+    ``sandboxes.default`` is the global profile; other profiles inherit from
+    it and list only the keys they override. Resolved **per session** at
+    creation, saved in the session file, and fixed for the session's
+    lifetime except via /sandbox or /filter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_network: bool = False
+    gpu_access: bool = False
+    # Off by default; on disables the git guard entirely (the agent manages
+    # git itself) — tracking guarantees no longer hold.
+    allow_git_write: bool = False
+    auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
+    # Paths not mounted into the container (a mount exclusion, not a
+    # gitignore). Part of SandboxConfig.mount_key, so the persistent shell
+    # restarts when it changes.
+    filter_list: list[str] = Field(default_factory=list)
+    # False = tools run as a user-level stateful bash on the host (an
+    # unsandboxed mode; the TUI shows a visible marker).
+    use_container: bool = True
+    tool_output_limit: int | None = Field(default=None, ge=256)
+    # Replaces the hardcoded 120 s; a per-command timeout_seconds overrides.
+    default_timeout: float = Field(default=120.0, gt=0)
+    # False: no checkpoints, diff bar, accept/reject or file revert; undo is
+    # conversation-only; no auto-init of a repo.
+    enable_tracking: bool = True
+
+    def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
+        """Inheritance: keys this profile sets explicitly win over ``base``."""
+        merged = base.model_copy()
+        for name in type(self).model_fields:
+            if name in self.model_fields_set:
+                setattr(merged, name, getattr(self, name))
+        return merged
+
+
+class PresetSettings(BaseModel):
+    """One named preset: a model + sandbox (+ subagent, parsed but not yet
+    used — the subagent feature comes later)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str | None = None
+    sandbox: str | None = None
+    subagent: str | None = None
+
+
+class ServerSettings(BaseModel):
+    """The "server" section: TCP port for ``xarness --server`` (0 = pick a
+    free loopback port). The unix socket is always served."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    port: int = Field(default=0, ge=0, le=65535)
+
+
+@dataclass(frozen=True)
+class SectionedConfig:
+    """The sectioned view of one config file (either layout)."""
+
+    models: dict[str, ProviderProfile]
+    sandboxes: dict[str, SandboxSettings]
+    presets: dict[str, PresetSettings]
+    theme: str
+    default_preset: str
+    server: ServerSettings
+    # Notices (e.g. old-layout deprecation) for the caller to surface.
+    notices: list[str]
+
+    def resolve_sandbox(self, name: str | None) -> tuple[str, SandboxSettings]:
+        """Resolve a sandbox profile by name ("default" when None), with
+        inheritance from ``sandboxes.default``."""
+        key = name or "default"
+        if key not in self.sandboxes:
+            raise ConfigError(
+                f"no sandbox profile named {key!r}; available: "
+                + (", ".join(self.sandboxes) or "none")
+            )
+        settings = self.sandboxes[key]
+        if key != "default" and "default" in self.sandboxes:
+            settings = settings.merged_over(self.sandboxes["default"])
+        return key, settings
+
+    def resolve_model(self, name: str | None) -> tuple[str, ProviderProfile]:
+        key = name or self.default_preset_model()
+        if key not in self.models:
+            raise ConfigError(
+                f"no model named {key!r}; available: " + ", ".join(self.models)
+            )
+        return key, self.models[key]
+
+    def default_preset_model(self) -> str | None:
+        preset = self.presets.get(self.default_preset)
+        return preset.model if preset else None
+
+    def default_preset_sandbox(self) -> str | None:
+        preset = self.presets.get(self.default_preset)
+        return preset.sandbox if preset else None
+
+
+def _sectioned(path: Path, data: dict[str, Any]) -> SectionedConfig:
+    """Parse either layout into a SectionedConfig.
+
+    The old layout (``profiles`` list + ``container`` + ``default_theme`` +
+    ``default_profile``) keeps working, with a deprecation notice; new
+    writes go to the sectioned layout."""
+    notices: list[str] = []
+    if isinstance(data.get("models"), dict):
+        # Sectioned layout.
+        models = {
+            name: _validate(path, ProviderProfile, {"name": name, **fields})
+            for name, fields in data["models"].items()
+        }
+        sandboxes = {
+            name: _validate(path, SandboxSettings, fields)
+            for name, fields in (data.get("sandboxes") or {"default": {}}).items()
+        }
+        sandboxes.setdefault("default", SandboxSettings())
+        presets = {
+            name: _validate(path, PresetSettings, fields)
+            for name, fields in (data.get("presets") or {}).items()
+        }
+        ui = data.get("ui") or {}
+        defaults = data.get("defaults") or {}
+        server = _validate(path, ServerSettings, data.get("server") or {})
+        return SectionedConfig(
+            models=models, sandboxes=sandboxes, presets=presets,
+            theme=ui.get("theme") or DEFAULT_THEME,
+            default_preset=defaults.get("preset") or "default",
+            server=server, notices=notices,
+        )
+    # Old layout: normalize to the sectioned form in memory.
+    notices.append(
+        "config uses the old layout (profiles/container sections); it still "
+        "works — rewrite it with named sections (models/sandboxes/presets) "
+        "when you next edit it"
+    )
+    normalized = _normalize(path, data)
+    profiles = _validate(path, list[ProviderProfile], normalized.get("profiles"))
+    models = {p.name or "default": p for p in profiles}
+    container = _validate(path, ContainerSettings | None, data.get("container")) or ContainerSettings()
+    sandboxes = {"default": SandboxSettings(
+        auto_include_refs=list(container.auto_include_refs),
+        tool_output_limit=container.tool_output_limit,
+    )}
+    default_profile = normalized.get("default_profile")
+    # Synthesize the default preset from default_profile, so the usual
+    # preset-based resolution works unchanged for old-layout files.
+    presets = {"default": PresetSettings(model=default_profile, sandbox="default")}
+    return SectionedConfig(
+        models=models, sandboxes=sandboxes, presets=presets,
+        theme=data.get("default_theme") or DEFAULT_THEME,
+        default_preset="default",
+        server=ServerSettings(), notices=notices,
+    )
+
+
+def load_sectioned(path: Path) -> SectionedConfig:
+    """Load the config file as a SectionedConfig (either layout)."""
+    return _sectioned(path, _read(path))
+
+
 def _read(path: Path) -> dict[str, Any]:
     """Read and parse the config file into a top-level object."""
     if not path.exists():
@@ -376,14 +545,41 @@ def save_preferences(
     the ``provider`` section when the config uses one).
     """
     data = _read(path)
+    sectioned = isinstance(data.get("models"), dict)
     if default_theme is not None:
-        data["default_theme"] = default_theme
+        if sectioned:
+            data.setdefault("ui", {})["theme"] = default_theme
+        else:
+            data["default_theme"] = default_theme
     # default_profile only fits the named-profiles form; a stray one would
-    # make a flat config invalid, so it is not written there.
-    if default_profile is not None and isinstance(data.get("profiles"), list):
-        data["default_profile"] = default_profile
+    # make a flat config invalid, so it is not written there. In the
+    # sectioned form it must land where _sectioned reads it back: either as
+    # ``defaults.preset`` (when a preset carries that model) or as the
+    # default preset's model.
+    if default_profile is not None and (
+        sectioned or isinstance(data.get("profiles"), list)
+    ):
+        if sectioned:
+            presets = data.setdefault("presets", {})
+            defaults = data.setdefault("defaults", {})
+            current = defaults.get("preset") or "default"
+            matching = [
+                name for name, fields in presets.items()
+                if isinstance(fields, dict) and fields.get("model") == default_profile
+            ]
+            if matching:
+                defaults["preset"] = matching[0]
+            else:
+                presets.setdefault(current, {})["model"] = default_profile
+        else:
+            data["default_profile"] = default_profile
     if auto_compact is not None:
-        if isinstance(data.get("profiles"), list):
+        if sectioned:
+            target = profile or default_profile
+            if target is None:
+                raise ConfigError("no model named to write auto_compact onto")
+            data.setdefault("models", {}).setdefault(target, {})["auto_compact"] = auto_compact
+        elif isinstance(data.get("profiles"), list):
             target = profile or data.get("default_profile")
             entries = [p for p in data["profiles"] if p.get("name") == target]
             if not entries:
@@ -405,11 +601,19 @@ def load_all_profiles(path: Path) -> dict[str, ProviderProfile]:
     return {p.name: p for p in _validate(path, list[ProviderProfile], data["profiles"])}
 
 
-def resolve_api_key(profile: ProviderProfile) -> str | None:
-    """Read the API key from the env var named by ``api_key_env``."""
+def resolve_api_key(
+    profile: ProviderProfile, env: dict[str, str] | None = None,
+) -> str | None:
+    """Read the API key from the env var named by ``api_key_env``.
+
+    ``env`` defaults to this process's environment; a host process resolves
+    keys against the *client's* environment instead (its own is stale — the
+    host is long-lived). The mapping is used only for the lookup and is
+    never persisted or logged."""
     if profile.api_key_env is None:
         return None
-    key = os.environ.get(profile.api_key_env)
+    source = os.environ if env is None else env
+    key = source.get(profile.api_key_env)
     if not key:
         raise ConfigError(
             f"environment variable {profile.api_key_env!r} (api_key_env from config) is not set; "

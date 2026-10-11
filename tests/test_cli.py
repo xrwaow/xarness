@@ -1,32 +1,40 @@
-"""CLI flag parsing: --network / --gpu launch-time booleans (default true)."""
+"""CLI flag parsing: model/sandbox/preset selection and tri-state overrides."""
 
-from xarness.cli import _flag_value, build_parser
-
-
-def test_network_and_gpu_default_true() -> None:
-    args = build_parser().parse_args([])
-    assert _flag_value(args.network) is True
-    assert _flag_value(args.gpu) is True
+from xarness.cli import build_parser
 
 
-def test_flags_accept_false() -> None:
-    args = build_parser().parse_args(["--network", "false", "--gpu", "false"])
-    assert _flag_value(args.network) is False
-    assert _flag_value(args.gpu) is False
-
-
-def test_flags_collect_lists_last_wins() -> None:
+def test_model_sandbox_preset_flags() -> None:
     args = build_parser().parse_args(
-        ["--network", "false", "--network", "true", "--gpu", "false"],
+        ["--model", "fast", "--sandbox", "gpu", "--preset", "ml"]
     )
-    assert args.network == ["false", "true"]
-    assert _flag_value(args.network) is True
-    assert args.gpu == ["false"]
-    assert _flag_value(args.gpu) is False
+    assert args.model == "fast"
+    assert args.sandbox == "gpu"
+    assert args.preset == "ml"
 
 
-def test_flag_value_nonstandard_strings() -> None:
-    assert _flag_value(["TRUE"]) is True
-    assert _flag_value(["0"]) is False
-    assert _flag_value(["no"]) is False
-    assert _flag_value([]) is True
+def test_profile_is_an_alias_for_model() -> None:
+    args = build_parser().parse_args(["--profile", "fast"])
+    assert args.model == "fast"
+
+
+def test_network_gpu_default_none() -> None:
+    args = build_parser().parse_args([])
+    assert args.network is None
+    assert args.gpu is None
+
+
+def test_network_gpu_tri_state() -> None:
+    args = build_parser().parse_args(["--network", "--no-gpu"])
+    assert args.network is True
+    assert args.gpu is False
+
+
+def test_session_and_server_flags() -> None:
+    args = build_parser().parse_args(["--session", "2026-01-01_x"])
+    assert args.session == "2026-01-01_x"
+    assert args.sessions is False
+    assert args.server is False
+    args = build_parser().parse_args(["--sessions"])
+    assert args.sessions is True
+    args = build_parser().parse_args(["--server"])
+    assert args.server is True

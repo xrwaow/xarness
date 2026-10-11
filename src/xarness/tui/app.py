@@ -1,18 +1,19 @@
-"""The xarness chat application.
+"""The xarness chat application — a thin client of the host API.
 
-Owns the event loop between :class:`ChatController` (conversation + API) and
-the widget tree. All state transitions — processing → thinking → answer
-streaming — are driven by stream events, never by timers.
+Owns the widget tree and renders the event stream of one headless
+:class:`~xarness.session.Session` running in the host process. All state
+and logic — the turn loop, tool execution, steering, undo/retry,
+accept/reject, compaction, persistence — live in the session; this process
+only renders events and sends commands. It never imports the controller,
+session, tools, gitwork or sandbox modules.
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
-import time
-from collections.abc import Callable
+import httpx
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -24,28 +25,23 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
 
 from .. import theme
-from ..config import (
-    ConfigError, ProviderProfile, load_all_profiles, resolve_api_key, save_preferences,
+from ..clientlib import ClientError, XarnessClient
+from ..config import DEFAULT_CONFIG_PATH, save_preferences
+from ..conversation import SUMMARY_PREFIX, Message
+from ..events import ToolCallStatus
+from ..images import ImageAttachment
+from ..protocol import (
+    AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
+    DiscardQueued, DriftResolved, Event, FilterAdd, FilterRemove,
+    FlushQueued, HistoryReplaced, ImageAttachmentModel, MessageModel,
+    Notice, ReasoningDelta, Reject, ResolveDrift,
+    Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
+    StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
+    ToolCallArgumentsDelta, ToolCallArgumentsDone, ToolCallStarted,
+    ToolExecStarted, ToolFinished, ToolOutputDelta, TurnComplete,
+    TurnFinished, Undo, UndoTo, UserMessageAdded,
 )
-from ..conversation import SUMMARY_PREFIX, Conversation, Message
-from ..controller import ChatController, RollbackPlan
-from ..events import (
-    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
-    ToolCallArgumentsDone, ToolCallStarted, ToolCallStatus, TurnComplete, Usage,
-)
-from ..file_search import search_files
-from .. import images as image_loader
-from ..images import ImageAttachment, ImageError
-from ..gitwork import (
-    DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
-    attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
-    setup_tracking, snapshot_tree, tree_diff_stat,
-)
-from ..prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
-from ..sandbox import SandboxConfig, SandboxSession
-from ..tools import ToolRegistry, build_registry
 from .confirm_screen import ConfirmScreen
-
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
@@ -67,34 +63,11 @@ INPUT_PLACEHOLDER = (
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 
-# An @-mention token that resolves to an image file attaches it (its literal
-# text still goes to the model). A quoted form (@"path with spaces.png")
-# covers paths pasted from terminals; plain tokens may not contain spaces.
-_IMAGE_TOKEN_RE = re.compile(
-    r'@("[^"\n]+\.(?:png|jpe?g|webp|gif|bmp)"|[^\s@]+\.(?:png|jpe?g|webp|gif|bmp))\b',
-    re.IGNORECASE,
-)
-
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
 
-# Tools that modify workspace files — a successful call means a diff now
-# exists, so the pending-changes bar should surface above the input.
-_WRITING_TOOLS = frozenset({"write_file", "edit_file"})
-
-
-def _format_drift_detail(stat: DiffStat, limit: int = 6) -> str:
-    """A short plain-text summary of drifted files for the confirm modal."""
-    if not stat.files:
-        return ""
-    lines = []
-    for f in stat.files[:limit]:
-        tag = " (new)" if f.is_new else ""
-        lines.append(f"  {f.path}{tag}  +{f.additions} -{f.deletions}")
-    if len(stat.files) > limit:
-        lines.append(f"  … and {len(stat.files) - limit} more")
-    return "\n".join(lines)
-
+# How long to wait for a cancel command to unwind before exiting anyway.
+CANCEL_TIMEOUT = 2.0
 
 # Divider mounted in the chat log at every compaction point (live and on
 # /resume): everything above is history the model no longer sees verbatim.
@@ -104,10 +77,49 @@ COMPACTED_DIVIDER = (
 )
 
 
+class ContinueHeadlessScreen(ModalScreen[bool | None]):
+    """Ctrl+C while a request is still running: continue it in the
+    background in the host, or cancel it and quit.
+
+    ``True`` = continue headless, ``False`` = stop and quit, ``None``
+    (escape) = stay in the app. Styled entirely by the existing modal CSS
+    (same conventions as ConfirmScreen — no new visual style)."""
+
+    BINDINGS = [
+        ("escape", "stay", "Stay"),
+        ("y", "continue_headless", "Continue headless"),
+        ("n", "stop_quit", "Stop and quit"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Vertical
+        from textual.widgets import Button, Label
+        with Vertical(id="confirm-modal"):
+            yield Label(
+                "A request is still running. Continue it in the background?",
+                id="confirm-title", markup=False,
+            )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Continue headless", id="confirm-yes", variant="primary")
+                yield Button("Stop and quit", id="confirm-no", variant="error")
+
+    def on_button_pressed(self, event) -> None:
+        self.dismiss(event.button.id == "confirm-yes")
+
+    def action_continue_headless(self) -> None:
+        self.dismiss(True)
+
+    def action_stop_quit(self) -> None:
+        self.dismiss(False)
+
+    def action_stay(self) -> None:
+        self.dismiss(None)
+
+
 class _RoundView:
     """Widget state for one streaming round: pending indicator, thinking
-    block, assistant message, tool-writing shimmer, tool-call blocks. The
-    turn driver (_run_turn) only loops rounds and executes tools."""
+    block, assistant message, tool-writing shimmer, tool-call blocks. Fed
+    by the event pump; the session drives pacing."""
 
     def __init__(self, app: "AgentApp", chat: "VerticalScroll") -> None:
         self.app = app
@@ -130,8 +142,15 @@ class _RoundView:
         self.indicator_live = True
         await self.chat.mount(self.indicator)
 
-    async def handle(self, event) -> None:
+    async def handle(self, event: Event) -> None:
         if isinstance(event, ReasoningDelta):
+            if self.thinking is not None and self.thinking.done:
+                # A new round of the same turn (previous round ended with
+                # tool calls): the finished thinking block and settled
+                # answer belong to the transcript — start fresh widgets, or
+                # round 2+ CoT and answers stream into finished (collapsed,
+                # dropped-text) widgets and stay invisible until reload.
+                await self._new_round()
             if self.thinking is None:
                 await self._hide_indicator()
                 self.thinking = ThinkingBlock()
@@ -139,17 +158,19 @@ class _RoundView:
                 await self.app._mount_spaced(self.chat, self.thinking)
             self.thinking.append_reasoning(event.text)
         elif isinstance(event, ContentDelta):
+            if self.assistant is not None and self.assistant.finalized:
+                await self._new_round()
             if self.assistant is None:
                 await self._hide_indicator()
                 if self.thinking is not None:
-                    self.thinking.finish(duration=None)
+                    self.thinking.finish(duration=None, estimate_if_unknown=False)
                 self.assistant = AssistantMessage()
                 await self.app._mount_spaced(self.chat, self.assistant)
             await self.assistant.append_delta(event.text)
         elif isinstance(event, ToolCallStarted):
             await self._hide_indicator()
             if self.thinking is not None:
-                self.thinking.finish(duration=None)
+                self.thinking.finish(duration=None, estimate_if_unknown=False)
             # One shared "Writing <tool>" shimmer while arguments stream; the
             # indicator accumulates the streamed args itself. Per-call blocks
             # appear once args are complete.
@@ -176,6 +197,26 @@ class _RoundView:
             if self.pending_writes == 0 and self.writing is not None:
                 await self.app._dismiss_indicator(self.writing)
                 self.writing = None
+        elif isinstance(event, ToolExecStarted):
+            pass  # the block's amber "Running" dot is already showing
+        elif isinstance(event, ToolOutputDelta):
+            block = self.tool_blocks.get(event.call_id)
+            if block is not None:
+                block.append_output(event.text)
+        elif isinstance(event, ToolFinished):
+            # The ToolCallStatus mapping lives here (client-side): the
+            # session reports the outcome, the client picks the dot color.
+            if event.parse_error:
+                status = ToolCallStatus.PARSING_ERROR
+            elif event.ok:
+                status = ToolCallStatus.CALL_SUCCEEDED
+            else:
+                status = ToolCallStatus.CALL_FAILED
+            block = self.tool_blocks.get(event.call_id)
+            if block is not None:
+                block.set_result(
+                    status, output=event.output, error=event.error, header=event.header,
+                )
         elif isinstance(event, TurnComplete):
             self.round_has_tools = event.has_tool_calls
             await self.app._complete_round(event, self.thinking, self.assistant)
@@ -188,6 +229,14 @@ class _RoundView:
             await self.chat.mount(ErrorLine(event.message))
             self.had_stream_error = True
             self.app._clear_hint_lines()
+
+    async def _new_round(self) -> None:
+        """Reset the per-round widgets for the turn's next round (the tool
+        blocks of earlier rounds stay put — their results may still land)."""
+        self.thinking = None
+        self.assistant = None
+        self.round_has_tools = False
+        self.had_stream_error = False
 
     async def _hide_indicator(self) -> None:
         if self.indicator_live:
@@ -211,7 +260,7 @@ class _RoundView:
         if self.indicator is not None and self.indicator_live:
             await self.app._dismiss_indicator(self.indicator)
         if self.thinking is not None and not self.thinking.done:
-            self.thinking.finish(duration=None)
+            self.thinking.finish(duration=None, estimate_if_unknown=False)
         if self.assistant is not None:
             # Interrupted rounds never reach TurnComplete/finalize: settle the
             # partial answer so it's selectable (and matches the /resume replay).
@@ -227,8 +276,10 @@ SLASH_COMMANDS = [
     ("model", "choose what model and reasoning effort to use"),
     ("sessions", "resume a previous session"),
     ("mode", "switch between plan (read-only) and write mode"),
+    ("sandbox", "choose this session's sandbox profile (idle only)"),
+    ("filter", "add/remove/list paths excluded from the sandbox mounts"),
     ("theme", "choose a color theme"),
-    ("new", "start a new chat"),
+    ("new", "leave this session and start a fresh chat"),
     ("delete", "delete the current session and start a new one (your files are left exactly as they are)"),
     ("diff", "show pending changes (optionally: /diff <path>)"),
     ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
@@ -236,6 +287,22 @@ SLASH_COMMANDS = [
     ("undo", "drop the last turn and revert its file edits"),
     ("retry", "revert the last turn's file edits and resend your message"),
 ]
+
+
+class ChatLog(VerticalScroll):
+    """The transcript scroll.
+
+    The scrollbar is hidden app-wide, so Textual's only built-in anchor
+    release (grabbing the scrollbar) never fires: without this, the log
+    stays pinned to the bottom forever and every relayout — a streaming
+    flush, expanding a block — yanks the view back down while you're
+    reading, which reads as scroll/expand lag. Release the anchor as soon
+    as the user scrolls up; scrolling back to the bottom re-arms it."""
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if new_value < old_value and self._anchored and not self._anchor_released:
+            self.release_anchor()
 
 
 class AgentApp(App[None]):
@@ -252,90 +319,63 @@ class AgentApp(App[None]):
 
     def __init__(
         self,
-        profile: ProviderProfile,
-        api_key: str | None,
-        controller: ChatController | None = None,
-        tool_registry: ToolRegistry | None = None,
+        client: XarnessClient,
         workspace: Path | None = None,
         session_name: str | None = None,
-        config_path: Path | None = None,
-        profile_name: str | None = None,
-        sandbox: SandboxConfig | None = None,
-        sandbox_session: SandboxSession | None = None,
-        tool_output_limit: int | None = None,
-        git_info: GitInfo | None = None,
+        config_path: Path | None = DEFAULT_CONFIG_PATH,
+        model: str | None = None,
+        sandbox: str | None = None,
+        preset: str | None = None,
+        network: bool | None = None,
+        gpu: bool | None = None,
+        no_init_repo: bool = False,
+        no_session: bool = False,
         startup_notices: list[str] | None = None,
     ) -> None:
         super().__init__()
-        self.profile = profile
-        self.api_key = api_key
-        # Kept on the app so /mode can rebuild a registry without re-deriving
-        # the sandbox setup.
-        self.sandbox = sandbox
-        self.sandbox_session = sandbox_session
-        self.mode: Literal["plan", "write"] = "write"
-        # The app owns the sandbox's mode (build_registry doesn't mutate it).
-        if sandbox is not None:
-            sandbox.read_only = self.mode != "write"
-        self.tool_registry = tool_registry or build_registry(
-            sandbox, sandbox_session, mode=self.mode,
-            ask_callback=self._ask_user,
-            git_guard=self._make_git_guard(),
-        )
-        if tool_output_limit is not None:
-            self.tool_registry.max_output_chars = tool_output_limit
-        self.controller = controller or ChatController(
-            profile, api_key, tool_registry=self.tool_registry
-        )
-        self.controller.git_info = git_info
+        self.client = client
         self.workspace = workspace
         self.session_name = session_name
         self.config_path = config_path
-        self.profile_name = profile_name
-        self.git_info = git_info
+        self.model = model
+        self.sandbox_name = sandbox
+        self.preset = preset
+        # Tri-state sandbox overrides (None = not given).
+        self.network = network
+        self.gpu = gpu
+        self.no_init_repo = no_init_repo
+        self.no_session = no_session
         self.startup_notices = startup_notices or []
-        self._turn_busy = False
-        # Auto-compact: run compaction automatically when the context window
-        # passes the profile's auto_compact_threshold (checked at the end of
-        # each turn). Off unless the profile's config enables it.
-        self.auto_compact = self.profile.auto_compact
-        # True while a compaction is rewriting the history: submissions
-        # queue (like a busy turn) instead of racing the rewrite. Auto-
-        # compaction runs at the end of a turn; /new //delete wait it out.
-        self._compacting = False
-        self._queued: list[tuple[str, list[ImageAttachment] | None]] = []
+        # Latest status from the session (drives the bars); a draft has none.
+        self.status: StatusPayload | None = None
+        self._view: _RoundView | None = None
+        # Message ids currently rendered in the chat log (see
+        # _mount_user_message / _on_history_replaced: the trim path).
+        self._rendered_ids: set[str] = set()
+        self._pump_worker: Worker | None = None
         self._ask_future: asyncio.Future[str | None] | None = None
+        self._ask_id: str | None = None
+        self._ask_worker: Worker | None = None
+        self._drift_modal_open = False
         self._last_thinking: ThinkingBlock | None = None
-        self._worker: Worker | None = None
         # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
         # the second one within INTERRUPT_ARM_SECONDS actually cancels.
         self._interrupt_armed = False
         self._interrupt_timer = None
         self._at_search_timer = None
-        self._profiles_cache: dict[str, ProviderProfile] = {}
-        self.ensure_system_message()
+        self._config_cache = None
+        # Draft-chat state (before any session exists): the mode Tab toggles
+        # locally and is applied to the session once it is created.
+        self._draft_mode = "write"
 
-    def ensure_system_message(self) -> None:
-        """Make sure the conversation leads with the mode-aware system prompt.
-
-        Called at startup, after a conversation swap (/resume, cli.py's
-        existing-session load), and on /mode. An existing system message is
-        updated IN PLACE rather than appended: there is exactly one, at index
-        0, and rewriting it means a mode switch applies from the very next
-        round onward without duplicating prompts in the history.
-        """
-        conversation = self.controller.conversation
-        content = system_prompt_for(GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox)
-        if conversation.messages and conversation.messages[0].role == "system":
-            conversation.messages[0].content = content
-        else:
-            conversation.messages.insert(0, Message(role="system", content=content))
+    # ------------------------------------------------------------------
+    # layout
 
     def get_css_variables(self) -> dict[str, str]:
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="chat-log")
+        yield ChatLog(id="chat-log")
         with Container(id="input-wrap"):
             yield GeneratingBar(id="generating-bar")
             yield DiffSummary(id="diff-summary")
@@ -359,21 +399,173 @@ class AgentApp(App[None]):
         # content streams, the anchor is released the moment the user scrolls up
         # (so nothing yanks the viewport back), and it re-arms once they scroll
         # down to the bottom again.
-        self.query_one("#chat-log", VerticalScroll).anchor()
-        # A conversation loaded before mount (e.g. `--session <name>` resume
-        # in cli.py) has never been rendered — replay it into the chat log.
-        if any(m.role != "system" for m in self.controller.conversation.messages):
-            await self._render_history()
+        self.query_one("#chat-log", ChatLog).anchor()
+        self._load_draft_defaults()
         for notice in self.startup_notices:
             self._post_line(NoticeLine(notice))
-        # On a resumed session this reconnects the pending-changes summary.
+        if self.session_name is not None:
+            await self._attach(self.session_name)
+
+    async def on_unmount(self) -> None:
+        await self.client.aclose()
+
+    # ------------------------------------------------------------------
+    # Attach + event pump
+
+    async def _attach(self, name: str) -> None:
+        """Attach to a hosted session: snapshot first, then live events."""
+        if self._pump_worker is not None:
+            self._pump_worker.cancel()
+            self._pump_worker = None
+        self.session_name = name
+        try:
+            snap = await self.client.snapshot(name)
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"could not attach to {name}: {exc}"))
+            return
+        self.status = snap.status
+        self._refresh_title()
+        await self._render_history(snap)
+        self._refresh_status()
+        self._refresh_steer_bar()
+        if snap.status.finished_while_away:
+            self._post_line(NoticeLine("finished while you were away"))
         await self.refresh_diff_summary()
-        # A session loaded before mount (e.g. a future `--session <name>` resume)
-        # may have drifted while it was closed; surface it the same way a
-        # /sessions resume does, rather than deciding for the user.
-        drift = await self._detect_resume_drift()
-        if drift is not None and self.git_info is not None:
-            self._prompt_resume_drift(self.git_info, drift[0], drift[1])
+        # Seed the pump with the seq we just rendered: the host replays only
+        # the missed events instead of sending a snapshot, so the history is
+        # not rendered a second time on attach.
+        self._pump_worker = self._pump_events(name, snap.seq)
+
+    @work(group="stream", exit_on_error=False)
+    async def _pump_events(self, name: str, last_seq: int | None = None) -> None:
+        """Consume the session's event stream, reconnecting with backoff.
+
+        The clientlib reader replays with Last-Event-ID across dropped
+        connections; a fresh Snapshot arrives when the replay window was
+        missed. Never crashes the app on connection loss."""
+        try:
+            async for item in self.client.attach(name, last_seq):
+                if isinstance(item, Snapshot):
+                    self.status = item.status
+                    await self._render_history(item)
+                    self._view = None
+                else:
+                    await self._handle_event(item)
+        except asyncio.CancelledError:
+            raise
+        except (ClientError, httpx.HTTPError) as exc:
+            self._view = None
+            # Recover outside this worker: _attach cancels the pump worker,
+            # and a task cannot reliably cancel and replace itself.
+            self.call_later(self._recover, name, exc)
+        except Exception as exc:  # noqa: BLE001 - never crash on connection loss
+            self._view = None
+            self.call_later(self._recover, name, exc)
+
+    async def _recover(self, name: str, exc: Exception) -> None:
+        """Connection loss: respawn the host if it died, reload the session
+        on the (fresh) host, and reattach. One attempt: a failure is
+        reported and the user reattaches via /sessions."""
+        self._post_line(ErrorLine(f"connection lost: {exc} — reconnecting"))
+        try:
+            from ..clientlib import ensure_host
+            await ensure_host()
+            try:
+                await self.client.load_session(name)
+            except ClientError:
+                pass  # the fresh host may already host it (load is idempotent)
+            await self._attach(name)
+        except ClientError as recover_exc:
+            self._post_line(ErrorLine(
+                f"could not reconnect: {recover_exc} — /sessions to reattach",
+            ))
+
+    async def _handle_event(self, event: Event) -> None:
+        """Route one live event to the widgets."""
+        if isinstance(event, StatusChanged):
+            was_streaming = self.status is not None and self.status.state in (
+                "running", "compacting",
+            )
+            self.status = event.status
+            self._refresh_status()
+            self._refresh_steer_bar()
+            self._refresh_generating()
+            await self._maybe_prompt_drift()
+            if (
+                was_streaming and self.status.state not in ("running", "compacting")
+                and self._view is not None
+            ):
+                # The turn ended without a TurnComplete for this client —
+                # an interrupt (esc / stop-and-quit) or a forced steer
+                # cancelling it. Settle the live round, or the Thinking
+                # shimmer (and a half-streamed tool's writing shimmer)
+                # keeps animating next to the "interrupted" error line.
+                await self._view.cancel()
+                self._view = None
+            return
+        if isinstance(event, Notice):
+            if event.level == "error":
+                self._post_line(ErrorLine(event.text))
+            else:
+                self._post_line(NoticeLine(event.text))
+            return
+        if isinstance(event, UserMessageAdded):
+            await self._mount_user_message(event)
+            return
+        if isinstance(event, HistoryReplaced):
+            await self._on_history_replaced(event)
+            return
+        if isinstance(event, AskRequested):
+            self._ask_worker = self._ask_flow(event.ask_id, event.questions)
+            return
+        if isinstance(event, AskResolved):
+            self._on_ask_resolved(event)
+            return
+        if isinstance(event, DriftResolved):
+            self._drift_modal_open = False
+            return
+        if isinstance(event, TurnFinished):
+            self._post_line(NoticeLine(f"Worked for {_format_duration(event.elapsed)}"))
+            self._refresh_diff_summary_soon()
+            return
+        if isinstance(event, SessionDeleted):
+            # The session went away (deleted, or closed by this or another
+            # client — a Notice with the specifics precedes this event).
+            self._detach()
+            return
+        # Everything else is a streaming-round event.
+        if self._view is None:
+            self._view = _RoundView(self, self.query_one("#chat-log", VerticalScroll))
+            await self._view.mount()
+        await self._view.handle(event)
+        if isinstance(event, ToolFinished):
+            self._refresh_diff_summary_soon()
+
+    # ------------------------------------------------------------------
+    # Commands
+
+    async def _send_command(self, command: Command) -> dict | None:
+        """Send one command to the session; returns its result payload.
+
+        Errors (busy rejection, unknown target, git failure) surface as an
+        ErrorLine — the session broadcast the effects to everyone anyway."""
+        if self.session_name is None:
+            return None
+        try:
+            result = await self.client.command(self.session_name, command)
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(str(exc)))
+            return None
+        return result.payload
+
+    def _post_command(self, command: Command) -> None:
+        """Fire-and-forget command send: results are ignored (the effects
+        arrive as events / StatusChanged anyway). Every caller that does not
+        await _send_command must go through this — calling the coroutine
+        bare silently does nothing."""
+        self.run_worker(
+            self._send_command(command), group="post-command", exit_on_error=False,
+        )
 
     # ------------------------------------------------------------------
     # Terminal title
@@ -395,27 +587,111 @@ class AgentApp(App[None]):
             cropped = cropped[4:]
         self._set_terminal_title(f"xarness {cropped}")
 
+    def _refresh_title(self) -> None:
+        """Follow the attached session: its workspace in the tab title, or
+        the default when detached — otherwise switching to a session in a
+        different workspace keeps the stale title."""
+        workspace = self.status.workspace if (
+            self.session_name is not None and self.status is not None
+        ) else None
+        if workspace:
+            cropped = crop_path(workspace, _TITLE_PATH_LEN)
+            if cropped.startswith(".../"):
+                cropped = cropped[4:]
+            self._set_terminal_title(f"xarness {cropped}")
+        else:
+            self._set_default_title()
+
     # ------------------------------------------------------------------
-    # Status bar
+    # Status bar / bars
 
     def _refresh_status(self) -> None:
-        # The last round's prompt already includes the entire prior
-        # conversation (including earlier assistant outputs), so the current
-        # context is that prompt plus only the newest round's output.
-        context_used = self.last_in + self.last_out
+        status = self.status
+        if status is None:
+            # Draft chat: the backend tells us what a fresh session starts
+            # with (/config defaults), so show that instead of a dash.
+            config = self._config_cache
+            self.query_one("#status-bar", StatusBar).update_status(
+                shown_name=(
+                    config.default_model_display_name if config else None
+                ) or "—",
+                effort="medium", mode=self._draft_mode,
+                total_in=0, total_out=0, context_used=0, max_context=128_000,
+                workspace=str(self.workspace) if self.workspace else None,
+            )
+            return
         self.query_one("#status-bar", StatusBar).update_status(
-            shown_name=self.profile.display_name,
-            effort=self.profile.cot_strength.value,
-            mode=self.mode,
-            total_in=self.total_in,
-            total_out=self.total_out,
-            context_used=context_used,
-            max_context=self.profile.max_context,
-            workspace=str(self.workspace) if self.workspace else None,
+            shown_name=status.model_display_name,
+            effort=status.cot_strength,
+            mode=status.mode,
+            total_in=status.total_in,
+            total_out=status.total_out,
+            context_used=status.context_used,
+            max_context=status.max_context,
+            workspace=status.workspace,
         )
 
+    @work(group="draft-status", exit_on_error=False)
+    async def _load_draft_defaults(self) -> None:
+        """Draft chat: fetch /config so the status bar can show the default
+        model instead of a dash (and /model works without a round trip
+        later). Harmless no-op once a session is attached."""
+        if self.session_name is not None or self._config_cache is not None:
+            return
+        try:
+            self._config_cache = await self.client.config()
+        except (ClientError, httpx.HTTPError):
+            return
+        if self.session_name is None:
+            self._refresh_status()
+
+    def _refresh_generating(self) -> None:
+        try:
+            bar = self.query_one("#generating-bar", GeneratingBar)
+        except NoMatches:
+            return
+        state = self.status.state if self.status else "idle"
+        if state in ("running", "compacting"):
+            bar.add_class("active")
+        else:
+            bar.remove_class("active")
+
+    def _refresh_steer_bar(self) -> None:
+        """Mirror the session's queued steer messages into the bar above the
+        input. The queue is session state (StatusChanged.queued), so every
+        client's bar shows it."""
+        try:
+            bar = self.query_one("#steer-queue-bar", SteerQueueBar)
+        except NoMatches:
+            return  # app shutting down
+        queued = self.status.queued if self.status else []
+        bar.update_items([q.text for q in queued])
+
+    def _refresh_diff_summary_soon(self) -> None:
+        """Recompute the pending-changes bar soon (debounced per event)."""
+        self.set_timer(0.05, lambda: self.call_later(self.refresh_diff_summary))
+
+    async def refresh_diff_summary(self) -> None:
+        """Recompute the pending-changes bar (hidden when empty or gitless)."""
+        try:
+            widget = self.query_one("#diff-summary", DiffSummary)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
+        if self.session_name is None:
+            await widget.clear()
+            return
+        try:
+            info = await self.client.diff(self.session_name)
+        except ClientError:
+            await widget.clear()  # tracking broken (e.g. repo gone): stay quiet
+            return
+        if not info.files:
+            await widget.clear()
+        else:
+            await widget.set_summary(info)
+
     # ------------------------------------------------------------------
-    # Submission / turn lifecycle
+    # Submission / ask flow
 
     def on_chat_input_chat_submitted(self, event: ChatInput.ChatSubmitted) -> None:
         # While the ask tool waits for an answer, every submission is the
@@ -435,61 +711,175 @@ class AgentApp(App[None]):
             return
         self._submit(text, event.images)
 
+    def _submit(self, text: str, images: list[ImageAttachment] | None = None) -> None:
+        """Send a message. No local echo: the message lands in the transcript
+        when UserMessageAdded arrives, identically for every client."""
+        self.call_later(self._submit_async, text, images)
+
+    async def _submit_async(self, text: str, images: list[ImageAttachment] | None) -> None:
+        if self.session_name is None:
+            # Draft chat: the session comes into existence on the server with
+            # the first message.
+            try:
+                summary = await self.client.create_session(
+                    workspace=str(self.workspace) if self.workspace else None,
+                    model=self.model,
+                    sandbox=self.sandbox_name,
+                    preset=self.preset,
+                    network=self.network,
+                    gpu=self.gpu,
+                    no_init_repo=self.no_init_repo,
+                )
+            except (ClientError, httpx.HTTPError) as exc:
+                self._post_line(ErrorLine(f"could not start a session: {exc}"))
+                return
+            self.model = None
+            self.sandbox_name = None
+            self.preset = None
+            self.network = None
+            self.gpu = None
+            await self._attach(summary.name)
+            # Carry the draft-mode toggle (Tab before any message) into the
+            # freshly created session.
+            if self._draft_mode != "write":
+                self._post_command(SetMode(mode=self._draft_mode))
+            self._draft_mode = "write"
+        # Pasted/dragged images ride along as base64 attachments; @path
+        # tokens in the text are resolved server-side.
+        models = [
+            ImageAttachmentModel(
+                name=i.name, mime=i.mime, data_b64=i.data_b64,
+                width=i.width, height=i.height,
+            )
+            for i in (images or [])
+        ]
+        await self._send_command(SendMessage(text=text, images=models or None))
+
+    async def _mount_user_message(self, event: UserMessageAdded) -> None:
+        """Land a user message in the transcript (sent or steered)."""
+        chat = self.query_one("#chat-log", VerticalScroll)
+        images = [
+            ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
+                            width=i.width, height=i.height)
+            for i in (event.images or [])
+        ]
+        widget = UserMessage(event.text, images or None)
+        widget.message = Message(role="user", content=event.text, id=event.message_id or "")
+        widget.mark_sent()
+        await self._mount_spaced(chat, widget)
+        # Track the rendered id: HistoryReplaced's trim path compares these
+        # against the new history to trim in place instead of re-rendering
+        # the whole chat (undo-from-here on a message that arrived live
+        # during this attach must trim, not reload).
+        if event.message_id:
+            self._rendered_ids.add(event.message_id)
+
+    # ------------------------------------------------------------------
+    # Ask tool (event-driven)
+
+    @work(group="ask")
+    async def _ask_flow(self, ask_id: str, questions: list[str]) -> None:
+        """Show the questions one at a time in the AskBar; the user answers
+        through the normal chat input (Enter submits, Esc skips all). The
+        collected answers go back as one ``answer_ask`` command — any client
+        may answer; first answer wins."""
+        ask_bar = self.query_one("#ask-bar", AskBar)
+        chat_input = self.query_one("#chat-input", ChatInput)
+        answers: list[str] = []
+        try:
+            for index, question in enumerate(questions):
+                ask_bar.show_question(f"Question {index + 1}/{len(questions)}: {question}")
+                chat_input.placeholder = ASK_PLACEHOLDER
+                chat_input.focus()
+                future: asyncio.Future[str | None] = (
+                    asyncio.get_running_loop().create_future()
+                )
+                self._ask_future = future
+                self._ask_id = ask_id
+                answer = await future
+                if answer is None:  # esc: skip the remaining questions
+                    await self._send_command(AnswerAsk(ask_id=ask_id, answers=None))
+                    return
+                answers.append(answer)
+            await self._send_command(AnswerAsk(ask_id=ask_id, answers=answers))
+        finally:
+            self._ask_future = None
+            self._ask_id = None
+            ask_bar.hide()
+            chat_input.placeholder = INPUT_PLACEHOLDER
+
+    def _on_ask_resolved(self, event: AskResolved) -> None:
+        """Another client answered first: close this client's prompt."""
+        if self._ask_id is not None and self._ask_id == event.ask_id:
+            if self._ask_future is not None and not self._ask_future.done():
+                self._ask_future.cancel()
+            if self._ask_worker is not None:
+                self._ask_worker.cancel()
+                self._ask_worker = None
+
+    # ------------------------------------------------------------------
+    # Drift prompt (session state; any client may resolve)
+
+    async def _maybe_prompt_drift(self) -> None:
+        """The workspace changed outside this session while it was closed.
+
+        Show what drifted and let the user choose: accept it as the new
+        baseline, or keep tracking against the last known state. Never pick
+        for them. The prompt is session state — if another client resolves
+        it first, DriftResolved closes this modal's follow-up."""
+        if (
+            self.status is None or self.status.pending_drift is None
+            or self._drift_modal_open
+        ):
+            return
+        self._drift_modal_open = True
+        choice = await self.push_screen_wait(ConfirmScreen(
+            "Workspace changed outside this session since it was last open:",
+            confirm_label="Accept as baseline",
+            cancel_label="Keep tracking",
+        ))
+        self._drift_modal_open = False
+        if self.status is None or self.status.pending_drift is None:
+            return  # resolved elsewhere while the modal was open
+        if choice is None:
+            return  # dismissed: leave the prompt pending
+        await self._send_command(ResolveDrift(accept=bool(choice)))
+
+    # ------------------------------------------------------------------
+    # Slash commands
+
     def _handle_slash_command(self, text: str) -> None:
         parts = text[1:].split(maxsplit=1)
         cmd = parts[0] if parts else ""
         if cmd == "tools":
-            names = ", ".join(t["function"]["name"] for t in self.tool_registry.schema())
+            names = ", ".join(self.status.tools) if self.status and self.status.tools else "none"
             self._post_line(MessageLine(f"tools: {names}", kind="info"))
         elif cmd == "sessions":
-            self.push_screen(
-                ResumeScreen(workspace=str(self.workspace) if self.workspace else None),
-                self._on_session_selected,
-            )
+            self._open_sessions()
         elif cmd == "new":
-            if self._compacting:
-                self._post_line(ErrorLine("/new: wait for the compaction to finish first"))
-            else:
-                self._start_new_session()
+            self._start_new_session()
         elif cmd == "delete":
-            if self._turn_busy or self._compacting:
-                self._post_line(ErrorLine("/delete: wait for the current turn or compaction to finish first"))
-            else:
-                self._start_delete()
+            self._start_delete()
         elif cmd == "accept":
-            preflight = self._git_action_preflight("accept")
-            if preflight is not None:
-                self._start_accept(*preflight)
+            self._post_command(Accept())
         elif cmd == "reject":
-            preflight = self._git_action_preflight("reject")
-            if preflight is not None:
-                self._start_reject(*preflight)
+            self._post_command(Reject())
+        elif cmd == "undo":
+            self._post_command(Undo())
+        elif cmd == "retry":
+            self._post_command(Retry())
         elif cmd == "diff":
             arg = parts[1].strip() if len(parts) > 1 else ""
             self._show_diff_command(arg)
         elif cmd == "model":
-            if self.config_path is None:
-                self._post_line(ErrorLine("/model unavailable: no config path known"))
-                return
-            try:
-                self._profiles_cache = load_all_profiles(self.config_path)
-            except ConfigError as exc:
-                self._post_line(ErrorLine(f"/model failed: {exc}"))
-                return
-            self.push_screen(
-                PickerScreen(
-                    list(self._profiles_cache),
-                    current=self.profile_name,
-                    title="Switch model",
-                ),
-                self._on_model_selected,
-            )
+            self._open_model_picker()
+        elif cmd == "sandbox":
+            self._open_sandbox_picker()
+        elif cmd == "filter":
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            self._handle_filter_command(arg)
         elif cmd == "mode":
             self._switch_mode()
-        elif cmd == "undo":
-            self._run_undo(resend=False)
-        elif cmd == "retry":
-            self._run_undo(resend=True)
         elif cmd == "theme":
             arg = parts[1].strip() if len(parts) > 1 else ""
             if arg:
@@ -508,382 +898,191 @@ class AgentApp(App[None]):
             self._post_line(ErrorLine(f"unknown command: /{cmd}"))
 
     def _switch_mode(self) -> None:
-        """Toggle plan/write mode; shared by /mode and the Tab shortcut."""
-        new_mode = "plan" if self.mode == "write" else "write"
-        self.mode = new_mode
-        if self.sandbox is not None:
-            self.sandbox.read_only = new_mode != "write"
-        self.tool_registry = build_registry(
-            self.sandbox, self.sandbox_session, mode=new_mode,
-            ask_callback=self._ask_user,
-            git_guard=self._make_git_guard(),
-        )
-        self.controller.tools = self.tool_registry  # rewire to the new registry
-        self.ensure_system_message()
-        self._refresh_status()
-
-    # ------------------------------------------------------------------
-    # /undo + /retry
-
-    @property
-    def total_in(self) -> int:
-        return self.controller.usage_total.input_tokens
-
-    @property
-    def total_out(self) -> int:
-        return self.controller.usage_total.output_tokens
-
-    def _last_usage(self) -> Usage | None:
-        messages = self.controller.conversation.messages
-        return next((m.usage for m in reversed(messages) if m.usage), None)
-
-    @property
-    def last_in(self) -> int:
-        return self._last_usage().input_tokens if self._last_usage() else 0
-
-    @property
-    def last_out(self) -> int:
-        return self._last_usage().output_tokens if self._last_usage() else 0
-
-    @work(group="undo", exclusive=True)
-    async def _run_undo(self, resend: bool) -> None:
-        """Shared body of /undo (drop the last turn, put its user message
-        back in the input) and /retry (drop it and resend it).
-
-        Only file edits are reverted — the workspace is restored to the
-        turn's checkpoint snapshot. Anything run_bash did beyond the files
-        (installs, background jobs, network calls) is not undone."""
-        label = "retry" if resend else "undo"
-        if self._turn_busy or self._compacting:
-            self._post_line(MessageLine(
-                f"/{label}: wait for the current turn or compaction to finish first",
-                kind="warn",
-            ))
+        """Toggle plan/write mode; shared by /mode and the Tab shortcut.
+        With no session attached the toggle is local draft state, applied to
+        the session the moment the first message creates it."""
+        if self.session_name is None:
+            self._draft_mode = "plan" if self._draft_mode == "write" else "write"
+            self._refresh_status()
             return
-        plan = self.controller.rollback_plan()
-        if plan is None:
-            self._post_line(NoticeLine(f"nothing to {label}"))
-            return
-        await self._apply_rollback(plan, resend=resend)
+        current = self.status.mode if self.status else "write"
+        new_mode = "plan" if current == "write" else "write"
+        self._post_command(SetMode(mode=new_mode))
 
-    @work(group="undo", exclusive=True)
-    async def _run_undo_to(self, message: Message) -> None:
+    async def _run_undo_to(self, message_id: str) -> None:
         """Click-to-undo: drop the clicked user message and everything after
         it (file edits reverted), putting that message back in the input."""
-        if self._turn_busy or self._compacting:
-            self._post_line(MessageLine(
-                "wait for the current turn or compaction to finish first",
-                kind="warn",
-            ))
-            return
-        plan = self.controller.rollback_plan_to(message)
-        if plan is None:
-            self._post_line(NoticeLine("nothing to undo there"))
-            return
-        await self._apply_rollback(plan, resend=False, scope="messages from here on")
+        payload = await self._send_command(UndoTo(message_id=message_id))
+        self._put_back_user_text(payload)
+
+    def _put_back_user_text(self, payload: dict | None) -> None:
+        """The user text an /undo wants back in the input box (the command
+        result goes only to the issuer — everyone else just saw the
+        HistoryReplaced broadcast)."""
+        user_text = (payload or {}).get("user_text")
+        if user_text:
+            chat_input = self.query_one("#chat-input", ChatInput)
+            chat_input.load_text(user_text)
+            chat_input.focus()
 
     def on_user_message_undo_requested(self, event: UserMessage.UndoRequested) -> None:
         event.stop()
         message = event.user_message.message
-        if message is not None:
-            self._run_undo_to(message)
+        if message is not None and message.id:
+            self.call_later(self._run_undo_to, message.id)
 
-    async def _apply_rollback(
-        self, plan: RollbackPlan, resend: bool, scope: str = "last turn"
-    ) -> None:
-        """Carry out a rollback plan: rewrite the history, revert the files,
-        and report what happened. Shared by /undo, /retry, and click-to-undo."""
-        if plan.compaction_only:
-            # Undoing the compaction itself: history restored, the turn that
-            # triggered it stays intact, no files reverted, input untouched.
-            self.controller.apply_rollback(plan)
-            await self._render_history()
-            self._refresh_status()
-            self._persist_git_state()
-            if resend:
-                self._post_line(NoticeLine(
-                    "compaction undone: pre-compaction history restored — "
-                    "nothing to retry (the turn is still in the conversation)"
+    def _start_new_session(self) -> None:
+        """Slash /new: leave the current session (it keeps running in the
+        host) and return to a draft chat."""
+        self._detach()
+        self._post_line(NoticeLine(
+            "started a fresh chat — the previous session keeps running in "
+            "the background (/sessions to go back)"
+        ))
+
+    def _detach(self) -> None:
+        """Return to a draft chat: no session attached, empty log."""
+        if self._pump_worker is not None:
+            self._pump_worker.cancel()
+            self._pump_worker = None
+        self.session_name = None
+        self.status = None
+        self._view = None
+        self._last_thinking = None
+        self._refresh_title()
+        chat = self.query_one("#chat-log", VerticalScroll)
+        chat.remove_children()
+        # Fresh, empty log: follow it again from the top of the new session.
+        chat.anchor()
+        self._refresh_status()
+        self._refresh_steer_bar()
+        self._refresh_generating()
+        self.call_later(self.refresh_diff_summary)
+
+    def _start_delete(self) -> None:
+        """Slash /delete: end the current session for good. Deleting a
+        session is pure bookkeeping — the saved session file is removed and
+        a fresh session starts; the workspace is never touched."""
+        self.call_later(self._delete_async)
+
+    async def _delete_async(self) -> None:
+        name = self.session_name
+        self._detach()
+        if name is None:
+            self._post_line(NoticeLine("no session to delete"))
+            return
+        try:
+            await self.client.delete_session(name)
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"/delete failed: {exc}"))
+            return
+        self._post_line(NoticeLine(
+            "deleted: saved session removed — started a fresh session; "
+            "your files are untouched"
+        ))
+
+    def _open_sessions(self) -> None:
+        self.call_later(self._open_sessions_async)
+
+    async def _open_sessions_async(self) -> None:
+        try:
+            entries = await self.client.sessions()
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"/sessions failed: {exc}"))
+            return
+        self.push_screen(
+            ResumeScreen(
+                entries,
+                workspace=str(self.workspace) if self.workspace else None,
+            ),
+            self._on_session_selected,
+        )
+
+    async def _on_session_selected(self, name: str | None) -> None:
+        if not name:
+            return
+        if name == self.session_name:
+            return
+        try:
+            active = {s.name: s for s in await self.client.sessions()}
+            summary = active.get(name)
+            if summary is None or not summary.active:
+                await self.client.load_session(name)
+            await self._attach(name)
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"could not open {name}: {exc}"))
+
+    def _open_model_picker(self) -> None:
+        self.call_later(self._open_model_picker_async)
+
+    async def _open_model_picker_async(self) -> None:
+        try:
+            self._config_cache = await self.client.config()
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"/model failed: {exc}"))
+            return
+        names = [m["name"] for m in self._config_cache.models]
+        self.push_screen(
+            PickerScreen(
+                names,
+                current=self.status.model_name if self.status else None,
+                title="Switch model",
+            ),
+            self._on_model_selected,
+        )
+
+    def _on_model_selected(self, name: str | None) -> None:
+        if not name:
+            return
+        self._post_command(SwitchModel(name=name))
+        self._save_preference(default_profile=name)
+
+    def _open_sandbox_picker(self) -> None:
+        self.call_later(self._open_sandbox_picker_async)
+
+    async def _open_sandbox_picker_async(self) -> None:
+        try:
+            self._config_cache = await self.client.config()
+        except (ClientError, httpx.HTTPError) as exc:
+            self._post_line(ErrorLine(f"/sandbox failed: {exc}"))
+            return
+        names = [s["name"] for s in self._config_cache.sandboxes]
+        self.push_screen(
+            PickerScreen(
+                names,
+                current=self.status.sandbox_name if self.status else None,
+                title="Sandbox profile (applies when the session is idle)",
+            ),
+            self._on_sandbox_selected,
+        )
+
+    def _on_sandbox_selected(self, name: str | None) -> None:
+        if not name:
+            return
+        self._post_command(SetSandbox(name=name))
+
+    def _handle_filter_command(self, arg: str) -> None:
+        sub = arg.split(maxsplit=1)
+        action = sub[0] if sub else "list"
+        path = sub[1].strip() if len(sub) > 1 else ""
+        if action == "add" and path:
+            self._post_command(FilterAdd(path=path))
+        elif action == "remove" and path:
+            self._post_command(FilterRemove(path=path))
+        elif action == "list":
+            filters = self.status.filter_list if self.status else []
+            if filters:
+                self._post_line(MessageLine(
+                    "filtered out of the sandbox mounts: " + ", ".join(filters),
+                    kind="info",
                 ))
             else:
-                self._post_line(NoticeLine(
-                    "compaction undone: pre-compaction history restored"
-                ))
-            return
-        # Reverse the turn's file edits FIRST, against the live workspace.
-        # A conflict aborts the whole undo, leaving both the workspace and
-        # the conversation exactly as they were.
-        label = "retry" if resend else "undo"
-        try:
-            await self.controller.revert_changes(plan.revert_turns)
-        except RevertConflict as exc:
-            self._post_line(ErrorLine(
-                f"/{label} conflict: the turn's changes overlap edits made "
-                f"since — nothing was changed\n{exc}"
-            ))
-            return
-        except (GitWorktreeError, OSError) as exc:
-            self._post_line(ErrorLine(f"/{label} failed: {exc}"))
-            return
-        self.controller.apply_rollback(plan)
-        # Trim the transcript instead of re-rendering it: an undo only removes
-        # widgets from the end, so everything above the undo point (settled
-        # markdown, diffs, tool output) stays exactly as it was rendered.
-        if not await self._trim_history(plan.dropped):
-            await self._render_history()
-        self._refresh_status()
-        await self.refresh_diff_summary()
-        if self.git_info is None:
-            note = "no git tracking for this session — file edits could not be reverted"
-        elif not plan.revert_turns:
-            note = "no file edits to revert"
+                self._post_line(MessageLine("no paths filtered out", kind="info"))
         else:
-            note = "file edits reverted"
-        if resend:
-            self._post_line(NoticeLine(f"retrying: {scope} rolled back ({note})"))
-            self._submit(plan.user_text)
-        else:
-            chat_input = self.query_one("#chat-input", ChatInput)
-            chat_input.load_text(plan.user_text)
-            chat_input.focus()
-            self._post_line(NoticeLine(f"undone: {scope} removed ({note})"))
-        # Persist the rolled-back state: without this, /new + /sessions
-        # resumes the session as it was before the undo.
-        self._persist_git_state()
+            self._post_line(ErrorLine("usage: /filter add <path> | /filter remove <path> | /filter list"))
 
     # ------------------------------------------------------------------
-    # Git change tracking (diff summary + accept/reject)
-
-    def _make_git_guard(self) -> Callable[[str], str | None]:
-        """run_bash veto closure; reads self.git_info at call time so /resume
-        rebinding takes effect without rebuilding the guard."""
-
-        def guard(command: str) -> str | None:
-            info = self.git_info
-            if info is None:
-                return None
-            return check_blocked_git(command, None, info.workspace)
-
-        return guard
-
-    async def refresh_diff_summary(self) -> None:
-        """Recompute the pending-changes bar (hidden when empty or gitless)."""
-        try:
-            widget = self.query_one("#diff-summary", DiffSummary)
-        except NoMatches:
-            return  # app shutting down; DOM already pruned
-        info = self.git_info
-        if info is None:
-            await widget.clear()
-            return
-        try:
-            # Attribute each file to its source: agent turns vs. changes made
-            # outside the session (drift).
-            stat = await attributed_diff_stat(info, self.controller.turn_checkpoints())
-        except GitWorktreeError:
-            await widget.clear()  # tracking broken (e.g. repo gone): stay quiet
-            return
-        if not stat.files:
-            await widget.clear()
-        else:
-            await widget.set_summary(stat)
-
-    async def on_diff_summary_diff_requested(self, event: DiffSummary.DiffRequested) -> None:
-        info = self.git_info
-        if info is None:
-            return
-        widget = self.query_one("#diff-summary", DiffSummary)
-        if widget.active_diff_key == event.key:
-            widget.hide_diff()  # same affordance again: collapse the diff
-            return
-        try:
-            if event.key is None:
-                text = await git_diff(info)
-            else:
-                text = await git_diff(info, event.key)
-        except GitWorktreeError as exc:
-            widget.hide_diff()
-            self._post_line(ErrorLine(f"diff failed: {exc}"))
-            return
-        widget.show_diff(event.key, text)
-
-    @work(group="diff-view", exclusive=True)
-    async def _show_diff_command(self, arg: str) -> None:
-        """Slash /diff: toggle the pending-changes panel — the first /diff
-        expands the per-file list, /diff again hides it entirely. With an
-        argument, /diff <path> shows that one file's unified diff."""
-        info = self.git_info
-        if info is None:
-            self._post_line(ErrorLine(
-                "/diff: no change tracking for this session — the workspace "
-                "could not be tracked with git (auto-init disabled via --no-init-repo, "
-                "or repo setup failed), so the agent's edits cannot be diffed"
-            ))
-            return
-        widget = self.query_one("#diff-summary", DiffSummary)
-
-        if not arg:
-            # Toggle: fully shown file list (no diff open) → hide the panel.
-            if widget.has_class("visible") and widget.has_class("expanded") and not widget.diff_shown:
-                await widget.clear()
-                return
-            await self.refresh_diff_summary()
-            if not widget.has_class("visible"):
-                self._post_line(NoticeLine("no pending changes to diff"))
-                return
-            widget.add_class("expanded")
-            return
-
-        try:
-            text = await git_diff(info, arg)
-        except GitWorktreeError as exc:
-            widget.hide_diff()
-            self._post_line(ErrorLine(f"/diff failed: {exc}"))
-            return
-        if not text.strip():
-            self._post_line(NoticeLine(f"no pending changes for {arg}"))
-            return
-        # Rebuild the row list first (a previous /diff toggle may have cleared
-        # it) so the active-row highlight has something to attach to.
-        await self.refresh_diff_summary()
-        widget.show_diff(arg, text)
-
-    def _rebind_tracking(self, info: GitInfo) -> None:
-        """Attach (possibly resumed) change-tracking state to this session.
-
-        The sandbox already points at the user's real workspace — only the
-        git_info wiring (checkpoints, diff summary, git guard) changes."""
-        self.git_info = info
-        self.controller.git_info = info
-
-    def _persist_git_state(self) -> None:
-        if self.session_name:
-            from ..session_store import save_session
-            save_session(
-                self.session_name, self.profile.model_id, self.controller.conversation,
-                git=self.git_info.to_block() if self.git_info else None,
-                workspace=str(self.workspace) if self.workspace else None,
-            )
-
-    def _rewrite_checkpoints(self, sha: str) -> None:
-        """Point every turn's checkpoints at ``sha`` (the accepted tree), so
-        /undo //retry can no longer revert file state past an accept: both the
-        before and after tree become the accepted state, making each turn's
-        diff empty."""
-        for message in self.controller.conversation.messages:
-            if message.role == "user" and message.checkpoint_sha is not None:
-                message.checkpoint_sha = sha
-                message.after_tree = sha
-        if self.controller.conversation.compact_snapshot:
-            for message in self.controller.conversation.compact_snapshot:
-                if message.role == "user" and message.checkpoint_sha is not None:
-                    message.checkpoint_sha = sha
-                    message.after_tree = sha
-
-    def _git_action_preflight(self, label: str) -> tuple[GitInfo, bool] | None:
-        """Shared /accept //reject guards; mounts an error line if blocked.
-
-        Returns the git info plus whether a turn is still generating — these
-        are allowed mid-turn (snapshots use throwaway indexes and the running
-        turn's checkpoint is rewritten like any other), the caller just warns
-        that the agent may keep editing."""
-        info = self.git_info
-        if info is None:
-            self._post_line(ErrorLine(
-                f"/{label}: no change tracking for this session (the workspace "
-                "isn't a git repo, or tracking setup failed)"
-            ))
-            return None
-        return info, self._turn_busy or self._compacting
-
-    @work(group="git-action", exclusive=True)
-    async def _start_accept(self, info: GitInfo, mid_turn: bool = False) -> None:
-        """Lock in the changes made so far: they become the new baseline —
-        off /diff's radar and out of /undo's reach. Work continues from
-        here, change-per-feature. Allowed mid-turn: the running turn's
-        checkpoint is rewritten along with the rest, so its eventual
-        after-tree measures from the accepted baseline too. (Guarding
-        happens synchronously in the slash-command handler.)"""
-        if info is None:
-            return
-        try:
-            stat = await diff_stat(info)
-        except GitWorktreeError:
-            stat = None
-        try:
-            sha = await accept_changes(info)
-        except GitWorktreeError as exc:
-            self._post_line(ErrorLine(f"/accept failed: {exc}"))
-            return
-        self._rewrite_checkpoints(sha)
-        self._persist_git_state()
-        await self.refresh_diff_summary()
-        if mid_turn:
-            self._post_line(NoticeLine(
-                "note: the current turn is still generating — it may keep "
-                "editing files on top of the accepted state"
-            ))
-        if stat is None or not stat.files:
-            self._post_line(NoticeLine(
-                "accepted: no pending changes — baseline reset; /diff and /undo "
-                "now measure from here"
-            ))
-        else:
-            self._post_line(NoticeLine(
-                f"accepted: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
-                "locked in; /diff is reset and /undo can no longer revert them"
-            ))
-
-    @work(group="git-action", exclusive=True)
-    async def _start_reject(self, info: GitInfo, mid_turn: bool = False) -> None:
-        """Discard every change made since the last /accept: the workspace is
-        restored to the accepted baseline. The conversation keeps going (the
-        agent sees the reverted files on its next turn). Allowed mid-turn —
-        the generating turn simply keeps working from the reverted files.
-        (Guarding happens synchronously in the slash-command handler.)"""
-        if info is None:
-            return
-        try:
-            stat = await diff_stat(info)
-            await revert_to_tree(info, info.baseline_tree)
-        except GitWorktreeError as exc:
-            self._post_line(ErrorLine(f"/reject failed: {exc}"))
-            return
-        self._rewrite_checkpoints(info.baseline_tree)
-        self._persist_git_state()
-        await self.refresh_diff_summary()
-        if mid_turn:
-            self._post_line(NoticeLine(
-                "note: the current turn is still generating — it may keep "
-                "editing files on top of the reverted state"
-            ))
-        if not stat.files:
-            self._post_line(NoticeLine("rejected: nothing to discard"))
-        else:
-            self._post_line(NoticeLine(
-                f"rejected: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
-                "since the last accept were reverted"
-            ))
-
-    @work(group="git-action", exclusive=True)
-    async def _start_delete(self) -> None:
-        """Slash /delete: end the current session for good. Deleting a session
-        is pure bookkeeping — the saved session file is removed and a fresh
-        session starts; the workspace is never touched (no revert, no accept).
-        (Guarding happens synchronously in the slash-command handler; the
-        worker assumes it passed.)"""
-        deleted = False
-        if self.session_name is not None:
-            from ..session_store import delete_session
-            deleted = delete_session(self.session_name)
-        self._start_new_session()
-        await self.refresh_diff_summary()
-        # Posted after _start_new_session: it wipes the chat log.
-        state = "saved session removed" if deleted else "no saved session file"
-        self._post_line(NoticeLine(
-            f"deleted: {state} — started a fresh session; your files are "
-            "untouched"
-        ))
+    # Theme (client-side preference)
 
     def _on_theme_selected(self, name: str | None) -> None:
         if name:
@@ -918,7 +1117,7 @@ class AgentApp(App[None]):
                 auto_compact=auto_compact,
                 profile=profile,
             )
-        except ConfigError as exc:
+        except Exception as exc:  # noqa: BLE001 - preference save is best-effort
             self._post_line(NoticeLine(f"note: could not save preference: {exc}"))
 
     def _apply_theme(self, name: str) -> None:
@@ -944,164 +1143,8 @@ class AgentApp(App[None]):
         self._refresh_status()
         self.query_one("#diff-summary", DiffSummary).recolor()
 
-    def _start_new_session(self) -> None:
-        """Slash /new: fresh conversation, fresh session file (unless disabled)."""
-        self.controller.conversation = Conversation()
-        self.controller.usage_total = Usage(input_tokens=0, output_tokens=0)
-        self.controller._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
-        self.controller._absorbed_spent = False
-        self.controller.last_compaction = None
-        if self.session_name is not None:
-            from ..session_store import new_session_name
-            self.session_name = new_session_name()
-        self.ensure_system_message()
-        self._last_thinking = None
-        self._queued.clear()
-        self._refresh_steer_bar()
-        chat = self.query_one("#chat-log", VerticalScroll)
-        chat.remove_children()
-        # Fresh, empty log: follow it again from the top of the new session.
-        chat.anchor()
-        self._refresh_status()
-
-    async def _on_session_selected(self, name: str | None) -> None:
-        if not name:
-            return
-        from ..session_store import load_state
-        chat = self.query_one("#chat-log", VerticalScroll)
-        state = load_state(name)
-        self.controller.conversation = state.conversation
-        self.session_name = name
-        self.ensure_system_message()
-        # Per-message usage is persisted: restore the status-bar totals.
-        self._refresh_status()
-        # Notices mount after _render_history (which clears the chat log).
-        notes: list[str] = []
-        errors: list[str] = []
-        block = state.git
-        if block is not None:
-            try:
-                info = GitInfo.from_block(block)
-            except (KeyError, TypeError, ValueError):
-                info = None
-            if info is not None:
-                self._rebind_tracking(info)
-                notes.append(f"reconnected change tracking for {info.agent_workspace}")
-            else:
-                # Session predates direct-write tracking (old worktree block).
-                notes.append(
-                    "note: old worktree session; switched to direct edits with fresh tracking"
-                )
-                await self._setup_tracking_for_resume(name, notes, errors)
-        elif self.sandbox is not None:
-            # Session predates git tracking. Set up tracking now if possible
-            # (same policy as cli.py — including auto-init on a bare directory).
-            await self._setup_tracking_for_resume(name, notes, errors)
-        # Workspace changes made outside this session (while it was closed)
-        # are surfaced, not decided on, after the history is re-rendered.
-        drift = await self._detect_resume_drift()
-        await self._render_history()
-        for note in notes:
-            self._post_line(NoticeLine(note))
-        for error in errors:
-            self._post_line(ErrorLine(error))
-        await self.refresh_diff_summary()
-        if drift is not None and self.git_info is not None:
-            self._prompt_resume_drift(self.git_info, drift[0], drift[1])
-
-    async def _detect_resume_drift(self) -> tuple[str, str] | None:
-        """(last_known, current) when the workspace changed outside this
-        session since it was last open, else None.
-
-        ``last_known`` is the last turn's after-tree, or the baseline when
-        the session has no reversible turns (e.g. an older session saved
-        before after-trees were recorded)."""
-        info = self.git_info
-        if info is None:
-            return None
-        turns = self.controller.turn_checkpoints()
-        last_known = turns[-1].after_tree if turns else info.baseline_tree
-        try:
-            current = await snapshot_tree(info.workspace, info.subtree)
-        except GitWorktreeError:
-            return None
-        if current == last_known:
-            return None
-        return last_known, current
-
-    @work(group="resume-drift", exclusive=True)
-    async def _prompt_resume_drift(self, info: GitInfo, last_known: str, current: str) -> None:
-        """The workspace changed outside this session while it was closed.
-
-        Show what drifted and let the user choose: accept it as the new
-        baseline, or keep tracking against the last known state. Never pick
-        for them."""
-        try:
-            stat = await tree_diff_stat(info, last_known, current)
-        except GitWorktreeError:
-            return
-        detail = _format_drift_detail(stat)
-        choice = await self.push_screen_wait(ConfirmScreen(
-            "Workspace changed outside this session since it was last open:",
-            confirm_label="Accept as baseline",
-            cancel_label="Keep tracking",
-            detail=detail,
-        ))
-        if not choice:
-            self._post_line(NoticeLine(
-                "keeping tracking against the last known state — the drift "
-                "shows up in /diff"
-            ))
-            return
-        try:
-            await accept_changes(info)
-        except GitWorktreeError as exc:
-            self._post_line(ErrorLine(f"could not accept the drift: {exc}"))
-            return
-        self._rewrite_checkpoints(info.baseline_tree)
-        self._persist_git_state()
-        self._post_line(NoticeLine(
-            "drift accepted: the workspace is the new baseline; /diff and "
-            "/undo now measure from here"
-        ))
-        await self.refresh_diff_summary()
-
-    async def _setup_tracking_for_resume(
-        self, name: str, notes: list[str], errors: list[str]
-    ) -> None:
-        """Set up fresh change tracking for a resumed session that has none
-        (legacy worktree block or pre-tracking session). The sandbox already
-        points at the real workspace."""
-        from .. import gitwork
-        try:
-            info, setup_notes = await gitwork.setup_tracking(
-                self.workspace or Path.cwd(), name
-            )
-        except GitWorktreeError as exc:
-            errors.append(f"git change tracking unavailable: {exc}")
-            return
-        if info is not None:
-            self._rebind_tracking(info)
-            notes.extend(setup_notes)
-
-    def _on_model_selected(self, name: str | None) -> None:
-        if not name:
-            return
-        profile = self._profiles_cache.get(name)
-        if profile is None:
-            return
-        try:
-            api_key = resolve_api_key(profile)
-        except ConfigError as exc:
-            self._post_line(ErrorLine(f"could not switch model: {exc}"))
-            return
-        # Swap the provider underneath the existing controller: client,
-        # conversation, and tools all carry over.
-        self.controller.switch_profile(profile, api_key)
-        self.profile = profile
-        self.profile_name = name
-        self._refresh_status()
-        self._save_preference(default_profile=name)
+    # ------------------------------------------------------------------
+    # Rendering
 
     async def _mount_spaced(
         self,
@@ -1116,22 +1159,46 @@ class AgentApp(App[None]):
             widget.add_class("after-tools")
         await chat.mount(widget)
 
-    async def _trim_history(self, dropped: list[Message]) -> bool:
-        """Remove the rendered widgets for `dropped` messages and everything
+    async def _on_history_replaced(self, event: HistoryReplaced) -> None:
+        """The conversation was rewritten (undo, retry, accept, compaction,
+        drift accept): re-render, trimming the removed tail when possible."""
+        self._view = None
+        new_ids = {
+            m.message_id for m in event.snapshot.messages if m.message_id
+        }
+        if hasattr(self, "_rendered_ids") and self._rendered_ids == new_ids:
+            # Nothing added or removed (e.g. /accept, which only moves the
+            # baseline): the rendered transcript is already correct — don't
+            # rebuild the whole chat, just the parts that depend on git
+            # state.
+            self._refresh_status()
+            self.call_later(self.refresh_diff_summary)
+            return
+        dropped = self._rendered_ids - new_ids if hasattr(self, "_rendered_ids") else set()
+        self._rendered_ids = new_ids
+        if dropped and await self._trim_history(dropped):
+            self._refresh_status()
+            self.call_later(self.refresh_diff_summary)
+            return
+        await self._render_history(event.snapshot)
+        self._refresh_status()
+        self.call_later(self.refresh_diff_summary)
+
+    async def _trim_history(self, dropped_ids: set[str]) -> bool:
+        """Remove the rendered widgets for `dropped_ids` and everything
         after them, keeping the rest of the transcript untouched.
 
         Returns False — the caller falls back to a full _render_history —
         when no rendered widget matches (e.g. a conversation loaded but never
         rendered, or a widget without a message binding)."""
         chat = self.query_one("#chat-log", VerticalScroll)
-        dropped_ids = {id(m) for m in dropped}
         children = list(chat.children)
         cut = next(
             (
                 i
                 for i, widget in enumerate(children)
                 if getattr(widget, "message", None) is not None
-                and id(widget.message) in dropped_ids
+                and getattr(widget.message, "id", None) in dropped_ids
             ),
             None,
         )
@@ -1139,45 +1206,34 @@ class AgentApp(App[None]):
             return False
         for widget in children[cut:]:
             await widget.remove()
-        if self.controller.conversation.compact_snapshot is None:
-            # The undo point is before the compaction: the snapshot was
-            # dropped, so its divider must go too (it sits right before the
-            # summary, which the trim above already removed).
-            divider = next(
-                (
-                    widget
-                    for widget in chat.children
-                    if isinstance(widget, NoticeLine)
-                    and widget.content.plain == COMPACTED_DIVIDER
-                ),
-                None,
-            )
-            if divider is not None:
-                await divider.remove()
         chat.scroll_end(animate=False)
         return True
 
-    async def _render_history(self) -> None:
-        """Rebuild #chat-log from the conversation.
+    async def _render_history(self, snap: Snapshot) -> None:
+        """Rebuild #chat-log from a snapshot.
 
-        Used by /resume. Best-effort reconstruction: tool-call status is
-        inferred from whether the recorded tool-role content starts with
-        "error: " (see ChatController.record_tool_result), since the
+        Best-effort reconstruction: tool-call status is inferred from whether
+        the recorded tool-role content starts with "error: ", since the
         original ToolCallStatus enum value isn't itself persisted.
 
         If the conversation was compacted, the pre-compaction messages are
         rendered first (they are history, kept for the human), then a
         divider, then the summary and everything after it — mirroring what
-        the model actually sees.
-        """
+        the model actually sees. The current turn's buffered events are fed
+        through a fresh _RoundView, so a mid-turn attach rebuilds the
+        thinking block, partial answer and running tool blocks."""
+        self._view = None
+        self._rendered_ids = {
+            m.message_id for m in snap.messages if m.message_id
+        }
         chat = self.query_one("#chat-log", VerticalScroll)
         await chat.remove_children()
-        conversation = self.controller.conversation
-        messages = conversation.messages
-        pre_compact = conversation.compact_snapshot or []
+        messages = snap.messages
+        pre_compact = snap.compact_snapshot
         all_messages = [*pre_compact, *messages]
         tool_results = {
-            m.tool_call_id: m for m in all_messages if m.role == "tool" and m.tool_call_id
+            m.tool_call_id: m for m in all_messages
+            if m.role == "tool" and m.tool_call_id
         }
 
         for message in pre_compact:
@@ -1187,12 +1243,15 @@ class AgentApp(App[None]):
         for message in messages:
             await self._render_message(chat, message, tool_results)
         chat.scroll_end(animate=False)
+        # Mid-turn attach: rebuild the live round from the buffered events.
+        for event in snap.turn_events:
+            await self._handle_event(event)
 
     async def _render_message(
         self,
         chat: "VerticalScroll",
-        message: Message,
-        tool_results: dict[str, Message],
+        message: MessageModel,
+        tool_results: dict[str, MessageModel],
     ) -> None:
         """Render one persisted message into the chat log."""
         if message.role == "user":
@@ -1202,11 +1261,20 @@ class AgentApp(App[None]):
                 summary = CompactionSummary(
                     message.content.removeprefix(SUMMARY_PREFIX).strip()
                 )
-                summary.message = message
+                summary.message = Message(
+                    role="user", content=message.content, id=message.message_id or "",
+                )
                 await chat.mount(summary)
             else:
-                widget = UserMessage(message.content, message.images)
-                widget.message = message
+                images = [
+                    ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
+                                    width=i.width, height=i.height)
+                    for i in (message.images or [])
+                ]
+                widget = UserMessage(message.content, images or None)
+                widget.message = Message(
+                    role="user", content=message.content, id=message.message_id or "",
+                )
                 await self._mount_spaced(chat, widget)
         elif message.role == "assistant":
             if message.reasoning:
@@ -1216,21 +1284,26 @@ class AgentApp(App[None]):
                 thinking.finish(message.reasoning_seconds, estimate_if_unknown=False)
             # Tool-call-only rounds render no AssistantMessage body; an
             # empty assistant message with no tool calls replays as
-            # "(no output)", matching the live-stream finalize path.
-            if message.content or not message.tool_calls:
+            # "(no output)" — except a reasoning-only partial (saved on
+            # cancel): its thinking block is the whole message.
+            if message.content or (not message.tool_calls and not message.reasoning):
                 assistant = AssistantMessage()
                 await self._mount_spaced(chat, assistant)
                 if message.content:
                     await assistant.append_delta(message.content)
                 await assistant.finalize()
             for call in message.tool_calls or []:
-                block = ToolCallBlock(call.call_id, call.name)
+                function = call.get("function") or {}
+                block = ToolCallBlock(call.get("id", ""), function.get("name", ""))
                 await chat.mount(block)
-                block.append_arguments(call.arguments_json)
-                result = tool_results.get(call.call_id)
+                block.append_arguments(function.get("arguments", ""))
+                result = tool_results.get(call.get("id", ""))
                 if result is not None:
                     is_error = result.content.startswith("error: ")
-                    status = ToolCallStatus.CALL_FAILED if is_error else ToolCallStatus.CALL_SUCCEEDED
+                    status = (
+                        ToolCallStatus.CALL_FAILED if is_error
+                        else ToolCallStatus.CALL_SUCCEEDED
+                    )
                     block.set_result(
                         status,
                         output="" if is_error else result.content,
@@ -1243,6 +1316,9 @@ class AgentApp(App[None]):
                     # It can never complete now — render it as failed instead
                     # of an eternally shimmering "Running …".
                     block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+
+    # ------------------------------------------------------------------
+    # Popups (@ search runs server-side against the session's workspace)
 
     def on_chat_input_mode_toggle(self, event: ChatInput.ModeToggle) -> None:
         self._switch_mode()
@@ -1279,8 +1355,11 @@ class AgentApp(App[None]):
         chat_input = self.query_one("#chat-input", ChatInput)
         if chat_input.popup_active != "at":
             return  # dismissed (e.g. escape) while the search was pending
-        root = self.workspace or Path.cwd()
-        results = await search_files(root, query)
+        root = str(self.workspace or Path.cwd())
+        try:
+            results = await self.client.search_files(root, query)
+        except ClientError:
+            results = []
         self._show_popup([(r, r) for r in results])
 
     def on_chat_input_popup_dismiss(self, event: ChatInput.PopupDismiss) -> None:
@@ -1348,90 +1427,25 @@ class AgentApp(App[None]):
             return  # app shutting down; DOM already pruned
         chat.mount(widget)
 
-    def _refresh_steer_bar(self) -> None:
-        """Mirror the queued steer messages into the bar above the input.
-        They move into the chat log (as UserMessages) when actually sent."""
-        try:
-            bar = self.query_one("#steer-queue-bar", SteerQueueBar)
-        except NoMatches:
-            return  # app shutting down
-        bar.update_items([text for text, _ in self._queued])
-
-    def _extract_images(self, text: str) -> list[ImageAttachment]:
-        """Load every ``@path`` token in ``text`` that names an image file.
-
-        The token itself stays in the message text (the model reads
-        ``@file.png`` literally); the image rides along as an attachment.
-        Duplicates resolve once; unreadable files are reported and skipped.
-        """
-        images: list[ImageAttachment] = []
-        seen: set[str] = set()
-        root = self.workspace or Path.cwd()
-        for match in _IMAGE_TOKEN_RE.finditer(text):
-            raw = match.group(1)
-            path = image_loader.parse_image_path(raw)
-            if path is None or not image_loader.is_image_path(path):
-                continue
-            if not path.is_absolute():
-                path = root / path
-            try:
-                resolved = str(path.resolve())
-            except OSError:
-                continue
-            if resolved in seen or not path.is_file():
-                continue
-            seen.add(resolved)
-            try:
-                images.append(image_loader.load_image(path))
-            except ImageError as exc:
-                self._post_line(ErrorLine(str(exc)))
-        return images
-
-    def _check_vision(self, images: list[ImageAttachment]) -> bool:
-        """True when the current profile can take images (or there are none)."""
-        if not images or self.controller.profile.supports_vision:
-            return True
-        self._post_line(ErrorLine(
-            f"{self.controller.profile.display_name} is not configured with "
-            "supports_vision: true — image attachments were not sent"
-        ))
-        return False
-
-    def _submit(self, text: str, images: list[ImageAttachment] | None = None) -> None:
-        chat = self.query_one("#chat-log", VerticalScroll)
-        # Editor tokens come pre-ordered from the input; @-mentioned paths
-        # typed manually are scanned out of the text and appended.
-        all_images = list(images or [])
-        for scanned in self._extract_images(text):
-            if scanned not in all_images:
-                all_images.append(scanned)
-        if not self._check_vision(all_images):
-            return
-        if self._turn_busy or self._compacting:
-            # Queued: shown in the steer bar above the input until sent.
-            self._queued.append((text, all_images or None))
-            self._refresh_steer_bar()
-            return
-        user_message = UserMessage(text, all_images or None)
-        chat.mount(user_message)
-        self._worker = self._run_turn(text, user_message, all_images or None)
+    # ------------------------------------------------------------------
+    # Steer queue commands
 
     def action_steer_discard(self) -> None:
         """ctrl+shift+backspace: discard the oldest queued steer message."""
-        if not self._queued:
+        if self.status is None or not self.status.queued:
             return
-        self._queued.pop(0)
-        self._refresh_steer_bar()
+        self._post_command(DiscardQueued())
 
     def _flush_queued_now(self) -> None:
         """Enter on an empty input while messages are queued: send now.
 
-        Interrupts the running turn; the worker's cleanup pops the oldest
-        queued message and starts it as a turn immediately, instead of
-        waiting for the next round boundary.
-        """
-        if self._turn_busy and self._queued and self._worker is not None:
-            self._worker.cancel()
+        Cancels the running turn; the session starts the queued message
+        immediately instead of waiting for the next round boundary."""
+        if self.status and self.status.queued and self.status.state == "running":
+            self._post_command(FlushQueued())
+
+    # ------------------------------------------------------------------
+    # Copy / quit / interrupt
 
     def _copy_selection(self) -> bool:
         """Copy the active selection (TextArea or screen); True if copied."""
@@ -1445,23 +1459,52 @@ class AgentApp(App[None]):
             return True
         return False
 
+    @work(group="quit", exclusive=True)
     async def action_copy_or_quit(self) -> None:
         """ctrl+c: copy the active selection if there is one, quit otherwise.
 
-        Quitting is immediate, but an in-flight turn is cancelled and given a
-        moment to unwind first — otherwise the worker keeps running against a
-        closed app and sprays cancellation errors on the way out.
-        """
+        Quitting while a request is still running asks first: the session
+        lives in the host, so it can keep running headless — or be cancelled
+        on the way out. Idle quits immediately. (A worker: push_screen_wait
+        requires one.)"""
         if self._copy_selection():
             return
         self._disarm_interrupt()
-        worker = self._worker if self._turn_busy else None
-        if worker is not None:
-            worker.cancel()
+        state = self.status.state if self.status else "idle"
+        has_pending_ask = bool(self.status and self.status.pending_ask)
+        busy = self.session_name is not None and (
+            state in ("running", "compacting") or has_pending_ask
+        )
+        if busy:
+            # Another client has the session open: the session keeps running
+            # for them regardless, and "stop and quit" would yank it away —
+            # so don't ask, just detach and exit.
+            if self.status is not None and self.status.clients_attached > 1:
+                self.exit()
+                return
+            choice = await self.push_screen_wait(ContinueHeadlessScreen())
+            if choice is None:
+                return  # esc: stay in the app
+            if choice:
+                # Close the event stream and exit; the session keeps
+                # running in the host.
+                self.exit()
+                return
+            # Stop and quit: cancel, wait for it to unwind, then unload the
+            # session from the host (it stays saved on disk) and exit.
             try:
-                await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._send_command(Cancel()), timeout=CANCEL_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, ClientError):
                 pass
+            if self.session_name is not None:
+                try:
+                    await self.client.close_session(self.session_name)
+                except (ClientError, httpx.HTTPError):
+                    pass  # exiting anyway; the host grace-exits on its own
+            self.exit()
+            return
         self.exit()
 
     def action_copy_selection(self) -> None:
@@ -1496,11 +1539,11 @@ class AgentApp(App[None]):
             # Second esc: close the file list too; only the summary remains.
             diff_summary.collapse()
             return
-        if self._turn_busy and self._worker is not None:
+        if self.status is not None and self.status.state in ("running", "compacting"):
             if self._interrupt_armed:
                 # Second esc within the window: actually stop the turn.
                 self._disarm_interrupt()
-                self._worker.cancel()
+                self._post_command(Cancel())
             else:
                 # First esc only arms the interrupt, so a stray keypress can't
                 # kill a turn mid-flight.
@@ -1518,246 +1561,72 @@ class AgentApp(App[None]):
             self._interrupt_timer.stop()
             self._interrupt_timer = None
 
-    async def _ask_user(self, questions: list[str]) -> list[str] | None:
-        """Callback for the ask tool: show the questions one at a time in the
-        AskBar above the input; the user answers through the normal chat
-        input (Enter submits, Esc skips all questions).
+    # ------------------------------------------------------------------
+    # /diff
 
-        Runs inside the turn worker, awaiting a future that the input
-        handler resolves — same event loop, so the await is safe.
-        """
-        ask_bar = self.query_one("#ask-bar", AskBar)
-        chat_input = self.query_one("#chat-input", ChatInput)
-        answers: list[str] = []
+    @work(group="diff-view", exclusive=True)
+    async def _show_diff_command(self, arg: str) -> None:
+        """Slash /diff: toggle the pending-changes panel — the first /diff
+        expands the per-file list, /diff again hides it entirely. With an
+        argument, /diff <path> shows that one file's unified diff."""
+        if self.session_name is None:
+            self._post_line(ErrorLine(
+                "/diff: no session attached — send a message first"
+            ))
+            return
+        widget = self.query_one("#diff-summary", DiffSummary)
         try:
-            for index, question in enumerate(questions):
-                ask_bar.show_question(f"Question {index + 1}/{len(questions)}: {question}")
-                chat_input.placeholder = ASK_PLACEHOLDER
-                self._set_terminal_title("xarness - ask")
-                chat_input.focus()
-                future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
-                self._ask_future = future
-                answer = await future
-                if answer is None:  # esc: skip the remaining questions
-                    return None
-                answers.append(answer)
-            return answers
-        finally:
-            self._ask_future = None
-            ask_bar.hide()
-            chat_input.placeholder = INPUT_PLACEHOLDER
-            self._set_default_title()
-
-    @work(group="turn")
-    async def _run_turn(
-        self,
-        text: str,
-        user_widget: UserMessage | None = None,
-        images: list[ImageAttachment] | None = None,
-    ) -> None:
-        """Drive the full exchange: rounds of (thinking → answer → tool calls).
-
-        Each round streams one model response; its widgets are owned by a
-        :class:`_RoundView`. If the round requested tool calls, they're
-        executed, their blocks settle, results are recorded into the
-        conversation, and the next round streams — until a round comes back
-        with no tool calls.
-        """
-        self._turn_busy = True
-        self._set_default_title()
-        chat = self.query_one("#chat-log", VerticalScroll)
-        gen_bar = self.query_one("#generating-bar", GeneratingBar)
-        gen_bar.add_class("active")
-        turn_start = time.monotonic()
-        turn_had_tools = False
-        view = _RoundView(self, chat)
-
-        stream = self.controller.send(text, images)
-        try:
-            while True:
-                view = _RoundView(self, chat)
-                await view.mount()
-
-                async for event in stream:
-                    if user_widget is not None and user_widget.message is None:
-                        # Bind the widget to its conversation message so
-                        # click-to-undo can locate this turn. The user message
-                        # is the last one added when the round starts.
-                        user_widget.message = next(
-                            (m for m in reversed(self.controller.conversation.messages)
-                             if m.role == "user"),
-                            None,
-                        )
-                    await view.handle(event)
-
-                await view.finish()
-
-                # A round that ended without finishing — a provider or
-                # transport error, say — still streamed something. Keep it
-                # (up to the last non-thinking block) instead of dropping the
-                # partial answer; a completed round has nothing partial left,
-                # so this is a no-op then.
-                if self.controller.save_interrupted_round():
-                    self._persist_git_state()
-
-                if not view.round_has_tools:
-                    if not view.had_stream_error:
-                        worked = _format_duration(time.monotonic() - turn_start)
-                        self._post_line(NoticeLine(f"Worked for {worked}"))
-                    break
-
-                # Execute the calls this round requested, in stream order.
-                turn_had_tools = True
-                round_wrote_files = False
-                for call_id, block in view.tool_blocks.items():
-                    result = await self.tool_registry.call(
-                        block.tool_name,
-                        block.accumulated_arguments,
-                        output_sink=block.append_output,
-                    )
-                    if result.parse_error:
-                        status = ToolCallStatus.PARSING_ERROR
-                    elif result.ok:
-                        status = ToolCallStatus.CALL_SUCCEEDED
-                    else:
-                        status = ToolCallStatus.CALL_FAILED
-                    block.set_result(
-                        status, output=result.output, error=result.error, header=result.header
-                    )
-                    self.controller.record_tool_result(call_id, result)
-                    if result.ok and block.tool_name in _WRITING_TOOLS:
-                        round_wrote_files = True
-                if round_wrote_files and self.git_info is not None:
-                    # The model just changed a file: surface the diff panel
-                    # (header only — the file list stays collapsed) above the
-                    # input without waiting for the turn to end.
-                    await self.refresh_diff_summary()
-
-                # Steer: anything typed while this round was streaming is
-                # injected here — after the tool answers, before the next
-                # LLM call — so the model sees it right away instead of the
-                # queued message waiting for the whole turn to end.
-                if self._queued:
-                    for queued_text, queued_images in self._queued:
-                        self.controller.inject_user_message(queued_text, queued_images)
-                    injected = self.controller.conversation.messages[-len(self._queued):]
-                    chat = self.query_one("#chat-log", VerticalScroll)
-                    for (queued_text, queued_images), message in zip(self._queued, injected):
-                        # Land the message in the transcript only now — after
-                        # the round's answer/tool calls it follows.
-                        widget = UserMessage(queued_text, queued_images)
-                        widget.message = message
-                        widget.mark_sent()
-                        await self._mount_spaced(chat, widget)
-                    self._queued.clear()
-                    self._refresh_steer_bar()
-
-                stream = self.controller.continue_after_tools()
-            if not view.had_stream_error:
-                # Auto-compact fires at the turn boundary: the history has no
-                # pending tool calls to break pairing.
-                await self._maybe_auto_compact()
-        except asyncio.CancelledError:
-            # `view` is the round in flight (reassigned at each loop top).
-            await view.cancel()
-            # Keep whatever the model had produced before the interruption —
-            # everything up to the last non-thinking block — so the next turn
-            # and a later /resume still see it. An empty or reasoning-only
-            # round saves nothing, leaving the history untouched.
-            if self.controller.save_interrupted_round():
-                self._persist_git_state()
-            self._post_line(ErrorLine("interrupted"))
-        finally:
-            # Record where the turn left the workspace so /undo //retry can
-            # reverse exactly this turn's diff later (interruptions included),
-            # and persist it for a later /resume.
-            await self.controller.finish_turn()
-            self._persist_git_state()
-            gen_bar.remove_class("active")
-            self._turn_busy = False
-            self._set_terminal_title("xarness - finished")
-            self._worker = None
-            # Cheapest correct trigger for the diff summary: after any turn
-            # that ran tools, recompute once — not per keystroke or per round.
-            if turn_had_tools and self.git_info is not None:
+            if not arg:
+                # Toggle: fully shown file list (no diff open) → hide the panel.
+                if widget.has_class("visible") and widget.has_class("expanded") and not widget.diff_shown:
+                    await widget.clear()
+                    return
                 await self.refresh_diff_summary()
-            self._disarm_interrupt()
-            if self._queued:
-                queued_text, queued_images = self._queued.pop(0)
-                widget = UserMessage(queued_text, queued_images)
-                await self._mount_spaced(chat, widget)
-                self._refresh_steer_bar()
-                self._worker = self._run_turn(queued_text, widget, queued_images)
+                if not widget.has_class("visible"):
+                    self._post_line(NoticeLine("no pending changes to diff"))
+                    return
+                widget.add_class("expanded")
+                return
+            info = await self.client.diff(self.session_name, path=arg)
+            text = await self._diff_text(arg)
+            if not text.strip():
+                self._post_line(NoticeLine(f"no pending changes for {arg}"))
+                return
+            # Rebuild the row list first (a previous /diff toggle may have
+            # cleared it) so the active-row highlight has something to attach to.
+            await self.refresh_diff_summary()
+            widget.show_diff(arg, text)
+        except (ClientError, httpx.HTTPError) as exc:
+            widget.hide_diff()
+            self._post_line(ErrorLine(f"/diff failed: {exc}"))
 
-    async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
-        if indicator is not None and indicator.is_mounted:
-            await indicator.remove()
+    async def _diff_text(self, path: str) -> str:
+        """One file's unified diff (the summary endpoint gives per-file
+        stats; the text comes from the same API's diff endpoint, which
+        populates ``text`` for path-specific requests)."""
+        info = await self.client.diff(self.session_name, path=path)
+        return info.text or ""
 
-    async def _run_compaction(self) -> str:
-        """Compact via the controller and refresh everything that depends on
-        it. Returns the summary, prefixed with the token-count line
-        ("compacted: N → M tokens (freed K)")."""
-        chat = self.query_one("#chat-log", VerticalScroll)
-        self._compacting = True
-        # A shimmering "Compacting" line while the summarizer runs, so the
-        # pause reads as work rather than a hang.
-        indicator = PendingIndicator(
-            "Compacting", theme.SHIMMER_COMPACTING, hint=""
-        )
-        await chat.mount(indicator)
-        try:
-            summary = await self.controller.compact()
-        finally:
-            if indicator.is_mounted:
-                await indicator.remove()
-            self._compacting = False
-        self._refresh_status()
-        # Mark the compaction point in the chat log — same divider /resume
-        # renders between the kept history and the summary — and show the
-        # handoff itself, rendered like the replayed one below it.
-        self._post_line(NoticeLine(COMPACTED_DIVIDER))
-        for message in self.controller.conversation.messages:
-            if message.role == "user" and message.content.startswith(SUMMARY_PREFIX):
-                summary_widget = CompactionSummary(
-                    message.content.removeprefix(SUMMARY_PREFIX).strip()
-                )
-                summary_widget.message = message
-                await chat.mount(summary_widget)
-                break
-        counts = self._compaction_counts()
-        return f"compacted: {counts}\n{summary}" if counts else summary
-
-    def _compaction_counts(self) -> str | None:
-        '"N → M tokens (freed K)" for the last compaction, or None.'
-        counts = self.controller.last_compaction
-        if counts is None:
-            return None
-        before, after = counts
-        return f"{before:,} → {after:,} tokens (freed {max(0, before - after):,})"
-
-    def _post_compaction_notice(self, label: str = "auto-compacted") -> None:
-        counts = self._compaction_counts()
-        if counts is None:
-            self._post_line(NoticeLine(f"{label}: nothing to compact yet"))
-        else:
-            self._post_line(NoticeLine(f"{label}: {counts}"))
-
-    async def _maybe_auto_compact(self) -> None:
-        """End-of-turn hook for the profile's auto-compact: compact at the
-        profile's auto_compact_threshold of the context window.
-
-        Runs only at a turn boundary, so there are no pending tool calls to
-        break pairing. The context estimate matches the status bar's
-        (last round's prompt + cumulative output)."""
-        if not self.auto_compact:
+    async def on_diff_summary_diff_requested(self, event: DiffSummary.DiffRequested) -> None:
+        if self.session_name is None:
             return
-        if self.last_in + self.last_out < self.profile.auto_compact_threshold * self.profile.max_context:
+        widget = self.query_one("#diff-summary", DiffSummary)
+        if widget.active_diff_key == event.key:
+            # Same affordance again: close the diff pane only — the file
+            # list stays up with the row still highlighted (same state as
+            # esc-minimize), so keyboard navigation keeps its context.
+            widget.minimize_diff()
             return
         try:
-            await self._run_compaction()
-        except RuntimeError:
+            text = await self._diff_text(event.key or "")
+        except (ClientError, httpx.HTTPError) as exc:
+            widget.hide_diff()
+            self._post_line(ErrorLine(f"diff failed: {exc}"))
             return
-        self._post_compaction_notice("auto-compacted")
+        widget.show_diff(event.key, text)
+
+    # ------------------------------------------------------------------
+    # misc
 
     def _clear_hint_lines(self) -> None:
         """Remove transient hint lines (e.g. 'press esc again to interrupt')
@@ -1769,6 +1638,10 @@ class AgentApp(App[None]):
             return  # app shutting down; DOM already pruned
         for line in chat.query(".msg.hint"):
             line.remove()
+
+    async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
+        if indicator is not None and indicator.is_mounted:
+            await indicator.remove()
 
     async def _complete_round(
         self,
@@ -1784,16 +1657,9 @@ class AgentApp(App[None]):
             await chat.mount(ErrorLine("empty response from model"))
         if thinking is not None:
             thinking.finish(event.reasoning_seconds)
-
+        if self._view is not None:
+            await self._view.finish()
         self._refresh_status()
-
-        if self.session_name:
-            from ..session_store import save_session
-            save_session(
-                self.session_name, self.profile.model_id, self.controller.conversation,
-                git=self.git_info.to_block() if self.git_info else None,
-                workspace=str(self.workspace) if self.workspace else None,
-            )
 
     def action_toggle_thoughts(self) -> None:
         if self._last_thinking is not None:

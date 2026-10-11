@@ -115,3 +115,19 @@ def test_subtree_scoped_plan_mode_keeps_subtree_read_only(tmp_path) -> None:
     write = _call(registry, "run_bash", '{"command": "touch nope.txt"}')
     assert not write.ok
     assert not (repo / "pkg" / "nope.txt").exists()
+
+
+def test_plan_mode_without_container_has_no_run_bash(tmp_path) -> None:
+    """Plan mode with use_container=False: there is no read-only mount to
+    enforce the mode with, so run_bash must not be available at all
+    (read_file stays). No bwrap needed — registry construction only."""
+    sandbox = SandboxConfig(workspace=_make_repo(tmp_path), use_container=False)
+    session = SandboxSession(sandbox)
+    sandbox.read_only = True
+    registry = build_registry(sandbox, session, mode="plan")
+    names = {t["function"]["name"] for t in registry.schema()}
+    assert names == {"read_file"}
+    # Write mode keeps run_bash (unsandboxed, but that is the mode's contract).
+    write_registry = build_registry(sandbox, session, mode="write")
+    write_names = {t["function"]["name"] for t in write_registry.schema()}
+    assert "run_bash" in write_names and "read_file" in write_names

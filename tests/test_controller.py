@@ -281,8 +281,8 @@ def test_compact_with_no_history_is_a_no_op() -> None:
 
     assert asyncio.run(controller.compact()) == "nothing to compact yet"
     assert controller.conversation.compact_snapshot is None
-    assert controller.conversation.messages == [
-        Message(role="system", content="system prompt")
+    assert [(m.role, m.content) for m in controller.conversation.messages] == [
+        ("system", "system prompt")
     ]
     assert controller.last_compaction is None
 
@@ -538,12 +538,26 @@ def test_save_interrupted_round_keeps_partial_answer() -> None:
     assert controller.save_interrupted_round() is False
 
 
-def test_save_interrupted_round_drops_reasoning_only() -> None:
-    """A round interrupted while still thinking (no answer text) saves nothing."""
+def test_save_interrupted_round_keeps_reasoning_only() -> None:
+    """A round interrupted while still thinking (no answer text) saves the
+    partial CoT: it belongs in the history and is sent with it (the same
+    keep_reasoning rule as any assistant message's reasoning)."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     controller._partial_round = PartialRound(["just thinking"], [])
+    assert controller.save_interrupted_round() is True
+    (message,) = controller.conversation.messages
+    assert message.role == "assistant"
+    assert message.reasoning == "just thinking"
+    assert message.content == ""
+    # The reasoning rides along on the wire (keep_reasoning on by default).
+    wire = message.to_wire(include_reasoning=PROFILE.keep_reasoning)
+    assert wire["reasoning_content"] == "just thinking"
+    # Cleared, so a second call is a no-op (the round is only saved once).
     assert controller.save_interrupted_round() is False
-    assert controller.conversation.messages == []
+
+
+def test_save_interrupted_round_drops_empty_round() -> None:
+    """A round with neither text nor reasoning saves nothing."""
 
 
 def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:

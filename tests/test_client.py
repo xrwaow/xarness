@@ -133,3 +133,41 @@ def test_midstream_drop_is_not_retried() -> None:
     assert transport.calls == 1  # a partial answer can never be replayed
     assert isinstance(events[-1], StreamError)
     assert any(isinstance(e, ContentDelta) for e in events)  # tokens did arrive
+
+
+def test_connect_error_respawns_host_and_retries() -> None:
+    """A request hitting a dead socket respawns the host and retries once
+    (a client idle on the draft screen outlives the host's grace exit) —
+    no raw httpx.ConnectError reaches the caller."""
+    import httpx
+    from xarness import clientlib
+
+    attempts: list[int] = []
+    spawned: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("[Errno 2] No such file or directory")
+        return httpx.Response(200, json=[])
+
+    async def fake_ensure_host(timeout: float = 5.0) -> None:
+        spawned.append(1)
+
+    async def go():
+        client = clientlib.XarnessClient(
+            httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+        )
+        original = clientlib.ensure_host
+        clientlib.ensure_host = fake_ensure_host
+        try:
+            sessions = await client.sessions()
+        finally:
+            clientlib.ensure_host = original
+        await client.aclose()
+        return sessions, attempts, spawned
+
+    sessions, attempts, spawned = asyncio.run(go())
+    assert sessions == []
+    assert len(attempts) == 2
+    assert spawned == [1]

@@ -145,3 +145,69 @@ def test_load_drops_unknown_message_fields(tmp_path, monkeypatch) -> None:
     loaded = session_store.load_session("old-session")
     assert [m.content for m in loaded.messages] == ["hi", "ho"]
     assert loaded.messages[1].usage == Usage(1, 2)
+
+
+def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monkeypatch) -> None:
+    import json
+    from xarness import session_store as store
+
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
+    conversation = Conversation()
+    conversation.add(Message(role="user", content="q", send_time="2026-01-01T00:00:00+00:00"))
+    conversation.add(Message(role="assistant", content="a"))
+    store.save_state("s", store.SessionState(
+        conversation, profile="p", workspace="/w", git={"session_id": "s"},
+        sandbox_name="sb",
+    ))
+    data = json.loads((tmp_path / "sessions" / "s.json").read_text())
+    assert data["meta"]["workspace"] == "/w"
+    assert data["meta"]["message_count"] == 2
+    assert data["meta"]["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
+    assert data["meta"]["tracking"] is True
+    assert data["meta"]["profile"] == "p" and data["meta"]["sandbox_name"] == "sb"
+
+    # Reading the meta must not build Conversation objects (the whole point:
+    # listing and last-used lookups stay cheap).
+    def explode(*args, **kwargs):
+        raise AssertionError("full conversation parsed")
+    monkeypatch.setattr(store, "_conversation_from", explode)
+    meta = store.load_meta("s")
+    assert meta["workspace"] == "/w" and meta["message_count"] == 2
+    assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
+    assert store.session_meta("s")["workspace"] == "/w"
+
+
+def test_load_meta_falls_back_for_old_files(tmp_path, monkeypatch) -> None:
+    import json
+    from xarness import session_store as store
+
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "old.json").write_text(json.dumps({
+        "profile": "p", "workspace": "/w", "updated_at": "t",
+        "messages": [{"role": "user", "content": "q", "send_time": "st"}],
+    }))
+    meta = store.load_meta("old")
+    assert meta["workspace"] == "/w" and meta["message_count"] == 1
+    assert meta["last_user_message_at"] == "st" and meta["profile"] == "p"
+
+
+def test_load_meta_backfills_old_files_on_first_read(tmp_path, monkeypatch) -> None:
+    import json
+    from xarness import session_store as store
+
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
+    (tmp_path / "sessions").mkdir()
+    path = tmp_path / "sessions" / "old.json"
+    path.write_text(json.dumps({
+        "profile": "p", "workspace": "/w", "updated_at": "t",
+        "messages": [{"role": "user", "content": "q", "send_time": "st"}],
+    }))
+    assert "meta" not in json.loads(path.read_text())
+    meta = store.load_meta("old")
+    assert meta["workspace"] == "/w"
+    # The derived block is written back into the file.
+    on_disk = json.loads(path.read_text())["meta"]
+    assert on_disk == meta
+    # Second read serves the persisted block (identical).
+    assert store.load_meta("old") == meta

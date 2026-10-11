@@ -664,7 +664,14 @@ def build_registry(
         # (sandbox.read_only) and the persistent shell restarts under those
         # mounts, so run_bash cannot change files. Write mode drops the
         # read-only mount and adds the editing tools.
-        if session is not None:
+        #
+        # EXCEPT when the sandbox is unsandboxed (use_container=False):
+        # there is no read-only mount to enforce plan mode with — commands
+        # would run unsandboxed on the host — so run_bash is NOT available
+        # in plan mode at all (read_file still is). filter_list,
+        # allow_network and gpu_access are likewise ignored in that mode
+        # (see SandboxConfig.use_container).
+        if session is not None and (sandbox.use_container or mode != "plan"):
             registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         if mode == "write":
             registry.register(_make_write_tool(sandbox))  # write_file

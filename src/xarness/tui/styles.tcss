@@ -19,26 +19,19 @@ Screen {
     scrollbar-size: 0 0; /* hide the scrollbar visual; wheel/key scrolling still works */
 }
 
-.msg {
-    margin-bottom: 1;
-}
+/* Vertical spacing is owned entirely by each widget's own margins: user
+   messages carry top+bottom margins, cot/assistant messages carry a top
+   margin, and tool blocks have none so they pack tightly against the
+   assistant message that produced them. (Textual's height:auto ignores
+   vertical padding, so margins — not padding — do the spacing.) */
 
-/* Tool call blocks are spacing-free: they pack tightly against whatever
-   precedes/follows them. Blank lines around a round are owned by the
-   cot/assistant/user messages instead. */
-.msg.toolcall {
-    margin-bottom: 0;
-}
+/* A cot/assistant/user message that directly follows tool call blocks: its
+   own top padding already provides the separating blank line.
+   (The .after-tools class set by app.py needs no styling.) */
 
-/* A cot/assistant/user message that directly follows tool call blocks still
-   gets a separating blank line (added by app.py when mounting). Note: set
-   both edges here — a margin-top rule replaces the whole margin in TCSS,
-   which would drop the .msg margin-bottom below the widget. */
-AssistantMessage.after-tools,
-ThinkingBlock.after-tools,
-UserMessage.after-tools {
-    margin: 1 0;
-}
+/* NOTE: Textual's height:auto ignores vertical padding (the box is sized to
+   its content), so vertical spacing here is done with margins — padding is
+   only used for horizontal insets. */
 
 UserMessage {
     width: 1fr;
@@ -46,6 +39,7 @@ UserMessage {
     background: $c-surface;
     color: $c-text;
     padding: 1 0;
+    margin: 1 0;
 }
 
 .user-row {
@@ -96,6 +90,7 @@ AssistantMessage {
     height: auto;
     color: $c-text;
     padding: 0 1;
+    /*margin-top: 1;*/
 }
 
 .assistant-row {
@@ -144,6 +139,7 @@ ThinkingBlock,
 PendingIndicator {
     height: auto;
     padding: 0 1;
+    margin-top: 1;
 }
 
 .thinking-summary {
@@ -238,6 +234,7 @@ ToolWritingIndicator {
    the same way; the class rules below only pick the color. */
 MessageLine {
     padding: 0 1;
+    margin-bottom: 1;
 }
 
 .msg.error {
@@ -638,6 +635,11 @@ ResumeScreen, PickerScreen, ConfirmScreen {
 }
 
 #resume-list {
+    /* Same as #picker-list: ListView's default height: 1fr collapses to a
+       single visible row inside the auto-height modal — one session at a
+       time, the rest only reachable by scrolling. */
+    height: auto;
+    max-height: 16;
     background: $c-surface;
     border: none;
     padding: 0;
@@ -660,10 +662,41 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     padding: 0 1;
 }
 
+/* Highlighted rows get a distinct background; the rebuild-on-filter case
+   (resume search) re-anchors the ListView cursor so the -highlight class
+   is always managed by the ListView itself. */
 #resume-list > ListItem.-highlight,
-#picker-list > ListItem.-highlight {
+#resume-list > ListItem.-hovered,
+#picker-list > ListItem.-highlight,
+#picker-list > ListItem.-hovered {
     background: $c-border;
     color: $c-text;
+    text-style: bold;
+}
+
+#resume-list ListItem {
+    height: auto;
+}
+
+/* The row container inside a ListItem: a bare Horizontal defaults to
+   height: 1fr, which against the auto-height ListItem resolves to the
+   list's max-height — every row then fills the whole popup and only one
+   session is visible at a time. */
+.resume-row {
+    height: auto;
+}
+
+/* Session rows: text (title + age) left, status dot right. Heights are
+   explicit — a bare Horizontal defaults to 1fr, which collapses to 0
+   inside the auto-height ListItem and makes the rows unclickable. */
+.resume-row-text {
+    width: 1fr;
+    height: 1;
+}
+
+.resume-row-dot {
+    width: auto;
+    height: 1;
 }
 
 #host-bash-bar {

@@ -22,7 +22,8 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import datetime, timezone
+from typing import Any, Callable, Protocol
 
 from .client import ChatClient
 from .config import ProviderProfile
@@ -47,6 +48,28 @@ from .tools import ToolRegistry, ToolResult
 # Rough chars-per-token for the fallback estimate when the provider sends no
 # usage data. Deliberately conservative; results are labeled approximate.
 _CHARS_PER_TOKEN = 4
+
+
+def _utcnow_iso() -> str:
+    """Wall-clock UTC timestamp (ISO 8601) for the message stamp fields."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _mono_to_iso(monotonic: float | None) -> str | None:
+    """A time.monotonic() reading converted to a wall-clock ISO stamp, or None.
+
+    Monotonic readings have no absolute epoch; the conversion anchors on
+    'now', which is accurate to within the seconds since the reading was
+    taken — fine for second-resolution reasoning timestamps."""
+    if monotonic is None:
+        return None
+    offset = time.monotonic() - monotonic
+    return _utcnow_iso_offset(-offset)
+
+
+def _utcnow_iso_offset(seconds: float) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 # A round's live partial output, mutated in place while it streams.
 @dataclass(slots=True)
@@ -161,6 +184,14 @@ class ChatController:
         # Live view of the round currently streaming. Cleared when the round
         # completes; read by save_interrupted_round() when a turn is cancelled.
         self._partial_round: PartialRound | None = None
+        # Wall-clock stamps of the most recent round (ISO 8601 UTC):
+        # (start, end, reasoning_start, reasoning_end). Set by _stream_round;
+        # the session copies them onto the assistant message.
+        self.last_round_stamps: tuple[str, str, str | None, str | None] | None = None
+        # Optional hook, called with each user message as it lands in the
+        # history (send and inject_user_message). The session uses it to emit
+        # UserMessageAdded — there is no local echo in the client.
+        self.on_user_message: Callable[[Message], None] | None = None
 
     async def send(self, user_text: str, images: list[ImageAttachment] | None = None) -> AsyncIterator[StreamEvent]:
         """Send a user message, streaming the first round.
@@ -182,6 +213,8 @@ class ChatController:
         self.conversation.turn_start = len(self.conversation.messages) - 1
         self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
         self._absorbed_spent = False
+        if self.on_user_message is not None:
+            self.on_user_message(self.conversation.messages[-1])
         async for event in self._stream_round():
             yield event
 
@@ -190,7 +223,10 @@ class ChatController:
         async for event in self._stream_round():
             yield event
 
-    def record_tool_result(self, call_id: str, result: ToolResult) -> None:
+    def record_tool_result(
+        self, call_id: str, result: ToolResult,
+        start_time: str | None = None, end_time: str | None = None,
+    ) -> None:
         """Append a ``tool`` role message with the outcome of one call."""
         content = result.output if result.ok else f"error: {result.error}"
         self.conversation.add(
@@ -199,34 +235,38 @@ class ChatController:
                 tool_call_id=call_id,
                 content=content,
                 header=result.header or None,
+                start_time=start_time,
+                end_time=end_time,
             )
         )
 
     def save_interrupted_round(self) -> bool:
         """Persist the partial round a turn was streaming when it ended early.
 
-        Called both when the user interrupts a turn and when a round ends
-        without completing (a provider or transport error). Keeps the
-        assistant text and reasoning that had arrived, but drops a trailing
-        reasoning-only segment — thinking that never led to an answer — and
-        any half-streamed tool call (it has no result to pair with, and an
-        orphaned tool call would be rejected on the next request). Returns
-        True when a message was added; an empty or reasoning-only round adds
-        nothing, so a turn that had not answered yet leaves the history
-        untouched.
+        Called both when the user interrupts a turn (cancel, or a forced
+        steer that cancels it) and when a round ends without completing (a
+        provider or transport error). Keeps the assistant text and the
+        partial chain of thought that had arrived — including a
+        reasoning-only segment (a cancel mid-thinking now saves the CoT,
+        instead of discarding it) — and drops any half-streamed tool call
+        (it has no result to pair with, and an orphaned tool call would be
+        rejected on the next request). Returns True when a message was
+        added; a round with neither text nor reasoning adds nothing, so a
+        turn that had not started answering leaves the history untouched.
         """
         partial = self._partial_round
         self._partial_round = None
         if partial is None:
             return False
         content = "".join(partial.content_parts)
-        if not content:
+        reasoning = "".join(partial.reasoning_parts) or None
+        if not content and not reasoning:
             return False
         self.conversation.add(
             Message(
                 role="assistant",
                 content=content,
-                reasoning="".join(partial.reasoning_parts) or None,
+                reasoning=reasoning,
             )
         )
         return True
@@ -241,6 +281,8 @@ class ChatController:
         running, whose snapshot /undo restores anyway.
         """
         self.conversation.add(Message(role="user", content=text, images=images or None))
+        if self.on_user_message is not None:
+            self.on_user_message(self.conversation.messages[-1])
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Point the session at a new provider profile.
@@ -589,6 +631,7 @@ class ChatController:
         # Expose this round's partial output live, so a cancelled turn can
         # persist whatever had streamed before the interruption.
         self._partial_round = partial
+        started_at = _utcnow_iso()
 
         tools_schema = self.tools.schema() if self.tools is not None else None
         async for event in self._client.stream(
@@ -629,6 +672,12 @@ class ChatController:
                     usage=usage,
                     reasoning_seconds=reasoning_seconds,
                     has_tool_calls=bool(done_calls),
+                )
+                self.last_round_stamps = (
+                    started_at,
+                    _utcnow_iso(),
+                    _mono_to_iso(first_reasoning_at),
+                    _mono_to_iso(first_content_at),
                 )
             yield event
 

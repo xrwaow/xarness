@@ -477,3 +477,111 @@ class GpuMountFixTest(unittest.TestCase):
                 module_present=True, uvm_present=True,
             )
         assert result == ("info", "GPU access verified: GPU 0: Tesla")
+
+
+class UnsandboxedModeTest(unittest.TestCase):
+    """use_container=False: no bwrap needed, and tool paths anchor at the
+    real workspace instead of a container mount."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name) / "wt"
+        self.workspace.mkdir()
+        # bwrap missing from PATH entirely: unsandboxed mode must still work.
+        patcher = mock.patch("shutil.which", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_no_bwrap_required_and_tool_paths_resolve_to_workspace(self):
+        config = SandboxConfig(workspace=self.workspace, use_container=False)
+        assert config.tool_path("src/app.py") == str(self.workspace / "src/app.py")
+        assert config.tool_path("./notes.txt") == str(self.workspace / "notes.txt")
+        assert config.build_argv(["/bin/sh"]) == ["/bin/sh"]
+
+
+class FilterListShadowTest(unittest.TestCase):
+    """filter_list: files are shadowed with the empty-file placeholder and
+    no directories are created in the worktree (no tmpfs mountpoints)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name) / "wt"
+        self.workspace.mkdir()
+        (self.workspace / "secret.txt").write_text("x\n")
+        (self.workspace / "secrets").mkdir()
+        patcher = mock.patch("shutil.which", return_value="/usr/bin/bwrap")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_files_get_empty_file_dirs_get_empty_dir_no_tmpfs(self):
+        from xarness.sandbox import _shadow_placeholders
+
+        config = SandboxConfig(
+            workspace=self.workspace, filter_list=["secret.txt", "secrets"],
+        )
+        argv = config.build_argv(["/bin/sh"])
+        empty_file, empty_dir = _shadow_placeholders()
+        assert not any(
+            a == "--tmpfs" and target.startswith("/workspace")
+            for a, target in zip(argv, argv[1:])
+        )
+        file_idx = argv.index(empty_file)
+        assert argv[file_idx + 1] == "/workspace/secret.txt"
+        dir_idx = argv.index(empty_dir)
+        assert argv[dir_idx + 1] == "/workspace/secrets"
+
+
+class FilterListMissingPathTest(unittest.TestCase):
+    """filter_list paths that do not exist are skipped at argv-build time:
+    no mountpoint is created in the worktree (and bwrap is not asked to
+    bind a target that isn't there). Pure argv construction — no bwrap run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name) / "wt"
+        self.workspace.mkdir()
+        (self.workspace / "real.txt").write_text("x\n")
+        patcher = mock.patch("shutil.which", return_value="/usr/bin/bwrap")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_paths_are_skipped_and_nothing_is_created(self):
+        config = SandboxConfig(
+            workspace=self.workspace, filter_list=["real.txt", "ghost.txt", "ghost_dir/n"],
+        )
+        argv = config.build_argv(["/bin/sh"])
+        assert "--ro-bind" in argv
+        # Only the existing path is shadowed.
+        assert "/workspace/real.txt" in argv
+        assert "/workspace/ghost.txt" not in argv
+        assert "/workspace/ghost_dir/n" not in argv
+        # Nothing appeared in the worktree.
+        assert not (self.workspace / "ghost.txt").exists()
+        assert not (self.workspace / "ghost_dir").exists()
+
+
+class UnsandboxedArgvTest(unittest.TestCase):
+    """use_container=False argv construction without bwrap: the command is
+    passed through unchanged (no container args), whatever the isolation
+    settings say — filter_list/allow_network/gpu_access are ignored."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name) / "wt"
+        self.workspace.mkdir()
+        patcher = mock.patch("shutil.which", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_isolation_settings_are_ignored_in_argv(self):
+        config = SandboxConfig(
+            workspace=self.workspace, use_container=False,
+            filter_list=["secret.txt"], allow_network=True, gpu_access=True,
+        )
+        assert config.build_argv(["/bin/sh", "-c", "echo hi"]) == [
+            "/bin/sh", "-c", "echo hi",
+        ]
