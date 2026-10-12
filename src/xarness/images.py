@@ -4,20 +4,21 @@ Loads an image file, downsamples it to at most :data:`MAX_PIXELS` pixels
 (Pillow's ``thumbnail`` with LANCZOS resampling, only when it actually
 exceeds the cap), and base64-encodes it for the OpenAI-compatible
 ``image_url`` content part (``data:`` URL). The resulting
-:class:`ImageAttachment` is a plain dataclass so it round-trips through
-session JSON unchanged — reloading a session never re-processes pixels.
+:class:`ImageAttachment` is a pydantic model so it round-trips through
+session JSON and the wire protocol unchanged — reloading a session never
+re-processes pixels.
 """
 
 from __future__ import annotations
 
 import base64
 import re
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from PIL import Image
+from pydantic import BaseModel, ConfigDict
 
 # Hard pixel budget per image; anything larger is downsampled once, on load.
 MAX_PIXELS = 1_000_000
@@ -30,20 +31,25 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 # The placeholder an attached image leaves in the input text (and the
 # transcript). One token per image, deleted atomically in the editor.
 _TOKEN_TEXT = "[🖼 {name} {width}×{height}]"
-_IMAGE_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
+# Single source of truth for the token shape (see conversation.to_wire).
+IMAGE_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
 
 
 class ImageError(Exception):
     """The file could not be read as an image."""
 
 
-@dataclass(slots=True)
-class ImageAttachment:
+class ImageAttachment(BaseModel):
     """One image attached to a user message.
 
     ``data_b64`` is the encoded image bytes; ``width``/``height`` describe
     the encoded image (post-downsample) so the TUI can show real dims
-    without decoding. Persisted verbatim in session files."""
+    without decoding. Persisted verbatim in session files and sent over the
+    wire in snapshots — a pydantic model so the same object does both.
+    Unknown fields are ignored, not rejected: the host and client can be
+    different builds across a restart."""
+
+    model_config = ConfigDict(extra="ignore")
 
     name: str
     mime: str
@@ -64,7 +70,7 @@ def token_text(image: ImageAttachment) -> str:
 
 def find_image_tokens(text: str) -> list[str]:
     """Image placeholder tokens appearing in ``text``, in order."""
-    return _IMAGE_TOKEN_RE.findall(text)
+    return IMAGE_TOKEN_RE.findall(text)
 
 
 def is_image_path(path: Path | str) -> bool:
@@ -105,6 +111,7 @@ def load_image(path: Path | str) -> ImageAttachment:
     except (OSError, ValueError) as exc:
         raise ImageError(f"could not read image {file}: {exc}") from None
     name = file.name
+    fmt = img.format or "PNG"
 
     if img.width * img.height > MAX_PIXELS:
         scale = (MAX_PIXELS / (img.width * img.height)) ** 0.5
@@ -116,7 +123,6 @@ def load_image(path: Path | str) -> ImageAttachment:
     else:
         downsampled = False
 
-    fmt = img.format or "PNG"
     if fmt == "GIF":
         # Animated GIFs keep their first frame, re-encoded as PNG/JPEG below.
         downsampled = True

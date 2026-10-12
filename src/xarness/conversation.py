@@ -6,23 +6,23 @@ can append tool-call/tool-result messages here without touching UI code.
 Reasoning text and token usage are stored locally per assistant message; by
 default reasoning is also sent back on later rounds (``keep_reasoning``), but
 usage never reaches the wire.
+
+``ToolCall`` and ``Message`` are pydantic models so the very same objects
+are persisted (session JSON) and shown to clients (snapshots) — there is no
+second mirrored model to keep in sync.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import BaseModel, Field, field_validator
+
 from .events import Usage
+from .images import IMAGE_TOKEN_RE
 from .images import ImageAttachment
-
-
-def _utcnow_iso() -> str:
-    """Wall-clock UTC timestamp (ISO 8601) for the message stamp fields."""
-    return datetime.now(timezone.utc).isoformat()
 
 
 # Prefix of the summary user message compaction leaves behind. Identifying
@@ -31,17 +31,26 @@ SUMMARY_PREFIX = "[earlier conversation, summarized]"
 
 # The placeholder tokens attached images leave in user text (see
 # images.token_text); matches are replaced by image content parts on the wire.
-_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
+_TOKEN_RE = IMAGE_TOKEN_RE
 
 
-@dataclass(slots=True)
-class ToolCall:
+class ToolCall(BaseModel):
     """One tool call the model requested — the single shape used everywhere
-    (stream events, history, wire format, TUI)."""
+    (stream events, history, wire format, TUI).
+
+    Constructed positionally in many places, so ``ToolCall(id, name, args)
+    keeps working."""
 
     call_id: str
     name: str
     arguments_json: str
+
+    def __init__(
+        self, call_id: str = "", name: str = "", arguments_json: str = ""
+    ) -> None:
+        super().__init__(
+            call_id=call_id, name=name, arguments_json=arguments_json
+        )
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -56,15 +65,14 @@ class ToolCall:
         return cls(call.get("id", ""), fn.get("name", ""), fn.get("arguments", ""))
 
 
-@dataclass(slots=True)
-class Message:
+class Message(BaseModel):
     """One conversation message, mirroring the API's message object."""
 
     role: str  # "user" | "assistant" | "system" | "tool"
     content: str = ""
-    # Stable id (uuid4), persisted; assigned on load for old sessions.
-    # Click-to-undo addresses messages by id, not object identity.
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Stable id (uuid4), persisted. Click-to-undo addresses messages by
+    # id, not object identity.
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     # Wall-clock UTC ISO 8601 stamps (None for old sessions). User messages
     # carry send_time (steering: when the client sent it, not when it was
     # injected); assistant messages start_time/end_time around the request,
@@ -99,9 +107,37 @@ class Message:
     # only) — computed by the tool, persisted so /resume renders the same
     # headers. Never sent over the wire.
     header: str | None = None
+    # Local-only: "Worked for X | Y Z W" timing of the turn that produced
+    # this assistant message (last one of the turn only) — total, streaming,
+    # idle-waiting-for-tools, and the leftover latency. Computed by the
+    # session at turn end from the persisted stamps, so every client and
+    # every reload shows the same line.
+    time_summary: str | None = None
     # Images attached to a user message (persisted; sent over the wire as
     # base64 ``image_url`` content parts on every round). None = text only.
     images: list[ImageAttachment] | None = None
+
+    @field_validator("tool_calls", mode="before")
+    @classmethod
+    def _coerce_tool_calls(cls, value: object) -> object:
+        """Accept tool calls in either shape: the wire shape persisted in
+        session files and sent to providers (``{id, type, function}``), and
+        the internal shape a ``model_dump()`` round-trip produces
+        (``{call_id, name, arguments_json}`` — snapshots serialize Message
+        as-is, so this is what crosses the host→client JSON boundary)."""
+        if isinstance(value, list):
+            out = []
+            for c in value:
+                if isinstance(c, ToolCall):
+                    out.append(c)
+                elif isinstance(c, dict) and (
+                    "call_id" in c or "arguments_json" in c
+                ):
+                    out.append(ToolCall.model_validate(c))
+                else:
+                    out.append(ToolCall.from_wire(c))
+            return out
+        return value
 
     def to_wire(self, include_reasoning: bool = False) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}
@@ -173,30 +209,45 @@ class Conversation:
         self.messages.append(message)
         return message
 
-    def to_wire(self, keep_reasoning: bool = False) -> list[dict[str, Any]]:
+    def last_turn_message(self) -> Message | None:
+        """The most recent user message that opened a tracked turn (carries
+        a checkpoint sha), or None."""
+        return next(
+            (m for m in reversed(self.messages)
+             if m.role == "user" and m.checkpoint_sha is not None),
+            None,
+        )
+
+    def repair_orphaned_tool_calls(self, now: str | None = None) -> bool:
+        """Give any assistant tool_call without a matching tool message a
+        synthetic ``error: interrupted`` result, so the next API request is
+        valid. Runs after a cancel and on a session load. Returns True when
+        anything was added."""
         answered = {
-            m.tool_call_id for m in self.messages if m.role == "tool" and m.tool_call_id
+            m.tool_call_id for m in self.messages
+            if m.role == "tool" and m.tool_call_id
         }
-        wire: list[dict[str, Any]] = []
+        changed = False
         for message in self.messages:
-            orphaned = (
-                message.role == "assistant"
-                and message.tool_calls
-                and any(c.call_id not in answered for c in message.tool_calls)
-            )
-            if not orphaned:
-                wire.append(message.to_wire(include_reasoning=keep_reasoning))
+            if message.role != "assistant" or not message.tool_calls:
                 continue
-            # A call without a result (turn interrupted mid-execution, session
-            # saved) would be rejected as an unpaired tool call: send only the
-            # answered ones, or drop the message when none remain and it
-            # carries no text.
-            paired = [c for c in message.tool_calls if c.call_id in answered]
-            if paired or message.content:
-                wire_message = message.to_wire(include_reasoning=keep_reasoning)
-                if paired:
-                    wire_message["tool_calls"] = [c.to_wire() for c in paired]
-                else:
-                    del wire_message["tool_calls"]
-                wire.append(wire_message)
-        return wire
+            for call in message.tool_calls:
+                if call.call_id not in answered:
+                    self.add(Message(
+                        role="tool", tool_call_id=call.call_id,
+                        content="error: interrupted",
+                        end_time=now,
+                    ))
+                    answered.add(call.call_id)
+                    changed = True
+        return changed
+
+    def to_wire(self, keep_reasoning: bool = False) -> list[dict[str, Any]]:
+        # Orphaned tool calls (turn interrupted mid-execution, session saved
+        # mid-turn) are answered synthetically by Session._repair_tool_calls,
+        # which runs on cancel and on session load, so every message can go
+        # out as-is.
+        return [
+            message.to_wire(include_reasoning=keep_reasoning)
+            for message in self.messages
+        ]

@@ -22,7 +22,6 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
 from .client import ChatClient
@@ -33,15 +32,14 @@ from .events import (
     ReasoningDelta,
     StreamError,
     StreamEvent,
-    ToolCallArgumentsDelta,
     ToolCallArgumentsDone,
-    ToolCallStarted,
     TurnComplete,
     Usage,
 )
 from .gitwork import GitInfo, GitWorktreeError, RevertConflict, TurnCheckpoint
 from .images import ImageAttachment
-from .gitwork import checkpoint as git_checkpoint
+from .util import mono_to_iso as _mono_to_iso, utcnow_iso as _utcnow_iso
+from .gitwork import snapshot_state as git_snapshot_state
 from .gitwork import revert_turns
 from .tools import ToolRegistry, ToolResult
 
@@ -49,27 +47,6 @@ from .tools import ToolRegistry, ToolResult
 # usage data. Deliberately conservative; results are labeled approximate.
 _CHARS_PER_TOKEN = 4
 
-
-def _utcnow_iso() -> str:
-    """Wall-clock UTC timestamp (ISO 8601) for the message stamp fields."""
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _mono_to_iso(monotonic: float | None) -> str | None:
-    """A time.monotonic() reading converted to a wall-clock ISO stamp, or None.
-
-    Monotonic readings have no absolute epoch; the conversion anchors on
-    'now', which is accurate to within the seconds since the reading was
-    taken — fine for second-resolution reasoning timestamps."""
-    if monotonic is None:
-        return None
-    offset = time.monotonic() - monotonic
-    return _utcnow_iso_offset(-offset)
-
-
-def _utcnow_iso_offset(seconds: float) -> str:
-    from datetime import timedelta
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 # A round's live partial output, mutated in place while it streams.
 @dataclass(slots=True)
@@ -97,11 +74,6 @@ def _last_user_turn_index(messages: list[Message]) -> int | None:
 def _summary_index(messages: list[Message]) -> int | None:
     """Index of the first compaction summary in the list, or None."""
     return next((i for i, m in enumerate(messages) if _is_summary(m)), None)
-
-
-def _message_key(message: Message) -> tuple:
-    """Value key for message identity across a save/load roundtrip."""
-    return (message.role, message.content, message.tool_call_id)
 
 
 def _turns_in(messages: list[Message]) -> list[TurnCheckpoint]:
@@ -134,12 +106,14 @@ class StreamClient(Protocol):
 
 @dataclass(slots=True)
 class RollbackPlan:
-    """What /undo or /retry needs to do, computed by :meth:`rollback_plan`."""
+    """What /undo or /retry needs to do, computed by :meth:`rollback_plan`.
+
+    Usage totals are monotonic (they count everything ever spent, including
+    undone turns), so a plan carries no usage bookkeeping."""
 
     user_text: str  # the turn's user message (input box / resend)
     revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
     keep: list[Message]  # what the conversation becomes
-    dropped: list[Message]  # messages whose usage must be subtracted
     # True when the restore point is before the most recent compaction, so
     # apply_rollback must drop the compact snapshot (the summary it covers
     # is no longer part of the history).
@@ -169,25 +143,18 @@ class ChatController:
         self.git_info: GitInfo | None = None
         # Cumulative session spend (input + output), folded together from
         # every round's usage — including compaction's own summarization
-        # round. /undo subtracts the usage of the messages it drops.
+        # round and everything an /undo later removes. Monotonic: it counts
+        # everything ever spent this session.
         self.usage_total = Usage(input_tokens=0, output_tokens=0)
-        # Usage folded into the totals for messages that compaction later
-        # removed during the current turn. /undo must subtract it too, since
-        # the message objects that carry it no longer exist.
-        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
-        # True once a rollback subtracted _absorbed_usage: a later compaction
-        # undo must re-fold the restored turns' spend (see apply_rollback).
-        self._absorbed_spent = False
+        # Usage of the most recent round, kept for the status payload
+        # (instead of re-scanning the message list on every status emit).
+        self.last_usage = Usage(input_tokens=0, output_tokens=0)
         # (before, after) token counts of the most recent compaction, for the
         # compaction notice.
         self.last_compaction: tuple[int, int] | None = None
         # Live view of the round currently streaming. Cleared when the round
         # completes; read by save_interrupted_round() when a turn is cancelled.
         self._partial_round: PartialRound | None = None
-        # Wall-clock stamps of the most recent round (ISO 8601 UTC):
-        # (start, end, reasoning_start, reasoning_end). Set by _stream_round;
-        # the session copies them onto the assistant message.
-        self.last_round_stamps: tuple[str, str, str | None, str | None] | None = None
         # Optional hook, called with each user message as it lands in the
         # history (send and inject_user_message). The session uses it to emit
         # UserMessageAdded — there is no local echo in the client.
@@ -211,8 +178,6 @@ class ChatController:
         # so restoring it rolls back the whole turn — even one that compacted
         # the history mid-flight.
         self.conversation.turn_start = len(self.conversation.messages) - 1
-        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
-        self._absorbed_spent = False
         if self.on_user_message is not None:
             self.on_user_message(self.conversation.messages[-1])
         async for event in self._stream_round():
@@ -306,7 +271,7 @@ class ChatController:
         if info is None:
             return None
         try:
-            return await git_checkpoint(info)
+            return await git_snapshot_state(info)
         except GitWorktreeError:
             return None
 
@@ -339,14 +304,11 @@ class ChatController:
         ):
             # Undo the compaction: restore the pre-compaction history
             # verbatim. The summary and everything after it leave the
-            # history (their usage is subtracted); the compaction turn's own
-            # messages come back — matched by value, since after a save/load
-            # the snapshot and the message list are distinct objects.
+            # history (their spend stays counted — totals are monotonic);
+            # the compaction turn's own messages come back.
             keep = list(compact_snapshot)
-            kept_values = {_message_key(m) for m in keep}
-            dropped = [m for m in messages if _message_key(m) not in kept_values]
             return RollbackPlan(
-                user_text="", revert_turns=[], keep=keep, dropped=dropped,
+                user_text="", revert_turns=[], keep=keep,
                 clears_compaction=True, compaction_only=True,
             )
         turn_start = self.conversation.turn_start
@@ -355,22 +317,22 @@ class ChatController:
                 return None  # the turn produced no response yet
             keep = list(messages[:turn_start])
             user_text = messages[turn_start].content
-            dropped = list(messages[turn_start:])
             # If the restore point is before the compaction (the undone turn
             # is the one that compacted), the summary is gone from the
             # history — the compact snapshot is no longer reachable.
             clears = not any(_is_summary(m) for m in keep)
+            revert_from = messages[turn_start:]
         else:
             index = last_real
             if index is None:
                 return None
             keep = list(messages[:index])
             user_text = messages[index].content
-            dropped = list(messages[index:])
             clears = False
+            revert_from = messages[index:]
         return RollbackPlan(
-            user_text=user_text, revert_turns=_turns_in(dropped), keep=keep,
-            dropped=dropped, clears_compaction=clears,
+            user_text=user_text, revert_turns=_turns_in(revert_from),
+            keep=keep, clears_compaction=clears,
         )
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
@@ -392,13 +354,12 @@ class ChatController:
         if index is not None:
             # Even when the message is the latest one (nothing after it to
             # drop) we still produce a plan: the text goes back into the
-            # input, with empty drop/revert lists.
+            # input.
             keep = list(messages[:index])
-            dropped = list(messages[index:])
             clears = not any(_is_summary(m) for m in keep)
             return RollbackPlan(
-                user_text=message.content, revert_turns=_turns_in(dropped),
-                keep=keep, dropped=dropped, clears_compaction=clears,
+                user_text=message.content, revert_turns=_turns_in(messages[index:]),
+                keep=keep, clears_compaction=clears,
             )
         snapshot = self.conversation.compact_snapshot
         if snapshot is None:
@@ -407,58 +368,21 @@ class ChatController:
         if idx is None:
             return None
         keep = list(snapshot[:idx])
-        kept_ids = {id(m) for m in keep}
-        # Only the live history's messages count for usage subtraction: the
-        # snapshot's own spend was already folded when compaction removed it.
-        dropped = [m for m in messages if id(m) not in kept_ids]
         # Revert every dropped turn — the ones the snapshot summarized away
         # (from the clicked turn onward) plus those that ran after compaction.
-        revert = _turns_in([*snapshot[idx:], *dropped])
+        revert = _turns_in([*snapshot[idx:], *messages])
         return RollbackPlan(
             user_text=message.content, revert_turns=revert,
-            keep=keep, dropped=dropped, clears_compaction=True,
-        )
-
-    def _subtract_usage(self, usage: Usage) -> None:
-        """Remove one round's spend from the cumulative total (floored at 0)."""
-        self.usage_total.input_tokens = max(
-            0, self.usage_total.input_tokens - usage.input_tokens
-        )
-        self.usage_total.output_tokens = max(
-            0, self.usage_total.output_tokens - usage.output_tokens
+            keep=keep, clears_compaction=True,
         )
 
     def apply_rollback(self, plan: RollbackPlan) -> None:
-        """Truncate the conversation, subtract the dropped turns' usage from
-        the running totals, and clear the snapshot. The file edits are
-        reversed separately (see :meth:`revert_changes`) so a conflict can
-        abort before the conversation changes."""
+        """Truncate the conversation and clear the snapshot. The file edits
+        are reversed separately (see :meth:`revert_changes`) so a conflict
+        can abort before the conversation changes. Usage totals are
+        monotonic and untouched."""
         self.conversation.messages = list(plan.keep)
         self.conversation.turn_start = None
-        current_keys = {_message_key(m) for m in self.conversation.messages}
-        for message in plan.dropped:
-            if message.usage is not None:
-                self._subtract_usage(message.usage)
-        # Usage of messages compaction destroyed (their objects are gone, so
-        # the loop above can't see them). A compaction undo restores those
-        # very objects — their spend stays folded until the turn itself is
-        # undone later.
-        if not plan.compaction_only:
-            self._subtract_usage(self._absorbed_usage)
-            if self._absorbed_usage.input_tokens or self._absorbed_usage.output_tokens:
-                # Consumed: a later compaction undo restores those turns, so
-                # it must re-fold their spend (below) to keep the totals and
-                # a later per-turn undo from double-counting.
-                self._absorbed_spent = True
-        elif self._absorbed_spent:
-            # The absorbed subtraction already removed the restored turns'
-            # spend; fold it back so the totals match the restored history.
-            for message in plan.keep:
-                if (_message_key(message) not in current_keys
-                        and message.usage is not None):
-                    self._fold_usage(message.usage)
-        self._absorbed_usage = Usage(input_tokens=0, output_tokens=0)
-        self._absorbed_spent = False
         self.last_compaction = None
         if plan.clears_compaction:
             # The restore point is before the compaction: its summary is no
@@ -476,15 +400,11 @@ class ChatController:
         info = self.git_info
         if info is None:
             return
-        turn = next(
-            (m for m in reversed(self.conversation.messages)
-             if m.role == "user" and m.checkpoint_sha is not None),
-            None,
-        )
+        turn = self.conversation.last_turn_message()
         if turn is None:
             return
         try:
-            turn.after_tree = await git_checkpoint(info)
+            turn.after_tree = await git_snapshot_state(info)
         except GitWorktreeError:
             return
 
@@ -547,18 +467,6 @@ class ChatController:
         self.conversation.compact_snapshot = list(messages)
         self.conversation.messages = [messages[0], summary_message]
         self.last_compaction = (before_tokens, self._message_tokens(summary_message))
-        # Usage of removed messages that belongs to the current turn (at or
-        # after turn_start): /undo must subtract it even though the message
-        # objects are gone. Pre-turn usage stays folded, matching rollback
-        # semantics; send() resets the tracker each turn.
-        self._absorbed_spent = False
-        turn_start = self.conversation.turn_start
-        if turn_start is not None:
-            for index in range(1, len(messages)):
-                removed = messages[index]
-                if index >= turn_start and removed.usage is not None:
-                    self._absorbed_usage.input_tokens += removed.usage.input_tokens
-                    self._absorbed_usage.output_tokens += removed.usage.output_tokens
         return summary
 
     @staticmethod
@@ -658,6 +566,7 @@ class ChatController:
                     reasoning_seconds = end - first_reasoning_at
                 usage = event.usage or self._estimate_usage(partial.content_parts)
                 self._fold_usage(usage)
+                reasoning_end = _mono_to_iso(first_content_at) or _utcnow_iso()
                 self.conversation.add(
                     Message(
                         role="assistant",
@@ -666,6 +575,12 @@ class ChatController:
                         reasoning_seconds=reasoning_seconds,
                         tool_calls=done_calls or None,
                         usage=usage,
+                        # Wall-clock stamps taken at the moment the round
+                        # actually streamed (never reconstructed later).
+                        start_time=started_at,
+                        end_time=_utcnow_iso(),
+                        reasoning_start=_mono_to_iso(first_reasoning_at),
+                        reasoning_end=reasoning_end,
                     )
                 )
                 event = TurnComplete(
@@ -673,18 +588,13 @@ class ChatController:
                     reasoning_seconds=reasoning_seconds,
                     has_tool_calls=bool(done_calls),
                 )
-                self.last_round_stamps = (
-                    started_at,
-                    _utcnow_iso(),
-                    _mono_to_iso(first_reasoning_at),
-                    _mono_to_iso(first_content_at),
-                )
             yield event
 
     def _fold_usage(self, usage: Usage) -> None:
         """Add one round's usage to the cumulative session total."""
         self.usage_total.input_tokens += usage.input_tokens
         self.usage_total.output_tokens += usage.output_tokens
+        self.last_usage = usage
 
     def _estimate_usage(self, content_parts: list[str]) -> Usage:
         prompt_chars = sum(len(message.content or "") for message in self.conversation.messages)

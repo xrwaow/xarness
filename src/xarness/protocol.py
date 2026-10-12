@@ -2,92 +2,48 @@
 
 One source of truth for every event and command that crosses a process
 boundary. Pydantic models with a ``type`` discriminator; FastAPI generates
-the OpenAPI schema from these directly, so the docs can never drift from the
-code. The internal stream dataclasses in :mod:`xarness.events` convert
-through :func:`event_to_protocol` / :func:`event_from_protocol`.
+the OpenAPI schema from these directly, so the docs can never drift from
+the code.
+
+Usage, ImageAttachment, ToolCall and Message are the very models defined in
+:mod:`xarness.events` / :mod:`xarness.conversation` (re-exported below) — a
+message is persisted, converted to a provider request and shown to a client
+as one object, with no mirrored copy to keep in sync. The transient stream
+deltas are likewise the models defined in :mod:`xarness.events`.
 """
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import Annotated, Any, get_args, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from .events import Usage
+from .conversation import Message
+from .events import (
+    ContentDelta,
+    EventBase,
+    ProcessingStarted,
+    ReasoningDelta,
+    StreamError,
+    ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
+    TurnComplete,
+    Usage,
+)
+from .images import ImageAttachment
 
 PROTOCOL_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # primitives
 
-
-class UsageModel(BaseModel):
-    """Token usage for one round."""
-
-    input_tokens: int = 0
-    output_tokens: int = 0
-    approximate: bool = False
-
-    @classmethod
-    def from_usage(cls, usage: Usage | None) -> "UsageModel | None":
-        if usage is None:
-            return None
-        return cls(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            approximate=usage.approximate,
-        )
-
-    def to_usage(self) -> Usage:
-        return Usage(
-            input_tokens=self.input_tokens,
-            output_tokens=self.output_tokens,
-            approximate=self.approximate,
-        )
-
-
-class ImageAttachmentModel(BaseModel):
-    """One base64 image attached to a user message."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    mime: str
-    data_b64: str
-    width: int
-    height: int
-
-
-class MessageModel(BaseModel):
-    """One conversation message as seen by clients.
-
-    Mirrors :class:`xarness.conversation.Message` one-to-one (including the
-    local-only fields the provider never sees: ids, timestamps, reasoning,
-    usage, git checkpoints) so a client can render the full history.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    role: str
-    content: str = ""
-    message_id: str | None = None
-    # Wall-clock UTC ISO 8601 stamps; None for old sessions.
-    send_time: str | None = None
-    start_time: str | None = None
-    end_time: str | None = None
-    reasoning: str | None = None
-    reasoning_seconds: float | None = None
-    reasoning_start: str | None = None
-    reasoning_end: str | None = None
-    usage: UsageModel | None = None
-    checkpoint_sha: str | None = None
-    after_tree: str | None = None
-    name: str | None = None
-    tool_call_id: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
-    header: str | None = None
-    images: list[ImageAttachmentModel] | None = None
+# The one and only usage/message/image shapes: the events/conversation models
+# cross the wire as-is (they are pydantic models), so there is no mirrored
+# protocol copy to keep in sync. Aliases keep the protocol namespace complete.
+UsageModel = Usage
+MessageModel = Message
+ImageAttachmentModel = ImageAttachment
 
 
 class QueuedMessage(BaseModel):
@@ -164,7 +120,6 @@ class ServerInfo(BaseModel):
     uptime_seconds: float
     persistent: bool = False
     unix_socket: str | None = None
-    tcp_address: str | None = None
 
 
 class SessionSummary(BaseModel):
@@ -237,45 +192,15 @@ class DiffInfo(BaseModel):
 # ---------------------------------------------------------------------------
 # events
 
-
-class EventBase(BaseModel):
-    """Every event carries the session-assigned ``seq`` (assigned on emit)."""
-
-    seq: int = 0
-    model_config = ConfigDict(extra="forbid")
+# EventBase and the transient stream deltas (ProcessingStarted, ReasoningDelta,
+# ContentDelta, ToolCallStarted, ToolCallArgumentsDelta, ToolCallArgumentsDone,
+# TurnComplete, StreamError) come from :mod:`xarness.events` — see the import
+# above.
 
 
-class ProcessingStarted(EventBase):
-    type: Literal["processing_started"] = "processing_started"
 
 
-class ReasoningDelta(EventBase):
-    type: Literal["reasoning_delta"] = "reasoning_delta"
-    text: str
 
-
-class ContentDelta(EventBase):
-    type: Literal["content_delta"] = "content_delta"
-    text: str
-
-
-class ToolCallStarted(EventBase):
-    type: Literal["tool_call_started"] = "tool_call_started"
-    call_id: str
-    name: str
-
-
-class ToolCallArgumentsDelta(EventBase):
-    type: Literal["tool_call_arguments_delta"] = "tool_call_arguments_delta"
-    call_id: str
-    text: str
-
-
-class ToolCallArgumentsDone(EventBase):
-    type: Literal["tool_call_arguments_done"] = "tool_call_arguments_done"
-    call_id: str
-    name: str
-    arguments_json: str
 
 
 class ToolExecStarted(EventBase):
@@ -299,16 +224,6 @@ class ToolFinished(EventBase):
     header: str = ""
 
 
-class TurnComplete(EventBase):
-    type: Literal["turn_complete"] = "turn_complete"
-    usage: UsageModel | None = None
-    reasoning_seconds: float | None = None
-    has_tool_calls: bool = False
-
-
-class StreamError(EventBase):
-    type: Literal["stream_error"] = "stream_error"
-    message: str
 
 
 class UserMessageAdded(EventBase):
@@ -362,6 +277,9 @@ class DriftResolved(EventBase):
 class TurnFinished(EventBase):
     type: Literal["turn_finished"] = "turn_finished"
     elapsed: float = 0.0
+    # "Worked for X | Y Z W" — total | streaming | tools | other; the same
+    # string the session persists on the turn's last assistant message.
+    summary: str = ""
 
 
 class SessionDeleted(EventBase):
@@ -396,10 +314,19 @@ Event = Annotated[
 ]
 Snapshot.model_rebuild()
 
+
+def _union_members(annotation) -> tuple[type[BaseModel], ...]:
+    """The member models of a discriminated ``Annotated[Union[...]]``."""
+    return get_args(get_args(annotation)[0])
+
+
 EVENT_TYPES: dict[str, type[BaseModel]] = {
     model.model_fields["type"].default: model  # type: ignore[index]
-    for model in get_args(get_args(Event)[0])
+    for model in _union_members(Event)
 }
+
+
+EVENT_ADAPTER = TypeAdapter(Event)
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +441,7 @@ Command = Annotated[
 
 COMMAND_TYPES: dict[str, type[BaseModel]] = {
     model.model_fields["type"].default: model  # type: ignore[index]
-    for model in get_args(get_args(Command)[0])
+    for model in _union_members(Command)
 }
 
 
@@ -544,62 +471,7 @@ class CreateSessionRequest(BaseModel):
     no_init_repo: bool = False
     network: bool | None = None
     gpu: bool | None = None
+    no_session: bool = False
     first_message: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# conversions
-
-from .conversation import Message  # noqa: E402
-from .images import ImageAttachment  # noqa: E402
-
-
-def message_to_model(message: Message) -> MessageModel:
-    """Full client-facing dump of one message (ids and timestamps included)."""
-    images = None
-    if message.images:
-        images = [
-            ImageAttachmentModel(
-                name=i.name, mime=i.mime, data_b64=i.data_b64,
-                width=i.width, height=i.height,
-            )
-            for i in message.images
-        ]
-    calls = None
-    if message.tool_calls is not None:
-        calls = [call.to_wire() for call in message.tool_calls]
-    return MessageModel(
-        role=message.role,
-        content=message.content,
-        message_id=message.id,
-        send_time=message.send_time,
-        start_time=message.start_time,
-        end_time=message.end_time,
-        reasoning=message.reasoning,
-        reasoning_seconds=message.reasoning_seconds,
-        reasoning_start=message.reasoning_start,
-        reasoning_end=message.reasoning_end,
-        usage=UsageModel.from_usage(message.usage),
-        checkpoint_sha=message.checkpoint_sha,
-        after_tree=message.after_tree,
-        name=message.name,
-        tool_call_id=message.tool_call_id,
-        tool_calls=calls,
-        header=message.header,
-        images=images,
-    )
-
-
-def image_from_model(model: ImageAttachmentModel) -> ImageAttachment:
-    return ImageAttachment(
-        name=model.name, mime=model.mime, data_b64=model.data_b64,
-        width=model.width, height=model.height,
-    )
-
-
-def images_from_model(
-    models: list[ImageAttachmentModel] | None,
-) -> list[ImageAttachment] | None:
-    if not models:
-        return None
-    return [image_from_model(m) for m in models]

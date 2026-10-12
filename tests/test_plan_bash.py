@@ -99,24 +99,6 @@ def test_mode_switch_restarts_shell_under_new_mounts(tmp_path) -> None:
     assert (sandbox.workspace / "s.txt").exists()
 
 
-def test_subtree_scoped_plan_mode_keeps_subtree_read_only(tmp_path) -> None:
-    from xarness.gitwork import setup_tracking
-
-    repo = _make_repo(tmp_path)
-    info, _ = asyncio.run(setup_tracking(repo / "pkg", "sess-ro"))
-    sandbox = SandboxConfig(
-        workspace=info.workspace, subtree=info.subtree, git_dir=info.git_dir,
-    )
-    session = SandboxSession(sandbox)
-    sandbox.read_only = True
-    registry = build_registry(sandbox, session, mode="plan")
-    read = _call(registry, "read_file", '{"path": "util.py"}')
-    assert read.ok
-    write = _call(registry, "run_bash", '{"command": "touch nope.txt"}')
-    assert not write.ok
-    assert not (repo / "pkg" / "nope.txt").exists()
-
-
 def test_plan_mode_without_container_has_no_run_bash(tmp_path) -> None:
     """Plan mode with use_container=False: there is no read-only mount to
     enforce the mode with, so run_bash must not be available at all

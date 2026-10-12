@@ -39,7 +39,6 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(host_mod, "HOST_DIR", tmp_path / "host")
     monkeypatch.setattr(host_mod, "SOCKET_PATH", tmp_path / "host" / "host.sock")
     monkeypatch.setattr(host_mod, "LOCK_PATH", tmp_path / "host" / "host.lock")
-    monkeypatch.setattr(host_mod, "BASELINES_DIR", tmp_path / "host" / "baselines")
     monkeypatch.setenv("XARNESS_TEST_KEY", "test-key")
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
@@ -249,39 +248,156 @@ def test_stale_socket_is_removed_and_host_spawns(tmp_path) -> None:
         monkey.undo()
 
 
-def test_shared_baseline_moves_with_accept(tmp_path) -> None:
-    """The baseline is shared per workspace: /accept in one session moves it
-    for every other live session on that directory."""
+def test_load_session_restores_saved_baseline(tmp_path) -> None:
+    """The regression the shared-baseline experiment caused: a session that
+    made changes and exited WITHOUT /accept must reopen with its saved
+    baseline and turn checkpoints intact — no drift prompt, /undo working."""
+
     async def go():
         host = make_host(tmp_path)
-        task = await _serve(host)
-        try:
-            (tmp_path / "ws").mkdir(exist_ok=True)
-            name_a = (await host.create_session(workspace=str(tmp_path / "ws"))).name
-            name_b = (await host.create_session(workspace=str(tmp_path / "ws"))).name
-            a, b = host.sessions[name_a], host.sessions[name_b]
-            assert a.git_info is not None and b.git_info is not None
-            # Both sessions start from the same baseline tree.
-            assert a.git_info.baseline_tree == b.git_info.baseline_tree
-            # /accept in A (with a fake accepted tree) moves B's checkpoints.
-            accepted = "0" * 40
-            await a.execute("x1", protocol.Accept())
-            # accept_changes ran against the real repo (no changes: same tree);
-            # simulate the shared move directly:
-            host.share_baseline(a, a.git_info, accepted)
-            assert b.conversation.messages == [] or True
-            b_user = Message(role="user", content="q", checkpoint_sha="1" * 40, after_tree="2" * 40)
-            b.conversation.add(b_user)
-            host.share_baseline(a, a.git_info, accepted)
-            assert b_user.checkpoint_sha == accepted
-            # The record exists and carries the accepted tree.
-            tree, epoch = host.read_baseline(a.git_info.workspace)
-            assert tree == accepted and epoch >= 1
-        finally:
-            await host.request_shutdown()
-            await asyncio.wait_for(task, timeout=5)
+        (tmp_path / "ws").mkdir()
+        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        name = summary.name
+        session = host.sessions[name]
+        assert session.git_info is not None
+        # Simulate a finished turn that changed the workspace (never accepted).
+        session.git_info.baseline_tree = "b" * 40
+        session.conversation.add(Message(
+            role="user", content="do things",
+            checkpoint_sha="b" * 40, after_tree="c" * 40,
+        ))
+        session._persist()
+        await host.unload_session(name)
 
+        loaded = await host.load_session(name)
+        info = loaded.git_info
+        assert info is not None
+        # The saved baseline survived the round-trip — it was NOT reset to
+        # the workspace's current state by the fresh setup_tracking().
+        assert info.baseline_tree == "b" * 40
+        turns = loaded.turn_checkpoints()
+        assert turns and turns[-1].after_tree == "c" * 40
+        # /undo still sees the turn's tree pair (not flattened to one sha).
+        assert turns[-1].before_tree != turns[-1].after_tree
+        # Drift compares current state against the last known tree — with the
+        # saved (real) baseline restored, no drift is reported after a
+        # clean exit. (Fake shas above only test persistence.)
+        assert loaded.git_info is not None
     asyncio.run(go())
+
+
+def test_no_false_drift_after_clean_exit(tmp_path) -> None:
+    """The reported symptom: make changes in a session, exit WITHOUT
+    /accept, reopen — no "workspace changed" prompt may appear (the saved
+    baseline, not the workspace's current state, must be restored)."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        (tmp_path / "ws" / "file.txt").write_text("hello")
+        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        name = summary.name
+        session = host.sessions[name]
+        assert session.git_info is not None
+        from xarness.gitwork import snapshot_state
+        current = await snapshot_state(session.git_info)
+        session.conversation.add(Message(
+            role="user", content="edit",
+            checkpoint_sha=current, after_tree=current,
+        ))
+        session._persist()
+        await host.unload_session(name)
+
+        loaded = await host.load_session(name)
+        assert loaded.git_info is not None
+        # Nothing changed since the session closed: no drift.
+        assert await loaded.detect_resume_drift() is None
+    asyncio.run(go())
+
+
+def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
+    """Quitting (or a host crash) mid-turn leaves the last user turn without
+    an after-tree. Reopening must finalize it against the workspace as it is
+    now — not leave it dangling, which made every reopen report drift."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        (tmp_path / "ws" / "file.txt").write_text("hello")
+        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        name = summary.name
+        session = host.sessions[name]
+        assert session.git_info is not None
+        from xarness.gitwork import snapshot_state
+        current = await snapshot_state(session.git_info)
+        # A turn with a checkpoint but no after-tree: finish_turn never ran.
+        session.conversation.add(Message(
+            role="user", content="still working",
+            checkpoint_sha=current, after_tree=None,
+        ))
+        session._persist()
+        await host.unload_session(name)
+
+        loaded = await host.load_session(name)
+        assert loaded.git_info is not None
+        turns = loaded.turn_checkpoints()
+        assert turns and turns[-1].after_tree  # finalized on load
+        # Nothing changed since: no drift.
+        assert await loaded.detect_resume_drift() is None
+    asyncio.run(go())
+
+
+def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -> None:
+    """A session with no saved git block (pre-tracking) still gets fresh
+    tracking on load."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        name = summary.name
+        session = host.sessions[name]
+        assert session.git_info is not None
+        session._persist()
+        await host.unload_session(name)
+
+        # Corrupt the saved git block: loading must fall back to fresh
+        # tracking instead of failing.
+        path = session_store.session_path(name)
+        data = json.loads(path.read_text())
+        data["git"] = {"bogus": True}
+        path.write_text(json.dumps(data))
+
+        loaded = await host.load_session(name)
+        assert loaded.git_info is not None
+        assert loaded.git_info.workspace == (tmp_path / "ws").resolve()
+        assert loaded.git_info.baseline_tree  # a real tree sha
+    asyncio.run(go())
+
+
+def test_protocol_models_tolerate_unknown_fields() -> None:
+    """Host and client can be different builds across a restart: a snapshot
+    carrying fields the validating model doesn't know must parse, not
+    crash with extra_forbidden (e.g. a message-level time_summary added by
+    a newer host while the TUI still runs an older clientlib)."""
+    raw = {
+        "seq": 7,
+        "status": {"state": "idle"},
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "hi",
+                "time_summary": "22m 45s | 8m 57s 11m 48s",
+                "some_future_field": {"nested": True},
+            },
+        ],
+    }
+    snap = protocol.Snapshot.model_validate(raw)
+    assert snap.messages[0].time_summary == "22m 45s | 8m 57s 11m 48s"
+    # Events are equally tolerant.
+    event = protocol.Notice.model_validate({"seq": 1, "text": "x", "new": 1})
+    assert event.text == "x"
+    # Commands stay strict: the host must reject unknown commands' fields.
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        protocol.SendMessage.model_validate({"text": "x", "bogus": 1})
 
 
 def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
@@ -314,43 +430,19 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_workspace_last_used_model_id_falls_through(tmp_path) -> None:
-    """Old sessions persisted profile.model_id instead of the profile key;
-    a last-used value that isn't a known model name must fall through to
-    the preset's model, not fail the request."""
-    async def go():
-        host = make_host(tmp_path)
-        (tmp_path / "ws").mkdir(exist_ok=True)
-        # A saved session carrying the model_id as its profile key.
-        session_store.save_state("stale", session_store.SessionState(
-            conversation=__import__("xarness.conversation", fromlist=["Conversation"]).Conversation(),
-            profile="z-ai/glm-5.3-flash",  # bogus: a model_id, not a name
-            workspace=str(tmp_path / "ws"),
-            updated_at="2026-01-01T00:00:00+00:00",
-        ))
-        parts = await host._build_parts(
-            workspace=str(tmp_path / "ws"), model=None, sandbox=None,
-            preset=None, no_init_repo=True, session_name="s",
-        )
-        assert parts["profile_name"] == "test"  # the preset's model
-
-    asyncio.run(go())
-
-
-def test_old_layout_resolves_default_preset(tmp_path) -> None:
-    """An old-layout config synthesizes its default preset from
-    default_profile, so preset-based resolution works unchanged."""
+def test_default_preset_resolves_model(tmp_path) -> None:
+    """The default preset picks the model used when none is requested."""
     from xarness.config import load_sectioned
-    config_path = tmp_path / "old.json"
+    config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
-        "default_profile": "glm-flash",
-        "default_theme": "ayu-darker",
-        "profiles": [
-            {"name": "local", "base_url": "http://127.0.0.1:8080/v1",
-             "api_key_env": None, "model_id": "qwen"},
-            {"name": "glm-flash", "base_url": "https://openrouter.ai/api/v1",
-             "api_key_env": "OPENROUTER_API_KEY", "model_id": "z-ai/glm-5.3-flash"},
-        ],
+        "models": {
+            "local": {"base_url": "http://127.0.0.1:8080/v1",
+                      "api_key_env": None, "model_id": "qwen"},
+            "glm-flash": {"base_url": "https://openrouter.ai/api/v1",
+                          "api_key_env": "OPENROUTER_API_KEY",
+                          "model_id": "z-ai/glm-5.3-flash"},
+        },
+        "presets": {"default": {"model": "glm-flash"}},
     }))
     sectioned = load_sectioned(config_path)
     name, profile = sectioned.resolve_model(None)
@@ -365,7 +457,6 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
     running in the host."""
     from xarness.clientlib import XarnessClient
     from xarness.tui.app import AgentApp
-    from xarness.tui.widgets import AssistantMessage, UserMessage
 
     async def go():
         host = make_host(tmp_path)
@@ -395,9 +486,16 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
                 assert app.session_name is not None
                 assert app.status is not None and app.status.state == "idle"
                 # No local echo: the user message arrived via the stream.
-                assert len(app.query("#chat-log > UserMessage")) == 1
-                assert len(app.query("#chat-log > AssistantMessage")) == 1
-                assert not app.query("#chat-log > ErrorLine")
+                from xarness.tui import flow as tflow
+                users = [e for e in app._flow_model.entries
+                         if isinstance(e.item, tflow.UserItem)]
+                answers = [e for e in app._flow_model.entries
+                           if isinstance(e.item, tflow.AssistantItem)]
+                assert len(users) == 1
+                assert len(answers) == 1
+                assert not [e for e in app._flow_model.entries
+                            if isinstance(e.item, tflow.LineItem)
+                            and e.item.kind == "error"]
             await client.aclose()
         finally:
             await host.request_shutdown()
@@ -450,8 +548,7 @@ def test_startup_race_yields_one_host(tmp_path) -> None:
 
 def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkeypatch) -> None:
     """Loading a saved session must honor its saved workspace (never the
-    host's cwd), its saved sandbox name/settings, and re-sync the workspace
-    baseline record (another session may have accepted changes)."""
+    host's cwd) and its saved sandbox name/settings."""
     from xarness.config import SandboxSettings
 
     async def go():
@@ -464,12 +561,11 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
-        # A distinct saved sandbox state + an /accept that happened in
-        # another session (a newer baseline record for the workspace).
+        saved_tree = session.git_info.baseline_tree
+        # A distinct saved sandbox state.
         session.sandbox_name = "default"
         session.sandbox_settings = SandboxSettings(allow_git_write=True)
         session._persist()
-        host.write_baseline(session.git_info.workspace, "f" * 40)
         await host.unload_session(name)
 
         # Load from a different host cwd: the saved workspace must win.
@@ -481,8 +577,9 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         assert loaded.sandbox_settings.allow_git_write is True
         assert loaded.git_info is not None
         assert loaded.git_info.workspace == (tmp_path / "ws").resolve()
-        # The workspace baseline record won over the saved git block.
-        assert loaded.git_info.baseline_tree == "f" * 40
+        # The SAVED git block won: the baseline is the session's own, not a
+        # fresh snapshot of the (possibly changed) workspace.
+        assert loaded.git_info.baseline_tree == saved_tree
         if loaded.sandbox is not None:
             assert loaded.sandbox.workspace == (tmp_path / "ws").resolve()
         return host

@@ -36,6 +36,8 @@ import os
 import re
 import shlex
 import tempfile
+from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -61,9 +63,6 @@ class RepoInfo:
 
     root: Path
     git_common_dir: Path  # shared .git dir — bound into the sandbox read-write
-    head_branch: str | None  # None when detached
-    base_ref: str | None  # commit sha; None = unborn HEAD (fine — snapshots
-    # are trees, not commits, so no baseline commit is needed anymore)
 
 
 @dataclass(slots=True)
@@ -160,32 +159,22 @@ async def _run_git(
 async def detect_repo(path: Path) -> RepoInfo | None:
     """Repo info for ``path``, or None if it isn't a git repo.
 
-    An unborn HEAD (``git init`` with no commits) is still a repo — it comes
-    back with ``base_ref=None``, which direct-write tracking handles fine
-    (snapshots are trees, so no baseline commit is needed).
     """
     path = Path(path).resolve()
-    rc, out, _ = await _run_git(["rev-parse", "--is-inside-work-tree"], cwd=path)
-    if rc != 0 or out.strip() != "true":
+    rc, out, _ = await _run_git(
+        ["rev-parse", "--is-inside-work-tree", "--show-toplevel",
+         "--git-common-dir"],
+        cwd=path,
+    )
+    if rc != 0 or out.splitlines()[0].strip() != "true":
         return None
-    rc, top, err = await _run_git(["rev-parse", "--show-toplevel"], cwd=path)
-    if rc != 0:
-        raise GitWorktreeError(f"could not find repo root: {err.strip()}")
-    rc, common, _ = await _run_git(["rev-parse", "--git-common-dir"], cwd=path)
-    if rc != 0:
-        raise GitWorktreeError("could not resolve the repo's git dir")
+    _, top, common = out.splitlines()
     common_dir = Path(common.strip())
     if not common_dir.is_absolute():
         common_dir = (path / common_dir).resolve()
-    rc, sha, _ = await _run_git(["rev-parse", "HEAD"], cwd=path)
-    base_ref = sha.strip() if rc == 0 else None  # unborn HEAD: no commits yet
-    rc, ref, _ = await _run_git(["branch", "--show-current"], cwd=path)
-    head_branch = ref.strip() or None if rc == 0 else None
     return RepoInfo(
         root=Path(top.strip()).resolve(),
         git_common_dir=common_dir,
-        head_branch=head_branch,
-        base_ref=base_ref,
     )
 
 
@@ -215,15 +204,23 @@ async def init_managed_repo(workspace: Path) -> RepoInfo:
 # tree snapshots (checkpoints + diff base)
 
 
-def _temp_index() -> str:
-    """Path of a throwaway index file for GIT_INDEX_FILE.
+@contextmanager
+def _temp_index():
+    """Yield the path of a throwaway index file for GIT_INDEX_FILE,
+    removing it afterwards.
 
-    The path must NOT exist — git refuses to read an empty file as an index
-    and wants to create it itself."""
+    The path must NOT exist while git runs — git refuses to read an empty
+    file as an index and wants to create it itself."""
     fd, name = tempfile.mkstemp(prefix="xarness-index-")
     os.close(fd)
     os.unlink(name)
-    return name
+    try:
+        yield name
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
 
 
 async def _git_ignored_paths(root: Path) -> tuple[str, ...]:
@@ -259,8 +256,7 @@ async def snapshot_tree(
     the resulting tree's paths are still repo-root relative.
     """
     root = Path(root).resolve()
-    index = _temp_index()
-    try:
+    with _temp_index() as index:
         env = {**os.environ, "GIT_INDEX_FILE": index}
         args = ["add", "-A"]
         pathspecs: list[str] = []
@@ -283,11 +279,6 @@ async def snapshot_tree(
         if rc != 0:
             raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
         return out.strip()
-    finally:
-        try:
-            os.unlink(index)
-        except OSError:
-            pass
 
 
 async def setup_tracking(
@@ -353,15 +344,6 @@ async def snapshot_state(info: GitInfo) -> str:
     return await snapshot_tree(info.workspace, info.subtree, exclude=info.ignored_paths)
 
 
-async def checkpoint(info: GitInfo) -> str:
-    """Snapshot the workspace's current state as a tree sha.
-
-    Used for both halves of a turn's checkpoint: the before-tree taken when
-    its user message is sent, and the after-tree recorded once its edits
-    finish. :func:`revert_turn` reverses the difference."""
-    return await snapshot_state(info)
-
-
 async def accept_changes(info: GitInfo) -> str:
     """Lock in every change made so far: snapshot the current state and make
     it the session's new baseline.
@@ -412,8 +394,7 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
             pass
 
     # Write the target tree's files back over the working tree.
-    index = _temp_index()
-    try:
+    with _temp_index() as index:
         env = {**os.environ, "GIT_INDEX_FILE": index}
         rc, _, err = await _run_git(["read-tree", tree], cwd=root, env=env)
         if rc != 0:
@@ -425,11 +406,6 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
             raise GitWorktreeError(
                 f"could not restore checkpoint {tree[:8]}: {err.strip()}"
             )
-    finally:
-        try:
-            os.unlink(index)
-        except OSError:
-            pass
 
 
 async def _wrap_commit(root: Path, tree: str, parent: str | None = None) -> str:
@@ -541,21 +517,6 @@ async def revert_turns(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None
     return None
 
 
-async def undo_last_turn(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None:
-    """Reverse the most recent turn, or do nothing when there is none.
-
-    The empty case is deliberate: with no turn since the baseline there is
-    nothing to reverse, and falling back to ``baseline_tree`` would destroy
-    every change made outside the session."""
-    if not turns:
-        return None
-    return await revert_turns(info, turns[-1:])
-
-
-# ----------------------------------------------------------------------
-# diff computation
-
-
 def _clean_numstat_path(raw: str) -> str:
     path = raw.strip()
     if path.startswith('"') and path.endswith('"') and len(path) >= 2:
@@ -611,15 +572,14 @@ def _parse_numstat(out: str) -> list[FileDiff]:
     return files
 
 
-# Snapshot trees are immutable, so a tree pair's diff and a tree's file list
-# never change once the objects exist. Cache them (keyed on the shas plus the
-# subtree, since paths are reported relative to it) so /diff stays cheap on
-# long sessions. Values are immutable, so callers can't corrupt the cache by
-# mutating what they get back. Bounded (oldest entry evicted) so a long-lived
-# process doesn't grow without end.
+# Snapshot trees are immutable, so a tree pair's diff never changes once the
+# objects exist. Cache it (keyed on the shas plus the subtree, since paths
+# are reported relative to it) so /diff stays cheap on long sessions. The
+# cached string is immutable, so callers can't corrupt the cache by mutating
+# what they get back. Bounded (oldest entry evicted) so a long-lived process
+# doesn't grow without end.
 _CACHE_LIMIT = 512
 _numstat_cache: dict[tuple[str, str, str], str] = {}
-_tree_files_cache: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def _cache_put(cache: dict, key, value):
@@ -629,40 +589,46 @@ def _cache_put(cache: dict, key, value):
 
 
 async def _numstat_between(info: GitInfo, base_tree: str, other_tree: str) -> str:
-    """Cached ``git diff --numstat`` between two snapshot trees."""
+    """Cached ``git diff --numstat --summary`` between two snapshot trees.
+
+    The ``--summary`` block marks created (and deleted/renamed) files, which
+    is where ``is_new`` comes from — no second ``ls-tree -r`` per tree."""
     key = (info.subtree, base_tree, other_tree)
     cached = _numstat_cache.get(key)
     if cached is None:
-        cached = await _diff_tree_pair(info, base_tree, other_tree, "--numstat")
+        cached = await _diff_tree_pair(
+            info, base_tree, other_tree, "--numstat", "--summary"
+        )
         _cache_put(_numstat_cache, key, cached)
     return cached
 
 
-async def _tree_files(info: GitInfo, tree: str) -> set[str]:
-    """Paths in a snapshot tree, subtree-relative when the session is scoped
-    (matching the paths ``--relative`` diffs report). Cached per tree."""
-    key = (info.subtree, tree)
-    cached = _tree_files_cache.get(key)
-    if cached is None:
-        rc, out, _ = await _run_git(
-            ["ls-tree", "--name-only", "-r", tree], cwd=info.workspace
-        )
-        names = set(out.splitlines()) if rc == 0 else set()
-        if info.subtree:
-            prefix = info.subtree + "/"
-            names = {n[len(prefix):] for n in names if n.startswith(prefix)}
-        cached = frozenset(names)
-        _cache_put(_tree_files_cache, key, cached)
-    return set(cached)
+def _created_paths(out: str, subtree: str = "") -> frozenset[str]:
+    """Paths the diff's ``--summary`` block reports as newly created.
+
+    Summary lines are always repo-root relative (``--relative`` does not
+    apply to them), so with a scoped subtree the prefix is stripped to make
+    them comparable to the numstat paths."""
+    created = set()
+    for line in out.splitlines():
+        if line.startswith(" create mode "):
+            path = line.rsplit(" ", 1)[-1]
+            if subtree:
+                prefix = subtree + "/"
+                if path.startswith(prefix):
+                    path = path[len(prefix):]
+            created.add(path)
+    return frozenset(created)
 
 
 async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffStat:
     """Per-file +/- counts between two snapshot trees, with ``is_new`` set
     relative to ``base_tree``."""
-    files = _parse_numstat(await _numstat_between(info, base_tree, other_tree))
-    base_files = await _tree_files(info, base_tree)
+    out = await _numstat_between(info, base_tree, other_tree)
+    files = _parse_numstat(out)
+    created = _created_paths(out, info.subtree)
     for f in files:
-        f.is_new = f.path not in base_files
+        f.is_new = f.path in created
     return DiffStat(files=files)
 
 

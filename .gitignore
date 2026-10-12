@@ -1,6 +1,4 @@
-config.json
-./*
+.*
+*_cache*
 *__pycache__*
 uv.lock
-rust/target
-xarness-rs/

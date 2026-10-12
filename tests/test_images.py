@@ -131,7 +131,7 @@ class TestOrderedWireFormat(unittest.TestCase):
         b = ImageAttachment(name="b.png", mime="image/png", data_b64="Qg==", width=3, height=3)
         message = Message(
             role="user",
-            content=f"compare [🖼 a.png 2×2] with [🖼 b.png 3×3]",
+            content="compare [🖼 a.png 2×2] with [🖼 b.png 3×3]",
             images=[a, b],
         )
         parts = message.to_wire()["content"]

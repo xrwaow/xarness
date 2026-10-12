@@ -15,14 +15,17 @@ import atexit
 import hashlib
 import os
 import shutil
-import subprocess
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .config import SandboxSettings
+    from .gitwork import GitInfo
 
 
 # Subdirectories of the persistent sandbox cache, created on demand.
@@ -39,6 +42,19 @@ _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
 # workspace-relative '.refs/<alias>' spelling; this is where they land.
 REFS_ANCHOR = "/tmp/refs"
 _REFS_PREFIX = ".refs"
+
+# Container anchor for shared toolchain state (caches, uv-managed pythons,
+# rustup). Everything the sandbox shares with the host is bound *under this
+# neutral path*, never at its real host path: a bind whose destination is
+# e.g. /home/<user>/... makes bwrap recreate that directory tree inside the
+# container, which leaks the host's username and layout and gives the agent
+# paths that only look like host paths. With everything anchored here the
+# container has no /home at all: nothing the agent can name — or list —
+# reveals the host layout. (One residual channel: /proc/self/mountinfo
+# shows bind sources; masking it is not worth the fragility. The
+# workspace's own files — .venv/pyvenv.cfg, .git/config — may contain host
+# paths too; that is the user's data.)
+CACHE_ANCHOR = "/cache"
 
 # Host paths bwrap creates as bind mountpoints inside the workspace (a
 # custom ref's target, e.g. a dropped-in ``.venv``). They are empty; removed
@@ -68,6 +84,36 @@ def _cleanup_mount_dirs() -> None:
                 p.unlink()
         except OSError:
             pass
+
+
+_ETC_SKELETON: Path | None = None
+
+
+def _etc_skeleton() -> Path:
+    """Host directory bound over /etc (read-only). Pre-creates every
+    mountpoint bwrap will bind into /etc (it cannot create mountpoints
+    inside a ro mount) and adds the minimal synthetic files the toolchain
+    needs — hosts (localhost), passwd/group (getpwuid; placeholder name,
+    the container's real uid/gid) — so nothing from the host's identity is
+    needed or leaked. The result: an /etc that carries no host identity and
+    is not writable."""
+    global _ETC_SKELETON
+    if _ETC_SKELETON is None:
+        root = Path(tempfile.mkdtemp(prefix="xarness-etc-"))
+        for sub in ("ssl", "pki", "alternatives"):
+            (root / sub).mkdir()
+        (root / "resolv.conf").touch()
+        uid, gid = os.getuid(), os.getgid()
+        (root / "passwd").write_text(
+            f"sandbox:x:{uid}:{gid}:sandbox:/tmp:/bin/sh\n"
+        )
+        (root / "group").write_text(f"sandbox:x:{gid}:\n")
+        (root / "hosts").write_text(
+            "127.0.0.1 localhost\n::1 localhost\n"
+        )
+        atexit.register(shutil.rmtree, root, True)
+        _ETC_SKELETON = root
+    return _ETC_SKELETON
 
 
 def cleanup_mount_dirs_now() -> None:
@@ -132,13 +178,8 @@ class SandboxConfig:
     """Paths and policy for one sandboxed session."""
 
     workspace: Path
-    # Workspace-root-relative subdirectory the session is scoped to ("" = the
-    # whole workspace). When set, the whole workspace is bound read-only (so
-    # git and the surrounding project stay visible) and only this subtree is
-    # re-bound read-write on top; the shell starts inside it.
-    subtree: str = ""
     # Read-only workspace (plan mode): the whole workspace is bound
-    # read-only, including any scoped subtree. Flipped by build_registry per
+    # read-only. Flipped by build_registry per
     # mode; a persistent SandboxSession restarts its shell when this changes.
     read_only: bool = False
     external_refs: dict[str, ContainerRef] = field(default_factory=dict)
@@ -179,15 +220,6 @@ class SandboxConfig:
         self.workspace = self.workspace.resolve()
         if not self.workspace.is_dir():
             raise SandboxUnavailable(f"workspace directory does not exist: {self.workspace}")
-        self.subtree = self.subtree.strip("/")
-        if self.subtree:
-            sub = Path(self.subtree)
-            if sub.is_absolute() or ".." in sub.parts:
-                raise SandboxUnavailable(f"invalid workspace subtree: {self.subtree}")
-            if not (self.workspace / self.subtree).is_dir():
-                raise SandboxUnavailable(
-                    f"workspace subtree directory does not exist: {self.subtree}"
-                )
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
     def ref_path(self, alias: str) -> str:
@@ -244,6 +276,11 @@ class SandboxConfig:
         mount = mount.strip("/")
         if not mount or ".." in Path(mount).parts:
             raise SandboxUnavailable(f"invalid ref mount point: {mount!r}")
+        if mount in (".", ".git") or mount.startswith(".git/"):
+            # '.' would mount over the workspace root; '.git' would shadow
+            # the harness's read-only git bind (the git guard assumes that
+            # mount stays ro).
+            raise SandboxUnavailable(f"ref mount point {mount!r} is not allowed")
         ref = ContainerRef(host=host_path, mount=mount, read_only=read_only)
         self.external_refs[alias] = ref
         return ref
@@ -252,7 +289,30 @@ class SandboxConfig:
         return self.external_refs.pop(alias, None) is not None
 
     # ------------------------------------------------------------------
-    # External references
+    # Config construction
+
+    @classmethod
+    def from_settings(
+        cls,
+        workspace: Path,
+        settings: "SandboxSettings",
+        git_info: "GitInfo | None" = None,
+    ) -> "SandboxConfig":
+        """Build a config from a config.SandboxSettings profile (shared by
+        Host._build_parts and Session._apply_sandbox_settings, which must
+        construct identical sandboxes)."""
+        return cls(
+            workspace=workspace,
+            allow_network=settings.allow_network,
+            gpu_access=settings.gpu_access,
+            use_container=settings.use_container,
+            filter_list=list(settings.filter_list),
+            timeout_seconds=settings.default_timeout,
+            external_refs=cls.resolve_auto_refs(
+                workspace, settings.auto_include_refs,
+            ),
+            git_dir=git_info.git_dir if git_info is not None else None,
+        )
 
     @staticmethod
     def resolve_auto_refs(
@@ -291,16 +351,12 @@ class SandboxConfig:
 
     @property
     def tool_root(self) -> str:
-        """Sandbox path the agent's workspace is anchored at: the scoped
-        subtree when one is set (the --workspace dir inside a bigger repo),
-        else the whole mounted workspace."""
-        return f"/workspace/{self.subtree}" if self.subtree else "/workspace"
+        """Sandbox path the agent's workspace is anchored at."""
+        return "/workspace"
 
     def tool_path(self, path: str) -> str:
         """Anchor a validated agent-workspace-relative path at its sandbox
-        mount point. Commands must not rely on the process cwd: with a
-        subtree session bwrap chdirs into the subtree, and tool paths are
-        relative to it (see validate_relpath).
+        mount point. Commands must not rely on the process cwd.
 
         Unsandboxed mode (use_container=False) has no container mount: paths
         resolve to the real workspace on the host."""
@@ -319,10 +375,12 @@ class SandboxConfig:
         enforcement — this just gives a clean error instead of a bwrap
         failure.
 
-        Paths are relative to the agent's workspace (the scoped subtree when
-        one is set, else the whole mounted workspace — see tool_path).
+        Paths are relative to the agent's workspace (see tool_path).
         Absolute paths and traversal are rejected in every mode, so a path
-        can never point outside the workspace's mount."""
+        can never point outside the workspace's mount. ``mode`` is accepted
+        for call-site symmetry (read_file/edit_file) — the check itself is
+        mode-independent, since the read-only mount already enforces plan
+        mode."""
         p = Path(path)
         if p.is_absolute():
             return f"path must be relative to the workspace, got absolute path '{path}'"
@@ -332,7 +390,17 @@ class SandboxConfig:
 
     def _system_ro_binds(self) -> list[str]:
         args: list[str] = []
-        for path in ("/usr", "/etc/resolv.conf", "/etc/ssl"):
+        # /etc first: a read-only skeleton with synthetic identity files and
+        # pre-created mountpoints (bwrap can't create mountpoints inside a
+        # ro mount), then the real DNS/TLS/trust files bound into it. The
+        # host's identity files (/etc/passwd, hostname, machine-id, …) don't
+        # exist in here — the container carries no trace of the host's user
+        # or name — and nothing under /etc is writable.
+        args += ["--ro-bind", str(_etc_skeleton()), "/etc"]
+        resolv = Path("/etc/resolv.conf")
+        if resolv.exists():
+            args += ["--ro-bind", str(resolv), "/etc/resolv.conf"]
+        for path in ("/usr", "/etc/ssl", "/etc/pki", "/etc/alternatives"):
             p = Path(path)
             if p.exists():
                 args += ["--ro-bind", str(p), str(p)]
@@ -350,59 +418,72 @@ class SandboxConfig:
         return args
 
     def _cache_binds_and_env(self) -> list[str]:
-        """Writable toolchain caches plus read-only toolchain homes, so uv,
-        pip, cargo and npm work inside the sandbox (offline installs from
-        warm caches, no writes leaking into the real HOME).
+        """Shared toolchain state, bound under the neutral CACHE_ANCHOR —
+        never at a host path, so the container has no /home and no trace of
+        the host layout. Sources are the host's real directories, so caches
+        are shared as-is and stay warm across sessions.
 
-        The cache root is bound at its real path (so the env vars below
-        point at valid in-sandbox locations and persist across sessions);
-        uv shares the host's ``~/.cache/uv`` directly; ``~/.rustup``,
-        ``~/.cargo`` and ``~/.local`` are bound read-only so rustup shims,
-        cargo, and user-installed tools (uv, pip) on PATH still resolve."""
+        Writable (rw): the sandbox cache root (pip/cargo/npm caches, project
+        venvs) and the host's own ``~/.cache/uv`` — content-addressed and
+        safe to share, already warm, so uv sync / uv run install offline
+        from day one, with no cache-warming step.
+
+        Read-only: uv-managed interpreters (``~/.local/share/uv/python``),
+        rustup (``~/.rustup``) and the tool binaries on PATH (``~/.cargo/bin``
+        and ``~/.local/bin``, prepended to PATH at their container paths).
+        The agent can read them, never write; anything a tool installs lands
+        in the writable caches."""
         root = sandbox_cache_root()
-        argv = ["--bind", str(root), str(root)]
+        anchor = CACHE_ANCHOR
+        argv = ["--bind", str(root), anchor]
         for var, sub in (
             ("PIP_CACHE_DIR", "pip"),
             ("CARGO_HOME", "cargo"),
             ("npm_config_cache", "npm"),
-        ):  # (UV_* envs are set below — see the comments there.)
-            argv += ["--setenv", var, f"{root}/{sub}"]
+        ):
+            argv += ["--setenv", var, f"{anchor}/{sub}"]
         argv += ["--setenv", "UV_LINK_MODE", "copy"]
-        # uv's cache is the host's own (~/.cache/uv), bound read-write: it's
-        # content-addressed and safe to share, and already warm — so uv sync
-        # / uv run install offline from day one, with no cache-warming step.
+        # The shell must not inherit a HOME that names a host path: '~' would
+        # point somewhere that looks meaningful but is empty (or, worse, a
+        # bind destination that recreates host layout). /tmp is the
+        # container's own writable tmpfs.
+        argv += ["--setenv", "HOME", "/tmp"]
+        # uv's cache is the host's own (~/.cache/uv), bound read-write.
         host_uv_cache = Path.home() / ".cache" / "uv"
         host_uv_cache.mkdir(parents=True, exist_ok=True)
-        argv += ["--bind", str(host_uv_cache), str(host_uv_cache)]
-        argv += ["--setenv", "UV_CACHE_DIR", str(host_uv_cache)]
+        argv += ["--bind", str(host_uv_cache), f"{anchor}/uv"]
+        argv += ["--setenv", "UV_CACHE_DIR", f"{anchor}/uv"]
         # uv's project env lives outside the workspace, keyed by the
         # workspace path: the project's own .venv has absolute paths baked
         # in for its real host location, which never matches the /workspace
-        # mount (or any subtree path) inside the sandbox — without this uv
-        # would try to rebuild .venv in the user's worktree, corrupting it.
-        # VIRTUAL_ENV is dropped for the same mismatch reason.
+        # mount inside the sandbox — without this uv would try to rebuild
+        # .venv in the user's worktree, corrupting it. VIRTUAL_ENV is
+        # dropped for the same mismatch reason.
         venv = root / "venvs" / hashlib.sha1(
-            str(self.workspace / self.subtree).encode()
+            str(self.workspace).encode()
         ).hexdigest()[:12]
         venv.mkdir(parents=True, exist_ok=True)
         argv += [
-            "--setenv", "UV_PROJECT_ENVIRONMENT", str(venv),
+            "--setenv", "UV_PROJECT_ENVIRONMENT", f"{anchor}/venvs/{venv.name}",
             "--unsetenv", "VIRTUAL_ENV",
         ]
         # Interpreter + discovery: match the host project venv's Python so
         # the wheels already in the host cache fit (e.g. host on 3.13 while
         # the sandbox's default `python3` is 3.14 — different wheel tags).
-        # And discover uv-managed interpreters where the host put them
-        # (~/.local/share/uv/python, covered by the read-only ~/.local
-        # bind), not the sandbox cache.
+        # uv-managed interpreters are the host's (~/.local/share/uv/python),
+        # read-only: discovery works, installs of new interpreters would
+        # need write access and fail — the writable UV_CACHE_DIR and
+        # UV_PROJECT_ENVIRONMENT cover everything uv must write.
         host_python_dir = Path.home() / ".local" / "share" / "uv" / "python"
         if host_python_dir.is_dir():
-            argv += ["--setenv", "UV_PYTHON_INSTALL_DIR", str(host_python_dir)]
+            argv += ["--ro-bind", str(host_python_dir), f"{anchor}/uv-python"]
+            argv += ["--setenv", "UV_PYTHON_INSTALL_DIR", f"{anchor}/uv-python"]
         host_venv_cfg = self.workspace / ".venv" / "pyvenv.cfg"
         try:
             for line in host_venv_cfg.read_text().splitlines():
-                if line.startswith("version"):
-                    argv += ["--setenv", "UV_PYTHON", line.split("=", 1)[1].strip()]
+                key, _, value = line.partition("=")
+                if key.strip() == "version":
+                    argv += ["--setenv", "UV_PYTHON", value.strip()]
                     break
         except OSError:
             pass
@@ -411,96 +492,102 @@ class SandboxConfig:
         # retries before failing).
         if not self.allow_network:
             argv += ["--setenv", "UV_OFFLINE", "1"]
+        # Toolchain homes, read-only, at container paths. RUSTUP_HOME is
+        # redirected so rustup shims find the toolchains; the shims
+        # themselves and other user-installed tools (uv, pip) come from the
+        # host bin dirs, bound read-only and prepended to PATH — the
+        # inherited PATH names host paths that do not exist in here.
         home = Path.home()
-        for name in (".rustup", ".cargo", ".local"):
-            p = home / name
-            if p.is_dir():
-                argv += ["--ro-bind", str(p), str(p)]
+        host_rustup = home / ".rustup"
+        if host_rustup.is_dir():
+            argv += ["--ro-bind", str(host_rustup), f"{anchor}/rustup"]
+            argv += ["--setenv", "RUSTUP_HOME", f"{anchor}/rustup"]
+        path_prepend: list[str] = []
+        cargo_bin = home / ".cargo" / "bin"
+        if cargo_bin.is_dir():
+            argv += ["--ro-bind", str(cargo_bin), f"{anchor}/cargo-bin"]
+            path_prepend.append(f"{anchor}/cargo-bin")
+        local_bin = home / ".local" / "bin"
+        if local_bin.is_dir():
+            argv += ["--ro-bind", str(local_bin), f"{anchor}/local-bin"]
+            path_prepend.append(f"{anchor}/local-bin")
+        if path_prepend:
+            # Keep only PATH entries that exist inside the container: the
+            # inherited PATH names host paths (~/..., toolchain dirs) that
+            # are not mounted — dead entries would only leak the host layout
+            # through env. /usr is bound wholesale, so /usr/* entries are
+            # real in here.
+            def _in_container(entry: str) -> bool:
+                return (entry == "/bin" or entry == "/sbin"
+                        or entry.startswith(("/usr/", "/bin/", "/sbin/", "/cache/"))
+                        and not entry.startswith("/usr/home"))
+            inherited = ":".join([
+                e for e in os.environ.get("PATH", "").split(":")
+                if _in_container(e)
+            ] or ["/usr/local/bin:/usr/bin"])
+            argv += ["--setenv", "PATH", ":".join([*path_prepend, inherited])]
         return argv
 
-    def build_argv(self, command: list[str]) -> list[str]:
-        if not self.use_container:
-            # Unsandboxed mode: a user-level stateful shell on the host —
-            # no bwrap, no mount isolation. The persistent shell starts in
-            # the workspace (see SandboxSession._ensure_started).
-            return list(command)
-        argv = ["bwrap"]
-        argv += self._system_ro_binds()
-        argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
-        if self.gpu_access:
-            # GPU compute: --dev above created an empty /dev, so bind the
-            # host's render/compute nodes back in (dev-bind: devices need
-            # more than read access). NVIDIA userland lives in /usr/lib(64),
-            # already bound read-only by _system_ro_binds.
-            gpu_devs = [
-                "/dev/dri", "/dev/kfd",
-                "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
-                "/dev/nvidia-modeset",
-                # Capability device nodes (nvidia-cap<N>): as a non-root user
-                # NVML is forced onto the caps path (/proc/driver/nvidia/
-                # capabilities → /dev/nvidia-caps/nvidia-cap<N>) and reports
-                # "GPU access blocked by the operating system" without them,
-                # even when the plain device nodes open fine.
-                "/dev/nvidia-caps",
-            ]
-            gpu_devs += sorted(str(p) for p in Path("/dev").glob("nvidia[0-9]*"))
-            for dev in gpu_devs:
-                p = Path(dev)
-                if p.is_dir():
-                    if any(p.iterdir()):
-                        argv += ["--dev-bind", dev, dev]
-                elif p.exists():
+    def _gpu_binds(self) -> list[str]:
+        """--dev-bind the host's GPU device nodes plus the driver sysfs the
+        CUDA/NVML userspace walks. Only called with ``gpu_access`` on."""
+        argv: list[str] = []
+        gpu_devs = [
+            "/dev/dri", "/dev/kfd",
+            "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
+            "/dev/nvidia-modeset",
+            # Capability device nodes (nvidia-cap<N>): as a non-root user
+            # NVML is forced onto the caps path (/proc/driver/nvidia/
+            # capabilities → /dev/nvidia-caps/nvidia-cap<N>) and reports
+            # "GPU access blocked by the operating system" without them,
+            # even when the plain device nodes open fine.
+            "/dev/nvidia-caps",
+        ]
+        gpu_devs += sorted(str(p) for p in Path("/dev").glob("nvidia[0-9]*"))
+        for dev in gpu_devs:
+            p = Path(dev)
+            if p.is_dir():
+                if any(p.iterdir()):
                     argv += ["--dev-bind", dev, dev]
-            # Driver enumeration paths (nvidia management, PCI/DRM topology
-            # walks by torch and friends). Read-only; missing ones skipped.
-            for sys_path in (
-                "/proc/driver/nvidia",
-                "/sys/bus/pci", "/sys/class/drm", "/sys/devices",
-            ):
-                if Path(sys_path).exists():
-                    argv += ["--ro-bind", sys_path, sys_path]
-            # CUDA (cuInit) hard-requires the kernel modules' sysfs state
-            # files: without /sys/module/nvidia/initstate it aborts with
-            # CUDA_ERROR_OS (304); without nvidia_uvm's, with UNKNOWN (999)
-            # — even though every device ioctl succeeds. Bind every nvidia*
-            # module dir the parent exposes.
-            for mod in sorted(Path("/sys/module").glob("nvidia*")):
-                if mod.is_dir():
-                    argv += ["--ro-bind", str(mod), str(mod)]
-            if _caps_unusable():
-                # NVML prefers the capability path (caps files →
-                # /dev/nvidia-caps/nvidia-cap<N>) and fails hard when those
-                # nodes are missing/unreadable. Shadow the caps directory so
-                # NVML falls back to direct device access, like on hosts
-                # without exposed caps — direct ioctls are unaffected.
-                empty_file, empty_dir = _shadow_placeholders()
-                argv += ["--bind", empty_dir, "/proc/driver/nvidia/capabilities"]
-        chdir = "/workspace"
-        if self.subtree:
-            # Whole workspace read-only — git keeps working (the .git file at
-            # the worktree root stays reachable) and the agent can read the
-            # surrounding project — with the session's subtree re-bound
-            # read-write on top (later binds shadow earlier ones).
-            argv += ["--ro-bind", str(self.workspace), "/workspace"]
-        else:
-            argv += ["--ro-bind" if self.read_only else "--bind",
-                     str(self.workspace), "/workspace"]
-        if self.subtree:
-            argv += [
-                "--ro-bind" if self.read_only else "--bind",
-                str(self.workspace / self.subtree), f"/workspace/{self.subtree}",
-            ]
-            chdir = f"/workspace/{self.subtree}"
+            elif p.exists():
+                argv += ["--dev-bind", dev, dev]
+        # Driver enumeration paths (nvidia management, PCI/DRM topology
+        # walks by torch and friends). Read-only; missing ones skipped.
+        for sys_path in (
+            "/proc/driver/nvidia",
+            "/sys/bus/pci", "/sys/class/drm", "/sys/devices",
+        ):
+            if Path(sys_path).exists():
+                argv += ["--ro-bind", sys_path, sys_path]
+        # CUDA (cuInit) hard-requires the kernel modules' sysfs state
+        # files: without /sys/module/nvidia/initstate it aborts with
+        # CUDA_ERROR_OS (304); without nvidia_uvm's, with UNKNOWN (999)
+        # — even though every device ioctl succeeds. Bind every nvidia*
+        # module dir the parent exposes.
+        for mod in sorted(Path("/sys/module").glob("nvidia*")):
+            if mod.is_dir():
+                argv += ["--ro-bind", str(mod), str(mod)]
+        if _caps_unusable():
+            # NVML prefers the capability path (caps files →
+            # /dev/nvidia-caps/nvidia-cap<N>) and fails hard when those
+            # nodes are missing/unreadable. Shadow the caps directory so
+            # NVML falls back to direct device access, like on hosts
+            # without exposed caps — direct ioctls are unaffected.
+            empty_file, empty_dir = _shadow_placeholders()
+            argv += ["--bind", empty_dir, "/proc/driver/nvidia/capabilities"]
+        return argv
+
+    def _filter_binds(self) -> list[str]:
+        """Shadow filter_list paths so they are simply not visible in the
+        container (a mount exclusion, not a gitignore)."""
+        argv: list[str] = []
         for rel in self.filter_list:
-            # Mount exclusions: shadowed with an existing host placeholder
-            # (empty file over files, empty dir over directories), so the
-            # path is simply not visible in the container (a mount exclusion,
-            # not a gitignore). No tmpfs: its mountpoint would be created
-            # inside the workspace bind, i.e. in the user's worktree. With
-            # tracking on, .git is always mounted and cannot be filtered.
-            # Paths that do not exist in the workspace are skipped: bwrap
-            # needs the mountpoint to exist, and creating one here would put
-            # a stray path in the user's worktree.
+            # Shadowed with an existing host placeholder (empty file over
+            # files, empty dir over directories), so no mountpoint is ever
+            # created inside the workspace bind — i.e. in the user's
+            # worktree. With tracking on, .git is always mounted and cannot
+            # be filtered. Paths that do not exist in the workspace are
+            # skipped: bwrap needs the mountpoint to exist.
             rel_path = self.workspace / rel.strip("/")
             if not rel_path.exists():
                 continue
@@ -510,6 +597,60 @@ class SandboxConfig:
                 argv += ["--ro-bind", empty_dir, target]
             else:
                 argv += ["--ro-bind", empty_file, target]
+        return argv
+
+    def _ref_binds(self) -> list[str]:
+        """The external-references mounts (part of build_argv; see the
+        REFS_ANCHOR note there for why the workspace bind must come first)."""
+        argv: list[str] = []
+        refs_anchor = False
+        for alias, ref in self.external_refs.items():
+            if ref.mount == _REFS_PREFIX or ref.mount.startswith(_REFS_PREFIX + "/"):
+                # The references area is a tmpfs nested under the
+                # container-only /tmp tmpfs (mounted at the top of
+                # build_argv — that ordering is what makes the anchor
+                # virtual: bwrap creates the mountpoint inside the tmpfs,
+                # so the host worktree is never touched, even transiently).
+                if not refs_anchor:
+                    argv += ["--tmpfs", REFS_ANCHOR]
+                    refs_anchor = True
+                target = REFS_ANCHOR + ref.mount[len(_REFS_PREFIX):]
+            else:
+                target = f"{self.tool_root}/{ref.mount}"
+                _note_mount_dir(self.workspace / ref.mount)
+            # Plan mode forces every ref read-only, like the rest of the
+            # workspace.
+            argv += ["--ro-bind" if (ref.read_only or self.read_only) else "--bind",
+                     str(ref.host), target]
+        return argv
+
+    def build_argv(self, command: list[str]) -> list[str]:
+        if not self.use_container:
+            # Unsandboxed mode: a user-level stateful shell on the host —
+            # no bwrap, no mount isolation. The persistent shell starts in
+            # the workspace (see SandboxSession._ensure_started).
+            return list(command)
+        argv = ["bwrap"]
+        # Clear the host environment before anything else: everything the
+        # toolchain needs is set explicitly below (see
+        # _cache_binds_and_env), and the inherited env would leak identity
+        # and secrets (USER, LOGNAME, XDG_RUNTIME_DIR, SSH_AUTH_SOCK,
+        # DBUS_*, API keys). Proxies are re-added for network mode at the
+        # bottom; --clearenv must precede every --setenv (bwrap processes
+        # options in order).
+        argv += ["--clearenv"]
+        argv += self._system_ro_binds()
+        argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+        if self.gpu_access:
+            # GPU compute: --dev above created an empty /dev, so bind the
+            # host's render/compute nodes back in (dev-bind: devices need
+            # more than read access). NVIDIA userland lives in /usr/lib(64),
+            # already bound read-only by _system_ro_binds.
+            argv += self._gpu_binds()
+        chdir = "/workspace"
+        argv += ["--ro-bind" if self.read_only else "--bind",
+                 str(self.workspace), "/workspace"]
+        argv += self._filter_binds()
         uv_lock = self.workspace / "uv.lock"
         if uv_lock.is_file():
             # Read-only: uv run may read the lock to build the project env
@@ -517,43 +658,36 @@ class SandboxConfig:
             # rewrite the user's lockfile from inside the sandbox.
             argv += ["--ro-bind", str(uv_lock), "/workspace/uv.lock"]
         if self.git_dir is not None:
-            # Same path as on the host, so git inside the sandbox resolves
-            # it unchanged. Read-only: the harness does all git writes.
-            # Only bindable when it lives inside the mounted workspace (a
-            # standalone repo): when the workspace is a subtree of a bigger
-            # repo, the git dir is outside the mount — and useless to the
-            # agent anyway, since it isn't an ancestor of /workspace — so
-            # binding it at its host path would only create stray container
-            # directories. Skip it.
+            # Bound read-only over the workspace bind (later binds shadow
+            # earlier ones) at its container path, so git reads work in
+            # write mode too while the agent never touches the index or
+            # object store — the harness checkpoints on the host (gitwork).
+            # Never bound at its host path: that destination would make
+            # bwrap recreate /home/<user>/... inside the container, leaking
+            # the host layout and giving the agent a fake project root.
+            # Only bindable when it lives inside the mounted workspace: when
+            # the workspace is a subtree of a bigger repo, the git dir is
+            # outside the mount — and useless to the agent anyway, since it
+            # isn't an ancestor of /workspace — so skip it.
             try:
-                self.git_dir.relative_to(self.workspace)
+                rel_git = self.git_dir.relative_to(self.workspace)
             except ValueError:
                 pass
             else:
-                argv += ["--ro-bind", str(self.git_dir), str(self.git_dir)]
+                argv += ["--ro-bind", str(self.git_dir),
+                         f"{self.tool_root}/{rel_git}"]
         argv += self._cache_binds_and_env()
-        refs_anchor = False
-        for alias, ref in self.external_refs.items():
-            if ref.mount == _REFS_PREFIX or ref.mount.startswith(_REFS_PREFIX + "/"):
-                # The references area is a tmpfs nested under the
-                # container-only /tmp tmpfs (mounted at the top of this
-                # function — that ordering is what makes the anchor virtual:
-                # bwrap creates the mountpoint inside the tmpfs, so the host
-                # worktree is never touched, even transiently).
-                if not refs_anchor:
-                    argv += ["--tmpfs", REFS_ANCHOR]
-                    refs_anchor = True
-                target = REFS_ANCHOR + ref.mount[len(_REFS_PREFIX):]
-            else:
-                target = f"{self.tool_root}/{ref.mount}"
-                _note_mount_dir((self.workspace / self.subtree / ref.mount)
-                                if self.subtree else (self.workspace / ref.mount))
-            # Plan mode forces every ref read-only, like the rest of the
-            # workspace.
-            argv += ["--ro-bind" if (ref.read_only or self.read_only) else "--bind",
-                     str(ref.host), target]
+        argv += self._ref_binds()
         argv += ["--chdir", chdir, "--unshare-all"]
+        # Fresh hostname: --unshare-all unshares the UTS ns but the host's
+        # hostname would still be inherited.
+        argv += ["--hostname", "sandbox"]
+        argv += ["--setenv", "LANG", "C.UTF-8"]
         if self.allow_network:
+            for var in ("http_proxy", "https_proxy", "no_proxy",
+                        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+                if var in os.environ:
+                    argv += ["--setenv", var, os.environ[var]]
             argv += ["--share-net"]
         argv += ["--die-with-parent", "--", *command]
         return argv
@@ -565,16 +699,6 @@ class SandboxResult:
     stdout: str
     stderr: str
     timed_out: bool = False
-
-
-GPU_PROBE_DEVICES = (
-    "/dev/nvidiactl", "/dev/dri", "/dev/kfd",
-)
-
-
-def _gpu_nodes_present() -> bool:
-    """Whether any GPU device node exists on the host (probe prerequisite)."""
-    return any(Path(p).exists() for p in GPU_PROBE_DEVICES)
 
 
 def _caps_unusable() -> bool:
@@ -589,92 +713,6 @@ def _caps_unusable() -> bool:
     if not nodes:
         return True
     return not all(os.access(p, os.R_OK) for p in nodes)
-
-
-def _module_sysfs_present(module: str = "nvidia") -> bool:
-    """Whether /sys/module/<module> is visible (CUDA init requires it)."""
-    return Path(f"/sys/module/{module}").is_dir()
-
-
-async def probe_gpu_access(config: SandboxConfig) -> tuple[str, str] | None:
-    """Verify GPU usability once ``gpu_access`` is on: run ``nvidia-smi -L``
-    inside a gpu-enabled sandbox.
-
-    bwrap can bind the device nodes, but a parent container's device cgroup
-    can still deny access (nested Docker/Podman without ``--gpus``); that
-    fails at ioctl time, so surface it up front instead of letting the
-    model's first CUDA call die mysteriously.
-
-    Returns (severity, message) — ``("info", ...)`` when CUDA answers,
-    ``("warn", ...)`` when nodes are bound but unusable — or None when there
-    is nothing to probe (no NVIDIA nodes, so nothing was bound)."""
-    if not _gpu_nodes_present():
-        return None
-    probe_config = SandboxConfig(
-        workspace=config.workspace,
-        subtree=config.subtree,
-        read_only=True,
-        gpu_access=True,
-    )
-    result = await run_in_sandbox(probe_config, ["nvidia-smi", "-L"])
-    output = (result.stderr or result.stdout).strip().splitlines()
-    detail = output[0].strip() if output else ""
-    if result.timed_out:
-        return ("warn", "GPU probe timed out (nvidia-smi hung inside the container)")
-    if detail.startswith("bwrap:"):
-        # The probe sandbox itself failed to start (mounting /proc, etc.) —
-        # not a GPU problem; report it verbatim so it's not confused with a
-        # driver issue.
-        return ("warn", f"GPU probe sandbox failed to start: {detail}")
-    if result.exit_code == 0:
-        nvml_ok = "GPU access verified: " + (detail or "nvidia-smi -L ok")
-        # nvidia-smi passing doesn't guarantee CUDA: cuInit needs the
-        # modules' sysfs state files (nvidia_uvm's included). Verify the
-        # compute path too so a green probe means green CUDA.
-        cuda = await run_in_sandbox(
-            probe_config,
-            ["python3", "-c",
-             "import ctypes,sys;c=ctypes.CDLL('libcuda.so.1');"
-             "c.cuInit.argtypes=[ctypes.c_int];"
-             "rc=c.cuInit(0);print('cuInit',rc);sys.exit(0 if rc==0 else 4)"],
-        )
-        cuda_out = (cuda.stderr or cuda.stdout).strip().splitlines()
-        if cuda.exit_code == 0:
-            return ("info", nvml_ok)
-        if not _module_sysfs_present("nvidia_uvm"):
-            return ("warn",
-                    "nvidia-smi works but CUDA init fails: "
-                    "/sys/module/nvidia_uvm is not visible to the parent "
-                    "container (cuInit aborts with CUDA_ERROR_UNKNOWN/304 "
-                    "without it). The parent must pass /sys/module read-only "
-                    "(e.g. -v /sys/module:/sys/module:ro)")
-        return ("warn", f"{nvml_ok}; but CUDA init failed "
-                        f"({'; '.join(cuda_out) or 'cuInit nonzero'})")
-    if _caps_unusable():
-        # Non-root NVML is forced onto the capability path: the caps files
-        # name device minors under /dev/nvidia-caps, and without (readable)
-        # nodes it bails with "GPU access blocked by the operating system"
-        # before ever touching the real device.
-        return ("warn",
-                "NVIDIA capability device nodes are missing or not readable "
-                "by this user: NVML requires readable "
-                "/dev/nvidia-caps/nvidia-cap<N> nodes, otherwise it refuses "
-                "GPU access. Fix on the host/parent: chmod a+r "
-                "/dev/nvidia-caps/nvidia-cap1 (nvidia-cap2 is usually "
-                "already readable) or run the parent container as root, "
-                "which bypasses the caps path")
-    if "blocked" in detail or "cgroup" in detail:
-        return ("warn",
-                "GPU nodes are bound but access is denied by the OS (device "
-                "cgroup) — is xarness running nested in a container? The "
-                "parent needs the GPU passed through (--gpus all / --device)")
-    if not _module_sysfs_present():
-        return ("warn",
-                "CUDA driver sysfs is not visible: /sys/module/nvidia is "
-                "missing, so cuInit/nvidia-smi abort with CUDA_ERROR_OS (304) "
-                "even though the device nodes work. The parent container must "
-                "pass /sys/module (or run xarness outside the container)")
-    return ("warn", f"GPU probe failed (nvidia-smi exit {result.exit_code}): {detail}")
 
 
 async def run_in_sandbox(
@@ -715,10 +753,13 @@ class SandboxSession:
 
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
-        self._read_only = config.read_only
         self._mount_key: tuple | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+
+    @property
+    def config(self) -> SandboxConfig:
+        return self._config
 
     async def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
@@ -731,7 +772,6 @@ class SandboxSession:
                 return
             await self.close()
         self._mount_key = self._config.mount_key
-        self._read_only = self._config.read_only
         argv = self._config.build_argv(["/bin/sh"])
         self._proc = await asyncio.create_subprocess_exec(
             *argv,

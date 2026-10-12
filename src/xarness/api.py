@@ -12,18 +12,17 @@ session mutates that state.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__, protocol
 from .host import Host
 from .protocol import (
-    CommandEnvelope, CommandResult, Event, Snapshot, SessionSummary,
+    CommandEnvelope, CommandResult, Snapshot, SessionSummary,
     ServerInfo, ServerStats,
 )
 from .session import Session, SessionError
@@ -40,6 +39,14 @@ def create_app(host: Host) -> FastAPI:
         ),
     )
     app.state.host = host
+
+    @app.exception_handler(SessionError)
+    async def _session_error_handler(request: Request, exc: SessionError):
+        """Every SessionError (bad request, unknown session, idle-only
+        violations) maps to one 400 with the message — handlers don't need
+        their own try/except."""
+        return JSONResponse(status_code=400, detail=str(exc))
+
     app.include_router(sessions_router(host))
     app.include_router(meta_router(host))
     _add_docs_only_schemas(app)
@@ -118,19 +125,17 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Create a session",
     )
     async def create_session(body: protocol.CreateSessionRequest) -> SessionSummary:
-        try:
-            session = await host.create_session(
-                workspace=body.workspace,
-                model=body.model,
-                sandbox=body.sandbox,
-                preset=body.preset,
-                no_init_repo=body.no_init_repo,
-                network=body.network,
-                gpu=body.gpu,
-                first_message=body.first_message,
-            )
-        except SessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        session = await host.create_session(
+            workspace=body.workspace,
+            model=body.model,
+            sandbox=body.sandbox,
+            preset=body.preset,
+            no_init_repo=body.no_init_repo,
+            network=body.network,
+            gpu=body.gpu,
+            no_session=body.no_session,
+            first_message=body.first_message,
+        )
         return host.summary_for(session)
 
     @router.post(
@@ -139,10 +144,7 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Host a saved session (idempotent)",
     )
     async def load_session(name: str) -> SessionSummary:
-        try:
-            session = await host.load_session(name)
-        except SessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        session = await host.load_session(name)
         return host.summary_for(session)
 
     @router.get(
@@ -163,7 +165,7 @@ def sessions_router(host: Host) -> APIRouter:
                     "text/event-stream. The first frame is `snapshot` (a "
                     "Snapshot); then `event` frames carrying Event models "
                     "(discriminated on `type`, see the Event schema). "
-                    "Reconnecting clients send Last-Event-ID."
+                    "Reconnects always receive a fresh snapshot."
                 ),
                 "content": {
                     "text/event-stream": {
@@ -175,10 +177,8 @@ def sessions_router(host: Host) -> APIRouter:
     )
     async def events(name: str, request: Request) -> StreamingResponse:
         session = await _session_or_load(host, name)
-        last_seq = request.headers.get("last-event-id")
-        last_seq_int = int(last_seq) if last_seq and last_seq.isdigit() else None
         return StreamingResponse(
-            _event_stream(session, last_seq_int),
+            _event_stream(session),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -198,10 +198,8 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Pending changes: summary and per-file diffs",
     )
     async def diff(name: str, path: str | None = None) -> protocol.DiffInfo:
-        try:
-            return await host.diff_info(await _session_or_load(host, name), path)
-        except SessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        session = await _session_or_load(host, name)
+        return await session.diff_info(path)
 
     @router.post(
         "/sessions/{name}/close",
@@ -218,10 +216,7 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Delete a saved session (idle only; the workspace is untouched)",
     )
     async def delete_session(name: str) -> CommandResult:
-        try:
-            return await host.delete_session(name)
-        except SessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await host.delete_session(name)
 
     return router
 
@@ -260,29 +255,17 @@ def meta_router(host: Host) -> APIRouter:
     return router
 
 
-async def _event_stream(
-    session: Session, last_seq: int | None,
-) -> AsyncIterator[str]:
-    """SSE frames: snapshot first (or replay after Last-Event-ID), then live."""
-    if last_seq is None:
-        # First attach: now is when resume drift is detected (never at load
-        # time — a drifted workspace with nobody attached must not report
-        # "waiting" nor keep the host alive).
-        await session.prompt_resume_drift()
-    if last_seq is not None:
-        missed = session.replay_after(last_seq)
-        if missed is not None:
-            # Replay only: the client already rendered up to last_seq.
-            queue: asyncio.Queue[Event] = asyncio.Queue()
-            session._subscribers.append(queue)
-            for event in missed:
-                yield _sse("event", event)
-        else:
-            snapshot, queue = session.subscribe()
-            yield _sse("snapshot", snapshot)
-    else:
-        snapshot, queue = session.subscribe()
-        yield _sse("snapshot", snapshot)
+async def _event_stream(session: Session) -> AsyncIterator[str]:
+    """SSE frames: a fresh snapshot first, then live events. Reconnects
+    always re-snapshot: on a local unix socket the only real disconnect is
+    host death, and replaying deltas across a history rewrite would corrupt
+    the transcript."""
+    # (Re)attach time is when resume drift is detected (never at load time —
+    # a drifted workspace with nobody attached must not report "waiting" nor
+    # keep the host alive). Idempotent: the check runs once per hosting.
+    await session.prompt_resume_drift()
+    snapshot, queue = session.subscribe()
+    yield _sse("snapshot", snapshot)
     try:
         while True:
             event = await queue.get()
@@ -298,9 +281,5 @@ def _sse(event_name: str, payload: Any) -> str:
         payload.model_dump_json()
         if hasattr(payload, "model_dump_json") else json.dumps(payload)
     )
-    seq = getattr(payload, "seq", None)
-    lines = [f"event: {event_name}"]
-    if seq:
-        lines.append(f"id: {seq}")
-    lines.append(f"data: {data}")
+    lines = [f"event: {event_name}", f"data: {data}"]
     return "\n".join(lines) + "\n\n"

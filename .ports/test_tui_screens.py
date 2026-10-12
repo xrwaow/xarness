@@ -218,12 +218,8 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
     async def test_resume_screen_lists_filters_and_selects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(session_store, "SESSIONS_DIR", Path(tmp)):
-                session_store.save_session(
-                    "alpha-chat", "alpha-model", Conversation()
-                )
-                session_store.save_session(
-                    "beta-chat", "beta-model", Conversation()
-                )
+                session_store.save_state("alpha-chat", session_store.SessionState(Conversation(), "alpha-model"))
+                session_store.save_state("beta-chat", session_store.SessionState(Conversation(), "beta-model"))
                 app = make_app([])
                 results: list[str | None] = []
                 async with app.run_test() as pilot:
@@ -255,13 +251,17 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
             with patch.object(session_store, "SESSIONS_DIR", tmp):
                 here = Path(tmp) / "wt"
                 here.mkdir()
-                session_store.save_session(
-                    "here-chat", "alpha-model", Conversation(), workspace=str(here),
+                session_store.save_state(
+                    "here-chat", session_store.SessionState(
+                        Conversation(), "alpha-model", workspace=str(here))
                 )
-                session_store.save_session(
-                    "there-chat", "alpha-model", Conversation(), workspace=str(tmp / "other"),
+                session_store.save_state(
+                    "there-chat", session_store.SessionState(
+                        Conversation(), "alpha-model", workspace=str(tmp / "other"))
                 )
-                session_store.save_session("nowhere-chat", "alpha-model", Conversation())
+                session_store.save_state(
+                    "nowhere-chat", session_store.SessionState(Conversation(), "alpha-model")
+                )
                 app = make_app([], workspace=here)
                 results: list[str | None] = []
                 async with app.run_test() as pilot:
@@ -284,7 +284,7 @@ class TestResume(unittest.IsolatedAsyncioTestCase):
                         reasoning_seconds=80.0,
                     )
                 )
-                session_store.save_session("my-session", "alpha-model", saved)
+                session_store.save_state("my-session", session_store.SessionState(saved, "alpha-model"))
 
                 app = make_app(
                     [ContentDelta("fresh reply"), TurnComplete(usage=Usage(10, 2))]

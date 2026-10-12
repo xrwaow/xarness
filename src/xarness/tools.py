@@ -12,12 +12,8 @@ edit_file). ask_user is available in both modes.
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 import json
-import os
-import shlex
-import signal
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -130,6 +126,10 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
+
+    def tools(self) -> list[Tool]:
+        """The registered tools, in registration order."""
+        return list(self._tools.values())
 
     def schema(self) -> list[dict[str, Any]]:
         return [
@@ -349,14 +349,21 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
             return err
 
         target = sandbox.tool_path(path)
-        exists = await run_in_sandbox(sandbox, ["test", "-e", target])
-        created = exists.exit_code != 0
-        write_result = await run_in_sandbox(
-            sandbox, ["tee", target], input_bytes=content.encode()
+        # One bwrap spawn, not two: report whether the file existed before
+        # ("created" vs "overwrote") and write it in the same shell. The
+        # content travels on stdin (tee), so no quoting issues.
+        result = await run_in_sandbox(
+            sandbox,
+            ["sh", "-c",
+             'if [ -e "$1" ]; then echo existing; else echo new; fi; '
+             'tee -- "$1" >/dev/null',
+             "write_file", target],
+            input_bytes=content.encode(),
         )
-        if write_result.exit_code != 0:
-            return _exec_error(write_result, "write failed")
-        verb = "created" if created else "overwrote"
+        if result.exit_code != 0:
+            return _exec_error(result, "write failed")
+        first_line, _, _rest = result.stdout.partition("\n")
+        verb = "overwrote" if first_line == "existing" else "created"
         loc = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return ToolResult(
             ok=True,
@@ -375,23 +382,14 @@ _MAX_EDIT_DIFF_LINES = 400
 def _collect_edits(
     args: dict[str, Any],
 ) -> tuple[list[tuple[str, str]], ToolResult | None]:
-    """Normalize the two accepted argument shapes into ``(old, new)`` pairs.
-
-    Preferred is an ``edits`` array (every change to the file in one call);
-    a bare top-level ``old_string``/``new_string`` pair is still accepted so
-    older transcripts and habits keep working.
-    """
+    """Validate the ``edits`` array into ``(old, new)`` pairs."""
     raw = args.get("edits")
     if raw is None:
-        old = args.get("old_string", "")
-        if not old:
-            return [], ToolResult(
-                ok=False,
-                error="provide 'edits' (a list of {old_string, new_string}) or a "
-                "single 'old_string'/'new_string' pair",
-                parse_error=True,
-            )
-        return [(old, args.get("new_string", ""))], None
+        return [], ToolResult(
+            ok=False,
+            error="provide 'edits' (a list of {old_string, new_string})",
+            parse_error=True,
+        )
     if not isinstance(raw, list) or not raw:
         return [], ToolResult(
             ok=False, error="'edits' must be a non-empty list", parse_error=True
@@ -544,19 +542,36 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
     return edit_file
 
 
+def _run_bash_description(session: SandboxSession) -> str:
+    """Generate run_bash's description from the session's actual settings."""
+    config = session.config
+    parts = ["Run a shell command inside the sandboxed workspace."]
+    if config.use_container:
+        parts.append(
+            "Network access is available."
+            if config.allow_network
+            else "No network access."
+        )
+    parts.append(
+        "The shell persists across calls within this chat — cwd and exported "
+        "variables carry over. The command's stdin is /dev/null, so "
+        "interactive commands read EOF instead of hanging."
+    )
+    parts.append(
+        "Branch/ref git operations (checkout <ref>, switch, worktree, "
+        "branch -d/-D, reset --hard, rebase) are rejected; read-only git "
+        "commands (status/diff/log/show/blame) work."
+    )
+    return " ".join(parts)
+
+
 def _make_run_bash_tool(
     session: SandboxSession,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> Tool:
     @tool(
         "run_bash",
-        "Run a shell command inside the sandboxed workspace. No network access. "
-        "The shell persists across calls within this chat — cwd and exported "
-        "variables carry over. The command's stdin is /dev/null, so "
-        "interactive commands read EOF instead of hanging. Branch/ref git "
-        "operations (checkout <ref>, switch, worktree, branch -d/-D, reset "
-        "--hard, rebase) are rejected; status/diff/log/show/blame/add/commit "
-        "work.",
+        _run_bash_description(session),
         required=("command",),
         command="string",
         timeout_seconds=(
@@ -632,9 +647,6 @@ def _make_ask_user_tool(
 
     return ask_user
 
-
-# ---------------------------------------------------------------------------
-# read-only exploration: ls / glob / grep (plan mode only)
 
 def build_registry(
     sandbox: SandboxConfig | None,

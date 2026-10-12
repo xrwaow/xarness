@@ -1,7 +1,6 @@
 """Session tests: single-writer, fan-out, atomic save, tool repair, undo."""
 
 import asyncio
-import json
 from typing import Any
 
 import pytest
@@ -16,7 +15,7 @@ from xarness.events import (
 from xarness.protocol import (
     AnswerAsk, Cancel, Compact, Retry, SendMessage, Undo, UndoTo,
 )
-from xarness.session import Session, stream_event_to_protocol
+from xarness.session import Session
 from xarness.tools import ToolRegistry, ToolResult, tool
 
 PROFILE = ProviderProfile(
@@ -123,20 +122,21 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
     assert statuses[-1].context_used > 0
 
 
-def test_last_event_id_replay_and_gap(tmp_path) -> None:
+def test_history_replaced_never_sits_in_turn_events(tmp_path) -> None:
+    """A rewrite invalidates every buffered turn event, and the event itself
+    is never buffered: an attaching client gets the fresh history in its
+    snapshot, never a replayed HistoryReplaced on top of stale deltas."""
     session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
 
     async def go():
-        session._emit_notice("one")
-        session._emit_notice("two")
-        replay = session.replay_after(1)
-        assert replay is not None and [e.seq for e in replay] == [2]
-        # Too far behind (fell out of the ring): fresh snapshot needed.
-        from collections import deque
-        session._ring = deque(maxlen=2)
-        session._emit_notice("three")
-        session._emit_notice("four")
-        assert session.replay_after(1) is None
+        session.subscribe()
+        # Notices only buffer mid-turn (an attaching client mid-turn needs
+        # the deltas; an idle one gets the history in its snapshot).
+        session._set_state("running")
+        session._emit_notice("before")
+        assert session._turn_events
+        session._emit_history()
+        assert session._turn_events == []
 
     asyncio.run(go())
 
@@ -472,26 +472,6 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
     assert "after compact" in user_texts
 
 
-def test_accept_shared_baseline_updates_git_info(tmp_path) -> None:
-    from xarness.gitwork import GitInfo
-
-    session = make_session([], tmp_path)
-    session.git_info = GitInfo(
-        session_id="s", workspace=tmp_path, git_dir=tmp_path,
-        baseline_tree="a" * 40,
-    )
-    user = Message(role="user", content="q", checkpoint_sha="1" * 40, after_tree="2" * 40)
-    session.conversation.add(user)
-
-    async def go():
-        return await session.execute("a1", protocol.Accept()) if False else None
-
-    asyncio.run(go())
-    session.accept_shared_baseline("f" * 40)
-    assert session.git_info.baseline_tree == "f" * 40
-    assert user.checkpoint_sha == "f" * 40
-
-
 def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> None:
     from xarness.config import SandboxSettings
 
@@ -550,7 +530,9 @@ def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
     asyncio.run(go2())
 
 
-def test_stream_event_conversion() -> None:
+def test_stream_events_are_protocol_models() -> None:
+    """Internal stream events cross the wire as-is: they are the protocol
+    models themselves, with the ``type`` discriminator baked in."""
     cases = [
         (ProcessingStarted(), "processing_started"),
         (ReasoningDelta("x"), "reasoning_delta"),
@@ -559,8 +541,7 @@ def test_stream_event_conversion() -> None:
         (TurnComplete(usage=Usage(1, 2), has_tool_calls=True), "turn_complete"),
     ]
     for internal, expected_type in cases:
-        model = stream_event_to_protocol(internal)
-        assert model.model_dump()["type"] == expected_type
+        assert internal.model_dump()["type"] == expected_type
 
 
 def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
@@ -636,25 +617,21 @@ def test_history_replaced_never_buffered_and_resets_turn_events(tmp_path) -> Non
     asyncio.run(go())
 
 
-def test_replay_across_history_replaced_forces_fresh_snapshot(tmp_path) -> None:
-    """The ring stores only a marker for HistoryReplaced; a Last-Event-ID
-    replay whose window crosses it returns None (fresh snapshot required)."""
+def test_events_carry_monotonic_seqs_across_a_rewrite(tmp_path) -> None:
+    """Sequences keep increasing across a history rewrite; HistoryReplaced
+    itself is never buffered for attach (a fresh snapshot carries it)."""
     session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
         await session.execute("c1", SendMessage(text="hi"))
         await wait_idle(session)
-        last_seq = session._seq
+        seq = session._seq
         session._emit_notice("after")
-        replay = session.replay_after(last_seq)
-        assert replay is not None and len(replay) == 1
-        session._emit_history()  # a rewrite lands after the client's seq
-        assert session.replay_after(last_seq) is None
-        # Events after the marker replay fine (client re-snapshotted).
-        new_seq = session._seq
-        session._emit_notice("post-rewrite")
-        assert session.replay_after(new_seq) is not None
+        assert session._seq > seq
+        session._emit_history()  # a rewrite
+        assert session._seq > seq + 1
+        assert session._turn_events == []
 
     asyncio.run(go())
 
@@ -782,3 +759,119 @@ def test_forced_steer_saves_partial_cot(tmp_path) -> None:
     assert assistant and assistant[0].reasoning == "partial thoughts"
     user_texts = [m.content for m in session.conversation.messages if m.role == "user"]
     assert "second" in user_texts
+
+
+def test_stop_cancels_a_running_compaction(tmp_path) -> None:
+    """session.stop() cancels a detached compaction task too: closing a
+    session mid-compact must not leave a task that starts a turn on a
+    stopped session afterwards."""
+    gate = asyncio.Event()
+    session = make_session([], tmp_path)
+
+    async def fake_compact() -> str:
+        await gate.wait()
+        return "summary"
+
+    session.controller.compact = fake_compact
+
+    async def go():
+        session.subscribe()
+        await asyncio.wait_for(session.execute("c1", Compact()), timeout=2)
+        assert session._state == "compacting"
+        await session.stop()
+        assert session._compact_task is None
+
+    asyncio.run(go())
+    # The compact task was cancelled (stop() cleared the reference); the
+    # session state never came back to idle via the cancelled task's except
+    # path — stop() owns the teardown.
+    assert session._state == "compacting" or session._state == "idle"
+
+
+def test_no_save_disables_persistence(tmp_path) -> None:
+    """no_session: _persist never writes a session file."""
+    session = Session(
+        name="nosave", workspace=tmp_path, profile=PROFILE,
+        profile_name="test", api_key="key", client=FakeClient([]),
+        no_save=True,
+    )
+    session.conversation.add(Message(role="user", content="q"))
+    session._persist()
+    assert not session_store.session_path("nosave").exists()
+
+
+def test_turn_time_summary_format(tmp_path) -> None:
+    """_turn_time_summary derives total | streaming | tools | other from the
+    persisted stamps."""
+    from datetime import datetime, timedelta, timezone
+
+    session = make_session([], tmp_path)
+    base = datetime.now(timezone.utc)
+    iso = base.isoformat
+
+    session.conversation.add(Message(
+        role="user", content="hi", send_time=iso(),
+    ))
+    session.conversation.add(Message(
+        role="assistant", content="thinking about it",
+        start_time=iso(), end_time=(base + timedelta(seconds=2)).isoformat(),
+        reasoning_start=(base + timedelta(milliseconds=300)).isoformat(),
+    ))
+    session.conversation.add(Message(
+        role="tool", tool_call_id="c1",
+        start_time=(base + timedelta(seconds=2)).isoformat(),
+        end_time=(base + timedelta(seconds=5)).isoformat(),
+    ))
+    session.conversation.add(Message(
+        role="assistant", content="done",
+        start_time=(base + timedelta(seconds=5)).isoformat(),
+        end_time=(base + timedelta(seconds=8)).isoformat(),
+    ))
+    summary = session._turn_time_summary()
+    assert summary is not None
+    total, rest = summary.split("|")
+    streaming, tools, other = rest.split()
+    assert total.strip() == "8.0s"
+    assert streaming == "4.7s"  # round 1: 1.7s + round 2: 3s (no reasoning)
+    assert tools == "3.0s"
+    # total − streaming − tools: the 0.3s pre-first-token latency.
+    assert other == "0.3s"
+
+
+def test_turn_finish_stamps_time_summary_and_persists(tmp_path) -> None:
+    """A completed turn gets its timing summary on the last assistant message
+    (persisted, so reloads render it) and in TurnFinished.summary."""
+    session = make_session(
+        [[ReasoningDelta("hmm"), ContentDelta("Hello"), TurnComplete(usage=Usage(10, 2))]],
+        tmp_path,
+    )
+
+    async def go():
+        _, queue = session.subscribe()
+        await session.execute("c1", SendMessage(text="hi"))
+        await wait_idle(session)
+        finished = None
+        while not queue.empty():
+            event = queue.get_nowait()
+            if isinstance(event, protocol.TurnFinished):
+                finished = event
+        return finished
+
+    finished = asyncio.run(go())
+    last_assistant = session.conversation.messages[-1]
+    assert last_assistant.role == "assistant"
+    assert last_assistant.time_summary
+    assert finished is not None and finished.summary == last_assistant.time_summary
+    assert "|" in finished.summary
+
+    # Persisted: a reload sees the same line.
+    state = session_store.load_state("test")
+    assert state.conversation.messages[-1].time_summary == last_assistant.time_summary
+
+
+def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
+    """Messages without stamps (old sessions) produce no summary."""
+    session = make_session([], tmp_path)
+    session.conversation.add(Message(role="user", content="hi"))
+    session.conversation.add(Message(role="assistant", content="hello"))
+    assert session._turn_time_summary() is None

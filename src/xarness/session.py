@@ -24,97 +24,86 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field  # noqa: F401
-
 from . import protocol
 from .config import (
-    ConfigError, ProviderProfile, load_all_profiles, resolve_api_key,
+    ConfigError, ProviderProfile, SandboxSettings, load_sectioned, resolve_api_key,
 )
 from .conversation import Conversation, Message, ToolCall
+from .conversation import SUMMARY_PREFIX
 from .controller import ChatController, RollbackPlan
-from .events import (
-    ContentDelta, ReasoningDelta, StreamError, StreamEvent, ToolCallStatus,
-    ToolCallArgumentsDelta, ToolCallArgumentsDone, ToolCallStarted,
-    TurnComplete, Usage,
-)
+from .events import StreamEvent
 from .gitwork import (
     DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
     attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
-    tree_diff_stat,
+    snapshot_state,
 )
 from .images import ImageAttachment
 from .prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from .protocol import (
     Command, CommandResult, Event, Snapshot, StatusPayload,
 )
-from .sandbox import SandboxConfig, SandboxSession
+from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
 from . import session_store
-from .session_store import SessionState
-from .tools import ToolResult, build_registry
+from .session_store import SessionState, load_state
+from .tools import build_registry
+from .util import format_duration, utcnow_iso as _utcnow
 
 # How many recent cmd_ids are remembered for dedupe (client retries must
 # not double-send a command).
 CMD_DEDUPE_LIMIT = 128
 
-# Events kept for Last-Event-ID replay. Sized to cover a full turn of
-# deltas comfortably; beyond that, clients get a fresh snapshot.
-RING_SIZE = 4096
-
 State = Literal["idle", "running", "compacting"]
 
-
-class _HistoryMarker:
-    """Ring placeholder for a HistoryReplaced event (a full snapshot).
-
-    The event itself is never stored in the ring or the turn buffer; a
-    client replaying across the marker is forced to take a fresh snapshot."""
-
-    __slots__ = ("seq",)
-
-    def __init__(self, seq: int) -> None:
-        self.seq = seq
+# Internal stream events are protocol models (defined in xarness.events,
+# re-exported by xarness.protocol), so no conversion step is needed.
 
 
 class SessionError(Exception):
     """A command was rejected (busy, unknown target, git failure, …)."""
 
 
-def _utcnow() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+def _ok(payload: dict[str, Any] | None = None) -> CommandResult:
+    """A successful command result. ``cmd_id`` is stamped by the inbox."""
+    return CommandResult(cmd_id="", ok=True, payload=payload)
 
 
-def stream_event_to_protocol(event: StreamEvent) -> Event:
-    """Convert an internal stream dataclass into its protocol model."""
-    if isinstance(event, ReasoningDelta):
-        return protocol.ReasoningDelta(text=event.text)
-    if isinstance(event, ContentDelta):
-        return protocol.ContentDelta(text=event.text)
-    if isinstance(event, TurnComplete):
-        return protocol.TurnComplete(
-            usage=protocol.UsageModel.from_usage(event.usage),
-            reasoning_seconds=event.reasoning_seconds,
-            has_tool_calls=event.has_tool_calls,
-        )
-    if isinstance(event, StreamError):
-        return protocol.StreamError(message=event.message)
-    if isinstance(event, ToolCallStarted):
-        return protocol.ToolCallStarted(call_id=event.call_id, name=event.name)
-    if isinstance(event, ToolCallArgumentsDelta):
-        return protocol.ToolCallArgumentsDelta(call_id=event.call_id, text=event.text)
-    if isinstance(event, ToolCallArgumentsDone):
-        return protocol.ToolCallArgumentsDone(
-            call_id=event.call_id, name=event.name, arguments_json=event.arguments_json,
-        )
-    # ProcessingStarted carries no fields; anything else is a bug.
-    if type(event).__name__ == "ProcessingStarted":
-        return protocol.ProcessingStarted()
-    raise TypeError(f"unexpected stream event: {event!r}")
+async def _cancel_and_wait(task: asyncio.Task[None] | None) -> None:
+    """Cancel a task (if any) and let it unwind, swallowing cancellation."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - stopping must never raise
+        pass
+
+
+def _parse_iso(stamp: str | None) -> "datetime | None":
+    """Parse one of the ISO stamps carried on messages (None on failure)."""
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+
+
+def _is_summary_message(message: Message) -> bool:
+    """True for the summary user message a compaction leaves behind."""
+    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
+
+
+def _convert_stream_event(event: StreamEvent) -> Event:
+    """Stream events are protocol models — the conversion is the identity."""
+    return event
 
 
 class Session:
@@ -136,10 +125,10 @@ class Session:
         auto_compact: bool = False,
         tool_output_limit: int | None = None,
         client: Any = None,
-        ring_size: int = RING_SIZE,
         sandbox_name: str | None = None,
-        sandbox_settings: Any = None,
+        sandbox_settings: "SandboxSettings | None" = None,
         config_path: Path | None = None,
+        no_save: bool = False,
     ) -> None:
         self.name = name
         self.workspace = workspace
@@ -158,9 +147,9 @@ class Session:
         # config's sandbox profiles; fixed except via /sandbox or /filter).
         self.sandbox_name = sandbox_name
         self.sandbox_settings = sandbox_settings
-        self.allow_git_write = bool(getattr(sandbox_settings, "allow_git_write", False))
-        self.enable_tracking = bool(getattr(sandbox_settings, "enable_tracking", True))
-
+        self.allow_git_write = (
+            sandbox_settings.allow_git_write if sandbox_settings else False
+        )
         self.tool_registry = build_registry(
             sandbox, sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
@@ -192,10 +181,6 @@ class Session:
         # Set when a turn finishes with no subscriber attached; surfaced to
         # the next client that attaches ("finished while you were away").
         self._finished_while_away = False
-        # Host-provided hook: after /accept here, the host moves the shared
-        # per-workspace baseline record and updates the other live sessions
-        # of that workspace.
-        self.baseline_callback: Callable[["Session", GitInfo, str], None] | None = None
         # Host-provided hook: called whenever the session may have gone
         # fully inactive (idle, no subscribers, no pending ask) so the host
         # can persist and release it.
@@ -204,10 +189,16 @@ class Session:
         # never at load time (a drifted workspace with nobody attached must
         # not hold the host open or report "waiting").
         self._drift_checked = False
+        # no_session: the client asked for an unsaved conversation — _persist
+        # becomes a no-op and nothing is ever written to the session store.
+        self.no_save = no_save
+
+        # Debounced background persistence (see _persist).
+        self._persist_dirty = False
+        self._persist_task: asyncio.Task[None] | None = None
 
         # Fan-out.
         self._subscribers: list[asyncio.Queue[Event]] = []
-        self._ring: deque[Event] = deque(maxlen=ring_size)
         self._seq = 0
         self._turn_events: list[Event] = []
 
@@ -219,33 +210,6 @@ class Session:
 
     # ------------------------------------------------------------------
     # construction
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        name: str,
-        workspace: Path,
-        profile: ProviderProfile,
-        profile_name: str | None,
-        api_key: str | None,
-        config_path: Path | None = None,
-        sandbox: SandboxConfig | None = None,
-        sandbox_session: SandboxSession | None = None,
-        git_info: GitInfo | None = None,
-        auto_compact: bool = False,
-        tool_output_limit: int | None = None,
-        sandbox_name: str | None = None,
-        sandbox_settings: Any = None,
-    ) -> "Session":
-        return cls(
-            name=name, workspace=workspace, profile=profile,
-            profile_name=profile_name, api_key=api_key,
-            config_path=config_path, sandbox=sandbox,
-            sandbox_session=sandbox_session, git_info=git_info,
-            auto_compact=auto_compact, tool_output_limit=tool_output_limit,
-            sandbox_name=sandbox_name, sandbox_settings=sandbox_settings,
-        )
 
     @classmethod
     def load(
@@ -263,11 +227,16 @@ class Session:
         tool_output_limit: int | None = None,
         workspace: Path | None = None,
         sandbox_name: str | None = None,
-        sandbox_settings: Any = None,
+        sandbox_settings: "SandboxSettings | None" = None,
+        state: "SessionState | None" = None,
     ) -> "Session":
-        """Host a saved session: load its conversation and rebind tracking."""
-        from .session_store import load_state
-        state = load_state(name)
+        """Host a saved session: load its conversation and rebind tracking.
+
+        ``state`` may carry an already-loaded SessionState (the host loads it
+        to resolve the workspace before calling this); it is loaded here only
+        when not given."""
+        if state is None:
+            state = load_state(name)
         if not state.workspace and workspace is None:
             raise SessionError(
                 f"saved session {name!r} has no workspace recorded"
@@ -275,7 +244,7 @@ class Session:
         session = cls(
             name=name,
             workspace=Path(state.workspace) if state.workspace else workspace,
-            profile=profile, profile_name=state.profile or profile_name,
+            profile=profile, profile_name=profile_name,
             api_key=api_key, config_path=config_path,
             conversation=state.conversation,
             sandbox=sandbox, sandbox_session=sandbox_session,
@@ -284,6 +253,9 @@ class Session:
             sandbox_name=sandbox_name, sandbox_settings=sandbox_settings,
         )
         session.ensure_system_message()
+        # A session saved mid-turn can carry tool calls with no result; give
+        # them synthetic answers so the next request is valid.
+        session._repair_tool_calls()
         return session
 
     # ------------------------------------------------------------------
@@ -302,14 +274,11 @@ class Session:
             self._inbox_task = loop.create_task(self._run_inbox())
 
     async def stop(self) -> None:
-        """Stop the inbox loop and cancel a running turn."""
+        """Stop the inbox loop and cancel a running turn or compaction."""
         self._closed = True
-        if self._turn_task is not None and not self._turn_task.done():
-            self._turn_task.cancel()
-            try:
-                await self._turn_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await _cancel_and_wait(self._turn_task)
+        await _cancel_and_wait(self._compact_task)
+        self._compact_task = None
         if self._inbox_task is not None:
             self._inbox_task.cancel()
             try:
@@ -317,6 +286,51 @@ class Session:
             except asyncio.CancelledError:
                 pass
             self._inbox_task = None
+        await self._flush_persist()
+        # Release the provider connection pool.
+        client = getattr(self.controller, "_client", None)
+        if client is not None and hasattr(client, "aclose"):
+            await client.aclose()
+
+    @property
+    def is_active(self) -> bool:
+        """True while running, compacting, waiting on an ask, or holding an
+        open event stream.
+
+        A pending drift WITHOUT an attached client does not count: nothing
+        can resolve it, so it must neither report "waiting" nor keep the
+        host alive (the prompt is (re)computed when a client attaches)."""
+        return (
+            self._state != "idle"
+            or self._pending_ask is not None
+            or bool(self._subscribers)
+        )
+
+    async def shutdown(self, notice: str | None = None) -> None:
+        """Close the session for good: cancel a running turn, stop the loops
+        and sandbox shell, emit the closing notices, and release every
+        subscriber. Used by the host's delete/unload paths."""
+        await self.stop()
+        if notice:
+            self._emit(protocol.Notice(text=notice, level="info"))
+        self._emit(protocol.SessionDeleted(name=self.name))
+        for queue in list(self._subscribers):
+            self.unsubscribe(queue)
+
+    @property
+    def state(self) -> "State":
+        return self._state
+
+    @property
+    def pending_ask(self) -> "protocol.PendingAsk | None":
+        if self._pending_ask is None:
+            return None
+        ask_id, questions, _ = self._pending_ask
+        return protocol.PendingAsk(ask_id=ask_id, questions=questions)
+
+    @property
+    def pending_drift(self) -> bool:
+        return self._pending_drift is not None
 
     @property
     def conversation(self) -> Conversation:
@@ -336,10 +350,6 @@ class Session:
             # snapshot — buffering it would render history twice). The
             # buffer simply resets.
             self._turn_events.clear()
-            # The ring gets a marker, not the event: replaying a client
-            # across a rewrite must force a fresh snapshot (a replayed
-            # HistoryReplaced would double-render on top of stale deltas).
-            self._ring.append(_HistoryMarker(seq=self._seq))
         else:
             # UserMessageAdded is never buffered (the message is already in
             # the conversation — buffering it would render it twice on a
@@ -350,7 +360,6 @@ class Session:
                 event, (protocol.UserMessageAdded, protocol.TurnFinished)
             ):
                 self._turn_events.append(event)
-            self._ring.append(event)
         for queue in self._subscribers:
             queue.put_nowait(event)
         return event
@@ -382,23 +391,6 @@ class Session:
         except Exception:  # noqa: BLE001 - a host hook must not kill turns
             pass
 
-    def replay_after(self, last_seq: int) -> list[Event] | None:
-        """Events after ``last_seq`` from the ring, or None on a gap.
-
-        None means the client is too far behind (its events fell out of the
-        ring) and must take a fresh snapshot instead."""
-        if not self._ring:
-            return [] if last_seq == self._seq else None
-        oldest = self._ring[0].seq
-        if last_seq + 1 < oldest:
-            return None
-        events = [event for event in self._ring if event.seq > last_seq]
-        if any(isinstance(event, _HistoryMarker) for event in events):
-            # The client's window crosses a history rewrite: replaying the
-            # deltas would corrupt the transcript. Force a fresh snapshot.
-            return None
-        return events
-
     @property
     def clients_attached(self) -> int:
         return len(self._subscribers)
@@ -407,9 +399,7 @@ class Session:
     # snapshots and status
 
     def status(self) -> StatusPayload:
-        last_usage = next(
-            (m.usage for m in reversed(self.conversation.messages) if m.usage), None
-        )
+        last_usage = self.controller.last_usage
         pending_ask = None
         if self._pending_ask is not None:
             ask_id, questions, _ = self._pending_ask
@@ -445,31 +435,24 @@ class Session:
             enable_tracking=self.git_info is not None,
             total_in=self.controller.usage_total.input_tokens,
             total_out=self.controller.usage_total.output_tokens,
-            last_in=last_usage.input_tokens if last_usage else 0,
-            last_out=last_usage.output_tokens if last_usage else 0,
-            context_used=(last_usage.input_tokens if last_usage else 0)
-            + (last_usage.output_tokens if last_usage else 0),
+            last_in=last_usage.input_tokens,
+            last_out=last_usage.output_tokens,
+            context_used=last_usage.input_tokens + last_usage.output_tokens,
             queued=[protocol.QueuedMessage(text=text) for text, _, _ in self._queued],
             pending_ask=pending_ask,
             pending_drift=pending_drift,
             clients_attached=self.clients_attached,
-            tools=[t["function"]["name"] for t in self.tool_registry.schema()],
+            tools=[tool.name for tool in self.tool_registry.tools()],
             finished_while_away=self._finished_while_away,
         )
 
     def snapshot(self) -> Snapshot:
-        """Full client-facing state (synchronous; see :meth:`subscribe`)."""
-        messages = [
-            protocol.message_to_model(m) for m in self.conversation.messages
-        ]
-        compact = [
-            protocol.message_to_model(m)
-            for m in (self.conversation.compact_snapshot or [])
-        ]
+        """Full client-facing state (synchronous; see :meth:`subscribe`).
+        Messages are pydantic models, so they go over the wire as-is."""
         return Snapshot(
             seq=self._seq,
-            messages=messages,
-            compact_snapshot=compact,
+            messages=list(self.conversation.messages),
+            compact_snapshot=list(self.conversation.compact_snapshot or []),
             turn_start=self.conversation.turn_start,
             status=self.status(),
             turn_events=list(self._turn_events),
@@ -596,14 +579,15 @@ class Session:
     # commands
 
     async def _cmd_send(self, command: protocol.SendMessage) -> CommandResult:
-        images = protocol.images_from_model(command.images)
+        # SendMessage.images validates straight into ImageAttachment models.
+        images = command.images or None
         if self._state != "idle":
             # Steering: queued until the next round boundary (or turn end).
             self._queued.append((command.text, images, _utcnow()))
             self._emit_status()
-            return CommandResult(cmd_id="", ok=True, payload={"queued": True})
+            return _ok(payload={"queued": True})
         self._start_turn(command.text, images)
-        return CommandResult(cmd_id="", ok=True, payload={"started": True})
+        return _ok(payload={"started": True})
 
     def _start_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
         # Set synchronously, BEFORE create_task: the inbox can dispatch the
@@ -617,12 +601,12 @@ class Session:
 
     def _cmd_cancel(self) -> CommandResult:
         if self._state == "idle":
-            return CommandResult(cmd_id="", ok=True, payload={"cancelled": False})
+            return _ok(payload={"cancelled": False})
         if self._turn_task is not None:
             self._turn_task.cancel()
         if self._compact_task is not None:
             self._compact_task.cancel()
-        return CommandResult(cmd_id="", ok=True, payload={"cancelled": True})
+        return _ok(payload={"cancelled": True})
 
     def _cmd_answer_ask(self, command: protocol.AnswerAsk) -> CommandResult:
         pending = self._pending_ask
@@ -637,7 +621,7 @@ class Session:
             ask_id=command.ask_id, answers=command.answers,
         ))
         self._notify_idle()
-        return CommandResult(cmd_id="", ok=True)
+        return _ok()
 
     async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
         if self._pending_drift is None:
@@ -666,23 +650,23 @@ class Session:
                 "shows up in /diff"
             )
         self._notify_idle()
-        return CommandResult(cmd_id="", ok=True)
+        return _ok()
 
     def _cmd_discard_queued(self) -> CommandResult:
         if not self._queued:
-            return CommandResult(cmd_id="", ok=True, payload={"discarded": 0})
+            return _ok(payload={"discarded": 0})
         text, _, _ = self._queued.pop(0)
         self._emit_status()
-        return CommandResult(cmd_id="", ok=True, payload={"discarded": 1, "text": text})
+        return _ok(payload={"discarded": 1, "text": text})
 
     def _cmd_flush_queued(self) -> CommandResult:
         """Send the oldest queued message now: cancel the running turn; the
         turn loop's cleanup starts the queued message immediately."""
         if self._state == "idle" or not self._queued:
-            return CommandResult(cmd_id="", ok=True, payload={"flushed": False})
+            return _ok(payload={"flushed": False})
         if self._turn_task is not None:
             self._turn_task.cancel()
-        return CommandResult(cmd_id="", ok=True, payload={"flushed": True})
+        return _ok(payload={"flushed": True})
 
     async def _cmd_undo(self, resend: bool) -> CommandResult:
         """Shared body of /undo (drop the last turn, put its user message
@@ -691,9 +675,9 @@ class Session:
         plan = self.controller.rollback_plan()
         if plan is None:
             self._emit_notice(f"nothing to {label}")
-            return CommandResult(cmd_id="", ok=True, payload={"user_text": None})
+            return _ok(payload={"user_text": None})
         result = await self._apply_rollback(plan, resend=resend)
-        return CommandResult(cmd_id="", ok=True, payload=result)
+        return _ok(payload=result)
 
     async def _cmd_undo_to(self, command: protocol.UndoTo) -> CommandResult:
         message = self._message_by_id(command.message_id)
@@ -702,9 +686,9 @@ class Session:
         plan = self.controller.rollback_plan_to(message)
         if plan is None:
             self._emit_notice("nothing to undo there")
-            return CommandResult(cmd_id="", ok=True, payload={"user_text": None})
+            return _ok(payload={"user_text": None})
         result = await self._apply_rollback(plan, resend=False, scope="messages from here on")
-        return CommandResult(cmd_id="", ok=True, payload=result)
+        return _ok(payload=result)
 
     def _message_by_id(self, message_id: str) -> Message | None:
         for message in self.conversation.messages:
@@ -762,7 +746,7 @@ class Session:
         self._compact_task = asyncio.get_running_loop().create_task(
             self._run_compact()
         )
-        return CommandResult(cmd_id="", ok=True, payload={"started": True})
+        return _ok(payload={"started": True})
 
     async def _run_compact(self) -> None:
         try:
@@ -814,11 +798,6 @@ class Session:
         self._rewrite_checkpoints(sha)
         self._persist()
         self._emit_history()
-        if self.baseline_callback is not None:
-            # The baseline is shared per workspace: /accept here moves it for
-            # every session on this directory (live ones updated now; saved
-            # ones re-sync via the drift check on load).
-            self.baseline_callback(self, info, sha)
         if mid_turn:
             self._emit_notice(
                 "note: the current turn is still generating — it may keep "
@@ -834,21 +813,7 @@ class Session:
                 f"accepted: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
                 "locked in; /diff is reset and /undo can no longer revert them"
             )
-        return CommandResult(cmd_id="", ok=True)
-
-    def accept_shared_baseline(self, sha: str) -> None:
-        """Another session on this workspace accepted its changes: point this
-        session's baseline and checkpoints at the same accepted tree and tell
-        its clients (the baseline is shared per workspace)."""
-        if self.git_info is not None:
-            self.git_info.baseline_tree = sha
-        self._rewrite_checkpoints(sha)
-        self._persist()
-        self._emit_history()
-        self._emit_notice(
-            "baseline moved by another session in this workspace — /diff and "
-            "/undo now measure from the accepted state"
-        )
+        return _ok()
 
     async def _cmd_reject(self) -> CommandResult:
         """Discard every change made since the last /accept (allowed mid-turn)."""
@@ -879,7 +844,7 @@ class Session:
                 f"rejected: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
                 "since the last accept were reverted"
             )
-        return CommandResult(cmd_id="", ok=True)
+        return _ok()
 
     def _cmd_set_mode(self, command: protocol.SetMode) -> CommandResult:
         self.mode = command.mode
@@ -888,18 +853,15 @@ class Session:
         self._rebuild_registry()
         self.ensure_system_message()
         self._emit_status()
-        return CommandResult(cmd_id="", ok=True, payload={"mode": self.mode})
+        return _ok(payload={"mode": self.mode})
 
     async def _cmd_switch_model(self, command: protocol.SwitchModel) -> CommandResult:
         if self.config_path is None:
             raise SessionError("/model unavailable: no config path known")
         try:
-            profiles = load_all_profiles(self.config_path)
+            _, profile = load_sectioned(self.config_path).resolve_model(command.name)
         except ConfigError as exc:
             raise SessionError(f"/model failed: {exc}") from exc
-        profile = profiles.get(command.name)
-        if profile is None:
-            raise SessionError(f"no model named {command.name!r}")
         try:
             api_key = resolve_api_key(profile)
         except ConfigError as exc:
@@ -910,7 +872,7 @@ class Session:
         self.auto_compact = profile.auto_compact
         self._persist()
         self._emit_status()
-        return CommandResult(cmd_id="", ok=True, payload={"model": command.name})
+        return _ok(payload={"model": command.name})
 
     async def _cmd_set_sandbox(self, command: protocol.SetSandbox) -> CommandResult:
         """Switch this session's sandbox profile (idle only): the shell
@@ -921,7 +883,7 @@ class Session:
         self._emit_notice(
             f"sandbox switched to {name!r} — the persistent shell restarted"
         )
-        return CommandResult(cmd_id="", ok=True, payload={"sandbox": name})
+        return _ok(payload={"sandbox": name})
 
     async def _cmd_filter(self, path: str, add: bool) -> CommandResult:
         """Add/remove a mount exclusion (idle only). Saved in the session
@@ -954,13 +916,12 @@ class Session:
             f"{rel} {verb} the sandbox mount exclusions — the persistent "
             "shell restarted"
         )
-        return CommandResult(cmd_id="", ok=True, payload={"filter_list": filters})
+        return _ok(payload={"filter_list": filters})
 
     def _resolve_sandbox_profile(self, name: str | None):
         """Resolve a sandbox profile from the config (with inheritance)."""
         if self.config_path is None:
             raise SessionError("no config path known — cannot resolve sandbox profiles")
-        from .config import load_sectioned
         try:
             sectioned = load_sectioned(self.config_path)
         except ConfigError as exc:
@@ -969,28 +930,14 @@ class Session:
 
     async def _apply_sandbox_settings(self, name: str | None, settings) -> None:
         """Rebuild the sandbox + registry from new settings (idle only)."""
-        from .config import ConfigError
         self.sandbox_name = name
         self.sandbox_settings = settings
         self.allow_git_write = settings.allow_git_write
-        self.enable_tracking = settings.enable_tracking
         old_session = self.sandbox_session
         sandbox: SandboxConfig | None = None
         session_obj: SandboxSession | None = None
         try:
-            sandbox = SandboxConfig(
-                workspace=self.workspace,
-                subtree="",
-                allow_network=settings.allow_network,
-                gpu_access=settings.gpu_access,
-                use_container=settings.use_container,
-                filter_list=list(settings.filter_list),
-                timeout_seconds=settings.default_timeout,
-                external_refs=SandboxConfig.resolve_auto_refs(
-                    self.workspace, settings.auto_include_refs,
-                ),
-                git_dir=self.git_info.git_dir if self.git_info is not None else None,
-            )
+            sandbox = SandboxConfig.from_settings(self.workspace, settings, self.git_info)
             session_obj = SandboxSession(sandbox)
         except SandboxUnavailable as exc:
             sandbox = session_obj = None
@@ -1029,6 +976,60 @@ class Session:
             send_time=message.send_time,
         ))
 
+    def _turn_time_summary(self) -> str | None:
+        """The turn's timing line: total | streaming | tools | other.
+
+        Computed from the persisted wall-clock stamps, so the same string
+        can be stamped on the turn's last assistant message (reloads show
+        it) and sent in TurnFinished (the live clients show it). None when
+        the stamps are missing (old sessions, or nothing streamed).
+
+        - total: turn user message send_time → last assistant end_time
+        - streaming: per round, end_time − reasoning_start (start_time when
+          the round had no chain of thought)
+        - tools: summed tool execution durations
+        - other: what's left (per-round latency and round boundaries)
+        """
+        messages = self.conversation.messages
+        turn_user_index = next(
+            (i for i, m in reversed(list(enumerate(messages)))
+             if m.role == "user" and m.send_time and not _is_summary_message(m)),
+            None,
+        )
+        turn = messages[turn_user_index + 1:] if turn_user_index is not None else messages
+        assistants = [
+            m for m in turn if m.role == "assistant"
+            and m.start_time and m.end_time
+        ]
+        if not assistants:
+            return None
+        total_end = _parse_iso(assistants[-1].end_time)
+        total_start = (
+            _parse_iso(messages[turn_user_index].send_time)
+            if turn_user_index is not None
+            else _parse_iso(assistants[0].start_time)
+        )
+        if total_end is None or total_start is None:
+            return None
+        total = max(0.0, (total_end - total_start).total_seconds())
+        streaming = 0.0
+        for message in assistants:
+            end = _parse_iso(message.end_time)
+            first = _parse_iso(message.reasoning_start) or _parse_iso(message.start_time)
+            if end is not None and first is not None:
+                streaming += max(0.0, (end - first).total_seconds())
+        tools = 0.0
+        for message in turn:
+            if message.role != "tool":
+                continue
+            start = _parse_iso(message.start_time)
+            end = _parse_iso(message.end_time)
+            if start is not None and end is not None:
+                tools += max(0.0, (end - start).total_seconds())
+        other = max(0.0, total - streaming - tools)
+        fmt = format_duration
+        return f"{fmt(total)} | {fmt(streaming)} {fmt(tools)} {fmt(other)}"
+
     async def _run_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tools).
 
@@ -1038,7 +1039,6 @@ class Session:
         self._set_state("running")
         self._turn_events.clear()
         turn_start = time.monotonic()
-        turn_had_tools = False
         try:
             stream = self.controller.send(text, images)
             while True:
@@ -1052,7 +1052,6 @@ class Session:
                             protocol_event.arguments_json,
                         ))
                     self._emit(protocol_event)
-                self._stamp_assistant_message()
                 # A round that ended without finishing — a provider or
                 # transport error, say — still streamed something. Keep the
                 # partial answer (the controller decides what counts).
@@ -1066,7 +1065,6 @@ class Session:
                 if not done_calls:
                     break
                 # Execute the calls this round requested, in stream order.
-                turn_had_tools = True
                 for call in done_calls:
                     await self._execute_call(call)
                 # Steering: anything queued while this round streamed is
@@ -1085,8 +1083,20 @@ class Session:
             # end-of-turn unwinding would replay the round on top of the
             # snapshot messages (double render).
             self._turn_events.clear()
+            summary = self._turn_time_summary()
+            if summary is not None:
+                # Stamp the turn's last assistant message: the line persists
+                # (reloads render it) and every client derives the same one.
+                last_assistant = next(
+                    (m for m in reversed(self.conversation.messages)
+                     if m.role == "assistant"),
+                    None,
+                )
+                if last_assistant is not None:
+                    last_assistant.time_summary = summary
             self._emit(protocol.TurnFinished(
                 elapsed=time.monotonic() - turn_start,
+                summary=summary or "",
             ))
             # Auto-compact fires at the turn boundary: the history has no
             # pending tool calls to break pairing.
@@ -1102,6 +1112,7 @@ class Session:
             # reverse exactly this turn's diff later (interruptions included).
             await self.controller.finish_turn()
             self._persist()
+            await self._flush_persist()
             # The turn is over: its events live in the history now. Leaving
             # them buffered would make the next attach replay the finished
             # turn on top of the snapshot messages (double render).
@@ -1119,31 +1130,9 @@ class Session:
             else:
                 self._notify_idle()
 
-    def _stamp_assistant_message(self) -> None:
-        """Copy the round's wall-clock stamps onto the assistant message the
-        round produced (the last one in the history)."""
-        stamps = self.controller.last_round_stamps
-        if stamps is None:
-            return
-        message = next(
-            (m for m in reversed(self.conversation.messages) if m.role == "assistant"),
-            None,
-        )
-        if message is None:
-            return
-        start, end, reasoning_start, reasoning_end = stamps
-        if message.start_time is None:
-            message.start_time = start
-        if message.end_time is None:
-            message.end_time = end
-        if message.reasoning_start is None:
-            message.reasoning_start = reasoning_start
-        if message.reasoning_end is None:
-            message.reasoning_end = reasoning_end
-        self.controller.last_round_stamps = None
-
     def _convert_stream_event(self, event: StreamEvent) -> Event:
-        return stream_event_to_protocol(event)
+        # Stream events are protocol models — the conversion is the identity.
+        return event
 
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
@@ -1154,25 +1143,11 @@ class Session:
         def sink(text: str) -> None:
             self._emit(protocol.ToolOutputDelta(call_id=call_id, text=text))
 
-        try:
-            result = await self.tool_registry.call(
-                call.name, call.arguments_json, output_sink=sink,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a broken tool must not kill the turn
-            result = ToolResult(
-                ok=False, output="", error=f"{type(exc).__name__}: {exc}",
-            )
-            self._emit(protocol.ToolFinished(
-                call_id=call_id, ok=False, error=result.error,
-            ))
-            self.controller.record_tool_result(
-                call_id, result,
-                start_time=start, end_time=_utcnow(),
-            )
-            self._persist()
-            return
+        # ToolRegistry.call already converts any tool exception into a
+        # failed ToolResult, so no try/except is needed here.
+        result = await self.tool_registry.call(
+            call.name, call.arguments_json, output_sink=sink,
+        )
         end = _utcnow()
         self._emit(protocol.ToolFinished(
             call_id=call_id, ok=result.ok, parse_error=result.parse_error,
@@ -1199,27 +1174,9 @@ class Session:
         self._emit_status()
 
     def _repair_tool_calls(self) -> None:
-        """Give any assistant tool_call without a matching tool message a
-        synthetic ``error: interrupted`` result, so the next API request is
-        valid. Runs after a cancel, a finished turn, and a session load."""
-        answered = {
-            m.tool_call_id for m in self.conversation.messages
-            if m.role == "tool" and m.tool_call_id
-        }
-        changed = False
-        for message in self.conversation.messages:
-            if message.role != "assistant" or not message.tool_calls:
-                continue
-            for call in message.tool_calls:
-                if call.call_id not in answered:
-                    self.conversation.add(Message(
-                        role="tool", tool_call_id=call.call_id,
-                        content="error: interrupted",
-                        end_time=_utcnow(),
-                    ))
-                    answered.add(call.call_id)
-                    changed = True
-        if changed:
+        """Answer orphaned tool calls so the next API request is valid;
+        persist when anything changed."""
+        if self.conversation.repair_orphaned_tool_calls(now=_utcnow()):
             self._persist()
 
     # ------------------------------------------------------------------
@@ -1306,9 +1263,8 @@ class Session:
             return None
         turns = self.turn_checkpoints()
         last_known = turns[-1].after_tree if turns else info.baseline_tree
-        from .gitwork import snapshot_tree
         try:
-            current = await snapshot_tree(info.workspace, info.subtree)
+            current = await snapshot_state(info)
         except GitWorktreeError:
             return None
         if current == last_known:
@@ -1352,21 +1308,55 @@ class Session:
         self.controller.tools = self.tool_registry
 
     def _persist(self) -> None:
-        """Persist the session (profile key, not model_id; atomic write)."""
-        session_store.save_state(
-            self.name,
-            SessionState(
-                conversation=self.conversation,
-                profile=self.profile_name,
-                workspace=str(self.workspace),
-                git=self.git_info.to_block() if self.git_info else None,
-                sandbox_name=self.sandbox_name,
-                sandbox_settings=(
-                    self.sandbox_settings.model_dump()
-                    if self.sandbox_settings is not None else None
-                ),
+        """Persist the session (profile key, not model_id; atomic write).
+
+        The write itself is debounced and run in a worker thread so a burst
+        of tool results never serializes the whole (image-laden) history on
+        the event loop and stalls streaming for every client. ``await
+        _flush_persist()`` wherever the file must already be on disk (turn
+        end, compaction, shutdown)."""
+        if self.no_save:
+            return
+        self._persist_dirty = True
+        if self._persist_task is None or self._persist_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No loop (sync callers): write inline.
+                self._persist_dirty = False
+                self._write_state()
+                return
+            self._persist_task = loop.create_task(self._persist_loop())
+
+    def _persist_state(self) -> SessionState:
+        return SessionState(
+            conversation=self.conversation,
+            profile=self.profile_name,
+            workspace=str(self.workspace),
+            git=self.git_info.to_block() if self.git_info else None,
+            sandbox_name=self.sandbox_name,
+            sandbox_settings=(
+                self.sandbox_settings.model_dump()
+                if self.sandbox_settings is not None else None
             ),
         )
+
+    def _write_state(self) -> None:
+        session_store.save_state(self.name, self._persist_state())
+
+    async def _persist_loop(self) -> None:
+        while self._persist_dirty:
+            self._persist_dirty = False
+            await asyncio.to_thread(session_store.save_state, self.name, self._persist_state())
+
+    async def _flush_persist(self) -> None:
+        """Await completion of any pending background write."""
+        if self._persist_task is not None:
+            try:
+                await self._persist_task
+            except asyncio.CancelledError:
+                pass
+            self._persist_task = None
 
     async def _maybe_auto_compact(self) -> None:
         if not self.auto_compact:
@@ -1384,10 +1374,12 @@ class Session:
         # queued, never started mid-teardown.
         self._set_state("compacting")
         try:
-            summary = await self.controller.compact()
-        except RuntimeError:
+            await self.controller.compact()
+        except RuntimeError as exc:
+            self._emit_notice(f"auto-compact failed: {exc}", "warn")
             return
         self._persist()
+        await self._flush_persist()
         self._emit_history()
         counts = self._compaction_counts()
         self._emit_notice(f"auto-compacted: {counts}" if counts else "auto-compacted: nothing to compact yet")
@@ -1395,18 +1387,25 @@ class Session:
     # ------------------------------------------------------------------
     # stats row
 
-    def stats_row(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "workspace": str(self.workspace),
-            "state": self._state,
-            "clients_attached": self.clients_attached,
-            "model": self.profile_name,
-            "sandbox": self.sandbox_name,
-            "last_user_message_at": self.last_user_message_at(),
-            "message_count": len(self.conversation.messages),
-            "tracking": self.git_info is not None,
-            "queued": len(self._queued),
-            "pending_ask": self._pending_ask is not None,
-            "pending_drift": self._pending_drift is not None,
-        }
+    async def diff_info(self, path: str | None) -> protocol.DiffInfo:
+        """The /diff payload: per-file stat rows (+ the unified diff text
+        for a per-file click-through; the summary poll stays cheap)."""
+        stat = await self.diff_summary()
+        info = protocol.DiffInfo()
+        if stat is None:
+            return info
+        files = stat.files
+        if path is not None:
+            files = [f for f in files if f.path == path]
+        info.files = [
+            protocol.DiffFileInfo(
+                path=f.path, additions=f.additions, deletions=f.deletions,
+                is_new=f.is_new, source=f.source,
+            )
+            for f in files
+        ]
+        info.additions = sum(f.additions for f in files)
+        info.deletions = sum(f.deletions for f in files)
+        if path is not None:
+            info.text = await self.diff_text(path)
+        return info

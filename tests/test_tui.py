@@ -10,7 +10,8 @@ from textual.pilot import Pilot
 
 from xarness import protocol
 from xarness.clientlib import ClientError
-from xarness.config import ProviderProfile
+from xarness.tui import flow as tflow
+from xarness.events import ToolCallStatus
 from xarness.protocol import (
     CommandResult, DiffInfo, Event, SessionSummary, Snapshot, StatusPayload,
 )
@@ -30,7 +31,7 @@ class FakeClient:
     async def snapshot(self, name: str) -> Snapshot:
         return self.snapshot_data
 
-    async def attach(self, name: str, last_seq: int | None = None):
+    async def attach(self, name: str):
         if getattr(self, "fail_attach_first", False):
             self.fail_attach_first = False
             raise ClientError("connection lost")
@@ -168,23 +169,23 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
 class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
     async def test_user_message_reaches_the_log_only_via_the_event_stream(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import UserMessage
 
         client = FakeClient(make_snapshot())
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Nothing mounted yet: the client does not echo its own sends.
-            self.assertEqual(len(app.query("#chat-log > UserMessage")), 0)
+            # Nothing in the model yet: the client does not echo its own sends.
+            self.assertEqual(
+                [type(e.item).__name__ for e in app._flow_model.entries
+                 if type(e.item).__name__ == "UserItem"], [])
             client.queue.put_nowait(protocol.UserMessageAdded(
                 text="hello", message_id="m1", send_time="2026-01-01T00:00:00+00:00",
             ))
             await pilot.pause()
-            widgets = app.query("#chat-log > UserMessage")
-            self.assertEqual(len(widgets), 1)
-            self.assertEqual(widgets[0].message.id, "m1")
-            # Click-to-undo addresses the message by id.
-            await pilot._press_or_release("escape") if False else None
+            users = [e for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.UserItem)]
+            self.assertEqual(len(users), 1)
+            self.assertEqual(users[0].item.message.id, "m1")
             self.assertEqual(
                 [c for _, c in client.commands if c.type == "send_message"], [],
             )
@@ -275,49 +276,36 @@ class _WidgetApp(App):
 
 
 class ThinkingDurationTest(unittest.IsolatedAsyncioTestCase):
-    """Two clients viewing the same session must agree on 'Thought for Xs':
-    the live client's provisional estimate is overridden by the session-
-    recorded seconds from TurnComplete (which the replayed/history client
-    shows from the start)."""
+    """The live path settles WITHOUT a local estimate (the backend owns the
+    number); a later TurnComplete fills it in; the first backend number wins."""
 
     def test_backend_duration_used_not_client_estimate(self) -> None:
-        from xarness.tui.widgets import ThinkingBlock
-
-        async def go():
-            app = _WidgetApp()
-            async with app.run_test() as pilot:
-                thinking = ThinkingBlock()
-                await app.mount(thinking)
-                await pilot.pause()
-                thinking.append_reasoning("hmm")
-                # Content arrives: the live path settles WITHOUT a local
-                # estimate — the backend owns the number.
-                thinking.finish(duration=None, estimate_if_unknown=False)
-                first = thinking.summary_text
-                # TurnComplete lands with the recorded seconds: fill in.
-                thinking.finish(duration=7.0)
-                await pilot.pause()
-                return first, thinking.summary_text
-
-        first, final = asyncio.run(go())
-        self.assertEqual(first, "Thought for …")
-        self.assertEqual(final, "Thought for 7.0s")
+        thinking = tflow.ThinkingItem(parts=["hmm"])
+        thinking.finish(None)
+        self.assertEqual(thinking.summary_text(), "Thought for …")
+        thinking.finish(7.0)
+        self.assertEqual(thinking.summary_text(), "Thought for 7.0s")
 
     def test_backend_duration_first_wins(self) -> None:
-        from xarness.tui.widgets import ThinkingBlock
+        thinking = tflow.ThinkingItem()
+        thinking.finish(3.0)
+        thinking.finish(99.0)  # e.g. a stray second event
+        self.assertEqual(thinking.summary_text(), "Thought for 3.0s")
 
-        async def go():
-            app = _WidgetApp()
-            async with app.run_test() as pilot:
-                thinking = ThinkingBlock()
-                await app.mount(thinking)
-                await pilot.pause()
-                thinking.finish(duration=3.0)
-                thinking.finish(duration=99.0)  # e.g. a stray second event
-                await pilot.pause()
-                return thinking.summary_text
-
-        self.assertEqual(asyncio.run(go()), "Thought for 3.0s")
+    def test_streaming_expands_then_finish_collapses_and_click_toggles(self) -> None:
+        # Streaming: expanded by default, and clickable mid-stream.
+        thinking = tflow.ThinkingItem(parts=["hmm"])
+        self.assertTrue(thinking.expanded)
+        thinking.expanded = False  # user collapsed it mid-stream
+        thinking.expanded = True   # ...and reopened it — both allowed
+        # Round end: auto-collapse, whatever the user's last toggle was.
+        thinking.finish(2.0)
+        self.assertFalse(thinking.expanded)
+        # A later duration override (TurnComplete) must not re-collapse an
+        # item the user re-expanded after it finished.
+        thinking.expanded = True
+        thinking.finish(3.0)  # _estimated was False: ignored
+        self.assertTrue(thinking.expanded)
 
 
 class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
@@ -375,21 +363,20 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.is_running)
 
 
-class AttachSeedsLastSeqTest(unittest.IsolatedAsyncioTestCase):
-    """The event pump must resume from the seq of the snapshot it already
-    rendered, or the host sends a second snapshot and the history renders
-    twice on attach/reload."""
+class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
+    """The pump attaches to the session by name; reconnects always deliver
+    a fresh Snapshot (which re-renders the history exactly once — the
+    rendered snapshot is replaced, not appended to)."""
 
-    async def test_attach_passes_rendered_snapshot_seq(self) -> None:
-        from unittest import mock
+    async def test_attach_is_called_with_the_session_name(self) -> None:
 
         from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        calls: list[tuple[str, int | None]] = []
+        calls: list[str] = []
 
-        async def attach(name, last_seq=None):
-            calls.append((name, last_seq))
+        async def attach(name):
+            calls.append(name)
             while True:
                 item = await client.queue.get()
                 if item is None:
@@ -405,20 +392,21 @@ class AttachSeedsLastSeqTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-        self.assertEqual(calls, [("s1", 42)])
+        self.assertEqual(calls, ["s1"])
 
 
 class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
-    """Rounds 2+ of a turn must stream into FRESH widgets: the previous
-    round's thinking block is finished (collapsed, text dropped) and its
-    answer settled — appending to them made later CoT and answers invisible
-    until the session was reloaded."""
+    """Rounds 2+ of a turn must stream into FRESH entries: the previous
+    round's thinking block is finished (collapsed) and its answer settled —
+    appending to them made later CoT and answers invisible until reload."""
 
     async def test_second_round_streams_into_new_widgets(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import AssistantMessage, ThinkingBlock
 
         async def script(pilot: Pilot, client: FakeClient, app):
+            def items(cls):
+                return [e for e in app._flow_model.entries
+                        if isinstance(e.item, cls)]
             q = client.queue
             q.put_nowait(protocol.ReasoningDelta(text="think one"))
             q.put_nowait(protocol.ContentDelta(text="answer one"))
@@ -427,19 +415,19 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
                 call_id="c1", name="read_file", arguments_json="{}"))
             q.put_nowait(protocol.TurnComplete(has_tool_calls=True))
             q.put_nowait(protocol.ToolFinished(call_id="c1", ok=True, output="ok"))
-            await pilot.pause()
-            thinking = list(app.query(ThinkingBlock))
+            await pilot.pause(); await pilot.pause()
+            thinking = items(tflow.ThinkingItem)
             self.assertEqual(len(thinking), 1)
-            assert thinking[0].done
-            # Round 2 begins: fresh CoT and answer widgets.
+            self.assertTrue(thinking[0].item.done)
+            # Round 2 begins: fresh CoT and answer entries.
             q.put_nowait(protocol.ReasoningDelta(text="think two"))
             q.put_nowait(protocol.ContentDelta(text="answer two"))
-            await pilot.pause()
-            thinking = list(app.query(ThinkingBlock))
-            self.assertEqual(len(thinking), 2, "round 2 CoT needs its own block")
-            self.assertEqual(thinking[1].reasoning, "think two")
-            assistants = list(app.query(AssistantMessage))
-            self.assertEqual(len(assistants), 2, "round 2 answer needs its own widget")
+            await pilot.pause(); await pilot.pause()
+            thinking = items(tflow.ThinkingItem)
+            self.assertEqual(len(thinking), 2, "round 2 CoT needs its own entry")
+            self.assertEqual(thinking[1].item.reasoning, "think two")
+            assistants = items(tflow.AssistantItem)
+            self.assertEqual(len(assistants), 2, "round 2 answer needs its own entry")
             q.put_nowait(protocol.TurnComplete())
             await pilot.pause()
 
@@ -451,8 +439,9 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
-    """Session popup rows: {title} {age}, with a state dot on the right —
-    waiting=accent, running/compacting=success, idle=muted, saved=bg."""
+    """Session popup rows: {title} {age}, with a state dot on the right for
+    loaded sessions — waiting=accent, running/compacting=success, idle=muted;
+    saved (not loaded) rows show no dot at all."""
 
     def _summaries(self):
         def s(name, state, active, attached=0):
@@ -473,11 +462,12 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         from xarness import theme
         expected = {
             "waiting": "accent", "running": "success",
-            "compacting": "success", "idle": "muted", "saved": "surface",
+            "compacting": "success", "idle": "muted", "saved": None,
         }
         for state, key in expected.items():
             self.assertEqual(_dot_palette_key(state), key)
-            self.assertIn(key, theme.PALETTE)
+            if key is not None:
+                self.assertIn(key, theme.PALETTE)
 
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
@@ -496,13 +486,50 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             texts = [str(label.render()) for label in app.screen.query(".resume-row-text")]
             dots = [str(label.render()) for label in app.screen.query(".resume-row-dot")]
             self.assertEqual(len(texts), 5)
-            self.assertEqual(len(dots), 5)
+            # Only loaded sessions get a dot; saved-one shows none.
+            self.assertEqual(len(dots), 4)
             for name in ("waiting-one", "running-one", "compacting-one",
                          "idle-one", "saved-one"):
                 self.assertTrue(
                     any(name in t for t in texts), f"{name} missing from rows")
             # Every row shows an age column.
             self.assertTrue(all("m" in t or "h" in t or "d" in t for t in texts))
+
+    async def test_search_filters_and_restores_rows(self) -> None:
+        """Regression: typing in the search box must narrow the list and
+        deleting the query must bring every row back."""
+        from textual.app import App, ComposeResult
+        from textual.widgets import Input
+        from xarness.tui.resume_screen import ResumeScreen
+
+        entries = [
+            SessionSummary(name=f"2026-10-0{i} sess", state="saved")
+            for i in range(3)
+        ]
+
+        class Host(App):
+            def compose(self) -> ComposeResult:
+                yield Input()
+
+        app = Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(ResumeScreen(entries, workspace=None))
+            await pilot.pause()
+            lv = app.screen.query_one("#resume-list")
+            self.assertEqual(len(lv.children), 3)
+            await pilot.press("0", "0")
+            await pilot.pause()
+            self.assertEqual(len(lv.children), 1)  # only "2026-10-00 sess"
+            await pilot.press("backspace")
+            await pilot.pause()
+            self.assertEqual(len(lv.children), 3)
+            # Rows stay in entry order after re-filtering.
+            names = [it.session_name for it in lv.children]
+            self.assertEqual(names, [f"2026-10-0{i} sess" for i in range(3)])
+            await pilot.press("9", "9")
+            await pilot.pause()
+            self.assertEqual(len(lv.children), 0)
 
 class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
     """The CLI tab title follows the attached session's workspace."""
@@ -545,17 +572,16 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_status_settles_thinking_shimmer(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import ThinkingBlock
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
             q.put_nowait(protocol.ReasoningDelta(text="thinking..."))
             await pilot.pause()
             await pilot.pause()
-            thinking = list(app.query(ThinkingBlock))
+            thinking = [e for e in app._flow_model.entries
+                        if isinstance(e.item, tflow.ThinkingItem)]
             self.assertEqual(len(thinking), 1)
-            self.assertFalse(thinking[0].done)
-            self.assertTrue(list(app.query("#thinking-shimmer")))
+            self.assertFalse(thinking[0].item.done)
             # The interrupt: the session reports idle (an error Notice
             # accompanies it — the Notice itself settles nothing).
             q.put_nowait(protocol.Notice(text="interrupted", level="error"))
@@ -566,8 +592,9 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                 )
             ))
             await pilot.pause()
-            self.assertTrue(list(app.query(ThinkingBlock))[0].done)
-            self.assertFalse(list(app.query("#thinking-shimmer")))
+            self.assertTrue(
+                [e for e in app._flow_model.entries
+                 if isinstance(e.item, tflow.ThinkingItem)][0].item.done)
 
         client = FakeClient(make_snapshot(state="running"))
         app = AgentApp(client, workspace=None, session_name="s1")
@@ -577,7 +604,6 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_status_settles_tool_writing_shimmer(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import ToolCallBlock, ToolCallStatus, ToolWritingIndicator
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
@@ -585,7 +611,8 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             q.put_nowait(protocol.ToolCallArgumentsDelta(call_id="c1", text='{"f"'))
             await pilot.pause()
             await pilot.pause()
-            self.assertIsInstance(app.query_one(ToolWritingIndicator), ToolWritingIndicator)
+            self.assertTrue([e for e in app._flow_model.entries
+                             if isinstance(e.item, tflow.WritingItem)])
             q.put_nowait(protocol.Notice(text="interrupted", level="error"))
             q.put_nowait(protocol.StatusChanged(
                 status=StatusPayload(
@@ -594,16 +621,21 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                 )
             ))
             await pilot.pause()
-            self.assertFalse(list(app.query(ToolWritingIndicator)),
-                             "tool-writing shimmer outlived the interrupt")
+            self.assertFalse(
+                [e for e in app._flow_model.entries
+                 if isinstance(e.item, tflow.WritingItem) and e.alive],
+                "tool-writing shimmer outlived the interrupt")
             # A half-streamed call never reached ArgumentsDone, so no
-            # ToolCallBlock exists — the shimmer was the only artifact.
+            # ToolItem exists — the shimmer was the only artifact.
+            self.assertFalse([e for e in app._flow_model.entries
+                              if isinstance(e.item, tflow.ToolItem)])
 
         client = FakeClient(make_snapshot(state="running"))
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
             await script(pilot, client, app)
+
 
 class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
     """The /sessions list must show more than one row at a time (ListView's
@@ -634,17 +666,16 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
 
 
 def _msg(role: str, mid: str, content: str) -> protocol.MessageModel:
-    return protocol.MessageModel(role=role, message_id=mid, content=content)
+    return protocol.MessageModel(role=role, id=mid, content=content)
 
 
 class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
-    """Undo-from-here must trim the rendered tail in place — including
-    messages that arrived LIVE during the attach — not re-render the whole
-    chat (the pre-headless behavior)."""
+    """Undo-from-here rebuilds the transcript from the new snapshot — a
+    data-only rebuild (cheap under FlowView), including messages that
+    arrived LIVE during the attach."""
 
-    async def test_history_replaced_trims_instead_of_full_reload(self) -> None:
+    async def test_history_replaced_rebuilds_after_undo(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import AssistantMessage, UserMessage
 
         messages = [
             _msg("user", "u1", "first"),
@@ -662,20 +693,18 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
             client.queue.put_nowait(protocol.UserMessageAdded(
                 text="live", message_id="u3"))
             await pilot.pause()
-            before_user = list(app.query(UserMessage))
-            self.assertEqual(len(before_user), 3)
-            self.assertEqual(app._rendered_ids, {"u1", "a1", "u2", "a2", "u3"})
+            self.assertEqual(
+                app._rendered_ids, {"u1", "a1", "u2", "a2", "u3"})
 
             # Undo-from-here on "second" (u2): u2, a2 and u3 are gone.
             trimmed = make_snapshot()
             object.__setattr__(trimmed, "messages", messages[:2])
             client.queue.put_nowait(protocol.HistoryReplaced(snapshot=trimmed))
             await pilot.pause()
-            after_user = list(app.query(UserMessage))
-            self.assertEqual(len(after_user), 1)
-            # Identity preserved for the kept part: trimmed, not re-rendered.
-            self.assertIs(after_user[0], before_user[0])
             self.assertEqual(app._rendered_ids, {"u1", "a1"})
+            users = [e.item.message.id for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.UserItem)]
+            self.assertEqual(users, ["u1"])
 
 
 class AcceptNoFullReloadTest(unittest.IsolatedAsyncioTestCase):
@@ -685,7 +714,6 @@ class AcceptNoFullReloadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_history_replaced_with_same_ids_skips_rerender(self) -> None:
         from xarness.tui.app import AgentApp
-        from xarness.tui.widgets import UserMessage
 
         messages = [_msg("user", "u1", "first"), _msg("assistant", "a1", "answer")]
         snap = make_snapshot()
@@ -694,12 +722,13 @@ class AcceptNoFullReloadTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            before = list(app.query(UserMessage))
+            before = list(app._flow_model.entries)
             replaced = make_snapshot()
             object.__setattr__(replaced, "messages", messages)
             client.queue.put_nowait(protocol.HistoryReplaced(snapshot=replaced))
             await pilot.pause()
-            self.assertIs(list(app.query(UserMessage))[0], before[0])
+            # Entry identity preserved: no rebuild happened.
+            self.assertIs(list(app._flow_model.entries)[0], before[0])
 
 
 class DiffClickMinimizeTest(unittest.IsolatedAsyncioTestCase):
@@ -789,3 +818,114 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([c.mode for c in set_modes], ["plan"])
             # Draft state is spent.
             self.assertEqual(app._draft_mode, "write")
+
+
+class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
+    """Reloaded history must mount no shimmer at all (the block arrives
+    settled), and the persisted per-turn timing line must render."""
+
+    def _snapshot_with_history(self) -> Snapshot:
+        snap = make_snapshot()
+        snap.messages = [
+            protocol.MessageModel(
+                role="user", id="u1", content="do it", send_time="2025-01-01T00:00:00+00:00",
+            ),
+            protocol.MessageModel(
+                role="assistant", id="a2", content="",
+                reasoning="step one\nstep two", reasoning_seconds=4.0,
+                tool_calls=[{"id": "c1", "type": "function",
+                             "function": {"name": "read_file", "arguments": "{}"}}],
+            ),
+            protocol.MessageModel(
+                role="tool", id="t1", tool_call_id="c1", content="file body",
+            ),
+            protocol.MessageModel(
+                role="assistant", id="a1", content="Done.",
+                start_time="2025-01-01T00:00:01+00:00",
+                end_time="2025-01-01T00:00:05+00:00",
+                time_summary="4.0s | 4.0s 0.0s 0.0s",
+            ),
+        ]
+        snap.turn_events = []
+        return snap
+
+    async def test_replay_has_no_shimmer_and_shows_timing(self) -> None:
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(self._snapshot_with_history())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            flow = app.query_one("#chat-log")
+            # The tool result is paired with its call: succeeded, not failed.
+            tools = [e.item for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.ToolItem)]
+            self.assertEqual(len(tools), 1)
+            self.assertEqual(tools[0].status, ToolCallStatus.CALL_SUCCEEDED)
+            # The settled summary shows the tool name, not "Running read_file".
+            all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
+            self.assertIn("read_file", all_text)
+            self.assertNotIn("Running read_file", all_text)
+            # The replayed CoT block shows its "Thought for Xs" pill.
+            thinking = [e.item for e in app._flow_model.entries
+                        if isinstance(e.item, tflow.ThinkingItem)]
+            self.assertEqual(len(thinking), 1)
+            self.assertTrue(thinking[0].done)
+            self.assertIn("Thought for", all_text)
+            self.assertIn("Worked for 4.0s", all_text)
+
+
+class FlowViewTest(unittest.IsolatedAsyncioTestCase):
+    """The virtualized transcript: the WHOLE history lives in the FlowModel
+    (one FlowView widget regardless of length — that is the point); only the
+    visible rows are painted, so a 1k+-message session costs the same as a
+    fresh one."""
+
+    @staticmethod
+    def _big_snapshot(count: int = 1200) -> Snapshot:
+        from xarness.conversation import Message as Msg
+        snap = make_snapshot()
+        snap.messages = [
+            Msg(role="user" if i % 2 == 0 else "assistant",
+                content=f"body {i}", id=f"m{i}")
+            for i in range(count)
+        ]
+        return snap
+
+    async def test_full_history_in_model_one_widget(self) -> None:
+        from textual_flowview import FlowView
+
+        from xarness.tui.app import AgentApp
+
+        app = AgentApp(FakeClient(self._big_snapshot()), workspace=None,
+                       session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(len(list(app.query(FlowView))), 1)
+            self.assertEqual(len(app._flow_model), 1200)
+            # The tail is painted: the last user message is visible text.
+            flow = app.query_one("#chat-log", FlowView)
+            tail = "\n".join(
+                flow.row_text(y) for y in range(max(0, flow.row_count - 12),
+                                                flow.row_count)
+            )
+            self.assertIn("body 1198", tail)
+
+    async def test_presentations_stay_viewport_bounded(self) -> None:
+        # O(viewport) is the whole claim: after loading 1200 entries, only
+        # the visible band (+ overscan) has ever been presented.
+        from textual_flowview import FlowView
+
+        from xarness.tui.app import AgentApp
+
+        app = AgentApp(FakeClient(self._big_snapshot()), workspace=None,
+                       session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            flow = app.query_one("#chat-log", FlowView)
+            self.assertLess(len(flow._layout), 100)
+
+

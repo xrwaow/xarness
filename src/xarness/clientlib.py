@@ -20,10 +20,12 @@ import inspect
 import json
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 from . import protocol
 from .protocol import (
@@ -86,7 +88,9 @@ class XarnessClient:
         no active sessions the stale host is shut down and respawned."""
         from .host import SOCKET_PATH, connect_or_spawn
         if spawn:
-            connect_or_spawn()
+            # connect_or_spawn forks/waits on subprocesses — blocking work
+            # that must not stall the event loop this coroutine serves.
+            await asyncio.to_thread(connect_or_spawn)
         path = socket_path or SOCKET_PATH
         http = httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=str(path)),
@@ -146,9 +150,12 @@ class XarnessClient:
         network: bool | None = None,
         gpu: bool | None = None,
         no_init_repo: bool = False,
+        no_session: bool = False,
         first_message: str | None = None,
     ) -> SessionSummary:
         body: dict[str, Any] = {"no_init_repo": no_init_repo}
+        if no_session:
+            body["no_session"] = True
         for key, value in [
             ("workspace", workspace), ("model", model), ("sandbox", sandbox),
             ("preset", preset), ("network", network), ("gpu", gpu),
@@ -199,27 +206,16 @@ class XarnessClient:
     # ------------------------------------------------------------------
     # attach: SSE with reconnect
 
-    async def attach(
-        self, name: str, last_seq: int | None = None,
-    ) -> AsyncIterator[Snapshot | Event]:
+    async def attach(self, name: str) -> AsyncIterator[Snapshot | Event]:
         """Yield a Snapshot, then live Events, reconnecting automatically.
 
-        Pass ``last_seq`` (e.g. the seq of an already-rendered snapshot) to
-        resume instead of receiving a fresh full snapshot: the host replays
-        only the missed events, or sends a new Snapshot on a gap.
-
-        On a dropped connection the reader retries with backoff, sending
-        Last-Event-ID; if the host replayed, the stream continues seamlessly,
-        otherwise a fresh Snapshot arrives. Transport errors retry forever;
-        API errors (unknown session) raise :class:`ClientError`."""
+        On a dropped connection the reader retries with backoff; every
+        reconnect starts from a fresh Snapshot. Transport errors retry
+        forever; API errors (unknown session) raise :class:`ClientError`."""
         backoff = RECONNECT_MIN
         while True:
             try:
-                async for item in self._stream_once(name, last_seq):
-                    if isinstance(item, Snapshot):
-                        last_seq = item.seq
-                    elif isinstance(item, protocol.EventBase):
-                        last_seq = max(last_seq or 0, item.seq)
+                async for item in self._stream_once(name):
                     backoff = RECONNECT_MIN
                     yield item
                 # Server closed the stream cleanly (e.g. session deleted).
@@ -228,24 +224,36 @@ class XarnessClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX)
 
-    async def _stream_once(
-        self, name: str, last_seq: int | None,
-    ) -> AsyncIterator[Snapshot | Event]:
+    async def _stream_once(self, name: str) -> AsyncIterator[Snapshot | Event]:
         headers = {"Accept": "text/event-stream"}
-        if last_seq is not None:
-            headers["Last-Event-ID"] = str(last_seq)
-        async with await self._with_host_retry(
-            lambda: self._http.stream(
-                "GET", f"/v1/sessions/{name}/events", headers=headers,
+        # send(stream=True) connects here (unlike httpx.stream(), whose
+        # request only goes out at __aenter__), so a dead-socket ConnectError
+        # is raised inside _with_host_retry and the host gets respawned.
+        request = self._http.build_request(
+            "GET", f"/v1/sessions/{name}/events", headers=headers,
+        )
+
+        @asynccontextmanager
+        async def _response_cm() -> AsyncIterator[httpx.Response]:
+            response = await self._with_host_retry(
+                lambda: self._http.send(request, stream=True),
             )
-        ) as response:
+            try:
+                yield response
+            finally:
+                await response.aclose()
+
+        async with _response_cm() as response:
             if response.status_code != 200:
                 raise ClientError(f"attach failed: HTTP {response.status_code}")
             async for kind, data in _read_sse(response):
                 if kind == "snapshot":
                     yield Snapshot.model_validate(data)
                 elif kind == "event":
-                    yield _parse_event(data)
+                    try:
+                        yield protocol.EVENT_ADAPTER.validate_python(data)
+                    except ValidationError as exc:
+                        raise ClientError(f"invalid event frame: {exc}") from None
                 # Unknown frame kinds are ignored (forward compatibility).
 
     # ------------------------------------------------------------------
@@ -272,14 +280,6 @@ class XarnessClient:
                 detail = response.text
             raise ClientError(f"HTTP {response.status_code}: {detail}")
         return response.json()
-
-
-def _parse_event(data: dict[str, Any]) -> Event:
-    event_type = data.get("type")
-    model = protocol.EVENT_TYPES.get(event_type)
-    if model is None:
-        raise ClientError(f"unknown event type: {event_type!r}")
-    return model.model_validate(data)
 
 
 async def _read_sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, Any]]]:

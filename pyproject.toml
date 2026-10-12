@@ -17,6 +17,7 @@ dependencies = [
     "pillow>=10.0",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "textual-flowview",
 ]
 
 [project.optional-dependencies]
@@ -32,3 +33,6 @@ packages = ["src/xarness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+textual-flowview = { git = "https://github.com/tya5/textual-flowview.git" }

@@ -4,7 +4,6 @@ checkpoints, revert, diff) and the run_bash git-command filter.
 Uses a real temp git repo (git is a hard dependency of the feature anyway).
 """
 
-import asyncio
 import subprocess
 import tempfile
 import unittest
@@ -14,8 +13,9 @@ from unittest import mock
 from xarness import gitwork
 from xarness.gitwork import (
     GitInfo, TurnCheckpoint, accept_changes, attributed_diff_stat, check_blocked_git,
-    checkpoint, detect_repo, diff_stat, git_diff, revert_to_tree, revert_turn,
-    setup_tracking, snapshot_tree, tree_diff_stat, undo_last_turn,
+    detect_repo, diff_stat, git_diff, revert_to_tree, revert_turn,
+    snapshot_state,
+    setup_tracking, snapshot_tree, tree_diff_stat,
 )
 
 
@@ -50,22 +50,12 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
     # detection + setup
 
-    async def test_detect_repo_reads_head(self):
+    async def test_detect_repo_reads_root(self):
         assert await detect_repo(self.base) is None  # plain directory
         repo = self.make_repo()
         info = await detect_repo(repo)
         assert info is not None
         assert info.root == repo.resolve()
-        assert info.head_branch == "main"
-        assert info.base_ref is not None
-
-    async def test_detect_repo_unborn_head_has_no_base_ref(self):
-        repo = self.base / "unborn"
-        repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main", ".")
-        info = await detect_repo(repo)
-        assert info is not None
-        assert info.base_ref is None
 
     async def test_setup_tracking_auto_initializes_non_repo(self):
         """No git init from the user: the harness sets everything up itself."""
@@ -134,7 +124,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert by_path["draft.txt"].is_new
 
         # Revert restores the subtree (and only it).
-        sha = await checkpoint(info)
+        sha = await snapshot_state(info)
         (repo / "f" / "extra.txt").write_text("created\n")
         (repo / "f" / "notes.txt").unlink()
         await revert_to_tree(info, sha)
@@ -181,7 +171,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        sha = await checkpoint(info)
+        sha = await snapshot_state(info)
 
         # Agent turn: modify, delete, create.
         (repo / "app.py").write_text("line1\nagent edit\n")
@@ -203,7 +193,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "draft.txt").write_text("untracked\n")
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        sha = await checkpoint(info)
+        sha = await snapshot_state(info)
 
         (repo / "draft.txt").unlink()
         await revert_to_tree(info, sha)
@@ -219,7 +209,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         _git(repo, "commit", "-qm", "gitignore")
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        sha = await checkpoint(info)
+        sha = await snapshot_state(info)
 
         (repo / "ignored.dir").mkdir()
         (repo / "ignored.dir" / "artifact.bin").write_text("x\n")
@@ -244,9 +234,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "app.py").write_text("agent edit\n")  # the turn's edit
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
         (repo / "unrelated.txt").write_text("manual edit\n")  # after the turn
 
         conflict = await revert_turn(info, before, after)
@@ -262,9 +252,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "app.py").write_text("agent change\n")  # the turn's edit
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
         (repo / "app.py").write_text("manual change\n")  # overlapping manual edit
 
         conflict = await revert_turn(info, before, after)
@@ -282,7 +272,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         repo = self.make_repo()
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        tree = await checkpoint(info)
+        tree = await snapshot_state(info)
         (repo / "manual.txt").write_text("manual\n")
 
         result = await revert_turn(info, tree, tree)
@@ -296,7 +286,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         repo = self.make_repo()
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        tree = await checkpoint(info)
+        tree = await snapshot_state(info)
 
         with mock.patch.object(gitwork, "_wrap_commit", new=mock.AsyncMock()) as wrap, \
                 mock.patch.object(gitwork, "_run_git", new=mock.AsyncMock()) as run:
@@ -312,9 +302,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         repo = self.make_repo()
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "app.py").write_text("agent\n")
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
 
         first = await tree_diff_stat(info, before, after)
         first.files[0].additions = 999  # mutate the returned row
@@ -329,12 +319,12 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before1 = await checkpoint(info)
+        before1 = await snapshot_state(info)
         (repo / "one.txt").write_text("one\n")
-        after1 = await checkpoint(info)
-        before2 = await checkpoint(info)
+        after1 = await snapshot_state(info)
+        before2 = await snapshot_state(info)
         (repo / "two.txt").write_text("two\n")
-        after2 = await checkpoint(info)
+        after2 = await snapshot_state(info)
 
         conflict = await gitwork.revert_turns(info, [
             TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
@@ -344,34 +334,6 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert not (repo / "one.txt").exists()
         assert not (repo / "two.txt").exists()
 
-    async def test_undo_last_turn_is_a_noop_without_turns(self):
-        """No turn since the baseline: /undo must not fall back to reverting
-        the baseline and destroying changes made outside the session."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        (repo / "app.py").write_text("manual edit\n")
-        baseline = info.baseline_tree
-
-        result = await undo_last_turn(info, [])
-
-        assert result is None
-        assert (repo / "app.py").read_text() == "manual edit\n"
-        assert info.baseline_tree == baseline
-
-    async def test_undo_last_turn_reverses_the_most_recent(self):
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        before = await checkpoint(info)
-        (repo / "app.py").write_text("agent\n")
-        after = await checkpoint(info)
-
-        result = await undo_last_turn(info, [TurnCheckpoint(before, after)])
-
-        assert result is None
-        assert (repo / "app.py").read_text() == "line1\nline2\n"
-
     # ------------------------------------------------------------------
     # attributed diff
 
@@ -380,9 +342,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "agent.txt").write_text("agent\n")  # turn edit
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
         (repo / "manual.txt").write_text("manual\n")  # drift after the turn
 
         stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
@@ -403,9 +365,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "drift.txt").write_text("outside\n")
         # A later agent turn: its before_tree already contains the drift, and
         # it edits a different file.
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "agent.txt").write_text("agent\n")
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
 
         stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
         by_path = {f.path: f for f in stat.files}
@@ -419,13 +381,13 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before1 = await checkpoint(info)
+        before1 = await snapshot_state(info)
         (repo / "one.txt").write_text("one\n")
-        after1 = await checkpoint(info)
+        after1 = await snapshot_state(info)
         (repo / "mid.txt").write_text("mid\n")  # drift between the turns
-        before2 = await checkpoint(info)
+        before2 = await snapshot_state(info)
         (repo / "two.txt").write_text("two\n")
-        after2 = await checkpoint(info)
+        after2 = await snapshot_state(info)
 
         stat = await attributed_diff_stat(info, [
             TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
@@ -442,9 +404,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
 
-        before = await checkpoint(info)
+        before = await snapshot_state(info)
         (repo / "app.py").write_text("agent\n")
-        after = await checkpoint(info)
+        after = await snapshot_state(info)
         (repo / "app.py").write_text("agent\nmanual\n")
 
         stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])

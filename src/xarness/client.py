@@ -38,19 +38,12 @@ _RETRY_BACKOFF = 0.3
 
 # cot_strength -> the reasoning-effort-style parameter this provider expects.
 # Kept isolated so per-provider adjustments never touch the rest of the code.
-# "off" omits the parameter entirely, which is the portable way to ask for no
-# deliberate reasoning across OpenAI-compatible APIs.
-_REASONING_EFFORT: dict[CotStrength, str | None] = {
-    CotStrength.OFF: None,
-    CotStrength.LOW: "low",
-    CotStrength.MEDIUM: "medium",
-    CotStrength.HIGH: "high",
-}
-
-
 def reasoning_effort_for(strength: CotStrength) -> str | None:
-    """Map config ``cot_strength`` to the provider's reasoning-effort param."""
-    return _REASONING_EFFORT[strength]
+    """Map config ``cot_strength`` to the provider's reasoning-effort param.
+
+    "off" omits the parameter entirely, which is the portable way to ask
+    for no deliberate reasoning across OpenAI-compatible APIs."""
+    return None if strength is CotStrength.OFF else strength.value
 
 
 class _ToolCallAccumulator:
@@ -115,6 +108,21 @@ class ChatClient:
         self._profile = profile
         self._api_key = api_key
         self._transport = transport  # injectable for tests
+        # One shared HTTP client for the session's lifetime: every tool-loop
+        # round reuses the connection pool instead of paying a fresh
+        # TCP/TLS handshake. Created lazily (tests inject a transport).
+        self._http: httpx.AsyncClient | None = None
+
+    def _client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=_TIMEOUT, transport=self._transport)
+        return self._http
+
+    async def aclose(self) -> None:
+        """Release the shared connection pool (session shutdown)."""
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Repoint this client at a new provider profile mid-session."""
@@ -165,12 +173,9 @@ class ChatClient:
         received_any = False
         for attempt in range(1, _RETRY_ATTEMPTS + 1):
             try:
-                async with (
-                    httpx.AsyncClient(timeout=_TIMEOUT, transport=self._transport) as client,
-                    client.stream(
-                        "POST", url, json=self.build_payload(wire_messages, tools), headers=headers
-                    ) as response,
-                ):
+                async with self._client().stream(
+                    "POST", url, json=self.build_payload(wire_messages, tools), headers=headers
+                ) as response:
                     if response.status_code != 200:
                         detail = (await response.aread()).decode(errors="replace").strip()
                         yield StreamError(f"HTTP {response.status_code} from {url}: {detail[:500]}")

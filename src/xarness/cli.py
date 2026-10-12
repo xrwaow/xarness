@@ -71,23 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the host in the foreground, persistent, printing the stats.",
     )
     parser.add_argument(
-        "--network", action="store_true", default=None,
+        "--network", action=argparse.BooleanOptionalAction, default=None,
         help="Force network access for sandboxed tool commands on/off "
-        "(tri-state: flag given = true; use --no-network for false; not "
-        "given = the sandbox profile's setting).",
+        "(tri-state: --network = on, --no-network = off; not given = the "
+        "sandbox profile's setting).",
     )
     parser.add_argument(
-        "--no-network", dest="network", action="store_false", default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--gpu", action="store_true", default=None,
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
         help="Force GPU device access for sandboxed tool commands on/off "
         "(tri-state, like --network).",
-    )
-    parser.add_argument(
-        "--no-gpu", dest="gpu", action="store_false", default=None,
-        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -148,8 +140,6 @@ def _run_chat(args: argparse.Namespace) -> None:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
-    for notice in sectioned.notices:
-        print(f"note: {notice}", file=sys.stderr)
 
     try:
         theme.set_theme(sectioned.theme)
@@ -159,12 +149,12 @@ def _run_chat(args: argparse.Namespace) -> None:
 
     workspace = args.workspace or Path.cwd()
 
-    client = _connect()
-
     from .tui.app import AgentApp
 
+    # client=None: the app connects on mount, inside Textual's event loop —
+    # a client created under its own asyncio.run() would carry a closed loop.
     app = AgentApp(
-        client,
+        None,
         workspace=workspace,
         session_name=args.session,
         config_path=DEFAULT_CONFIG_PATH,
@@ -177,13 +167,7 @@ def _run_chat(args: argparse.Namespace) -> None:
         no_session=args.no_session,
     )
 
-    try:
-        app.run()
-    finally:
-        try:
-            asyncio.run(client.aclose())
-        except Exception:  # noqa: BLE001 - exiting anyway
-            pass
+    app.run()
 
 
 if __name__ == "__main__":

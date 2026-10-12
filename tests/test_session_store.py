@@ -29,9 +29,9 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     conversation.add(user)
     conversation.add(assistant)
     conversation.turn_start = 0
-    session_store.save_session("s", "m", conversation)
+    session_store.save_state("s", session_store.SessionState(conversation, "m"))
 
-    loaded = session_store.load_session("s")
+    loaded = session_store.load_state("s").conversation
     assert [m.role for m in loaded.messages] == ["user", "assistant"]
     assert loaded.messages[0].checkpoint_sha == "abc123"
     assert loaded.messages[0].after_tree == "def456"
@@ -50,7 +50,9 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
 
 def test_to_wire_drops_unpaired_tool_calls() -> None:
     """A tool call without a recorded result (turn interrupted mid-execution,
-    session saved) must not reach the wire: providers reject unpaired calls."""
+    session saved) must not reach the wire as an unpaired call: providers
+    reject unpaired calls. Repair adds the synthetic result; to_wire then
+    sends every message as-is."""
 
     def make_conversation(content, calls, results):
         conversation = Conversation()
@@ -58,32 +60,36 @@ def test_to_wire_drops_unpaired_tool_calls() -> None:
         conversation.add(Message(role="assistant", content=content, tool_calls=calls))
         for call_id, output in results:
             conversation.add(Message(role="tool", content=output, tool_call_id=call_id))
+        conversation.repair_orphaned_tool_calls()
         return conversation
 
-    # Two calls, one answered: the round stays valid with only the answered
-    # call; the orphaned call is gone.
-    wire = make_conversation(
+    # Two calls, one answered: the orphaned call gets a synthetic result.
+    conversation = make_conversation(
         "",
         [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
         [("call_1", "ok")],
-    ).to_wire()
-    assert [m["role"] for m in wire] == ["user", "assistant", "tool"]
-    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1"]
+    )
+    wire = conversation.to_wire()
+    assert [m["role"] for m in wire] == ["user", "assistant", "tool", "tool"]
+    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1", "call_2"]
+    assert wire[3]["tool_call_id"] == "call_2"
+    assert wire[3]["content"] == "error: interrupted"
 
-    # Text plus the answered call both survive.
+    # Text plus both calls survive; the synthetic result keeps the round valid.
     wire = make_conversation(
         "let me check",
         [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
         [("call_1", "ok")],
     ).to_wire()
     assert wire[1]["content"] == "let me check"
-    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1"]
+    assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1", "call_2"]
 
-    # No answered calls and no content: the round is dropped entirely.
+    # No answered calls and no content: repair adds a synthetic result for
+    # the unanswered call so the round stays valid.
     wire = make_conversation(
         "", [ToolCall("call_1", "run_bash", "{}")], []
     ).to_wire()
-    assert [m["role"] for m in wire] == ["user"]
+    assert [m["role"] for m in wire] == ["user", "assistant", "tool"]
 
     # Fully answered calls are untouched.
     wire = make_conversation(
@@ -108,9 +114,9 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
 
     controller = ChatController(PROFILE, "k", client=FakeClient())
     asyncio.run(_send(controller, "hi"))
-    session_store.save_session("s", "m", controller.conversation)
+    session_store.save_state("s", session_store.SessionState(controller.conversation, "m"))
 
-    resumed = session_store.load_session("s")
+    resumed = session_store.load_state("s").conversation
     controller2 = ChatController(PROFILE, "k", client=FakeClient())
     controller2.conversation = resumed
 
@@ -124,27 +130,6 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
 async def _send(controller: ChatController, text: str) -> None:
     async for _ in controller.send(text):
         pass
-
-
-def test_load_drops_unknown_message_fields(tmp_path, monkeypatch) -> None:
-    """Stray keys in saved messages (older builds wrote e.g. a message-level
-    'kind') are dropped on load instead of raising TypeError in /sessions."""
-    import json
-
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    (tmp_path / "old-session.json").write_text(json.dumps({
-        "messages": [
-            {"role": "user", "content": "hi", "kind": "job_notification",
-             "some_future_field": 1},
-            {"role": "assistant", "content": "ho",
-             "usage": {"input_tokens": 1, "output_tokens": 2}},
-        ],
-        "turn_start": 0,
-    }), encoding="utf-8")
-
-    loaded = session_store.load_session("old-session")
-    assert [m.content for m in loaded.messages] == ["hi", "ho"]
-    assert loaded.messages[1].usage == Usage(1, 2)
 
 
 def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monkeypatch) -> None:
@@ -174,40 +159,29 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
     meta = store.load_meta("s")
     assert meta["workspace"] == "/w" and meta["message_count"] == 2
     assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
-    assert store.session_meta("s")["workspace"] == "/w"
+    assert store.load_meta("s")["workspace"] == "/w"
 
 
-def test_load_meta_falls_back_for_old_files(tmp_path, monkeypatch) -> None:
+
+
+def test_meta_sidecar_written_and_removed(tmp_path, monkeypatch) -> None:
+    """save_state writes a meta sidecar so listing lookups never read the
+    full session file; deleting the session removes both files."""
     import json
-    from xarness import session_store as store
 
-    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
-    (tmp_path / "sessions").mkdir()
-    (tmp_path / "sessions" / "old.json").write_text(json.dumps({
-        "profile": "p", "workspace": "/w", "updated_at": "t",
-        "messages": [{"role": "user", "content": "q", "send_time": "st"}],
-    }))
-    meta = store.load_meta("old")
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    conversation = Conversation()
+    conversation.add(Message(role="user", content="q", send_time="2026-01-01T00:00:00+00:00"))
+    session_store.save_state("s", session_store.SessionState(conversation, "m", workspace="/w"))
+
+    sidecar = tmp_path / "s.meta.json"
+    assert sidecar.exists()
+    meta = json.loads(sidecar.read_text())
     assert meta["workspace"] == "/w" and meta["message_count"] == 1
-    assert meta["last_user_message_at"] == "st" and meta["profile"] == "p"
+    # The sidecar is not picked up as a session by list_sessions.
+    assert session_store.list_sessions() == ["s"]
+    assert session_store.load_meta("s")["workspace"] == "/w"
 
-
-def test_load_meta_backfills_old_files_on_first_read(tmp_path, monkeypatch) -> None:
-    import json
-    from xarness import session_store as store
-
-    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
-    (tmp_path / "sessions").mkdir()
-    path = tmp_path / "sessions" / "old.json"
-    path.write_text(json.dumps({
-        "profile": "p", "workspace": "/w", "updated_at": "t",
-        "messages": [{"role": "user", "content": "q", "send_time": "st"}],
-    }))
-    assert "meta" not in json.loads(path.read_text())
-    meta = store.load_meta("old")
-    assert meta["workspace"] == "/w"
-    # The derived block is written back into the file.
-    on_disk = json.loads(path.read_text())["meta"]
-    assert on_disk == meta
-    # Second read serves the persisted block (identical).
-    assert store.load_meta("old") == meta
+    assert session_store.delete_session("s") is True
+    assert not sidecar.exists()
+    assert not (tmp_path / "s.json").exists()

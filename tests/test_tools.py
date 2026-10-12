@@ -270,7 +270,8 @@ def test_write_file_rejects_refs(tmp_path) -> None:
 def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\nbeta\nalpha\n")
     result = asyncio.run(_registry_for(tmp_path).call(
-        "edit_file", '{"path": "f.txt", "old_string": "beta", "new_string": "BETA"}'
+        "edit_file",
+        '{"path": "f.txt", "edits": [{"old_string": "beta", "new_string": "BETA"}]}',
     ))
     assert result.ok
     assert (tmp_path / "f.txt").read_text() == "alpha\nBETA\nalpha\n"
@@ -278,6 +279,15 @@ def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     assert result.output.startswith("applied edit to f.txt")
     assert "-beta" in result.output
     assert "+BETA" in result.output
+
+
+def test_edit_file_rejects_bare_top_level_pair(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha\nbeta\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file", '{"path": "f.txt", "old_string": "beta", "new_string": "BETA"}'
+    ))
+    assert not result.ok
+    assert "edits" in result.error
 
 
 def test_edit_file_applies_multiple_edits_in_one_call(tmp_path) -> None:
@@ -365,7 +375,8 @@ def test_edit_file_rejects_malformed_edit_item(tmp_path) -> None:
 def test_edit_file_rejects_ambiguous_match(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\nalpha\n")
     result = asyncio.run(_registry_for(tmp_path).call(
-        "edit_file", '{"path": "f.txt", "old_string": "alpha", "new_string": "BETA"}'
+        "edit_file",
+        '{"path": "f.txt", "edits": [{"old_string": "alpha", "new_string": "BETA"}]}',
     ))
     assert not result.ok
     assert "not unique" in result.error
@@ -374,7 +385,8 @@ def test_edit_file_rejects_ambiguous_match(tmp_path) -> None:
 def test_edit_file_requires_old_string(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\n")
     result = asyncio.run(_registry_for(tmp_path).call(
-        "edit_file", '{"path": "f.txt", "new_string": "BETA"}'
+        "edit_file",
+        '{"path": "f.txt", "edits": [{"new_string": "BETA"}]}',
     ))
     assert not result.ok
     assert result.parse_error is True

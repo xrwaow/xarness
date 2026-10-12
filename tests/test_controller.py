@@ -359,9 +359,9 @@ def test_undo_across_compaction_after_later_turn() -> None:
     ]
     assert controller.conversation.messages[2].content == "second"
     assert controller.conversation.compact_snapshot is None
-    # Usage back to the end of turn 2: the summarizer's and turn 3's spend
-    # subtracted; turns 1-2's own spend stays until those turns are undone.
-    assert controller.usage_total == Usage(input_tokens=9, output_tokens=4)
+    # Totals are monotonic: everything ever spent (turns 1-2, the
+    # summarizer, turns 3-4) stays counted.
+    assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
     assert controller.conversation.turn_start is None
 
     # Fourth /undo: removes turn 2 normally.
@@ -371,20 +371,20 @@ def test_undo_across_compaction_after_later_turn() -> None:
     controller.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == ["first", "one"]
     assert controller.conversation.messages[1].role == "assistant"
-    # Turn 2's spend subtracted.
-    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+    # Totals unchanged: nothing new was spent, and undo never subtracts.
+    assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
 
     # A further /undo walks back the pre-compaction turns normally.
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "first"
     controller.apply_rollback(plan)
     assert controller.conversation.messages == []
-    assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
+    # Totals are monotonic: everything ever spent stays counted.
+    assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
 
 
 def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     """Save a compacted session, resume it, and undo across the compaction."""
-    import json
 
     from xarness import session_store
     from xarness.conversation import SUMMARY_PREFIX
@@ -403,8 +403,8 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
     asyncio.run(collect(controller, "third"))
 
-    session_store.save_session("s", "test-model", controller.conversation)
-    resumed_conversation = session_store.load_session("s")
+    session_store.save_state("s", session_store.SessionState(controller.conversation, "test-model"))
+    resumed_conversation = session_store.load_state("s").conversation
     assert resumed_conversation.compact_snapshot is not None
     assert any(
         m.content.startswith(SUMMARY_PREFIX) for m in resumed_conversation.messages
@@ -448,13 +448,13 @@ def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:
     assert plan is not None
     assert plan.user_text == "second"
     assert [m.content for m in plan.keep] == ["first", "one"]
-    assert [m.content for m in plan.dropped] == ["second", "two"]
 
     controller.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == [
         "first", "one",
     ]
-    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+    # Totals are monotonic: the undone turn's spend stays counted.
+    assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
 
 
 def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
@@ -475,7 +475,8 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     assert plan.revert_turns == [TurnCheckpoint("abc123", "def456")]
     controller.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == ["old", "a"]
-    assert controller.usage_total == Usage(input_tokens=5, output_tokens=3)
+    # Totals are monotonic: the undone turn's spend stays counted.
+    assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
 
 
 def test_rollback_is_a_noop_without_a_finished_turn() -> None:
@@ -504,7 +505,8 @@ def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
 
     controller.apply_rollback(plan)
     assert controller.conversation.messages == []
-    assert controller.usage_total == Usage(input_tokens=0, output_tokens=0)
+    # Totals are monotonic: all three turns' spend stays counted.
+    assert controller.usage_total == Usage(input_tokens=21, output_tokens=9)
 
 
 def test_rollback_plan_to_rejects_non_turns_allows_the_latest() -> None:
@@ -520,7 +522,6 @@ def test_rollback_plan_to_rejects_non_turns_allows_the_latest() -> None:
     assert plan is not None
     assert plan.user_text == "pending"
     assert plan.keep == messages[:2]
-    assert plan.dropped == [messages[2]]
     assert plan.revert_turns == []
 
 

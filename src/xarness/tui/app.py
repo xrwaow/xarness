@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+import sys
 from pathlib import Path
 from typing import ClassVar
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static, TextArea
@@ -41,16 +42,22 @@ from ..protocol import (
     ToolExecStarted, ToolFinished, ToolOutputDelta, TurnComplete,
     TurnFinished, Undo, UndoTo, UserMessageAdded,
 )
+from textual_flowview import Anchor, FlowModel, FlowView
+
+from ..util import format_duration as _format_duration
+from . import flow as tflow
+from .flow import (
+    AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
+    UserItem, WritingItem,
+)
 from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
 from .widgets import (
-    AskBar, AssistantMessage, ChatInput, CompactionSummary, DiffSummary,
-    ErrorLine, GeneratingBar,
-    MessageLine, NoticeLine, PendingIndicator, ShimmerText, StatusBar,
+    AskBar, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
+    MessageLine, NoticeLine, StatusBar,
     crop_path,
-    SteerQueueBar, SuggestionPopup, ThinkingBlock, ToolCallBlock,
-    ToolWritingIndicator, UserMessage, _format_duration,
+    SteerQueueBar, SuggestionPopup, _stream_parts,
 )
 
 
@@ -117,92 +124,110 @@ class ContinueHeadlessScreen(ModalScreen[bool | None]):
 
 
 class _RoundView:
-    """Widget state for one streaming round: pending indicator, thinking
-    block, assistant message, tool-writing shimmer, tool-call blocks. Fed
-    by the event pump; the session drives pacing."""
+    """Flow-entry state for one streaming round: pending indicator, thinking
+    block, assistant answer, tool-writing shimmer, tool-call blocks. Fed by
+    the event pump; the session drives pacing. Each element is one entry in
+    the transcript's FlowModel — the presenter renders it."""
 
-    def __init__(self, app: "AgentApp", chat: "VerticalScroll") -> None:
+    def __init__(self, app: "AgentApp") -> None:
         self.app = app
-        self.chat = chat
-        self.indicator: PendingIndicator | None = None
+        self.indicator = None            # Entry[PendingItem] | None
         self.indicator_live = False
-        self.thinking: ThinkingBlock | None = None
-        self.assistant: AssistantMessage | None = None
-        self.writing: ToolWritingIndicator | None = None
+        self.thinking = None             # Entry[ThinkingItem] | None
+        self.assistant = None            # Entry[AssistantItem] | None
+        self.writing = None              # Entry[WritingItem] | None
         self.pending_writes = 0
-        self.tool_blocks: dict[str, ToolCallBlock] = {}
+        self.tool_blocks: dict[str, object] = {}
         self.round_has_tools = False
         self.had_stream_error = False
-        # Set by cancel(): indicators mounted afterwards (a mount cancelled
-        # mid-flight still lands its widget) remove themselves on_mount.
+        # Set by cancel(): entries created afterwards (a cancelled event still
+        # landing) remove themselves — checked via self.cancelled on creation.
         self.cancelled = False
 
+    # -- helpers ---------------------------------------------------------
+
+    def _append(self, item):
+        entry = self.app._append_item(item)
+        if self.cancelled:
+            self.app._remove_entry(entry)
+        return entry
+
+    def _remove(self, entry) -> None:
+        if entry is not None:
+            self.app._remove_entry(entry)
+
     async def mount(self) -> None:
-        self.indicator = PendingIndicator(cancelled=lambda: self.cancelled)
+        self.indicator = self._append(PendingItem())
         self.indicator_live = True
-        await self.chat.mount(self.indicator)
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, ReasoningDelta):
-            if self.thinking is not None and self.thinking.done:
+            if self.thinking is not None and self.thinking.item.done:
                 # A new round of the same turn (previous round ended with
                 # tool calls): the finished thinking block and settled
-                # answer belong to the transcript — start fresh widgets, or
+                # answer belong to the transcript — start fresh entries, or
                 # round 2+ CoT and answers stream into finished (collapsed,
-                # dropped-text) widgets and stay invisible until reload.
-                await self._new_round()
+                # dropped-text) entries and stay invisible until reload.
+                self.thinking = None
+                self.assistant = None
+                self.round_has_tools = False
+                self.had_stream_error = False
             if self.thinking is None:
                 await self._hide_indicator()
-                self.thinking = ThinkingBlock()
-                self.app._last_thinking = self.thinking
-                await self.app._mount_spaced(self.chat, self.thinking)
-            self.thinking.append_reasoning(event.text)
+                self.thinking = self._append(ThinkingItem())
+            item: ThinkingItem = self.thinking.item
+            item.parts.append(event.text)
+            self.thinking.update()
         elif isinstance(event, ContentDelta):
-            if self.assistant is not None and self.assistant.finalized:
-                await self._new_round()
+            if self.assistant is not None and self.assistant.item.finalized:
+                self.thinking = None
+                self.assistant = None
+                self.round_has_tools = False
+                self.had_stream_error = False
             if self.assistant is None:
                 await self._hide_indicator()
                 if self.thinking is not None:
-                    self.thinking.finish(duration=None, estimate_if_unknown=False)
-                self.assistant = AssistantMessage()
-                await self.app._mount_spaced(self.chat, self.assistant)
-            await self.assistant.append_delta(event.text)
+                    self._finish_thinking(duration=None)
+                self.assistant = self._append(AssistantItem())
+            item: AssistantItem = self.assistant.item
+            item.append_delta(event.text)
+            self.assistant.update()
         elif isinstance(event, ToolCallStarted):
             await self._hide_indicator()
             if self.thinking is not None:
-                self.thinking.finish(duration=None, estimate_if_unknown=False)
-            # One shared "Writing <tool>" shimmer while arguments stream; the
-            # indicator accumulates the streamed args itself. Per-call blocks
+                self._finish_thinking(duration=None)
+            # One shared "Writing <tool>" entry while arguments stream; the
+            # item accumulates the streamed args itself. Per-call entries
             # appear once args are complete.
             self.pending_writes += 1
             if self.writing is None:
-                self.writing = ToolWritingIndicator(
-                    event.name, cancelled=lambda: self.cancelled
-                )
-                await self.chat.mount(self.writing)
-            else:
-                self.writing.set_tool(event.name)
-            self.writing.track_call(event.call_id, event.name)
+                self.writing = self._append(WritingItem(label=f"Running {event.name}"))
+            writing: WritingItem = self.writing.item
+            writing.label = f"Running {event.name}"
+            self.writing.update()
         elif isinstance(event, ToolCallArgumentsDelta):
             if self.writing is not None:
-                self.writing.append_args_delta(event.call_id, event.text)
+                writing: WritingItem = self.writing.item
+                writing.detail = _args_detail(writing.label, writing, event.call_id, event.text)
+                self.writing.update()
         elif isinstance(event, ToolCallArgumentsDone):
-            block = ToolCallBlock(event.call_id, event.name)
-            await self.chat.mount(block)
-            # After mount: append_arguments refreshes the summary label in
-            # place; before it, the widget isn't mounted and the update no-ops.
-            block.append_arguments(event.arguments_json)
+            block = self._append(ToolItem(
+                call_id=event.call_id, name=event.name,
+                args=event.arguments_json,
+            ))
             self.tool_blocks[event.call_id] = block
             self.pending_writes = max(0, self.pending_writes - 1)
             if self.pending_writes == 0 and self.writing is not None:
-                await self.app._dismiss_indicator(self.writing)
+                self._remove(self.writing)
                 self.writing = None
         elif isinstance(event, ToolExecStarted):
             pass  # the block's amber "Running" dot is already showing
         elif isinstance(event, ToolOutputDelta):
-            block = self.tool_blocks.get(event.call_id)
-            if block is not None:
-                block.append_output(event.text)
+            entry = self.tool_blocks.get(event.call_id)
+            if entry is not None:
+                item: ToolItem = entry.item
+                item.output += event.text
+                entry.update()
         elif isinstance(event, ToolFinished):
             # The ToolCallStatus mapping lives here (client-side): the
             # session reports the outcome, the client picks the dot color.
@@ -212,63 +237,80 @@ class _RoundView:
                 status = ToolCallStatus.CALL_SUCCEEDED
             else:
                 status = ToolCallStatus.CALL_FAILED
-            block = self.tool_blocks.get(event.call_id)
-            if block is not None:
-                block.set_result(
-                    status, output=event.output, error=event.error, header=event.header,
-                )
+            entry = self.tool_blocks.get(event.call_id)
+            if entry is not None:
+                item: ToolItem = entry.item
+                item.status = status
+                item.output = event.output or event.error
+                item.header = event.header
+                entry.update()
         elif isinstance(event, TurnComplete):
             self.round_has_tools = event.has_tool_calls
-            await self.app._complete_round(event, self.thinking, self.assistant)
+            await self.app._complete_round(event, self)
         elif isinstance(event, StreamError):
             await self._hide_indicator()
             if self.assistant is not None:
                 # No TurnComplete follows an error: settle the streamed text
-                # here, or it stays in the unselectable live Static.
-                await self.assistant.finalize()
-            await self.chat.mount(ErrorLine(event.message))
+                # here, or it stays in the unselectable live tail.
+                self.assistant.item.finalize()
+                self.assistant.update()
+            self.app._post_line(ErrorLine(event.message))
             self.had_stream_error = True
             self.app._clear_hint_lines()
 
-    async def _new_round(self) -> None:
-        """Reset the per-round widgets for the turn's next round (the tool
-        blocks of earlier rounds stay put — their results may still land)."""
-        self.thinking = None
-        self.assistant = None
-        self.round_has_tools = False
-        self.had_stream_error = False
+    def _finish_thinking(self, duration: float | None) -> None:
+        if self.thinking is None:
+            return
+        item: ThinkingItem = self.thinking.item
+        item.finish(duration)
+        self.thinking.update()
+        self.app._stop_anim(self.thinking)
 
     async def _hide_indicator(self) -> None:
         if self.indicator_live:
-            await self.app._dismiss_indicator(self.indicator)
+            self._remove(self.indicator)
             self.indicator_live = False
 
     async def finish(self) -> None:
         """Dismiss the round's transient indicators at the round's end."""
         if self.writing is not None:
-            await self.app._dismiss_indicator(self.writing)
+            self._remove(self.writing)
             self.writing = None
         await self._hide_indicator()
 
     async def cancel(self) -> None:
-        """Settle the round's widgets for an interrupted turn."""
-        # Flip first: any indicator whose mount was cancelled mid-flight (and
-        # so still lands after this method returns) removes itself on_mount.
+        """Settle the round's entries for an interrupted turn."""
+        # Flip first: any entry created afterwards (an event whose landing
+        # was cancelled mid-flight) removes itself via _append.
         self.cancelled = True
-        if self.writing is not None and self.writing.is_mounted:
-            await self.writing.remove()
-        if self.indicator is not None and self.indicator_live:
-            await self.app._dismiss_indicator(self.indicator)
-        if self.thinking is not None and not self.thinking.done:
-            self.thinking.finish(duration=None, estimate_if_unknown=False)
+        if self.writing is not None:
+            self._remove(self.writing)
+            self.writing = None
+        await self._hide_indicator()
+        if self.thinking is not None and not self.thinking.item.done:
+            self._finish_thinking(duration=None)
         if self.assistant is not None:
             # Interrupted rounds never reach TurnComplete/finalize: settle the
             # partial answer so it's selectable (and matches the /resume replay).
-            await self.assistant.finalize()
+            self.assistant.item.finalize()
+            self.assistant.update()
         self.app._clear_hint_lines()
-        for block in self.tool_blocks.values():
-            if block.status is ToolCallStatus.MAKING_CALL:
-                block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+        for entry in self.tool_blocks.values():
+            if entry.item.status is ToolCallStatus.MAKING_CALL:
+                item: ToolItem = entry.item
+                item.status = ToolCallStatus.CALL_FAILED
+                item.output = item.output or "interrupted"
+                item.header = item.header or ""
+                entry.update()
+
+
+def _args_detail(label: str, writing: WritingItem, call_id: str, text: str) -> str:
+    """Accumulate streamed argument fragments and return the static detail
+    ('g.py +4', 'git stat…') shown after the shimmering tool name."""
+    writing.args_parts[call_id] = writing.args_parts.get(call_id, "") + text
+    _, detail = _stream_parts(label[len("Running "):], writing.args_parts[call_id])
+    return detail
+
 
 
 SLASH_COMMANDS = [
@@ -289,20 +331,64 @@ SLASH_COMMANDS = [
 ]
 
 
-class ChatLog(VerticalScroll):
-    """The transcript scroll.
+# Transcript virtualization: the chat log is a textual_flowview.FlowView —
+# it paints only the visible rows, so the whole history lives in the model
+# and no windowing/pagination is needed at any transcript length.
 
-    The scrollbar is hidden app-wide, so Textual's only built-in anchor
-    release (grabbing the scrollbar) never fires: without this, the log
-    stays pinned to the bottom forever and every relayout — a streaming
-    flush, expanding a block — yanks the view back down while you're
-    reading, which reads as scroll/expand lag. Release the anchor as soon
-    as the user scrolls up; scrolling back to the bottom re-arms it."""
 
-    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
-        super().watch_scroll_y(old_value, new_value)
-        if new_value < old_value and self._anchored and not self._anchor_released:
-            self.release_anchor()
+class ChatFlowView(FlowView):
+    """FlowView with re-entrant presentation defused.
+
+    Root cause of the intermittent ``RecursionError`` renders: ``present``
+    runs on the event loop via a Textual worker, and Textual's eager task
+    factory starts ``create_task`` coroutines *synchronously on the current
+    stack*. So when ``_present_loop`` → ``_refresh_layout`` → ``scroll_to``
+    fires the ``watch_scroll_y`` reactive → ``_present_visible`` →
+    ``_present_entry`` → ``run_worker``, the new present worker begins
+    executing immediately, ~30 frames deeper. Repeat for every entry whose
+    presentation scrolls into view and the stack marches to the recursion
+    limit mid-render (depth=989/limit=1000 in the wild).
+
+    The recursive cycle is bigger than one re-entrant ``_present_entry``
+    though: a present kicked off from the *compositor paint* path
+    (``_entry_strips`` → ``run_worker`` → present → layout → scroll →
+    repaint → ``_entry_strips`` …) re-enters through rendering too, and a
+    simple depth counter on ``_present_entry`` misses those hops. Verified
+    in the wild: 933 elided ancestor frames — ~30 nested paint/present
+    cycles — ending in ``RecursionError`` inside a markdown parse, which
+    permanently pinned affected entries to their last good (stale, e.g.
+    pre-theme-switch) presentation.
+
+    Fix: defer based on *actual current stack depth*, not a re-entrancy
+    counter. Any present requested while the stack is already deep runs
+    from a fresh event-loop turn instead; the deferred call is idempotent
+    (``_presenting`` still dedupes per entry)."""
+
+    # Presenting on a stack shallower than this is safe (one synchronous
+    # present chain costs ~100 frames); deeper than this and we're inside
+    # a paint/present cycle that must not nest.
+    MAX_SYNC_STACK = 120
+
+    def _present_entry(self, entry) -> None:  # type: ignore[override]
+        # Defer when already presenting re-entrantly, or when the caller's
+        # stack is deep (e.g. we're inside a compositor repaint): either way
+        # starting the present loop inline would nest the paint/present
+        # cycle another ~30 frames, marching to the recursion limit.
+        depth = getattr(self, "_present_entry_depth", 0)
+        if depth == 0:
+            frame = sys._getframe()
+            steps = 0
+            while frame is not None and steps <= self.MAX_SYNC_STACK:
+                steps += 1
+                frame = frame.f_back
+        if depth > 0 or steps > self.MAX_SYNC_STACK:
+            self.call_after_refresh(self._present_entry, entry)
+            return
+        self._present_entry_depth = depth + 1
+        try:
+            super()._present_entry(entry)
+        finally:
+            self._present_entry_depth = depth
 
 
 class AgentApp(App[None]):
@@ -310,7 +396,6 @@ class AgentApp(App[None]):
     TITLE = "xarness"
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+t", "toggle_thoughts", "Thoughts", priority=True),
         Binding("ctrl+c", "copy_or_quit", "Copy / Quit", priority=True),
         Binding("ctrl+shift+c", "copy_selection", "Copy", priority=True),
         Binding("escape", "interrupt", "Interrupt", priority=True),
@@ -319,7 +404,7 @@ class AgentApp(App[None]):
 
     def __init__(
         self,
-        client: XarnessClient,
+        client: XarnessClient | None,
         workspace: Path | None = None,
         session_name: str | None = None,
         config_path: Path | None = DEFAULT_CONFIG_PATH,
@@ -352,12 +437,25 @@ class AgentApp(App[None]):
         # Message ids currently rendered in the chat log (see
         # _mount_user_message / _on_history_replaced: the trim path).
         self._rendered_ids: set[str] = set()
+        # Seq of the snapshot the chat log was last built from: the attach
+        # flow renders the GET snapshot, and the event stream immediately
+        # delivers the same snapshot again — skip that duplicate.
+        self._rendered_snapshot_seq: int | None = None
+        # The virtualized transcript: every entry (whole history included —
+        # FlowView paints only the visible rows) lives in this model.
+        self._flow_model: "FlowModel" = FlowModel()
+        self._presenter = tflow.Presenter()
+        self._last_snapshot: Snapshot | None = None
+        # Transient hint lines ("press esc again …"), removed when the
+        # assistant's message settles.
+        self._hint_entries: list = []
+        # Per-entry shimmer animation handles, keyed by entry id.
+        self._animations: dict[int, object] = {}
         self._pump_worker: Worker | None = None
         self._ask_future: asyncio.Future[str | None] | None = None
         self._ask_id: str | None = None
         self._ask_worker: Worker | None = None
         self._drift_modal_open = False
-        self._last_thinking: ThinkingBlock | None = None
         # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
         # the second one within INTERRUPT_ARM_SECONDS actually cancels.
         self._interrupt_armed = False
@@ -375,7 +473,15 @@ class AgentApp(App[None]):
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
 
     def compose(self) -> ComposeResult:
-        yield ChatLog(id="chat-log")
+        yield ChatFlowView(
+            model=self._flow_model,
+            presenter=self._presenter,
+            id="chat-log",
+            anchor=Anchor.STICKY_BOTTOM,
+            spacing=0,
+            overscan=8,
+            estimated_height=2,
+        )
         with Container(id="input-wrap"):
             yield GeneratingBar(id="generating-bar")
             yield DiffSummary(id="diff-summary")
@@ -391,15 +497,22 @@ class AgentApp(App[None]):
         yield StatusBar(id="status-bar")
 
     async def on_mount(self) -> None:
+        if self.client is None:
+            # Connect inside the app's event loop: a client created under
+            # another asyncio.run() would carry a closed loop and break on
+            # first use under Textual.
+            try:
+                self.client = await XarnessClient.connect_unix()
+            except (ClientError, httpx.HTTPError) as exc:
+                self._post_line(ErrorLine(f"could not connect to the host: {exc}"))
+                return
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_status()
         self._set_default_title()
-        # Follow new output only while the user is parked at the bottom.
-        # Textual's anchor does exactly that: the log stays pinned to the end as
-        # content streams, the anchor is released the moment the user scrolls up
-        # (so nothing yanks the viewport back), and it re-arms once they scroll
-        # down to the bottom again.
-        self.query_one("#chat-log", ChatLog).anchor()
+        # Follow new output only while the user is parked at the bottom:
+        # FlowView's STICKY_BOTTOM anchor does exactly that (released on a
+        # scroll-up gesture, re-armed at the tail).
+        self.query_one("#chat-log", FlowView).can_focus = False
         self._load_draft_defaults()
         for notice in self.startup_notices:
             self._post_line(NoticeLine(notice))
@@ -407,7 +520,8 @@ class AgentApp(App[None]):
             await self._attach(self.session_name)
 
     async def on_unmount(self) -> None:
-        await self.client.aclose()
+        if self.client is not None:
+            await self.client.aclose()
 
     # ------------------------------------------------------------------
     # Attach + event pump
@@ -431,23 +545,23 @@ class AgentApp(App[None]):
         if snap.status.finished_while_away:
             self._post_line(NoticeLine("finished while you were away"))
         await self.refresh_diff_summary()
-        # Seed the pump with the seq we just rendered: the host replays only
-        # the missed events instead of sending a snapshot, so the history is
-        # not rendered a second time on attach.
-        self._pump_worker = self._pump_events(name, snap.seq)
+        self._pump_worker = self._pump_events(name)
 
     @work(group="stream", exit_on_error=False)
-    async def _pump_events(self, name: str, last_seq: int | None = None) -> None:
+    async def _pump_events(self, name: str) -> None:
         """Consume the session's event stream, reconnecting with backoff.
 
-        The clientlib reader replays with Last-Event-ID across dropped
-        connections; a fresh Snapshot arrives when the replay window was
-        missed. Never crashes the app on connection loss."""
+        Every reconnect delivers a fresh Snapshot (full re-render). Never
+        crashes the app on connection loss."""
         try:
-            async for item in self.client.attach(name, last_seq):
+            async for item in self.client.attach(name):
                 if isinstance(item, Snapshot):
                     self.status = item.status
-                    await self._render_history(item)
+                    # The attach flow already rendered this exact snapshot
+                    # (GET /snapshot); only rebuild when the stream's
+                    # snapshot is newer (reconnect after missed events).
+                    if item.seq != self._rendered_snapshot_seq:
+                        await self._render_history(item)
                     self._view = None
                 else:
                     await self._handle_event(item)
@@ -490,7 +604,9 @@ class AgentApp(App[None]):
             self._refresh_status()
             self._refresh_steer_bar()
             self._refresh_generating()
-            await self._maybe_prompt_drift()
+            # Spawned, not awaited: it is a worker (push_screen_wait needs
+            # one) and must not block the event pump on its modal.
+            self._maybe_prompt_drift()
             if (
                 was_streaming and self.status.state not in ("running", "compacting")
                 and self._view is not None
@@ -525,7 +641,13 @@ class AgentApp(App[None]):
             self._drift_modal_open = False
             return
         if isinstance(event, TurnFinished):
-            self._post_line(NoticeLine(f"Worked for {_format_duration(event.elapsed)}"))
+            # The per-turn timing line (total | streaming | tools | other);
+            # the session also persists it on the turn's last assistant
+            # message, so a reload renders the identical line there.
+            self._post_line(NoticeLine(
+                f"Worked for {event.summary}" if event.summary
+                else f"Worked for {_format_duration(event.elapsed)}"
+            ))
             self._refresh_diff_summary_soon()
             return
         if isinstance(event, SessionDeleted):
@@ -535,7 +657,7 @@ class AgentApp(App[None]):
             return
         # Everything else is a streaming-round event.
         if self._view is None:
-            self._view = _RoundView(self, self.query_one("#chat-log", VerticalScroll))
+            self._view = _RoundView(self)
             await self._view.mount()
         await self._view.handle(event)
         if isinstance(event, ToolFinished):
@@ -706,6 +828,11 @@ class AgentApp(App[None]):
             # Empty input + Enter while messages are queued: send now.
             self._flush_queued_now()
             return
+        # The user is acting: follow the output their submission produces
+        # (their own message, or /tools-style command output landing at the
+        # bottom). Without this, a log scrolled up to read stays parked even
+        # though the sticky anchor re-arms only at the bottom.
+        self._flow_view().scroll_to_bottom(animate=False)
         if text.startswith("/"):
             self._handle_slash_command(text)
             return
@@ -729,6 +856,7 @@ class AgentApp(App[None]):
                     network=self.network,
                     gpu=self.gpu,
                     no_init_repo=self.no_init_repo,
+                    no_session=self.no_session,
                 )
             except (ClientError, httpx.HTTPError) as exc:
                 self._post_line(ErrorLine(f"could not start a session: {exc}"))
@@ -754,25 +882,6 @@ class AgentApp(App[None]):
             for i in (images or [])
         ]
         await self._send_command(SendMessage(text=text, images=models or None))
-
-    async def _mount_user_message(self, event: UserMessageAdded) -> None:
-        """Land a user message in the transcript (sent or steered)."""
-        chat = self.query_one("#chat-log", VerticalScroll)
-        images = [
-            ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
-                            width=i.width, height=i.height)
-            for i in (event.images or [])
-        ]
-        widget = UserMessage(event.text, images or None)
-        widget.message = Message(role="user", content=event.text, id=event.message_id or "")
-        widget.mark_sent()
-        await self._mount_spaced(chat, widget)
-        # Track the rendered id: HistoryReplaced's trim path compares these
-        # against the new history to trim in place instead of re-rendering
-        # the whole chat (undo-from-here on a message that arrived live
-        # during this attach must trim, not reload).
-        if event.message_id:
-            self._rendered_ids.add(event.message_id)
 
     # ------------------------------------------------------------------
     # Ask tool (event-driven)
@@ -820,13 +929,18 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # Drift prompt (session state; any client may resolve)
 
+    @work(group="drift-prompt", exclusive=True)
     async def _maybe_prompt_drift(self) -> None:
         """The workspace changed outside this session while it was closed.
 
         Show what drifted and let the user choose: accept it as the new
         baseline, or keep tracking against the last known state. Never pick
         for them. The prompt is session state — if another client resolves
-        it first, DriftResolved closes this modal's follow-up."""
+        it first, DriftResolved closes this modal's follow-up.
+
+        A worker, not an await inside the event pump: push_screen_wait
+        requires one, and blocking the pump on a modal would stall the
+        event stream while the prompt is open."""
         if (
             self.status is None or self.status.pending_drift is None
             or self._drift_modal_open
@@ -885,15 +999,7 @@ class AgentApp(App[None]):
             if arg:
                 self._handle_theme_command(arg)
             else:
-                # No argument: open the picker, same interaction as /model.
-                self.push_screen(
-                    PickerScreen(
-                        list(theme.THEMES),
-                        current=theme.CURRENT_THEME,
-                        title="Color theme",
-                    ),
-                    self._on_theme_selected,
-                )
+                self._open_theme_picker()
         else:
             self._post_line(ErrorLine(f"unknown command: /{cmd}"))
 
@@ -925,11 +1031,27 @@ class AgentApp(App[None]):
             chat_input.load_text(user_text)
             chat_input.focus()
 
-    def on_user_message_undo_requested(self, event: UserMessage.UndoRequested) -> None:
-        event.stop()
-        message = event.user_message.message
-        if message is not None and message.id:
-            self.call_later(self._run_undo_to, message.id)
+    def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
+        """In-transcript clicks: expand/collapse tool calls and thinking
+        blocks, arm/trigger the user message's undo affordance."""
+        entry, item = event.entry, event.entry.item
+        if isinstance(item, ToolItem):
+            item.expanded = not item.expanded
+            entry.update()
+        elif isinstance(item, ThinkingItem):
+            # Toggleable at any time — mid-stream too (the user can collapse
+            # the live CoT and reopen it; finish() re-collapses at round end).
+            item.expanded = not item.expanded
+            entry.update()
+        elif isinstance(item, UserItem) and item.message is not None:
+            if item.undo_armed:
+                # The click landed anywhere on the armed message: undo to it.
+                item.undo_armed = False
+                entry.update()
+                self.call_later(self._run_undo_to, item.message.id)
+            else:
+                item.undo_armed = True
+                entry.update()
 
     def _start_new_session(self) -> None:
         """Slash /new: leave the current session (it keeps running in the
@@ -948,12 +1070,10 @@ class AgentApp(App[None]):
         self.session_name = None
         self.status = None
         self._view = None
-        self._last_thinking = None
+        self._last_snapshot = None
         self._refresh_title()
-        chat = self.query_one("#chat-log", VerticalScroll)
-        chat.remove_children()
-        # Fresh, empty log: follow it again from the top of the new session.
-        chat.anchor()
+        self._flow_model.clear()
+        self._hint_entries = []
         self._refresh_status()
         self._refresh_steer_bar()
         self._refresh_generating()
@@ -1013,53 +1133,53 @@ class AgentApp(App[None]):
             self._post_line(ErrorLine(f"could not open {name}: {exc}"))
 
     def _open_model_picker(self) -> None:
-        self.call_later(self._open_model_picker_async)
+        self._pick_model()
 
-    async def _open_model_picker_async(self) -> None:
+    async def _pick(
+        self, names: list[str], *, current: str | None, title: str,
+    ) -> str | None:
+        """Show a picker screen and wait for the choice (None = dismissed).
+
+        Awaited only from within a worker: push_screen_wait requires an
+        active worker context."""
+        return await self.push_screen_wait(
+            PickerScreen(names, current=current, title=title)
+        )
+
+    @work(group="picker", exclusive=True)
+    async def _pick_model(self) -> None:
         try:
             self._config_cache = await self.client.config()
         except (ClientError, httpx.HTTPError) as exc:
             self._post_line(ErrorLine(f"/model failed: {exc}"))
             return
-        names = [m["name"] for m in self._config_cache.models]
-        self.push_screen(
-            PickerScreen(
-                names,
-                current=self.status.model_name if self.status else None,
-                title="Switch model",
-            ),
-            self._on_model_selected,
+        name = await self._pick(
+            [m["name"] for m in self._config_cache.models],
+            current=self.status.model_name if self.status else None,
+            title="Switch model",
         )
-
-    def _on_model_selected(self, name: str | None) -> None:
         if not name:
             return
         self._post_command(SwitchModel(name=name))
         self._save_preference(default_profile=name)
 
     def _open_sandbox_picker(self) -> None:
-        self.call_later(self._open_sandbox_picker_async)
+        self._pick_sandbox()
 
-    async def _open_sandbox_picker_async(self) -> None:
+    @work(group="picker", exclusive=True)
+    async def _pick_sandbox(self) -> None:
         try:
             self._config_cache = await self.client.config()
         except (ClientError, httpx.HTTPError) as exc:
             self._post_line(ErrorLine(f"/sandbox failed: {exc}"))
             return
-        names = [s["name"] for s in self._config_cache.sandboxes]
-        self.push_screen(
-            PickerScreen(
-                names,
-                current=self.status.sandbox_name if self.status else None,
-                title="Sandbox profile (applies when the session is idle)",
-            ),
-            self._on_sandbox_selected,
+        name = await self._pick(
+            [s["name"] for s in self._config_cache.sandboxes],
+            current=self.status.sandbox_name if self.status else None,
+            title="Sandbox profile (applies when the session is idle)",
         )
-
-    def _on_sandbox_selected(self, name: str | None) -> None:
-        if not name:
-            return
-        self._post_command(SetSandbox(name=name))
+        if name:
+            self._post_command(SetSandbox(name=name))
 
     def _handle_filter_command(self, arg: str) -> None:
         sub = arg.split(maxsplit=1)
@@ -1084,7 +1204,14 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # Theme (client-side preference)
 
-    def _on_theme_selected(self, name: str | None) -> None:
+    def _open_theme_picker(self) -> None:
+        self._pick_theme()
+
+    @work(group="picker", exclusive=True)
+    async def _pick_theme(self) -> None:
+        name = await self._pick(
+            list(theme.THEMES), current=theme.CURRENT_THEME, title="Color theme",
+        )
         if name:
             self._handle_theme_command(name)
 
@@ -1124,110 +1251,153 @@ class AgentApp(App[None]):
         """Switch palette live: CSS variables, input caret, shimmers, dots,
         summaries, status bar — anything that baked palette colors at render
         time must be re-rendered here, or the switched theme drifts from the
-        same theme set at startup."""
+        same theme set at startup.
+
+        The transcript recolors in place: ``_presenter.invalidate()`` busts
+        the per-item strip caches (every cache key carries the presenter
+        epoch), and bumping each entry's revision makes FlowView re-present
+        it — on screen now, or lazily when scrolled back into view. This is
+        deliberately NOT a rebuild from the last snapshot: a snapshot only
+        covers what was persisted at attach, so a rebuild would wipe every
+        entry that arrived via live events (the current turn's user message,
+        cot, tool and answer blocks). Working in place also means the switch
+        needs no idle gate — it is safe mid-turn."""
         theme.set_theme(name)
         self.refresh_css()
         self.query_one("#chat-input", ChatInput).apply_input_theme()
-        for shimmer in self.query(ShimmerText):
-            colors = (
-                theme.SHIMMER_PROCESSING if shimmer.id == "pending-shimmer"
-                else theme.SHIMMER_THINKING
-            )
-            shimmer.set_colors(*colors)
-        for message in self.query(UserMessage):
-            message.apply_palette()
-        for thinking in self.query(ThinkingBlock):
-            thinking.recolor()
-        for block in self.query(ToolCallBlock):
-            block.recolor()
+        self._presenter.invalidate()
         self._refresh_status()
         self.query_one("#diff-summary", DiffSummary).recolor()
+        # Recolor every live entry in place. Chunked: each update() can kick
+        # off present/layout/scroll work, and hundreds of them back-to-back
+        # in one handler stack is how the paint/present recursion blew the
+        # recursion limit (which is what pinned entries to stale strips).
+        entries = [e for e in self._flow_model.entries if e.alive]
+        if entries:
+            self._recolor_chunk(entries)
+
+    def _recolor_chunk(self, entries: list) -> None:
+        """Bump a batch of entries' revisions, then defer the rest."""
+        for entry in entries[:16]:
+            entry.update()
+        rest = entries[16:]
+        if rest:
+            self.call_after_refresh(self._recolor_chunk, rest)
 
     # ------------------------------------------------------------------
-    # Rendering
+    # Transcript (the FlowView model)
 
-    async def _mount_spaced(
-        self,
-        chat: "VerticalScroll",
-        widget: "ThinkingBlock | AssistantMessage | UserMessage",
-    ) -> None:
-        """Mount a cot/assistant/user block, keeping a blank line above it when
-        it directly follows tool call blocks (which carry no spacing of their
-        own)."""
-        children = chat.children
-        if children and isinstance(children[-1], ToolCallBlock):
-            widget.add_class("after-tools")
-        await chat.mount(widget)
+    def _flow_view(self) -> "FlowView":
+        return self.query_one("#chat-log", FlowView)
+
+    def _append_item(self, item):
+        """Append one transcript item to the FlowModel, registering shimmer
+        animations for the items that have one."""
+        entry = self._flow_model.append(item)
+        if isinstance(item, (PendingItem, WritingItem)) or (
+            isinstance(item, ThinkingItem) and not item.done
+        ):
+            self._start_anim(entry, item)
+        return entry
+
+    def _remove_entry(self, entry) -> None:
+        self._stop_anim(entry)
+        if entry.alive:
+            entry.remove()
+
+    def _start_anim(self, entry, item) -> None:
+        """Advance the item's shimmer phase while the entry is on screen
+        (FlowView pauses the timer when it scrolls out)."""
+        try:
+            view = self._flow_view()
+        except NoMatches:
+            return  # app shutting down / not mounted yet
+
+        def tick(e) -> None:
+            span = len(getattr(item, "label", "Thinking")) + 2 * theme.SHIMMER_BAND_WIDTH
+            item.phase = (item.phase + theme.SHIMMER_SPEED * 0.08) % span
+            e.update()
+
+        self._animations[entry.id] = view.animate_entry(entry, 0.08, tick)
+
+    def _stop_anim(self, entry) -> None:
+        handle = self._animations.pop(entry.id, None)
+        if handle is not None:
+            handle.stop()
+
+    def _post_line(self, widget: MessageLine) -> None:
+        """Post a one-line status message (notice/warn/error/hint).
+
+        ``widget`` is one of the light MessageLine shorthands the rest of the
+        app constructs; it is never mounted — it becomes a LineItem entry.
+        Whether it is in view is FlowView's business: it follows the tail
+        only if the user is already at the bottom."""
+        self._flow_view()  # raises NoMatches when the app is shutting down
+        item = LineItem(text=widget.message_text, kind=widget.kind)
+        entry = self._flow_model.append(item)
+        if widget.hint:
+            self._hint_entries.append(entry)
+
+    def _clear_hint_lines(self) -> None:
+        """Remove transient hint lines (e.g. 'press esc again to interrupt')
+        from the transcript. Called when the assistant's message settles, so
+        keypress coaching doesn't linger in the scrollback."""
+        for entry in self._hint_entries:
+            self._remove_entry(entry)
+        self._hint_entries = []
+
+    async def _complete_round(self, event: TurnComplete, view: "_RoundView") -> None:
+        self._clear_hint_lines()
+        if view.assistant is not None:
+            view.assistant.item.finalize()
+            view.assistant.update()
+        elif view.thinking is None and not event.has_tool_calls:
+            self._post_line(ErrorLine("empty response from model"))
+        if view.thinking is not None:
+            view._finish_thinking(event.reasoning_seconds)
+        await view.finish()
+        self._refresh_status()
 
     async def _on_history_replaced(self, event: HistoryReplaced) -> None:
         """The conversation was rewritten (undo, retry, accept, compaction,
-        drift accept): re-render, trimming the removed tail when possible."""
+        drift accept): re-render from the new snapshot. A data-only rebuild
+        is cheap under FlowView, so there is no incremental trim path."""
         self._view = None
-        new_ids = {
-            m.message_id for m in event.snapshot.messages if m.message_id
-        }
-        if hasattr(self, "_rendered_ids") and self._rendered_ids == new_ids:
+        new_ids = {m.id for m in event.snapshot.messages if m.id}
+        if self._rendered_ids == new_ids:
             # Nothing added or removed (e.g. /accept, which only moves the
             # baseline): the rendered transcript is already correct — don't
-            # rebuild the whole chat, just the parts that depend on git
-            # state.
+            # rebuild, just the parts that depend on git state.
             self._refresh_status()
             self.call_later(self.refresh_diff_summary)
             return
-        dropped = self._rendered_ids - new_ids if hasattr(self, "_rendered_ids") else set()
         self._rendered_ids = new_ids
-        if dropped and await self._trim_history(dropped):
-            self._refresh_status()
-            self.call_later(self.refresh_diff_summary)
-            return
         await self._render_history(event.snapshot)
         self._refresh_status()
         self.call_later(self.refresh_diff_summary)
 
-    async def _trim_history(self, dropped_ids: set[str]) -> bool:
-        """Remove the rendered widgets for `dropped_ids` and everything
-        after them, keeping the rest of the transcript untouched.
-
-        Returns False — the caller falls back to a full _render_history —
-        when no rendered widget matches (e.g. a conversation loaded but never
-        rendered, or a widget without a message binding)."""
-        chat = self.query_one("#chat-log", VerticalScroll)
-        children = list(chat.children)
-        cut = next(
-            (
-                i
-                for i, widget in enumerate(children)
-                if getattr(widget, "message", None) is not None
-                and getattr(widget.message, "id", None) in dropped_ids
-            ),
-            None,
-        )
-        if cut is None:
-            return False
-        for widget in children[cut:]:
-            await widget.remove()
-        chat.scroll_end(animate=False)
-        return True
-
     async def _render_history(self, snap: Snapshot) -> None:
-        """Rebuild #chat-log from a snapshot.
+        """Rebuild the transcript from a snapshot.
 
         Best-effort reconstruction: tool-call status is inferred from whether
         the recorded tool-role content starts with "error: ", since the
         original ToolCallStatus enum value isn't itself persisted.
 
-        If the conversation was compacted, the pre-compaction messages are
-        rendered first (they are history, kept for the human), then a
-        divider, then the summary and everything after it — mirroring what
-        the model actually sees. The current turn's buffered events are fed
-        through a fresh _RoundView, so a mid-turn attach rebuilds the
-        thinking block, partial answer and running tool blocks."""
+        If the conversation was compacted, the pre-compaction messages come
+        first (they are history, kept for the human), then a divider, then
+        the summary and everything after it — mirroring what the model
+        actually sees. The current turn's buffered events are fed through a
+        fresh _RoundView, so a mid-turn attach rebuilds the thinking block,
+        partial answer and running tool entries.
+
+        The FULL history goes into the model: FlowView paints only the
+        visible rows, so a 1k+-message session costs the same as a fresh one."""
         self._view = None
-        self._rendered_ids = {
-            m.message_id for m in snap.messages if m.message_id
-        }
-        chat = self.query_one("#chat-log", VerticalScroll)
-        await chat.remove_children()
+        self._last_snapshot = snap
+        self._rendered_snapshot_seq = snap.seq
+        self._rendered_ids = {m.id for m in snap.messages if m.id}
+        self._flow_model.clear()
+        self._hint_entries = []
         messages = snap.messages
         pre_compact = snap.compact_snapshot
         all_messages = [*pre_compact, *messages]
@@ -1235,87 +1405,96 @@ class AgentApp(App[None]):
             m.tool_call_id: m for m in all_messages
             if m.role == "tool" and m.tool_call_id
         }
-
         for message in pre_compact:
-            await self._render_message(chat, message, tool_results)
+            self._append_message_items(message, tool_results)
         if pre_compact:
-            await chat.mount(NoticeLine(COMPACTED_DIVIDER))
+            self._flow_model.append(DividerItem(COMPACTED_DIVIDER))
         for message in messages:
-            await self._render_message(chat, message, tool_results)
-        chat.scroll_end(animate=False)
+            self._append_message_items(message, tool_results)
         # Mid-turn attach: rebuild the live round from the buffered events.
-        for event in snap.turn_events:
-            await self._handle_event(event)
+        for tevent in snap.turn_events:
+            await self._handle_event(tevent)
+        try:
+            self._flow_view().scroll_to_bottom(animate=False)
+        except NoMatches:
+            pass
 
-    async def _render_message(
-        self,
-        chat: "VerticalScroll",
-        message: MessageModel,
-        tool_results: dict[str, MessageModel],
+    def _append_message_items(
+        self, message: MessageModel, tool_results: dict[str, MessageModel],
     ) -> None:
-        """Render one persisted message into the chat log."""
+        """Append the transcript items for one persisted message."""
         if message.role == "user":
             if message.content.startswith(SUMMARY_PREFIX):
-                # The handoff an auto-compaction left behind: padded and
-                # accent-colored, not a plain user message.
-                summary = CompactionSummary(
-                    message.content.removeprefix(SUMMARY_PREFIX).strip()
-                )
-                summary.message = Message(
-                    role="user", content=message.content, id=message.message_id or "",
-                )
-                await chat.mount(summary)
+                # The handoff an auto-compaction left behind: a distinct
+                # divider, not a plain user message.
+                self._flow_model.append(DividerItem(
+                    message.content.removeprefix(SUMMARY_PREFIX).strip(),
+                ))
             else:
-                images = [
-                    ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
-                                    width=i.width, height=i.height)
-                    for i in (message.images or [])
-                ]
-                widget = UserMessage(message.content, images or None)
-                widget.message = Message(
-                    role="user", content=message.content, id=message.message_id or "",
+                item = UserItem(text=message.content, images=message.images or [])
+                item.message = Message(
+                    role="user", content=message.content, id=message.id or "",
                 )
-                await self._mount_spaced(chat, widget)
+                self._flow_model.append(item)
         elif message.role == "assistant":
             if message.reasoning:
-                thinking = ThinkingBlock()
-                await self._mount_spaced(chat, thinking)
-                thinking.append_reasoning(message.reasoning)
-                thinking.finish(message.reasoning_seconds, estimate_if_unknown=False)
-            # Tool-call-only rounds render no AssistantMessage body; an
-            # empty assistant message with no tool calls replays as
-            # "(no output)" — except a reasoning-only partial (saved on
-            # cancel): its thinking block is the whole message.
+                # Settled: a replayed block is never running.
+                thinking = ThinkingItem(
+                    parts=[message.reasoning], done=True,
+                    duration=message.reasoning_seconds,
+                    expanded=False,
+                )
+                self._flow_model.append(thinking)
+            # Tool-call-only rounds render no answer body; an empty assistant
+            # message with no tool calls replays as "(no output)" — except a
+            # reasoning-only partial (saved on cancel): its thinking block is
+            # the whole message.
             if message.content or (not message.tool_calls and not message.reasoning):
-                assistant = AssistantMessage()
-                await self._mount_spaced(chat, assistant)
-                if message.content:
-                    await assistant.append_delta(message.content)
-                await assistant.finalize()
+                item = AssistantItem(finalized=True)
+                item.chunks = [message.content] if message.content else ["(no output)"]
+                self._flow_model.append(item)
             for call in message.tool_calls or []:
-                function = call.get("function") or {}
-                block = ToolCallBlock(call.get("id", ""), function.get("name", ""))
-                await chat.mount(block)
-                block.append_arguments(function.get("arguments", ""))
-                result = tool_results.get(call.get("id", ""))
+                item = ToolItem(
+                    call_id=call.call_id, name=call.name,
+                    args=call.arguments_json,
+                )
+                result = tool_results.get(call.call_id)
                 if result is not None:
                     is_error = result.content.startswith("error: ")
-                    status = (
+                    item.status = (
                         ToolCallStatus.CALL_FAILED if is_error
                         else ToolCallStatus.CALL_SUCCEEDED
                     )
-                    block.set_result(
-                        status,
-                        output="" if is_error else result.content,
-                        error=result.content[len("error: "):] if is_error else "",
-                        header=result.header or "",
-                    )
+                    item.output = result.content[len("error: "):] if is_error else result.content
+                    item.header = result.header or ""
                 else:
                     # The call never produced a result: the turn was
                     # interrupted mid-execution and the session was saved.
                     # It can never complete now — render it as failed instead
                     # of an eternally shimmering "Running …".
-                    block.set_result(ToolCallStatus.CALL_FAILED, error="interrupted")
+                    item.status = ToolCallStatus.CALL_FAILED
+                    item.output = "interrupted"
+                self._flow_model.append(item)
+            if message.time_summary:
+                self._flow_model.append(LineItem(
+                    text=f"Worked for {message.time_summary}", kind="notice",
+                ))
+
+    async def _mount_user_message(self, event: UserMessageAdded) -> None:
+        """Land a user message in the transcript (sent or steered)."""
+        images = [
+            ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
+                            width=i.width, height=i.height)
+            for i in (event.images or [])
+        ]
+        item = UserItem(text=event.text, images=images)
+        item.message = Message(role="user", content=event.text, id=event.message_id or "")
+        self._flow_model.append(item)
+        # Track the rendered id: HistoryReplaced compares these against the
+        # new history to decide between rebuild and no-op.
+        if event.message_id:
+            self._rendered_ids.add(event.message_id)
+
 
     # ------------------------------------------------------------------
     # Popups (@ search runs server-side against the session's workspace)
@@ -1414,18 +1593,6 @@ class AgentApp(App[None]):
 
     def _hide_popup(self) -> None:
         self.query_one("#suggestion-popup", SuggestionPopup).remove_class("visible")
-
-    def _post_line(self, widget: Static) -> None:
-        """Mount a notice/error line into the chat log.
-
-        Whether it lands in view is the chat log's business: it is anchored,
-        so it follows the new line only if the user is already at the bottom.
-        """
-        try:
-            chat = self.query_one("#chat-log", VerticalScroll)
-        except NoMatches:
-            return  # app shutting down; DOM already pruned
-        chat.mount(widget)
 
     # ------------------------------------------------------------------
     # Steer queue commands
@@ -1587,7 +1754,7 @@ class AgentApp(App[None]):
                     return
                 widget.add_class("expanded")
                 return
-            info = await self.client.diff(self.session_name, path=arg)
+            await self.client.diff(self.session_name, path=arg)
             text = await self._diff_text(arg)
             if not text.strip():
                 self._post_line(NoticeLine(f"no pending changes for {arg}"))
@@ -1626,41 +1793,3 @@ class AgentApp(App[None]):
         widget.show_diff(event.key, text)
 
     # ------------------------------------------------------------------
-    # misc
-
-    def _clear_hint_lines(self) -> None:
-        """Remove transient hint lines (e.g. 'press esc again to interrupt')
-        from the chat log. Called when the assistant's message settles, so
-        keypress coaching doesn't linger in the scrollback."""
-        try:
-            chat = self.query_one("#chat-log", VerticalScroll)
-        except NoMatches:
-            return  # app shutting down; DOM already pruned
-        for line in chat.query(".msg.hint"):
-            line.remove()
-
-    async def _dismiss_indicator(self, indicator: PendingIndicator | None) -> None:
-        if indicator is not None and indicator.is_mounted:
-            await indicator.remove()
-
-    async def _complete_round(
-        self,
-        event: TurnComplete,
-        thinking: ThinkingBlock | None,
-        assistant: AssistantMessage | None,
-    ) -> None:
-        chat = self.query_one("#chat-log", VerticalScroll)
-        self._clear_hint_lines()
-        if assistant is not None:
-            await assistant.finalize()
-        elif thinking is None and not event.has_tool_calls:
-            await chat.mount(ErrorLine("empty response from model"))
-        if thinking is not None:
-            thinking.finish(event.reasoning_seconds)
-        if self._view is not None:
-            await self._view.finish()
-        self._refresh_status()
-
-    def action_toggle_thoughts(self) -> None:
-        if self._last_thinking is not None:
-            self._last_thinking.toggle()

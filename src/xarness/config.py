@@ -1,17 +1,25 @@
 """Config file (JSON, default ``~/.config/xarness/config.json``).
 
-Two shapes: named profiles (``{"default_profile", "default_theme",
-"profiles": [{...}]}``, each profile needs a unique ``name``) or a flat
-single profile (a ``"provider"`` object, or profile fields at the top
-level). The API key is never stored here; ``api_key_env`` names the env
-var that holds it (null = no key needed).
+Sectioned layout:
+
+    {
+      "models":    {"<name>": {ProviderProfile fields}},
+      "sandboxes": {"<name>": {SandboxSettings fields}},
+      "presets":   {"<name>": {"model": ..., "sandbox": ...}},
+      "ui":        {"theme": "..."},
+      "defaults":  {"preset": "default"},
+      "server":    {"port": 0}
+    }
+
+A model's ``name`` is implied by its key in ``models``. The API key is never
+stored here; ``api_key_env`` names the env var that holds it (null = no key
+needed).
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -23,29 +31,15 @@ DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
 DEFAULT_THEME = "ayu-darker"
 
 # Config written on first run (no file at DEFAULT_CONFIG_PATH yet): one
-# OpenAI-shaped profile using the built-in defaults for everything else.
+# OpenAI-shaped model using the built-in defaults for everything else.
 STARTER_CONFIG: dict[str, Any] = {
-    "default_profile": "openai",
-    "profiles": [
-        {
-            "name": "openai",
+    "models": {
+        "openai": {
             "base_url": "https://api.openai.com/v1",
             "api_key_env": "OPENAI_API_KEY",
             "model_id": "gpt-4.1",
         }
-    ],
-}
-
-# Optional per-profile keys the starter config leaves at their defaults.
-PROFILE_OPTIONAL_DEFAULTS: dict[str, Any] = {
-    "api_key_env": "OPENAI_API_KEY",
-    "shown_name": None,
-    "max_context": 128_000,
-    "cot_strength": "medium",
-    "keep_reasoning": True,
-    "supports_vision": False,
-    "auto_compact": False,
-    "auto_compact_threshold": 0.9,
+    }
 }
 
 
@@ -68,8 +62,7 @@ class ProviderProfile(BaseModel):
     base_url: str
     api_key_env: str | None = "OPENAI_API_KEY"
     model_id: str
-    # Required (and unique) for profiles in the "profiles" list; the flat
-    # single-profile form has no name.
+    # The key in the config's "models" section; set when parsing.
     name: str | None = None
     shown_name: str | None = None
     max_context: int = Field(default=128_000, gt=0)
@@ -147,70 +140,6 @@ class RefSpec(BaseModel):
         return value
 
 
-class ContainerSettings(BaseModel):
-    """Sandbox/container knobs, top-level "container" section of the config.
-
-    Applies to the one sandbox all tools run in (see ``sandbox.py``);
-    independent of which profile is selected.
-
-    Network and GPU access are launch-time CLI flags (``--network``,
-    ``--gpu``), not config settings."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    # Host paths bound into the container at runtime, so the model can
-    # consult (or, when writable, reuse) files that live outside the
-    # workspace: specs, notes, other checkouts, prebuilt toolchains. Entries
-    # are plain paths (bound read-only under the container-only refs tmpfs,
-    # addressed as ``.refs/<alias>``) or RefSpec
-    # objects with an explicit ``mount`` and ``read_only`` flag. The alias is
-    # derived from the path (its basename, disambiguated with parent segments
-    # when two paths share a basename).
-    auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
-
-    # Per-tool output cap (chars) the model receives. None = the built-in
-    # default (tools.DEFAULT_OUTPUT_LIMIT).
-    tool_output_limit: int | None = Field(default=None, ge=256)
-
-    @field_validator("auto_include_refs", mode="before")
-    @classmethod
-    def _coerce_refs(cls, value: Any) -> Any:
-        if not isinstance(value, list):
-            return value
-        out: list[str | dict[str, Any]] = []
-        for entry in value:
-            if isinstance(entry, str):
-                if not entry.strip():
-                    raise ValueError("auto_include_refs entries must be non-empty paths")
-                if ".." in Path(entry.strip()).parts:
-                    raise ValueError(f"auto_include_refs entry must not contain '..': {entry!r}")
-                out.append(entry.strip())
-            elif isinstance(entry, dict):
-                out.append(entry)
-            else:
-                out.append(entry)
-        return out
-
-
-@dataclass(frozen=True)
-class LoadedConfig:
-    """Everything load_config derives from one config file read."""
-
-    profile: ProviderProfile
-    # Name of the selected profile ("default" for the flat form).
-    profile_name: str | None
-    # All profile names in the file ([] for the flat form).
-    profile_names: list[str]
-    default_theme: str
-    # Container settings (sandbox policy); defaults when the config omits
-    # the "container" section.
-    container: ContainerSettings = Field(default_factory=ContainerSettings)
-
-
-# ----------------------------------------------------------------------
-# sectioned layout (models / sandboxes / presets / ui / defaults / server)
-
-
 class SandboxSettings(BaseModel):
     """One named sandbox profile (the "sandboxes" config section).
 
@@ -221,8 +150,8 @@ class SandboxSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    allow_network: bool = False
-    gpu_access: bool = False
+    allow_network: bool = True
+    gpu_access: bool = True
     # Off by default; on disables the git guard entirely (the agent manages
     # git itself) — tracking guarantees no longer hold.
     allow_git_write: bool = False
@@ -241,6 +170,11 @@ class SandboxSettings(BaseModel):
     # conversation-only; no auto-init of a repo.
     enable_tracking: bool = True
 
+    @field_validator("auto_include_refs", mode="before")
+    @classmethod
+    def _coerce_refs(cls, value: Any) -> Any:
+        return coerce_refs(value)
+
     def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
         """Inheritance: keys this profile sets explicitly win over ``base``."""
         merged = base.model_copy()
@@ -251,37 +185,40 @@ class SandboxSettings(BaseModel):
 
 
 class PresetSettings(BaseModel):
-    """One named preset: a model + sandbox (+ subagent, parsed but not yet
-    used — the subagent feature comes later)."""
+    """One named preset: a model + sandbox profile."""
 
     model_config = ConfigDict(extra="forbid")
 
     model: str | None = None
     sandbox: str | None = None
-    subagent: str | None = None
 
 
-class ServerSettings(BaseModel):
-    """The "server" section: TCP port for ``xarness --server`` (0 = pick a
-    free loopback port). The unix socket is always served."""
+def coerce_refs(value: Any) -> Any:
+    """Validator body shared by every ``auto_include_refs`` field: reject
+    empty/``..`` string entries, pass dicts and RefSpecs through."""
+    if not isinstance(value, list):
+        return value
+    out: list[str | dict[str, Any]] = []
+    for entry in value:
+        if isinstance(entry, str):
+            if not entry.strip():
+                raise ValueError("auto_include_refs entries must be non-empty paths")
+            if ".." in Path(entry.strip()).parts:
+                raise ValueError(f"auto_include_refs entry must not contain '..': {entry!r}")
+            out.append(entry.strip())
+        else:
+            out.append(entry)
+    return out
 
-    model_config = ConfigDict(extra="forbid")
 
-    port: int = Field(default=0, ge=0, le=65535)
+class SectionedConfig(BaseModel):
+    """The parsed config file."""
 
-
-@dataclass(frozen=True)
-class SectionedConfig:
-    """The sectioned view of one config file (either layout)."""
-
-    models: dict[str, ProviderProfile]
-    sandboxes: dict[str, SandboxSettings]
-    presets: dict[str, PresetSettings]
-    theme: str
-    default_preset: str
-    server: ServerSettings
-    # Notices (e.g. old-layout deprecation) for the caller to surface.
-    notices: list[str]
+    models: dict[str, ProviderProfile] = Field(default_factory=dict)
+    sandboxes: dict[str, SandboxSettings] = Field(default_factory=dict)
+    presets: dict[str, PresetSettings] = Field(default_factory=dict)
+    theme: str = DEFAULT_THEME
+    default_preset: str = "default"
 
     def resolve_sandbox(self, name: str | None) -> tuple[str, SandboxSettings]:
         """Resolve a sandbox profile by name ("default" when None), with
@@ -297,83 +234,39 @@ class SectionedConfig:
             settings = settings.merged_over(self.sandboxes["default"])
         return key, settings
 
-    def resolve_model(self, name: str | None) -> tuple[str, ProviderProfile]:
+    def resolve_model(self, name: str | None = None) -> tuple[str, ProviderProfile]:
+        """Resolve a model profile by name, defaulting to the default
+        preset's model."""
         key = name or self.default_preset_model()
         if key not in self.models:
             raise ConfigError(
-                f"no model named {key!r}; available: " + ", ".join(self.models)
+                f"no model named {key!r}; available: " + (", ".join(self.models) or "none")
             )
         return key, self.models[key]
 
     def default_preset_model(self) -> str | None:
         preset = self.presets.get(self.default_preset)
-        return preset.model if preset else None
+        if preset and preset.model:
+            return preset.model
+        # No preset carrying a model: a single defined model is unambiguous.
+        if len(self.models) == 1:
+            return next(iter(self.models))
+        return None
 
     def default_preset_sandbox(self) -> str | None:
         preset = self.presets.get(self.default_preset)
         return preset.sandbox if preset else None
 
 
-def _sectioned(path: Path, data: dict[str, Any]) -> SectionedConfig:
-    """Parse either layout into a SectionedConfig.
-
-    The old layout (``profiles`` list + ``container`` + ``default_theme`` +
-    ``default_profile``) keeps working, with a deprecation notice; new
-    writes go to the sectioned layout."""
-    notices: list[str] = []
-    if isinstance(data.get("models"), dict):
-        # Sectioned layout.
-        models = {
-            name: _validate(path, ProviderProfile, {"name": name, **fields})
-            for name, fields in data["models"].items()
-        }
-        sandboxes = {
-            name: _validate(path, SandboxSettings, fields)
-            for name, fields in (data.get("sandboxes") or {"default": {}}).items()
-        }
-        sandboxes.setdefault("default", SandboxSettings())
-        presets = {
-            name: _validate(path, PresetSettings, fields)
-            for name, fields in (data.get("presets") or {}).items()
-        }
-        ui = data.get("ui") or {}
-        defaults = data.get("defaults") or {}
-        server = _validate(path, ServerSettings, data.get("server") or {})
-        return SectionedConfig(
-            models=models, sandboxes=sandboxes, presets=presets,
-            theme=ui.get("theme") or DEFAULT_THEME,
-            default_preset=defaults.get("preset") or "default",
-            server=server, notices=notices,
-        )
-    # Old layout: normalize to the sectioned form in memory.
-    notices.append(
-        "config uses the old layout (profiles/container sections); it still "
-        "works — rewrite it with named sections (models/sandboxes/presets) "
-        "when you next edit it"
-    )
-    normalized = _normalize(path, data)
-    profiles = _validate(path, list[ProviderProfile], normalized.get("profiles"))
-    models = {p.name or "default": p for p in profiles}
-    container = _validate(path, ContainerSettings | None, data.get("container")) or ContainerSettings()
-    sandboxes = {"default": SandboxSettings(
-        auto_include_refs=list(container.auto_include_refs),
-        tool_output_limit=container.tool_output_limit,
-    )}
-    default_profile = normalized.get("default_profile")
-    # Synthesize the default preset from default_profile, so the usual
-    # preset-based resolution works unchanged for old-layout files.
-    presets = {"default": PresetSettings(model=default_profile, sandbox="default")}
-    return SectionedConfig(
-        models=models, sandboxes=sandboxes, presets=presets,
-        theme=data.get("default_theme") or DEFAULT_THEME,
-        default_preset="default",
-        server=ServerSettings(), notices=notices,
-    )
-
-
-def load_sectioned(path: Path) -> SectionedConfig:
-    """Load the config file as a SectionedConfig (either layout)."""
-    return _sectioned(path, _read(path))
+def _validate(path: Path, model: Any, data: Any) -> Any:
+    try:
+        return TypeAdapter(model).validate_python(data)
+    except ValidationError as exc:
+        lines = [
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']} (got {repr(e.get('input'))[:60]})"
+            for e in exc.errors()
+        ]
+        raise ConfigError(f"invalid config in {path}:\n" + "\n".join(lines)) from None
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -391,138 +284,65 @@ def _read(path: Path) -> dict[str, Any]:
     return data
 
 
+_SECTIONED_CACHE: dict[tuple[str, int], SectionedConfig] = {}
+# SectionedConfig is immutable in practice (callers only read it); cache by
+# (path, mtime_ns) so per-request loads (config_info, sandbox resolution,
+# workspace last-used) don't re-read and re-validate the file.
+
+
+def load_sectioned(path: Path) -> SectionedConfig:
+    """Load and validate the config file (cached on path + mtime)."""
+    path = Path(path)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _SECTIONED_CACHE.get(key)
+        if cached is not None:
+            return cached
+    data = _read(path)
+    models = {
+        name: _validate(path, ProviderProfile, {"name": name, **fields})
+        for name, fields in (data.get("models") or {}).items()
+    }
+    sandboxes = {
+        name: _validate(path, SandboxSettings, fields)
+        for name, fields in (data.get("sandboxes") or {}).items()
+    }
+    sandboxes.setdefault("default", SandboxSettings())
+    presets = {
+        name: _validate(path, PresetSettings, fields)
+        for name, fields in (data.get("presets") or {}).items()
+    }
+    ui = data.get("ui") or {}
+    defaults = data.get("defaults") or {}
+    sectioned = SectionedConfig(
+        models=models, sandboxes=sandboxes, presets=presets,
+        theme=ui.get("theme") or DEFAULT_THEME,
+        default_preset=defaults.get("preset") or "default",
+    )
+    if key is not None:
+        _SECTIONED_CACHE.clear()  # keep at most the newest entry per file
+        _SECTIONED_CACHE[key] = sectioned
+    return sectioned
+
+
 def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> list[str]:
     """Single startup check for the config file.
 
-    Missing file: create one from the starter config. Existing file: report
-    (as returned notices) the optional values it omits so the user knows the
-    built-in defaults are in effect. Malformed/invalid files are left alone —
-    load_config reports them properly."""
-    if not path.exists():
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(STARTER_CONFIG, indent=2) + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise ConfigError(f"could not create {path}: {exc}") from exc
-        return [
-            f"created starter config at {path} — edit it to point at your provider"
-        ]
+    Missing file: create one from the starter config. Anything else is left
+    alone — load_sectioned reports malformed/invalid files properly."""
+    if path.exists():
+        return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []  # load_config reports the problem
-    if not isinstance(data, dict):
-        return []
-    missing: list[str] = []
-    if "default_theme" not in data:
-        missing.append("default_theme (= ayu-darker)")
-    if "container" not in data:
-        missing.append("container (= built-in defaults)")
-    profiles = data.get("profiles")
-    profiles = profiles if isinstance(profiles, list) else [
-        data.get("provider") if isinstance(data.get("provider"), dict) else data,
-    ]
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        name = profile.get("name") or "default"
-        absent = [key for key in PROFILE_OPTIONAL_DEFAULTS if key not in profile]
-        if absent:
-            missing.append(f"{name}: {', '.join(absent)} (= built-in defaults)")
-    if not missing:
-        return []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(STARTER_CONFIG, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not create {path}: {exc}") from exc
     return [
-        f"{path} is missing some optional values; the built-in defaults apply: "
-        + "; ".join(missing)
+        f"created starter config at {path} — edit it to point at your provider"
     ]
-
-
-def _validate(path: Path, model: Any, data: Any) -> Any:
-    try:
-        return TypeAdapter(model).validate_python(data)
-    except ValidationError as exc:
-        lines = [
-            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']} (got {repr(e.get('input'))[:60]})"
-            for e in exc.errors()
-        ]
-        raise ConfigError(f"invalid config in {path}:\n" + "\n".join(lines)) from None
-
-
-def _named_profiles(path: Path, data: dict[str, Any]) -> list[ProviderProfile]:
-    """Validate the named-profile form, returning its profiles."""
-    stray = [key for key in data
-             if key not in ("default_profile", "default_theme", "profiles", "container")]
-    if stray:
-        raise ConfigError(
-            f"{path} mixes a 'profiles' section with top-level fields {stray}; use one style or the other"
-        )
-    profiles = _validate(path, list[ProviderProfile], data.get("profiles"))
-    names = [p.name for p in profiles]
-    if any(not n for n in names):
-        raise ConfigError(f"every profile in {path} needs a non-empty 'name'")
-    if len(set(names)) != len(names):
-        raise ConfigError(f"duplicate profile names in {path}")
-    return profiles
-
-
-def _normalize(path: Path, data: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite either config shape into the named-profiles form.
-
-    The flat single-profile form becomes a one-entry ``profiles`` list named
-    "default" (in memory only — the file keeps its original style), so every
-    consumer works with one shape instead of branching per function."""
-    if isinstance(data.get("profiles"), list):
-        _named_profiles(path, data)  # validate the named form up front
-        return data
-    if "default_profile" in data:
-        raise ConfigError(f"'default_profile' in {path} is only meaningful alongside a 'profiles' section")
-    fields = dict(data["provider"]) if "provider" in data else {
-        key: value for key, value in data.items()
-        if key not in ("default_profile", "default_theme", "profiles", "provider", "container")
-    }
-    return {**data, "profiles": [{"name": "default", **fields}], "default_profile": "default"}
-
-
-def load_config(path: Path, profile_name: str | None = None) -> LoadedConfig:
-    """Load and validate the config file.
-
-    Profile selection order: explicit ``--profile`` > ``default_profile`` >
-    the only profile when exactly one is defined.
-    """
-    data = _read(path)
-    if not isinstance(data.get("profiles"), list) and profile_name is not None:
-        raise ConfigError(
-            f"{path} defines a single unnamed profile, so --profile {profile_name!r} has nothing to "
-            "select; add a top-level 'profiles' section to use named profiles"
-        )
-    normalized = _normalize(path, data)
-    profiles = _validate(path, list[ProviderProfile], normalized.get("profiles"))
-    names = [p.name for p in profiles]
-    selected = profile_name or normalized.get("default_profile") or (names[0] if len(names) == 1 else None)
-    if selected is None:
-        raise ConfigError(
-            f"{path} defines multiple profiles ({', '.join(names)}) but no 'default_profile'; "
-            "pass --profile to choose one"
-        )
-    if selected not in names:
-        raise ConfigError(
-            f"no profile named {selected!r} in {path}; available profiles: {', '.join(names)}"
-        )
-    by_name = {p.name: p for p in profiles}
-    container = _validate(path, ContainerSettings | None, data.get("container"))
-    return LoadedConfig(
-        by_name[selected], selected, names if isinstance(data.get("profiles"), list) else [],
-        data.get("default_theme") or DEFAULT_THEME,
-        container or ContainerSettings(),
-    )
-
-
-def list_profile_names(path: Path) -> list[str]:
-    """Profile names in the file ([] for the flat single-profile form)."""
-    data = _read(path)
-    if not isinstance(data.get("profiles"), list):
-        return []
-    return [p.name for p in _validate(path, list[ProviderProfile], _normalize(path, data)["profiles"])]
 
 
 def save_preferences(
@@ -536,69 +356,38 @@ def save_preferences(
     """Persist UI preferences (chosen theme / profile) into the config file so
     they carry over to the next session.
 
-    ``default_profile`` is only written when the file uses the named-profiles
-    form — the flat form has nothing to select, and a stray ``default_profile``
-    there would make the config invalid.
-
-    ``auto_compact`` is written onto the named profile (``profile``, defaulting
-    to the file's default); in the flat form it goes to the top level (or into
-    the ``provider`` section when the config uses one).
-    """
+    ``default_profile`` lands where the loader reads it back: as
+    ``defaults.preset`` (when a preset already carries that model) or as the
+    default preset's model. ``auto_compact`` is written onto the named model
+    (``profile``, defaulting to the file's default)."""
     data = _read(path)
-    sectioned = isinstance(data.get("models"), dict)
     if default_theme is not None:
-        if sectioned:
-            data.setdefault("ui", {})["theme"] = default_theme
+        data.setdefault("ui", {})["theme"] = default_theme
+    if default_profile is not None:
+        presets = data.setdefault("presets", {})
+        defaults = data.setdefault("defaults", {})
+        current = defaults.get("preset") or "default"
+        matching = [
+            name for name, fields in presets.items()
+            if isinstance(fields, dict) and fields.get("model") == default_profile
+        ]
+        if matching:
+            defaults["preset"] = matching[0]
         else:
-            data["default_theme"] = default_theme
-    # default_profile only fits the named-profiles form; a stray one would
-    # make a flat config invalid, so it is not written there. In the
-    # sectioned form it must land where _sectioned reads it back: either as
-    # ``defaults.preset`` (when a preset carries that model) or as the
-    # default preset's model.
-    if default_profile is not None and (
-        sectioned or isinstance(data.get("profiles"), list)
-    ):
-        if sectioned:
-            presets = data.setdefault("presets", {})
-            defaults = data.setdefault("defaults", {})
-            current = defaults.get("preset") or "default"
-            matching = [
-                name for name, fields in presets.items()
-                if isinstance(fields, dict) and fields.get("model") == default_profile
-            ]
-            if matching:
-                defaults["preset"] = matching[0]
-            else:
-                presets.setdefault(current, {})["model"] = default_profile
-        else:
-            data["default_profile"] = default_profile
+            presets.setdefault(current, {})["model"] = default_profile
     if auto_compact is not None:
-        if sectioned:
-            target = profile or default_profile
-            if target is None:
-                raise ConfigError("no model named to write auto_compact onto")
-            data.setdefault("models", {}).setdefault(target, {})["auto_compact"] = auto_compact
-        elif isinstance(data.get("profiles"), list):
-            target = profile or data.get("default_profile")
-            entries = [p for p in data["profiles"] if p.get("name") == target]
-            if not entries:
-                raise ConfigError(f"no profile named {target!r} in {path}")
-            entries[0]["auto_compact"] = auto_compact
-        elif "provider" in data:
-            data["provider"]["auto_compact"] = auto_compact
-        else:
-            data["auto_compact"] = auto_compact
+        target = profile or default_profile
+        if target is None:
+            # Fall back to the default preset's model.
+            sectioned = load_sectioned(path)
+            target = sectioned.default_preset_model()
+        if target is None:
+            raise ConfigError("no model named to write auto_compact onto")
+        data.setdefault("models", {}).setdefault(target, {})["auto_compact"] = auto_compact
     try:
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"could not write {path}: {exc}") from exc
-
-
-def load_all_profiles(path: Path) -> dict[str, ProviderProfile]:
-    """Every profile in the file, keyed by name ("default" for the flat form)."""
-    data = _normalize(path, _read(path))
-    return {p.name: p for p in _validate(path, list[ProviderProfile], data["profiles"])}
 
 
 def resolve_api_key(

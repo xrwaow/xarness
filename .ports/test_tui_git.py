@@ -394,7 +394,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({f.path for f in stat.files}, {"second.py"})
 
             # The accepted tree is persisted for resume.
-            block = session_store.load_git_block("testsess")
+            block = session_store.load_state("testsess").git
             self.assertEqual(block["baseline_tree"], info.baseline_tree)
 
     async def test_reject_discards_everything_since_last_accept(self):
@@ -432,7 +432,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         app, _info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         app.git_info = None
         app.controller.git_info = None
-        async with app.run_test() as pilot:
+        async with app.run_test():
             app._handle_slash_command("/accept")
             app._handle_slash_command("/reject")
             await self.wait_until(lambda: len(app.query(ErrorLine)) >= 2)
@@ -586,8 +586,8 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         app, _info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         app.git_info = None
         app.controller.git_info = None
-        session_store.save_session("testsess", "m", Conversation())
-        async with app.run_test() as pilot:
+        session_store.save_state("testsess", session_store.SessionState(Conversation(), "m"))
+        async with app.run_test():
             app._handle_slash_command("/delete")
             await self.wait_until(
                 lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
@@ -604,7 +604,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         app, info = await self.make_git_app([ContentDelta("hi"), TurnComplete(usage=None)])
         app.session_name = None
         (info.workspace / "app.py").write_text("manual edit\n")
-        async with app.run_test() as pilot:
+        async with app.run_test():
             app._handle_slash_command("/delete")
             await self.wait_until(
                 lambda: any("deleted:" in str(n.content) for n in app.query(NoticeLine))
@@ -621,7 +621,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(self.repo, "testsess")
         assert info is not None
         (self.repo / "app.py").write_text("pending agent edit\n")
-        session_store.save_session("testsess", "m", Conversation(), git=info.to_block())
+        session_store.save_state("testsess", session_store.SessionState(Conversation(), "m", git=info.to_block()))
 
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
         app = AgentApp(
@@ -657,7 +657,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
             "original_workspace": str(self.repo),
             "git_common_dir": str(self.repo / ".git"),
         }
-        session_store.save_session("testsess", "m", Conversation(), git=legacy_block)
+        session_store.save_state("testsess", session_store.SessionState(Conversation(), "m", git=legacy_block))
 
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
         app = AgentApp(
@@ -776,7 +776,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         )
         app.controller.conversation.add(Message(role="assistant", content="ok"))
         (info.workspace / "manual.txt").write_text("manual edit\n")
-        async with app.run_test() as pilot:
+        async with app.run_test():
             app._handle_slash_command("/undo")
             await self.wait_until(lambda: app.query_one(ChatInput).text == "did nothing")
 
@@ -876,7 +876,7 @@ class GitTUITest(unittest.IsolatedAsyncioTestCase):
         info, _ = await setup_tracking(self.repo, "testsess")
         assert info is not None
         (self.repo / "app.py").write_text("external edit\n")
-        session_store.save_session("testsess", "m", Conversation(), git=info.to_block())
+        session_store.save_state("testsess", session_store.SessionState(Conversation(), "m", git=info.to_block()))
 
         client = FakeClient([ContentDelta("x"), TurnComplete(usage=None)])
         app = AgentApp(
