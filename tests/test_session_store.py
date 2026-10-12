@@ -48,6 +48,27 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     )
 
 
+def test_usage_totals_round_trip(tmp_path, monkeypatch) -> None:
+    """Cumulative and last-round token counters persist, so a reloaded
+    session's footer shows real in/out/ctx instead of 0."""
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+
+    conversation = Conversation()
+    conversation.add(Message(role="user", content="hi"))
+    conversation.add(Message(role="assistant", content="hello"))
+    session_store.save_state("s", session_store.SessionState(
+        conversation, "m", total_in=1200, total_out=340, last_in=1100, last_out=300,
+    ))
+    loaded = session_store.load_state("s")
+    assert (loaded.total_in, loaded.total_out) == (1200, 340)
+    assert (loaded.last_in, loaded.last_out) == (1100, 300)
+
+    # A session saved with no usage yet loads as zeros.
+    session_store.save_state("empty", session_store.SessionState(conversation, "m"))
+    empty = session_store.load_state("empty")
+    assert (empty.total_in, empty.total_out, empty.last_in, empty.last_out) == (0, 0, 0, 0)
+
+
 def test_to_wire_drops_unpaired_tool_calls() -> None:
     """A tool call without a recorded result (turn interrupted mid-execution,
     session saved) must not reach the wire as an unpaired call: providers

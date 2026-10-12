@@ -37,6 +37,7 @@ from .config import (
 from .conversation import Conversation, Message, ToolCall
 from .conversation import turn_time_summary
 from .controller import ChatController, RollbackPlan
+from .events import Usage
 from .gitwork import (
     GitInfo, GitWorktreeError, RevertConflict, accept_changes,
     attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
@@ -241,6 +242,14 @@ class Session:
             idle_callback=idle_callback,
         )
         session.ensure_system_message()
+        # Restore the persisted token counters so the client's footer shows
+        # real in/out/ctx immediately instead of 0 until the next round.
+        session.controller.usage_total = Usage(
+            input_tokens=state.total_in, output_tokens=state.total_out,
+        )
+        session.controller.last_usage = Usage(
+            input_tokens=state.last_in, output_tokens=state.last_out,
+        )
         # A session saved mid-turn can carry tool calls with no result; give
         # them synthetic answers so the next request is valid.
         session._repair_tool_calls()
@@ -1031,6 +1040,8 @@ class Session:
             call_id=call_id, ok=result.ok, parse_error=result.parse_error,
             output=result.output, error=result.error, header=result.header,
         ))
+        # Refresh the footer's in/out/ctx per message, not just per round.
+        self._emit_status()
         self.controller.record_tool_result(
             call_id, result, start_time=start, end_time=end,
         )
@@ -1221,6 +1232,10 @@ class Session:
                 self.sandbox_settings.model_dump()
                 if self.sandbox_settings is not None else None
             ),
+            total_in=self.controller.usage_total.input_tokens,
+            total_out=self.controller.usage_total.output_tokens,
+            last_in=self.controller.last_usage.input_tokens,
+            last_out=self.controller.last_usage.output_tokens,
         )
 
     def _write_state(self) -> None:

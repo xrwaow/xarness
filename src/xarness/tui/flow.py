@@ -381,8 +381,9 @@ class Presenter:
         # Every non-user row carries the old `padding: 0 1` left inset.
         # User rows are the full-width surface box and skip it (a transparent
         # gutter column would punch a hole in the box's background).
+        base_style = Style(color=theme.PALETTE["text"])
         if not isinstance(item, UserItem):
-            inset = Strip.blank(1)
+            inset = Strip.blank(1, base_style)
             strips = [
                 Strip.join([inset, s]).adjust_cell_length(width) for s in strips
             ]
@@ -395,7 +396,11 @@ class Presenter:
             strips = [pad, *strips, pad]
         leading = self._leading_blanks(entry, item)
         if leading:
-            strips = [Strip.blank(width) for _ in range(leading)] + strips
+            # Styled: unstyled filler cells make the selection highlighter
+            # crash (None + Style) when a drag spans the blank row.
+            strips = [
+                Strip.blank(width, base_style) for _ in range(leading)
+            ] + strips
         # Give every cell an explicit *foreground* base. Text cells must NOT
         # carry an explicit background: rich's style merge lets cell styles
         # win over any later-applied style, so a baked bgcolor would defeat
@@ -414,12 +419,18 @@ class Presenter:
         now owned by the presenter.
 
         user   → 1, except flush under a status line (e.g. "Worked for …")
+                 and at the very top of the transcript (nothing above)
         cot    → 1
         answer → 1, except flush under its own cot
-        tools/shimmers → 0 (they pack tight under the reply above them)
+        tools/shimmers → 1 after a user message (a turn can open with a
+                 tool call, and it needs the same gap as a reply), else 0
+                 (they pack tight under the reply above them)
         status lines → 1 (they belong to the reply above them)"""
         if isinstance(item, UserItem):
-            return 0 if isinstance(self._previous_item(entry), LineItem) else 1
+            prev = self._previous_item(entry)
+            return 0 if prev is None or isinstance(prev, LineItem) else 1
+        if isinstance(item, (ToolItem, WritingItem, PendingItem)):
+            return isinstance(self._previous_item(entry), UserItem)
         if isinstance(item, LineItem):
             return 1
         if isinstance(item, (ThinkingItem, AssistantItem)):

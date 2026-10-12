@@ -32,7 +32,7 @@ from textual.worker import Worker
 from .. import theme
 from ..clientlib import ClientError, XarnessClient
 from ..config import DEFAULT_CONFIG_PATH, save_preferences
-from ..conversation import SUMMARY_PREFIX, Message
+from ..conversation import SUMMARY_PREFIX, Message, normalize_time_summary
 from ..events import ToolCallStatus
 from ..images import ImageAttachment
 from ..protocol import (
@@ -86,6 +86,17 @@ COMPACTED_DIVIDER = (
     "— compacted: the model sees only the summary below; "
     "messages above are kept here for you —"
 )
+
+
+def _item_streaming(item) -> bool:
+    """True while the item is still actively streaming (drives its shimmer).
+    Pending/Writing entries live only while they stream — they are removed
+    the moment they settle — so they are always "streaming" here."""
+    if isinstance(item, tflow.ThinkingItem):
+        return not item.done
+    if isinstance(item, tflow.ToolItem):
+        return item.status is ToolCallStatus.MAKING_CALL
+    return True
 
 
 class _RoundView:
@@ -214,6 +225,10 @@ class _RoundView:
             await self.app._complete_round(event, self)
         elif isinstance(event, StreamError):
             await self._hide_indicator()
+            if self.thinking is not None:
+                # No TurnComplete follows an error: settle the cot here, or
+                # it keeps shimmering next to the error line.
+                self._finish_thinking(duration=None)
             if self.assistant is not None:
                 # No TurnComplete follows an error: settle the streamed text
                 # here, or it stays in the unselectable live tail.
@@ -415,8 +430,14 @@ class ChatFlowView(FlowView):
         for segment in strip:
             if start_cell <= x < end_cell:
                 # ``+`` lets the right operand win: selection colors override
-                # any cell bg/fg, while meta (content offsets) is kept.
-                out.append(Segment(segment.text, segment.style + sel_style))
+                # any cell bg/fg, while meta (content offsets) is kept. Blank
+                # filler cells can carry style=None — use the selection style
+                # alone there (None + Style raises TypeError).
+                base = segment.style
+                out.append(Segment(
+                    segment.text,
+                    base + sel_style if base is not None else sel_style,
+                ))
             else:
                 out.append(segment)
             x += segment.cell_length
@@ -669,7 +690,10 @@ class AgentApp(App[None]):
             # the session also persists it on the turn's last assistant
             # message, so a reload renders the identical line there.
             self._notice(
-                f"Worked for {event.summary}" if event.summary
+                # normalize_time_summary re-renders a stale host's spaced /
+                # legacy-shaped summary in the current compact form.
+                f"Worked for {normalize_time_summary(event.summary)}"
+                if event.summary
                 else f"Worked for {_format_duration(event.elapsed)}"
             )
             self._refresh_diff_summary_soon()
@@ -1265,7 +1289,7 @@ class AgentApp(App[None]):
         animations for the items that have one."""
         entry = self._flow_model.append(item)
         if isinstance(item, (PendingItem, WritingItem)) or (
-            isinstance(item, ThinkingItem) and not item.done
+            isinstance(item, (ThinkingItem, ToolItem)) and _item_streaming(item)
         ):
             self._start_anim(entry, item)
         return entry
@@ -1285,6 +1309,13 @@ class AgentApp(App[None]):
             return  # app shutting down / not mounted yet
 
         def tick(e) -> None:
+            if not _item_streaming(item):
+                # Completed (or settled by some path that missed its stop):
+                # kill the animation here, like the interrupt path does — a
+                # leaked tick must never keep a finished cot/tool shimmering.
+                self._stop_anim(entry)
+                e.update()
+                return
             span = len(getattr(item, "label", "Thinking")) + 2 * theme.SHIMMER_BAND_WIDTH
             item.phase = (item.phase + theme.SHIMMER_SPEED * 0.08) % span
             e.update()
@@ -1446,8 +1477,12 @@ class AgentApp(App[None]):
                     item.output = "interrupted"
                 self._flow_model.append(item)
             if message.time_summary:
+                # normalize_time_summary upgrades the legacy three-number
+                # 'total | streaming tools other' line saved by older
+                # versions to the current 'total | running idle' shape.
                 self._flow_model.append(LineItem(
-                    text=f"Worked for {message.time_summary}", kind="notice",
+                    text=f"Worked for {normalize_time_summary(message.time_summary)}",
+                    kind="notice",
                 ))
 
     async def _mount_user_message(self, event: UserMessageAdded) -> None:

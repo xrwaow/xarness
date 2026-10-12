@@ -53,6 +53,13 @@ class SessionState:
     # sandbox profiles; fixed except via /sandbox or /filter).
     sandbox_name: str | None = None
     sandbox_settings: dict | None = None
+    # Cumulative (total_in/total_out) and last-round (last_in/last_out) token
+    # usage, so a reloaded session's footer shows real numbers immediately
+    # instead of 0 until the next round completes.
+    total_in: int = 0
+    total_out: int = 0
+    last_in: int = 0
+    last_out: int = 0
 
 
 def _message_from(raw: dict) -> Message:
@@ -142,6 +149,12 @@ def save_state(name: str, state: SessionState) -> None:
         data["sandbox_name"] = state.sandbox_name
     if state.sandbox_settings is not None:
         data["sandbox_settings"] = state.sandbox_settings
+    if state.total_in or state.total_out:
+        data["total_in"] = state.total_in
+        data["total_out"] = state.total_out
+    if state.last_in or state.last_out:
+        data["last_in"] = state.last_in
+        data["last_out"] = state.last_out
     _atomic_write_json(session_path(name), data)
     _atomic_write_json(meta_path(name), _meta_block(
         conversation,
@@ -165,6 +178,10 @@ def load_state(name: str) -> SessionState:
         sandbox_name=data.get("sandbox_name"),
         sandbox_settings=data.get("sandbox_settings")
         if isinstance(data.get("sandbox_settings"), dict) else None,
+        total_in=data.get("total_in") or 0,
+        total_out=data.get("total_out") or 0,
+        last_in=data.get("last_in") or 0,
+        last_out=data.get("last_out") or 0,
     )
 
 

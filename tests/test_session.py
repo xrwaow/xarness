@@ -798,8 +798,8 @@ def test_no_save_disables_persistence(tmp_path) -> None:
 
 
 def test_turn_time_summary_format(tmp_path) -> None:
-    """turn_time_summary derives total | streaming | tools | other from the
-    persisted stamps."""
+    """turn_time_summary derives total | running | idle from the persisted
+    stamps (running = streaming + tools)."""
     from datetime import datetime, timedelta, timezone
 
     session = make_session([], tmp_path)
@@ -827,12 +827,13 @@ def test_turn_time_summary_format(tmp_path) -> None:
     summary = turn_time_summary(session.conversation.messages)
     assert summary is not None
     total, rest = summary.split("|")
-    streaming, tools, other = rest.split()
+    running, idle = rest.split()
     assert total.strip() == "8.0s"
-    assert streaming == "4.7s"  # round 1: 1.7s + round 2: 3s (no reasoning)
-    assert tools == "3.0s"
-    # total − streaming − tools: the 0.3s pre-first-token latency.
-    assert other == "0.3s"
+    # running = streaming (round 1: 1.7s + round 2: 3s, no reasoning)
+    #          + tools (3.0s).
+    assert running == "7.7s"
+    # total − running: the 0.3s pre-first-token latency.
+    assert idle == "0.3s"
 
 
 def test_turn_finish_stamps_time_summary_and_persists(tmp_path) -> None:

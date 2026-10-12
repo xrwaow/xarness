@@ -259,7 +259,7 @@ class DriftResolved(EventBase):
 class TurnFinished(EventBase):
     type: Literal["turn_finished"] = "turn_finished"
     elapsed: float = 0.0
-    # "Worked for X | Y Z W" — total | streaming | tools | other; the same
+    # "Worked for X | Y Z" — total | running (streaming + tools) | idle; the same
     # string the session persists on the turn's last assistant message.
     summary: str = ""
 

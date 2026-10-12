@@ -14,6 +14,7 @@ second mirrored model to keep in sync.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,7 +38,7 @@ def is_summary(message: "Message") -> bool:
 
 
 def turn_time_summary(messages: list["Message"]) -> str | None:
-    """The turn's timing line: total | streaming | tools | other.
+    """The turn's timing line: total | running | idle.
 
     Computed from the persisted wall-clock stamps, so the same string can be
     stamped on the turn's last assistant message (reloads show it) and sent
@@ -45,10 +46,9 @@ def turn_time_summary(messages: list["Message"]) -> str | None:
     missing (old sessions, or nothing streamed).
 
     - total: turn user message send_time → last assistant end_time
-    - streaming: per round, end_time − reasoning_start (start_time when the
-      round had no chain of thought)
-    - tools: summed tool execution durations
-    - other: what's left (per-round latency and round boundaries)
+    - running: streaming (per round, end_time − reasoning_start; start_time
+      when the round had no chain of thought) + tool execution durations
+    - idle: what's left (per-round latency and round boundaries)
     """
     turn_user_index = next(
         (i for i, m in reversed(list(enumerate(messages)))
@@ -86,7 +86,62 @@ def turn_time_summary(messages: list["Message"]) -> str | None:
             tools += max(0.0, (end - start).total_seconds())
     other = max(0.0, total - streaming - tools)
     fmt = format_duration
-    return f"{fmt(total)} | {fmt(streaming)} {fmt(tools)} {fmt(other)}"
+    return f"{fmt(total)} | {fmt(streaming + tools)} {fmt(other)}"
+
+
+def normalize_time_summary(summary: str) -> str:
+    """Re-render a persisted timing line in the current shape:
+    'total | running idle' with compact durations ('1m02s').
+
+    Older versions persisted 'total | streaming tools other' (three
+    numbers) and spaced durations ('1m 02s'); both are re-rendered — the
+    three numbers merge into running = streaming + tools. Anything that
+    doesn't parse as a timing line passes through unchanged, and a line
+    already in the current shape is returned as-is.
+    """
+    unit_seconds = {"s": 1, "m": 60, "h": 3600}
+
+    parts = [part.strip() for part in summary.split("|")]
+    if len(parts) != 2:
+        return summary
+    # Split the tail into durations via its number+unit pairs ('1m02s' and
+    # the legacy '1m 02s' both give (1,m),(02,s)). Units descend h→m→s
+    # within one duration, so a pair continues the previous duration when
+    # it steps down the chain (h→m, m→s) and starts a new one otherwise.
+    # Whitespace is irrelevant.
+    durations: list[float] = []
+    previous_unit = ""
+    current_has_hours = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", parts[1]):
+        value = float(number) * unit_seconds[unit]
+        # 'h' durations end at 'm' (format_duration never emits h+m+s), so
+        # an 'm' pair that completes an 'h' does not absorb a following 's'.
+        continues = (
+            (previous_unit, unit) == ("h", "m")
+            or ((previous_unit, unit) == ("m", "s") and not current_has_hours)
+        )
+        if continues and durations:
+            durations[-1] += value
+        else:
+            durations.append(value)
+            current_has_hours = unit == "h"
+        previous_unit = unit
+    if len(durations) == 3:
+        # Legacy three-number line: streaming + tools merge into running.
+        running, idle = durations[0] + durations[1], durations[2]
+    elif len(durations) == 2:
+        running, idle = durations
+    else:
+        return summary
+    total = 0.0
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", parts[0]):
+        total += float(number) * unit_seconds[unit]
+    if total <= 0:
+        return summary
+    rendered = (
+        f"{format_duration(total)} | {format_duration(running)} {format_duration(idle)}"
+    )
+    return rendered if rendered != summary else summary
 
 
 def _parse_iso(stamp: str | None) -> datetime | None:

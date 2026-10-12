@@ -7,16 +7,16 @@ from datetime import datetime, timedelta, timezone
 
 
 def format_duration(seconds: float) -> str:
-    """Human duration: 5.3s · 42s · 2m 15s · 1h 04m."""
+    """Human duration, compact (no inner spaces): 5.3s · 42s · 2m15s · 1h04m."""
     if seconds < 10:
         return f"{seconds:.1f}s"
     if seconds < 60:
         return f"{int(seconds)}s"
     minutes, secs = divmod(int(seconds), 60)
     if minutes < 60:
-        return f"{minutes}m {secs:02d}s"
+        return f"{minutes}m{secs:02d}s"
     hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes:02d}m"
+    return f"{hours}h{minutes:02d}m"
 
 
 def utcnow_iso() -> str:

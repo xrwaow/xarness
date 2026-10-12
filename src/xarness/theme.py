@@ -105,8 +105,8 @@ def rich_markdown_theme() -> "object":
     p = PALETTE
     return rich_theme.Theme({
         "markdown.paragraph": "",
-        "markdown.h1": f"bold underline {p['status']}",
-        "markdown.h2": f"bold underline {p['status']}",
+        "markdown.h1": f"bold {p['status']}",
+        "markdown.h2": f"bold {p['status']}",
         "markdown.h3": f"bold {p['status']}",
         "markdown.h4": f"italic bold {p['status']}",
         "markdown.h5": f"italic {p['status']}",
@@ -118,7 +118,7 @@ def rich_markdown_theme() -> "object":
         "markdown.item.bullet": "",
         "markdown.item.number": "",
         "markdown.link": p["status"],
-        "markdown.link_url": f"underline {p['status']}",
+        "markdown.link_url": f"bold {p['status']}",
         "markdown.block_quote": f"italic {p['muted']}",
         "markdown.hr": p["border"],
         "markdown.s": "strike",
@@ -177,7 +177,7 @@ class CodeHighlightTheme(HighlightTheme):
         Token.Comment: "italic $c-muted",
         Token.Error: "$c-error",
         Token.Generic.Error: "$c-error",
-        Token.Generic.Heading: "underline $c-status",
+        Token.Generic.Heading: "bold $c-status",
         Token.Generic.Subheading: "$c-status",
         Token.Keyword: "$c-accent",
         Token.Keyword.Constant: "bold $c-accent2",
