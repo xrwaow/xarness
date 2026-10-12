@@ -24,7 +24,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    model_validator,
+)
 
 DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
 
@@ -172,8 +175,14 @@ class SandboxSettings(BaseModel):
 
     @field_validator("auto_include_refs", mode="before")
     @classmethod
-    def _coerce_refs(cls, value: Any) -> Any:
-        return coerce_refs(value)
+    def _normalize_refs(cls, value: Any) -> Any:
+        """Plain string entries become ``{"path": ...}`` so RefSpec's own
+        validation (non-empty, no '..') applies uniformly; the normalized
+        field always holds ``str | RefSpec`` — a str meaning "bind at
+        ``.refs/<alias>``", a RefSpec mounting wherever it says."""
+        if not isinstance(value, list):
+            return value
+        return [{"path": entry} if isinstance(entry, str) else entry for entry in value]
 
     def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
         """Inheritance: keys this profile sets explicitly win over ``base``."""
@@ -193,32 +202,39 @@ class PresetSettings(BaseModel):
     sandbox: str | None = None
 
 
-def coerce_refs(value: Any) -> Any:
-    """Validator body shared by every ``auto_include_refs`` field: reject
-    empty/``..`` string entries, pass dicts and RefSpecs through."""
-    if not isinstance(value, list):
-        return value
-    out: list[str | dict[str, Any]] = []
-    for entry in value:
-        if isinstance(entry, str):
-            if not entry.strip():
-                raise ValueError("auto_include_refs entries must be non-empty paths")
-            if ".." in Path(entry.strip()).parts:
-                raise ValueError(f"auto_include_refs entry must not contain '..': {entry!r}")
-            out.append(entry.strip())
-        else:
-            out.append(entry)
-    return out
-
-
 class SectionedConfig(BaseModel):
-    """The parsed config file."""
+    """The parsed config file (one pydantic root model: the whole file is
+    validated in a single pass; ``models`` entries get their ``name`` from
+    the section key)."""
 
     models: dict[str, ProviderProfile] = Field(default_factory=dict)
     sandboxes: dict[str, SandboxSettings] = Field(default_factory=dict)
     presets: dict[str, PresetSettings] = Field(default_factory=dict)
     theme: str = DEFAULT_THEME
     default_preset: str = "default"
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _inject_names(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {name: {"name": name, **fields} for name, fields in value.items()}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_ui_defaults(cls, data: Any) -> Any:
+        """The file nests these under 'ui'/'defaults'; the model keeps them
+        flat (theme, default_preset)."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        ui = data.pop("ui", None)
+        if isinstance(ui, dict) and ui.get("theme"):
+            data["theme"] = ui["theme"]
+        defaults = data.pop("defaults", None)
+        if isinstance(defaults, dict) and defaults.get("preset"):
+            data["default_preset"] = defaults["preset"]
+        return data
 
     def resolve_sandbox(self, name: str | None) -> tuple[str, SandboxSettings]:
         """Resolve a sandbox profile by name ("default" when None), with
@@ -258,15 +274,12 @@ class SectionedConfig(BaseModel):
         return preset.sandbox if preset else None
 
 
-def _validate(path: Path, model: Any, data: Any) -> Any:
-    try:
-        return TypeAdapter(model).validate_python(data)
-    except ValidationError as exc:
-        lines = [
-            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']} (got {repr(e.get('input'))[:60]})"
-            for e in exc.errors()
-        ]
-        raise ConfigError(f"invalid config in {path}:\n" + "\n".join(lines)) from None
+def _format_validation_error(path: Path, exc: ValidationError) -> ConfigError:
+    lines = [
+        f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']} (got {repr(e.get('input'))[:60]})"
+        for e in exc.errors()
+    ]
+    return ConfigError(f"invalid config in {path}:\n" + "\n".join(lines))
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -302,26 +315,13 @@ def load_sectioned(path: Path) -> SectionedConfig:
         if cached is not None:
             return cached
     data = _read(path)
-    models = {
-        name: _validate(path, ProviderProfile, {"name": name, **fields})
-        for name, fields in (data.get("models") or {}).items()
-    }
-    sandboxes = {
-        name: _validate(path, SandboxSettings, fields)
-        for name, fields in (data.get("sandboxes") or {}).items()
-    }
-    sandboxes.setdefault("default", SandboxSettings())
-    presets = {
-        name: _validate(path, PresetSettings, fields)
-        for name, fields in (data.get("presets") or {}).items()
-    }
-    ui = data.get("ui") or {}
-    defaults = data.get("defaults") or {}
-    sectioned = SectionedConfig(
-        models=models, sandboxes=sandboxes, presets=presets,
-        theme=ui.get("theme") or DEFAULT_THEME,
-        default_preset=defaults.get("preset") or "default",
-    )
+    # Unknown top-level keys (e.g. 'server') are ignored: forward
+    # compatibility with newer configs.
+    try:
+        sectioned = SectionedConfig.model_validate(data)
+    except ValidationError as exc:
+        raise _format_validation_error(path, exc) from None
+    sectioned.sandboxes.setdefault("default", SandboxSettings())
     if key is not None:
         _SECTIONED_CACHE.clear()  # keep at most the newest entry per file
         _SECTIONED_CACHE[key] = sectioned

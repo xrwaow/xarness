@@ -45,52 +45,11 @@ def create_app(host: Host) -> FastAPI:
         """Every SessionError (bad request, unknown session, idle-only
         violations) maps to one 400 with the message — handlers don't need
         their own try/except."""
-        return JSONResponse(status_code=400, detail=str(exc))
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     app.include_router(sessions_router(host))
     app.include_router(meta_router(host))
-    _add_docs_only_schemas(app)
     return app
-
-
-def _add_docs_only_schemas(app: FastAPI) -> None:
-    """Reference the event/command unions from the OpenAPI document.
-
-    SSE has no native OpenAPI representation; the stream endpoint documents
-    its payload as ``Event`` so every event and command model still shows up
-    under ``components/schemas`` in the generated docs."""
-    original_openapi = app.openapi
-
-    def openapi() -> dict[str, Any]:
-        schema = original_openapi()
-        components = schema.setdefault("components", {}).setdefault("schemas", {})
-        # Ensure both unions (and every member model) are present even when
-        # no route's request/response models reference them directly.
-        for model in list(protocol.EVENT_TYPES.values()) + list(protocol.COMMAND_TYPES.values()):
-            name = model.__name__
-            if name not in components:
-                components[name] = model.model_json_schema(
-                    ref_template="#/components/schemas/{model}"
-                )
-        components.setdefault("Event", {
-            "oneOf": [
-                {"$ref": f"#/components/schemas/{m.__name__}"}
-                for m in protocol.EVENT_TYPES.values()
-            ],
-            "discriminator": {"propertyName": "type"},
-            "description": "One event on a session's SSE stream (see GET /sessions/{name}/events).",
-        })
-        components.setdefault("Command", {
-            "oneOf": [
-                {"$ref": f"#/components/schemas/{m.__name__}"}
-                for m in protocol.COMMAND_TYPES.values()
-            ],
-            "discriminator": {"propertyName": "type"},
-            "description": "One command in POST /sessions/{name}/commands (wrapped in CommandEnvelope).",
-        })
-        return schema
-
-    app.openapi = openapi  # type: ignore[method-assign]
 
 
 async def _session_or_load(host: Host, name: str) -> Session:
@@ -164,14 +123,10 @@ def sessions_router(host: Host) -> APIRouter:
                 "description": (
                     "text/event-stream. The first frame is `snapshot` (a "
                     "Snapshot); then `event` frames carrying Event models "
-                    "(discriminated on `type`, see the Event schema). "
+                    "(discriminated on `type`; every event model appears "
+                    "under components/schemas via Snapshot.turn_events). "
                     "Reconnects always receive a fresh snapshot."
                 ),
-                "content": {
-                    "text/event-stream": {
-                        "schema": {"$ref": "#/components/schemas/Event"},
-                    },
-                },
             },
         },
     )

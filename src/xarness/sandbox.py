@@ -21,11 +21,51 @@ from collections.abc import Callable, Iterable
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .config import SandboxSettings
+    from .config import RefSpec, SandboxSettings
     from .gitwork import GitInfo
+
+
+def bind_ref(
+    workspace: Path,
+    refs: dict[str, ContainerRef],
+    host: str | Path,
+    *,
+    alias: str | None = None,
+    mount: str | None = None,
+    read_only: bool = True,
+) -> ContainerRef:
+    """Bind a host path into the container (appended to ``refs``); returns
+    the (possibly disambiguated) entry. ``mount`` defaults to
+    ``.refs/<alias>`` with the alias from the path's basename; duplicate
+    basenames prepend parent segments until unique."""
+    host_path = Path(host).expanduser()
+    host_path = host_path if host_path.is_absolute() else workspace / host_path
+    host_path = host_path.resolve()
+    if not host_path.exists():
+        raise FileNotFoundError(f"no such path: {host_path}")
+    if alias is None:
+        alias = host_path.name
+        for depth in range(2, len(host_path.parts) + 1):
+            existing = refs.get(alias)
+            if existing is None or existing.host == host_path:
+                break
+            alias = "-".join(host_path.parts[-depth:])
+    if mount is None:
+        mount = f".refs/{alias}"
+    mount = mount.strip("/")
+    if not mount or ".." in Path(mount).parts:
+        raise SandboxUnavailable(f"invalid ref mount point: {mount!r}")
+    if mount in (".", ".git") or mount.startswith(".git/"):
+        # '.' would mount over the workspace root; '.git' would shadow
+        # the harness's read-only git bind (the git guard assumes that
+        # mount stays ro).
+        raise SandboxUnavailable(f"ref mount point {mount!r} is not allowed")
+    ref = ContainerRef(host=host_path, mount=mount, read_only=read_only)
+    refs[alias] = ref
+    return ref
 
 
 # Subdirectories of the persistent sandbox cache, created on demand.
@@ -136,7 +176,8 @@ def sandbox_cache_root() -> Path:
 
 
 class SandboxUnavailable(Exception):
-    """Raised when bwrap isn't installed or usable on this host."""
+    """Raised when bwrap isn't installed or usable on this host (the
+    session falls back to filesystem/bash tools being disabled)."""
 
 
 _SHADOW: tuple[str, str] | None = None
@@ -256,34 +297,9 @@ class SandboxConfig:
         read_only: bool = True,
     ) -> ContainerRef:
         """Bind a host path into the container; returns the (possibly
-        disambiguated) entry. ``mount`` defaults to ``.refs/<alias>`` with
-        the alias from the path's basename; duplicate basenames prepend
-        parent segments until unique."""
-        host_path = Path(host).expanduser()
-        host_path = host_path if host_path.is_absolute() else self.workspace / host_path
-        host_path = host_path.resolve()
-        if not host_path.exists():
-            raise FileNotFoundError(f"no such path: {host_path}")
-        if alias is None:
-            alias = host_path.name
-            for depth in range(2, len(host_path.parts) + 1):
-                existing = self.external_refs.get(alias)
-                if existing is None or existing.host == host_path:
-                    break
-                alias = "-".join(host_path.parts[-depth:])
-        if mount is None:
-            mount = f".refs/{alias}"
-        mount = mount.strip("/")
-        if not mount or ".." in Path(mount).parts:
-            raise SandboxUnavailable(f"invalid ref mount point: {mount!r}")
-        if mount in (".", ".git") or mount.startswith(".git/"):
-            # '.' would mount over the workspace root; '.git' would shadow
-            # the harness's read-only git bind (the git guard assumes that
-            # mount stays ro).
-            raise SandboxUnavailable(f"ref mount point {mount!r} is not allowed")
-        ref = ContainerRef(host=host_path, mount=mount, read_only=read_only)
-        self.external_refs[alias] = ref
-        return ref
+        disambiguated) entry. See :func:`bind_ref`."""
+        return bind_ref(self.workspace, self.external_refs, host,
+                        alias=alias, mount=mount, read_only=read_only)
 
     def remove_ref(self, alias: str) -> bool:
         return self.external_refs.pop(alias, None) is not None
@@ -298,9 +314,7 @@ class SandboxConfig:
         settings: "SandboxSettings",
         git_info: "GitInfo | None" = None,
     ) -> "SandboxConfig":
-        """Build a config from a config.SandboxSettings profile (shared by
-        Host._build_parts and Session._apply_sandbox_settings, which must
-        construct identical sandboxes)."""
+        """Build a config from a config.SandboxSettings profile."""
         return cls(
             workspace=workspace,
             allow_network=settings.allow_network,
@@ -317,7 +331,7 @@ class SandboxConfig:
     @staticmethod
     def resolve_auto_refs(
         workspace: Path,
-        specs: Iterable[str | object],
+        specs: Iterable["str | RefSpec"],
         external: dict[str, ContainerRef] | None = None,
     ) -> dict[str, ContainerRef]:
         """Turn config ``auto_include_refs`` entries (plain path strings or
@@ -331,20 +345,13 @@ class SandboxConfig:
         ``notes-spec.md``). Missing paths are skipped — refs are
         conveniences, not hard requirements."""
         resolved: dict[str, ContainerRef] = dict(external or {})
-        probe = SandboxConfig.__new__(SandboxConfig)  # add_ref without __post_init__
-        probe.workspace = Path(workspace).resolve()
-        probe.external_refs = resolved
         for spec in specs:
-            if isinstance(spec, dict):
-                path = spec.get("path", "")
-                mount = spec.get("mount")
-                ro = spec.get("read_only", True)
+            if isinstance(spec, str):
+                path, mount, ro = spec, None, True
             else:
-                path = getattr(spec, "path", spec)
-                mount = getattr(spec, "mount", None)
-                ro = getattr(spec, "read_only", True)
+                path, mount, ro = spec.path, spec.mount, spec.read_only
             try:
-                probe.add_ref(path, mount=mount, read_only=bool(ro))
+                bind_ref(workspace, resolved, path, mount=mount, read_only=ro)
             except FileNotFoundError:
                 continue
         return resolved
@@ -370,17 +377,15 @@ class SandboxConfig:
             return REFS_ANCHOR + norm[len(_REFS_PREFIX):]
         return f"{self.tool_root}/{norm}"
 
-    def validate_relpath(self, path: str, mode: Literal["read", "write"] = "write") -> str | None:
+    def validate_relpath(self, path: str) -> str | None:
         """Defense-in-depth path check; bwrap's mount namespace is the real
         enforcement — this just gives a clean error instead of a bwrap
         failure.
 
         Paths are relative to the agent's workspace (see tool_path).
-        Absolute paths and traversal are rejected in every mode, so a path
-        can never point outside the workspace's mount. ``mode`` is accepted
-        for call-site symmetry (read_file/edit_file) — the check itself is
-        mode-independent, since the read-only mount already enforces plan
-        mode."""
+        Absolute paths and traversal are rejected, so a path can never
+        point outside the workspace's mount (the read-only mount in plan
+        mode is what enforces write restrictions)."""
         p = Path(path)
         if p.is_absolute():
             return f"path must be relative to the workspace, got absolute path '{path}'"
@@ -876,3 +881,16 @@ class SandboxSession:
             # bwrap has torn down its tmpfs/bind mounts by now; drop the
             # empty mountpoint dirs it created in the worktree.
             cleanup_mount_dirs_now()
+
+
+def make_sandbox(
+    workspace: Path,
+    settings: "SandboxSettings",
+    git_info: "GitInfo | None",
+) -> tuple[SandboxConfig | None, SandboxSession | None]:
+    """Build a sandbox config + persistent shell from a settings profile.
+
+    Raises :class:`SandboxUnavailable` when the sandbox can't be built
+    (callers fall back to filesystem/bash tools being disabled)."""
+    config = SandboxConfig.from_settings(workspace, settings, git_info)
+    return config, SandboxSession(config)

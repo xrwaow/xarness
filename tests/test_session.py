@@ -7,7 +7,7 @@ import pytest
 
 from xarness import protocol, session_store
 from xarness.config import ProviderProfile
-from xarness.conversation import Message
+from xarness.conversation import Message, turn_time_summary
 from xarness.events import (
     ContentDelta, ProcessingStarted, ReasoningDelta, StreamError,
     ToolCallArgumentsDone, ToolCallStarted, TurnComplete, Usage,
@@ -50,7 +50,6 @@ def make_session(script, tmp_path, tools=None) -> Session:
     if tools is not None:
         session.tool_registry = tools
         session.controller.tools = tools
-    session.start()
     return session
 
 
@@ -63,7 +62,7 @@ async def wait_idle(session: Session, timeout: float = 10.0) -> None:
 
 def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:
     session = make_session(
-        [[ReasoningDelta("hmm"), ContentDelta("Hello"), TurnComplete(usage=Usage(10, 2))]],
+        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
     )
 
@@ -96,10 +95,10 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
     noop = tool("noop", "does nothing")(lambda: "ok")
     session = make_session(
         [
-            [ContentDelta("one"), TurnComplete(usage=Usage(100, 10)),
+            [ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=100, output_tokens=10)),
              ToolCallStarted(call_id="c1", name="noop"),
              ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}")],
-            [ContentDelta("two"), TurnComplete(usage=Usage(200, 20))],
+            [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=200, output_tokens=20))],
         ],
         tmp_path, tools=ToolRegistry([noop]),
     )
@@ -126,7 +125,7 @@ def test_history_replaced_never_sits_in_turn_events(tmp_path) -> None:
     """A rewrite invalidates every buffered turn event, and the event itself
     is never buffered: an attaching client gets the fresh history in its
     snapshot, never a replayed HistoryReplaced on top of stale deltas."""
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -158,7 +157,7 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
                 ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
                 TurnComplete(has_tool_calls=True),
             ],
-            [ContentDelta("second round"), TurnComplete()],
+            [ContentDelta(text="second round"), TurnComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -196,7 +195,7 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
                 ToolCallArgumentsDone(call_id="c1", name="blocker", arguments_json="{}"),
                 TurnComplete(has_tool_calls=True),
             ],
-            [ContentDelta("x"), TurnComplete()],
+            [ContentDelta(text="x"), TurnComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -213,7 +212,7 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
 
 
 def test_cancel_interrupts_turn(tmp_path) -> None:
-    session = make_session([[ContentDelta("partial"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="partial"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -227,7 +226,7 @@ def test_cancel_interrupts_turn(tmp_path) -> None:
 
 
 def test_cmd_id_dedupe(tmp_path) -> None:
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         first = await session.execute("same-id", SendMessage(text="hi"))
@@ -242,7 +241,7 @@ def test_cmd_id_dedupe(tmp_path) -> None:
 
 
 def test_ask_first_answer_wins(tmp_path) -> None:
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         queue = session.subscribe()[1]
@@ -298,7 +297,7 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
 
 def test_undo_to_by_message_id(tmp_path) -> None:
     session = make_session(
-        [[ContentDelta("answer"), TurnComplete(usage=Usage(5, 2))]], tmp_path,
+        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
     )
 
     async def go():
@@ -316,7 +315,7 @@ def test_undo_to_by_message_id(tmp_path) -> None:
 
 def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
     session = make_session(
-        [[ContentDelta("answer"), TurnComplete(usage=Usage(5, 2))]], tmp_path,
+        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
     )
 
     async def go():
@@ -346,9 +345,9 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
     drops the last turn and reports the user text; retry drops the turn and
     resends it."""
     script = [
-        [ContentDelta("first answer"), TurnComplete(usage=Usage(5, 2))],
-        [ContentDelta("second answer"), TurnComplete(usage=Usage(5, 2))],
-        [ContentDelta("second answer"), TurnComplete(usage=Usage(5, 2))],
+        [ContentDelta(text="first answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
+        [ContentDelta(text="second answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
+        [ContentDelta(text="second answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
     ]
 
     async def go():
@@ -404,7 +403,7 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
     finish_gate = asyncio.Event()
 
     session = make_session(
-        [[ContentDelta("answer"), TurnComplete(usage=Usage(900, 100))]],
+        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=900, output_tokens=100))]],
         tmp_path,
     )
     session.auto_compact = True
@@ -442,7 +441,7 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
     """A manual compaction runs as a task (the inbox keeps serving commands)
     and the steering queue is drained when it finishes."""
     gate = asyncio.Event()
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def fake_compact() -> str:
         await gate.wait()
@@ -535,10 +534,10 @@ def test_stream_events_are_protocol_models() -> None:
     models themselves, with the ``type`` discriminator baked in."""
     cases = [
         (ProcessingStarted(), "processing_started"),
-        (ReasoningDelta("x"), "reasoning_delta"),
-        (ContentDelta("y"), "content_delta"),
-        (StreamError("bad"), "stream_error"),
-        (TurnComplete(usage=Usage(1, 2), has_tool_calls=True), "turn_complete"),
+        (ReasoningDelta(text="x"), "reasoning_delta"),
+        (ContentDelta(text="y"), "content_delta"),
+        (StreamError(message="bad"), "stream_error"),
+        (TurnComplete(usage=Usage(input_tokens=1, output_tokens=2), has_tool_calls=True), "turn_complete"),
     ]
     for internal, expected_type in cases:
         assert internal.model_dump()["type"] == expected_type
@@ -565,7 +564,7 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
                 ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
                 TurnComplete(has_tool_calls=True),
             ],
-            [ContentDelta("second round"), TurnComplete()],
+            [ContentDelta(text="second round"), TurnComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -599,7 +598,7 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
 def test_history_replaced_never_buffered_and_resets_turn_events(tmp_path) -> None:
     """HistoryReplaced must never sit in snapshot.turn_events: while idle
     the buffer is empty, and a rewrite while running resets the buffer."""
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -620,7 +619,7 @@ def test_history_replaced_never_buffered_and_resets_turn_events(tmp_path) -> Non
 def test_events_carry_monotonic_seqs_across_a_rewrite(tmp_path) -> None:
     """Sequences keep increasing across a history rewrite; HistoryReplaced
     itself is never buffered for attach (a fresh snapshot carries it)."""
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -641,7 +640,7 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
     created in the worktree and the filter list is unchanged."""
     from xarness.config import SandboxSettings
 
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
     session.sandbox_settings = SandboxSettings()
     (tmp_path / "real.txt").write_text("x")
 
@@ -660,7 +659,7 @@ def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
     """After an /undo (a rewrite) an attaching client's snapshot has empty
     turn_events: the history is rendered exactly once — the HistoryReplaced
     event itself is never stored or replayed."""
-    session = make_session([[ContentDelta("x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -690,17 +689,16 @@ def test_cancel_saves_partial_cot_reasoning_only(tmp_path) -> None:
     class BlockingClient:
         async def stream(self, wire_messages, tools=None):
             yield ProcessingStarted()
-            yield ReasoningDelta("thinking half ")
-            yield ReasoningDelta("a thought")
+            yield ReasoningDelta(text="thinking half ")
+            yield ReasoningDelta(text="a thought")
             started.set()
             await release.wait()
-            yield ContentDelta("never arrives")
+            yield ContentDelta(text="never arrives")
 
     session = Session(
         name="test", workspace=tmp_path, profile=PROFILE, profile_name="test",
         api_key="key", client=BlockingClient(),
     )
-    session.start()
 
     async def go():
         session.subscribe()
@@ -732,16 +730,15 @@ def test_forced_steer_saves_partial_cot(tmp_path) -> None:
     class BlockingClient:
         async def stream(self, wire_messages, tools=None):
             yield ProcessingStarted()
-            yield ReasoningDelta("partial thoughts")
+            yield ReasoningDelta(text="partial thoughts")
             started.set()
             await release.wait()
-            yield ContentDelta("never arrives")
+            yield ContentDelta(text="never arrives")
 
     session = Session(
         name="test", workspace=tmp_path, profile=PROFILE, profile_name="test",
         api_key="key", client=BlockingClient(),
     )
-    session.start()
 
     async def go():
         session.subscribe()
@@ -801,7 +798,7 @@ def test_no_save_disables_persistence(tmp_path) -> None:
 
 
 def test_turn_time_summary_format(tmp_path) -> None:
-    """_turn_time_summary derives total | streaming | tools | other from the
+    """turn_time_summary derives total | streaming | tools | other from the
     persisted stamps."""
     from datetime import datetime, timedelta, timezone
 
@@ -827,7 +824,7 @@ def test_turn_time_summary_format(tmp_path) -> None:
         start_time=(base + timedelta(seconds=5)).isoformat(),
         end_time=(base + timedelta(seconds=8)).isoformat(),
     ))
-    summary = session._turn_time_summary()
+    summary = turn_time_summary(session.conversation.messages)
     assert summary is not None
     total, rest = summary.split("|")
     streaming, tools, other = rest.split()
@@ -842,7 +839,7 @@ def test_turn_finish_stamps_time_summary_and_persists(tmp_path) -> None:
     """A completed turn gets its timing summary on the last assistant message
     (persisted, so reloads render it) and in TurnFinished.summary."""
     session = make_session(
-        [[ReasoningDelta("hmm"), ContentDelta("Hello"), TurnComplete(usage=Usage(10, 2))]],
+        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
     )
 
@@ -874,4 +871,4 @@ def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
     session = make_session([], tmp_path)
     session.conversation.add(Message(role="user", content="hi"))
     session.conversation.add(Message(role="assistant", content="hello"))
-    assert session._turn_time_summary() is None
+    assert turn_time_summary(session.conversation.messages) is None

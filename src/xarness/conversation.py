@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 from .events import Usage
+from .util import format_duration
 from .images import IMAGE_TOKEN_RE
 from .images import ImageAttachment
 
@@ -29,6 +31,74 @@ from .images import ImageAttachment
 # it by content (not identity) keeps working across a session save/load.
 SUMMARY_PREFIX = "[earlier conversation, summarized]"
 
+def is_summary(message: "Message") -> bool:
+    """True for the summary user message a compaction leaves behind."""
+    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
+
+
+def turn_time_summary(messages: list["Message"]) -> str | None:
+    """The turn's timing line: total | streaming | tools | other.
+
+    Computed from the persisted wall-clock stamps, so the same string can be
+    stamped on the turn's last assistant message (reloads show it) and sent
+    in TurnFinished (the live clients show it). None when the stamps are
+    missing (old sessions, or nothing streamed).
+
+    - total: turn user message send_time → last assistant end_time
+    - streaming: per round, end_time − reasoning_start (start_time when the
+      round had no chain of thought)
+    - tools: summed tool execution durations
+    - other: what's left (per-round latency and round boundaries)
+    """
+    turn_user_index = next(
+        (i for i, m in reversed(list(enumerate(messages)))
+         if m.role == "user" and m.send_time and not is_summary(m)),
+        None,
+    )
+    turn = messages[turn_user_index + 1:] if turn_user_index is not None else messages
+    assistants = [
+        m for m in turn if m.role == "assistant" and m.start_time and m.end_time
+    ]
+    if not assistants:
+        return None
+    total_end = _parse_iso(assistants[-1].end_time)
+    total_start = (
+        _parse_iso(messages[turn_user_index].send_time)
+        if turn_user_index is not None
+        else _parse_iso(assistants[0].start_time)
+    )
+    if total_end is None or total_start is None:
+        return None
+    total = max(0.0, (total_end - total_start).total_seconds())
+    streaming = 0.0
+    for message in assistants:
+        end = _parse_iso(message.end_time)
+        first = _parse_iso(message.reasoning_start) or _parse_iso(message.start_time)
+        if end is not None and first is not None:
+            streaming += max(0.0, (end - first).total_seconds())
+    tools = 0.0
+    for message in turn:
+        if message.role != "tool":
+            continue
+        start = _parse_iso(message.start_time)
+        end = _parse_iso(message.end_time)
+        if start is not None and end is not None:
+            tools += max(0.0, (end - start).total_seconds())
+    other = max(0.0, total - streaming - tools)
+    fmt = format_duration
+    return f"{fmt(total)} | {fmt(streaming)} {fmt(tools)} {fmt(other)}"
+
+
+def _parse_iso(stamp: str | None) -> datetime | None:
+    """Parse one of the ISO stamps carried on messages (None on failure)."""
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+
+
 # The placeholder tokens attached images leave in user text (see
 # images.token_text); matches are replaced by image content parts on the wire.
 _TOKEN_RE = IMAGE_TOKEN_RE
@@ -36,21 +106,11 @@ _TOKEN_RE = IMAGE_TOKEN_RE
 
 class ToolCall(BaseModel):
     """One tool call the model requested — the single shape used everywhere
-    (stream events, history, wire format, TUI).
-
-    Constructed positionally in many places, so ``ToolCall(id, name, args)
-    keeps working."""
+    (stream events, history, wire format, TUI)."""
 
     call_id: str
     name: str
     arguments_json: str
-
-    def __init__(
-        self, call_id: str = "", name: str = "", arguments_json: str = ""
-    ) -> None:
-        super().__init__(
-            call_id=call_id, name=name, arguments_json=arguments_json
-        )
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -62,7 +122,10 @@ class ToolCall(BaseModel):
     @classmethod
     def from_wire(cls, call: dict[str, Any]) -> ToolCall:
         fn = call.get("function") or {}
-        return cls(call.get("id", ""), fn.get("name", ""), fn.get("arguments", ""))
+        return cls(
+            call_id=call.get("id", ""), name=fn.get("name", ""),
+            arguments_json=fn.get("arguments", ""),
+        )
 
 
 class Message(BaseModel):
@@ -86,8 +149,6 @@ class Message(BaseModel):
     reasoning_end: str | None = None
     # Local-only: reasoning-channel text for assistant messages.
     reasoning: str | None = None
-    # Local-only: seconds spent in the reasoning channel (None if unknown).
-    reasoning_seconds: float | None = None
     # Local-only: token usage reported for the round that produced this
     # message (assistant messages only; never sent over the wire).
     usage: Usage | None = None
@@ -138,6 +199,18 @@ class Message(BaseModel):
                     out.append(ToolCall.from_wire(c))
             return out
         return value
+
+    @property
+    def reasoning_duration(self) -> float | None:
+        """Seconds spent in the reasoning channel, derived from the
+        reasoning_start/reasoning_end stamps (None when unknown)."""
+        if not self.reasoning_start or not self.reasoning_end:
+            return None
+        start = _parse_iso(self.reasoning_start)
+        end = _parse_iso(self.reasoning_end)
+        if start is None or end is None:
+            return None
+        return max(0.0, (end - start).total_seconds())
 
     def to_wire(self, include_reasoning: bool = False) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}

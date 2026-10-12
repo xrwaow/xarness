@@ -6,7 +6,7 @@ the OpenAPI schema from these directly, so the docs can never drift from
 the code.
 
 Usage, ImageAttachment, ToolCall and Message are the very models defined in
-:mod:`xarness.events` / :mod:`xarness.conversation` (re-exported below) — a
+:mod:`xarness.events` / :mod:`xarness.conversation` / :mod:`xarness.images` — a
 message is persisted, converted to a provider request and shown to a client
 as one object, with no mirrored copy to keep in sync. The transient stream
 deltas are likewise the models defined in :mod:`xarness.events`.
@@ -14,7 +14,7 @@ deltas are likewise the models defined in :mod:`xarness.events`.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, get_args, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -29,7 +29,6 @@ from .events import (
     ToolCallArgumentsDone,
     ToolCallStarted,
     TurnComplete,
-    Usage,
 )
 from .images import ImageAttachment
 
@@ -38,19 +37,13 @@ PROTOCOL_VERSION = 1
 # ---------------------------------------------------------------------------
 # primitives
 
-# The one and only usage/message/image shapes: the events/conversation models
-# cross the wire as-is (they are pydantic models), so there is no mirrored
-# protocol copy to keep in sync. Aliases keep the protocol namespace complete.
-UsageModel = Usage
-MessageModel = Message
-ImageAttachmentModel = ImageAttachment
 
 
 class QueuedMessage(BaseModel):
     """A steering message waiting to be injected at a round boundary."""
 
     text: str
-    images: list[ImageAttachmentModel] | None = None
+    images: list[ImageAttachment] | None = None
 
 
 class PendingAsk(BaseModel):
@@ -103,8 +96,8 @@ class Snapshot(BaseModel):
     """The full state a client receives when it attaches (SSE first event)."""
 
     seq: int = 0
-    messages: list[MessageModel] = Field(default_factory=list)
-    compact_snapshot: list[MessageModel] = Field(default_factory=list)
+    messages: list[Message] = Field(default_factory=list)
+    compact_snapshot: list[Message] = Field(default_factory=list)
     turn_start: int | None = None
     status: StatusPayload = Field(default_factory=StatusPayload)
     # Events buffered during the current turn (empty when idle).
@@ -190,18 +183,7 @@ class DiffInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# events
-
-# EventBase and the transient stream deltas (ProcessingStarted, ReasoningDelta,
-# ContentDelta, ToolCallStarted, ToolCallArgumentsDelta, ToolCallArgumentsDone,
-# TurnComplete, StreamError) come from :mod:`xarness.events` — see the import
-# above.
-
-
-
-
-
-
+# events (EventBase and the transient stream deltas come from xarness.events)
 
 class ToolExecStarted(EventBase):
     type: Literal["tool_exec_started"] = "tool_exec_started"
@@ -234,7 +216,7 @@ class UserMessageAdded(EventBase):
 
     type: Literal["user_message_added"] = "user_message_added"
     text: str
-    images: list[ImageAttachmentModel] | None = None
+    images: list[ImageAttachment] | None = None
     message_id: str | None = None
     send_time: str | None = None
 
@@ -315,17 +297,6 @@ Event = Annotated[
 Snapshot.model_rebuild()
 
 
-def _union_members(annotation) -> tuple[type[BaseModel], ...]:
-    """The member models of a discriminated ``Annotated[Union[...]]``."""
-    return get_args(get_args(annotation)[0])
-
-
-EVENT_TYPES: dict[str, type[BaseModel]] = {
-    model.model_fields["type"].default: model  # type: ignore[index]
-    for model in _union_members(Event)
-}
-
-
 EVENT_ADAPTER = TypeAdapter(Event)
 
 
@@ -340,7 +311,7 @@ class CommandBase(BaseModel):
 class SendMessage(CommandBase):
     type: Literal["send_message"] = "send_message"
     text: str
-    images: list[ImageAttachmentModel] | None = None
+    images: list[ImageAttachment] | None = None
 
 
 class Cancel(CommandBase):
@@ -438,12 +409,6 @@ Command = Annotated[
     ],
     Field(discriminator="type"),
 ]
-
-COMMAND_TYPES: dict[str, type[BaseModel]] = {
-    model.model_fields["type"].default: model  # type: ignore[index]
-    for model in _union_members(Command)
-}
-
 
 class CommandResult(BaseModel):
     """Reply to one command, delivered only to its issuer."""

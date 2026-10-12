@@ -98,30 +98,23 @@ def main(argv: list[str] | None = None) -> None:
     _run_chat(args)
 
 
-def _connect():
-    """Connect to the host, auto-starting it (detached) if needed."""
+def _print_sessions() -> None:
+    """Connect, fetch, print and close — all in one asyncio.run, so the
+    httpx client never outlives its event loop."""
     from .clientlib import ClientError, XarnessClient
 
-    async def _go():
-        return await XarnessClient.connect_unix()
-
-    try:
-        return asyncio.run(_go())
-    except ClientError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(2) from None
-
-
-def _print_sessions() -> None:
-    client = _connect()
-
-    async def _go():
+    async def _go() -> list:
+        client = await XarnessClient.connect_unix()
         try:
             return await client.sessions(active=True)
         finally:
             await client.aclose()
 
-    sessions = asyncio.run(_go())
+    try:
+        sessions = asyncio.run(_go())
+    except ClientError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     if not sessions:
         print("no active sessions")
         return

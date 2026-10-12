@@ -101,8 +101,8 @@ def _exec_error(result, fallback: str) -> ToolResult:
     return ToolResult(ok=False, error=result.stderr.strip() or fallback)
 
 
-def _check_path(sandbox: SandboxConfig, path: str, mode: str | None = None) -> ToolResult | None:
-    error = sandbox.validate_relpath(path, mode=mode)
+def _check_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
+    error = sandbox.validate_relpath(path)
     return None if error is None else _bad(error)
 
 
@@ -230,7 +230,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     )
     async def read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        if err := _check_path(sandbox, path, mode="read"):
+        if err := _check_path(sandbox, path):
             return err
 
         try:
@@ -471,14 +471,11 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         "fails to match, nothing is written. The result includes a diff of "
         "what changed. Use write_file to create a file or replace its whole "
         "contents. Cannot write under '.refs/', which is read-only.",
-        required=("path",),
+        required=("path", "edits"),
         path="string",
         edits={
             "type": "array",
-            "description": (
-                "replacements to apply, in order (prefer this over the "
-                "single-edit old_string/new_string pair)"
-            ),
+            "description": "replacements to apply, in order",
             "items": {
                 "type": "object",
                 "properties": {
@@ -494,11 +491,6 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
                 "required": ["old_string", "new_string"],
             },
         },
-        old_string=(
-            "string",
-            "single-edit form: the exact text to replace (must match once)",
-        ),
-        new_string=("string", "single-edit form: the replacement text"),
     )
     async def edit_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")

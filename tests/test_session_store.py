@@ -24,7 +24,7 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     conversation = Conversation()
     user = Message(role="user", content="hi", checkpoint_sha="abc123", after_tree="def456")
     assistant = Message(
-        role="assistant", content="hello", reasoning="thoughts", usage=Usage(12, 3)
+        role="assistant", content="hello", reasoning="thoughts", usage=Usage(input_tokens=12, output_tokens=3)
     )
     conversation.add(user)
     conversation.add(assistant)
@@ -35,7 +35,7 @@ def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
     assert [m.role for m in loaded.messages] == ["user", "assistant"]
     assert loaded.messages[0].checkpoint_sha == "abc123"
     assert loaded.messages[0].after_tree == "def456"
-    assert loaded.messages[1].usage == Usage(12, 3)
+    assert loaded.messages[1].usage == Usage(input_tokens=12, output_tokens=3)
     assert loaded.messages[1].reasoning == "thoughts"
     assert loaded.turn_start == 0
     assert loaded.messages[loaded.turn_start].checkpoint_sha == "abc123"
@@ -66,7 +66,7 @@ def test_to_wire_drops_unpaired_tool_calls() -> None:
     # Two calls, one answered: the orphaned call gets a synthetic result.
     conversation = make_conversation(
         "",
-        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [ToolCall(call_id="call_1", name="run_bash", arguments_json="{}"), ToolCall(call_id="call_2", name="read_file", arguments_json="{}")],
         [("call_1", "ok")],
     )
     wire = conversation.to_wire()
@@ -78,7 +78,7 @@ def test_to_wire_drops_unpaired_tool_calls() -> None:
     # Text plus both calls survive; the synthetic result keeps the round valid.
     wire = make_conversation(
         "let me check",
-        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [ToolCall(call_id="call_1", name="run_bash", arguments_json="{}"), ToolCall(call_id="call_2", name="read_file", arguments_json="{}")],
         [("call_1", "ok")],
     ).to_wire()
     assert wire[1]["content"] == "let me check"
@@ -87,14 +87,14 @@ def test_to_wire_drops_unpaired_tool_calls() -> None:
     # No answered calls and no content: repair adds a synthetic result for
     # the unanswered call so the round stays valid.
     wire = make_conversation(
-        "", [ToolCall("call_1", "run_bash", "{}")], []
+        "", [ToolCall(call_id="call_1", name="run_bash", arguments_json="{}")], []
     ).to_wire()
     assert [m["role"] for m in wire] == ["user", "assistant", "tool"]
 
     # Fully answered calls are untouched.
     wire = make_conversation(
         "",
-        [ToolCall("call_1", "run_bash", "{}"), ToolCall("call_2", "read_file", "{}")],
+        [ToolCall(call_id="call_1", name="run_bash", arguments_json="{}"), ToolCall(call_id="call_2", name="read_file", arguments_json="{}")],
         [("call_1", "ok"), ("call_2", "ok")],
     ).to_wire()
     assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1", "call_2"]
@@ -105,7 +105,7 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
     from the session file drive the same rollback as in-session."""
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
 
-    client_script = [ContentDelta("answer"), TurnComplete(usage=Usage(10, 4))]
+    client_script = [ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=4))]
 
     class FakeClient:
         async def stream(self, wire_messages, tools=None):
@@ -145,11 +145,14 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
         sandbox_name="sb",
     ))
     data = json.loads((tmp_path / "sessions" / "s.json").read_text())
-    assert data["meta"]["workspace"] == "/w"
-    assert data["meta"]["message_count"] == 2
-    assert data["meta"]["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
-    assert data["meta"]["tracking"] is True
-    assert data["meta"]["profile"] == "p" and data["meta"]["sandbox_name"] == "sb"
+    # The meta block lives only in the sidecar, never in the session file.
+    assert "meta" not in data
+    meta_file = json.loads((tmp_path / "sessions" / "s.meta.json").read_text())
+    assert meta_file["workspace"] == "/w"
+    assert meta_file["message_count"] == 2
+    assert meta_file["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
+    assert meta_file["tracking"] is True
+    assert meta_file["profile"] == "p" and meta_file["sandbox_name"] == "sb"
 
     # Reading the meta must not build Conversation objects (the whole point:
     # listing and last-used lookups stay cheap).

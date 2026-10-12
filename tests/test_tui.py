@@ -117,8 +117,8 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("ctrl+c")
             await pilot.pause()
-            from xarness.tui.app import ContinueHeadlessScreen
-            self.assertIsInstance(app.screen, ContinueHeadlessScreen)
+            from xarness.tui.confirm_screen import ConfirmScreen
+            self.assertIsInstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await pilot.pause()
             self.assertFalse(app.is_running)
@@ -160,8 +160,8 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+c")
             await pilot.pause()
             self.assertFalse(app.is_running)
-            from xarness.tui.app import ContinueHeadlessScreen
-            self.assertNotIsInstance(app.screen, ContinueHeadlessScreen)
+            from xarness.tui.confirm_screen import ConfirmScreen
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
 
         await self._run(make_snapshot(), script)
 
@@ -458,20 +458,21 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         ]
 
     def test_dot_color_per_state(self) -> None:
-        from xarness.tui.resume_screen import _dot_palette_key
+        from xarness.tui.resume_screen import _DOT_COLORS
         from xarness import theme
         expected = {
             "waiting": "accent", "running": "success",
-            "compacting": "success", "idle": "muted", "saved": None,
+            "compacting": "success", "idle": "muted",
         }
         for state, key in expected.items():
-            self.assertEqual(_dot_palette_key(state), key)
-            if key is not None:
-                self.assertIn(key, theme.PALETTE)
+            self.assertEqual(_DOT_COLORS.get(state), key)
+            self.assertIn(key, theme.PALETTE)
+        # Saved / not loaded sessions show no dot at all.
+        self.assertIsNone(_DOT_COLORS.get("saved"))
 
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
-        from textual.widgets import Label
+        from textual.widgets import Label, OptionList
         from xarness.tui.resume_screen import ResumeScreen
 
         class Host(App):
@@ -483,23 +484,27 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             app.push_screen(ResumeScreen(self._summaries(), workspace=None))
             await pilot.pause()
-            texts = [str(label.render()) for label in app.screen.query(".resume-row-text")]
-            dots = [str(label.render()) for label in app.screen.query(".resume-row-dot")]
-            self.assertEqual(len(texts), 5)
+            option_list = app.screen.query_one("#resume-list", OptionList)
+            prompts = [
+                str(option_list.get_option_at_index(i).prompt)
+                for i in range(option_list.option_count)
+            ]
+            self.assertEqual(len(prompts), 5)
             # Only loaded sessions get a dot; saved-one shows none.
-            self.assertEqual(len(dots), 4)
+            dotted = sum("●" in p for p in prompts)
+            self.assertEqual(dotted, 4)
             for name in ("waiting-one", "running-one", "compacting-one",
                          "idle-one", "saved-one"):
                 self.assertTrue(
-                    any(name in t for t in texts), f"{name} missing from rows")
+                    any(name in p for p in prompts), f"{name} missing from rows")
             # Every row shows an age column.
-            self.assertTrue(all("m" in t or "h" in t or "d" in t for t in texts))
+            self.assertTrue(all("m" in p or "h" in p or "d" in p for p in prompts))
 
     async def test_search_filters_and_restores_rows(self) -> None:
         """Regression: typing in the search box must narrow the list and
         deleting the query must bring every row back."""
         from textual.app import App, ComposeResult
-        from textual.widgets import Input
+        from textual.widgets import Input, OptionList
         from xarness.tui.resume_screen import ResumeScreen
 
         entries = [
@@ -516,20 +521,20 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             app.push_screen(ResumeScreen(entries, workspace=None))
             await pilot.pause()
-            lv = app.screen.query_one("#resume-list")
-            self.assertEqual(len(lv.children), 3)
+            ol = app.screen.query_one("#resume-list", OptionList)
+            self.assertEqual(ol.option_count, 3)
             await pilot.press("0", "0")
             await pilot.pause()
-            self.assertEqual(len(lv.children), 1)  # only "2026-10-00 sess"
+            self.assertEqual(ol.option_count, 1)  # only "2026-10-00 sess"
             await pilot.press("backspace")
             await pilot.pause()
-            self.assertEqual(len(lv.children), 3)
+            self.assertEqual(ol.option_count, 3)
             # Rows stay in entry order after re-filtering.
-            names = [it.session_name for it in lv.children]
+            names = [str(o.id) for o in ol.options]
             self.assertEqual(names, [f"2026-10-0{i} sess" for i in range(3)])
             await pilot.press("9", "9")
             await pilot.pause()
-            self.assertEqual(len(lv.children), 0)
+            self.assertEqual(ol.option_count, 0)
 
 class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
     """The CLI tab title follows the attached session's workspace."""
@@ -638,11 +643,12 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
-    """The /sessions list must show more than one row at a time (ListView's
-    1fr default collapses to a single row inside the auto-height modal)."""
+    """The /sessions list must show more than one row at a time (the list
+    widgets' 1fr default collapses to a single row inside the auto-height
+    modal)."""
 
     async def test_multiple_rows_visible(self) -> None:
-        from textual.widgets import ListItem
+        from textual.widgets import OptionList
         from xarness.tui.resume_screen import ResumeScreen
 
         from xarness.tui.app import AgentApp
@@ -657,16 +663,16 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
             app.push_screen(ResumeScreen(summaries, workspace=None))
             await pilot.pause()
             screen = app.screen
-            list_view = screen.query_one("#resume-list")
+            option_list = screen.query_one("#resume-list", OptionList)
             self.assertGreaterEqual(
-                list_view.region.height, 5,
+                option_list.region.height, 5,
                 "list collapsed: not all 5 rows visible at once",
             )
-            self.assertEqual(len(list(screen.query(ListItem))), 5)
+            self.assertEqual(option_list.option_count, 5)
 
 
-def _msg(role: str, mid: str, content: str) -> protocol.MessageModel:
-    return protocol.MessageModel(role=role, id=mid, content=content)
+def _msg(role: str, mid: str, content: str) -> protocol.Message:
+    return protocol.Message(role=role, id=mid, content=content)
 
 
 class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
@@ -827,19 +833,19 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
     def _snapshot_with_history(self) -> Snapshot:
         snap = make_snapshot()
         snap.messages = [
-            protocol.MessageModel(
+            protocol.Message(
                 role="user", id="u1", content="do it", send_time="2025-01-01T00:00:00+00:00",
             ),
-            protocol.MessageModel(
+            protocol.Message(
                 role="assistant", id="a2", content="",
-                reasoning="step one\nstep two", reasoning_seconds=4.0,
+                reasoning="step one\nstep two", reasoning_start='2026-01-01T00:00:00+00:00', reasoning_end='2026-01-01T00:00:04+00:00',
                 tool_calls=[{"id": "c1", "type": "function",
                              "function": {"name": "read_file", "arguments": "{}"}}],
             ),
-            protocol.MessageModel(
+            protocol.Message(
                 role="tool", id="t1", tool_call_id="c1", content="file body",
             ),
-            protocol.MessageModel(
+            protocol.Message(
                 role="assistant", id="a1", content="Done.",
                 start_time="2025-01-01T00:00:01+00:00",
                 end_time="2025-01-01T00:00:05+00:00",
@@ -927,5 +933,51 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             flow = app.query_one("#chat-log", FlowView)
             self.assertLess(len(flow._layout), 100)
+
+
+class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
+    """Mouse drag over the transcript must both highlight and extract text.
+
+    Regression: the presenter used to bake a bgcolor into every text cell,
+    and rich's style merge lets cell styles win over the later-applied
+    ``screen--selection`` component style — so a drag selected text (copy
+    worked) but highlighted nothing."""
+
+    async def test_drag_selects_and_highlights_transcript_text(self) -> None:
+        from xarness import theme
+        from xarness.tui.app import AgentApp
+        from xarness.tui.flow import UserItem
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None,
+                       session_name="s1")
+        async with app.run_test(size=(80, 24)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+            app._flow_model.append(UserItem(text="selectable body text"))
+            for _ in range(10):
+                await pilot.pause()
+            view = app.query_one("#chat-log")
+            # Drag across the row that actually carries the user text
+            # (spacer/separator rows between entries aren't selectable).
+            row = next(y for y in range(view.row_count)
+                       if "selectable body text" in view.row_text(y))
+            await pilot.mouse_down(offset=(10, row))
+            await pilot.mouse_up(offset=(40, row))
+            await pilot.pause()
+            # Text is extractable for the clipboard (the drag starts a few
+            # columns into the line, so the first word is clipped).
+            selected = app.screen.get_selected_text()
+            self.assertIn("body text", selected or "")
+            # And the drag paints the theme's selection highlight.
+            highlight = theme.PALETTE["highlight"]
+            highlighted = any(
+                seg.style is not None and seg.style.bgcolor is not None
+                and seg.style.bgcolor.get_truecolor("#000").hex == highlight
+                for seg in view.render_line(row)
+            )
+            self.assertTrue(
+                highlighted,
+                f"no cell on row 5 carries the selection highlight {highlight}",
+            )
 
 

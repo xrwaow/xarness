@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from xarness.config import SandboxSettings
+from xarness.config import RefSpec, SandboxSettings
 from xarness.sandbox import (
     CACHE_ANCHOR,
     REFS_ANCHOR,
@@ -199,8 +199,8 @@ class ContainerMountsTest(SandboxArgvTest):
         kw.setdefault("filter_list", ["secret.txt", "secrets"])
         kw.setdefault("external_refs", SandboxConfig.resolve_auto_refs(
             self.workspace,
-            ["docs/spec.md", {"path": str(external), "mount": ".venv",
-                              "read_only": False}],
+            ["docs/spec.md", RefSpec(path=str(external), mount=".venv",
+                              read_only=False)],
         ))
         return self.config(**kw)
 
@@ -341,7 +341,7 @@ class ContainerMountsTest(SandboxArgvTest):
         config = self.config(external_refs=SandboxConfig.resolve_auto_refs(
             self.workspace,
             ["docs/spec.md",
-             {"path": str(other), "mount": ".venv", "read_only": False}],
+             RefSpec(path=str(other), mount=".venv", read_only=False)],
         ))
         argv = config.build_argv(["/bin/sh"])
         # One tmpfs anchor for the refs area, nested under the container-only

@@ -67,6 +67,12 @@ def _best(paths: list[str], query: str) -> list[str]:
     return heapq.nsmallest(_MAX_RESULTS, matching, key=len)
 
 
+def _search(root: Path, query: str) -> list[str]:
+    """The whole blocking pipeline (git ls-files + ranking), run in one
+    executor job — nothing here may touch the event loop."""
+    return _best(_candidates(root), query)
+
+
 async def search_files(root: Path, query: str) -> list[str]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _best, _candidates(root), query)
+    return await loop.run_in_executor(None, _search, root, query)

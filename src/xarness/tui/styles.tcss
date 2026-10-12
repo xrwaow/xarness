@@ -17,8 +17,10 @@ Screen {
     padding: 0;
     background: $c-bg;
     /* NOTE: transcript text colors do NOT come from CSS — the presenter
-       paints raw strips and gives every cell an explicit palette base
-       (see Presenter.present in flow.py). Cell styles always win. */
+       paints raw strips and gives every cell an explicit foreground base
+       (see Presenter.present in flow.py). The background deliberately stays
+       unstyled on text cells: a baked bgcolor would defeat Textual's
+       screen--selection highlight, so the bg comes from this rule instead. */
     scrollbar-size: 0 0; /* hide the scrollbar visual; wheel/key scrolling still works */
 }
 
@@ -358,10 +360,11 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     background-tint: transparent;
 }
 
-#resume-list {
-    /* Same as #picker-list: ListView's default height: 1fr collapses to a
-       single visible row inside the auto-height modal — one session at a
-       time, the rest only reachable by scrolling. */
+#resume-list, #picker-list {
+    /* The default height: 1fr collapses to a single visible row inside the
+       auto-height modal — one entry at a time, the rest only reachable by
+       scrolling. Also: the widgets default to Textual's own dark $surface,
+       which renders as a big dark block inside the auto-height modal. */
     height: auto;
     max-height: 16;
     background: $c-surface;
@@ -369,17 +372,7 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     padding: 0;
 }
 
-/* ListView defaults to height: 1fr + Textual's own dark $surface, which
-   renders as a big dark block inside the auto-height modal. */
-#picker-list {
-    height: auto;
-    max-height: 16;
-    background: $c-surface;
-    border: none;
-    padding: 0;
-}
-
-#resume-list > ListItem,
+#resume-list > Option, #resume-list > ListItem,
 #picker-list > ListItem {
     background: $c-surface;
     color: $c-text;
@@ -387,8 +380,10 @@ ResumeScreen, PickerScreen, ConfirmScreen {
 }
 
 /* Highlighted rows get a distinct background; the rebuild-on-filter case
-   (resume search) re-anchors the ListView cursor so the -highlight class
-   is always managed by the ListView itself. */
+   (resume search) re-anchors the cursor so the -highlight class
+   is always managed by the list itself. */
+#resume-list > Option.-highlight,
+#resume-list > Option.-hovered,
 #resume-list > ListItem.-highlight,
 #resume-list > ListItem.-hovered,
 #picker-list > ListItem.-highlight,
@@ -398,29 +393,8 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     text-style: bold;
 }
 
-#resume-list ListItem {
+#resume-list > Option, #resume-list > ListItem {
     height: auto;
-}
-
-/* The row container inside a ListItem: a bare Horizontal defaults to
-   height: 1fr, which against the auto-height ListItem resolves to the
-   list's max-height — every row then fills the whole popup and only one
-   session is visible at a time. */
-.resume-row {
-    height: auto;
-}
-
-/* Session rows: text (title + age) left, status dot right. Heights are
-   explicit — a bare Horizontal defaults to 1fr, which collapses to 0
-   inside the auto-height ListItem and makes the rows unclickable. */
-.resume-row-text {
-    width: 1fr;
-    height: 1;
-}
-
-.resume-row-dot {
-    width: auto;
-    height: 1;
 }
 
 #steer-queue-bar {

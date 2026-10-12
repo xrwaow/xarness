@@ -25,7 +25,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, replace as dataclasses_replace
+from dataclasses import dataclass, fields, replace as dataclasses_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -35,10 +35,12 @@ from .config import (
     DEFAULT_CONFIG_PATH, ConfigError, ProviderProfile, SandboxSettings,
     SectionedConfig, load_sectioned, resolve_api_key,
 )
-from .gitwork import GitInfo, GitWorktreeError
 from . import gitwork
+from .gitwork import GitInfo, GitWorktreeError
 from .protocol import CommandResult, SessionSummary, ServerInfo, ServerStats
-from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
+from .sandbox import (
+    SandboxConfig, SandboxSession, make_sandbox, SandboxUnavailable,
+)
 from .session import Session, SessionError
 from .util import utcnow_iso as _utcnow
 
@@ -59,7 +61,9 @@ class SessionParts:
     """Everything :class:`Session` needs, resolved by ``_build_parts``.
 
     Typed instead of a ``**``-splatted dict, so a mismatch with the
-    ``Session`` constructor is a type error, not a runtime surprise."""
+    ``Session`` constructor is a type error, not a runtime surprise. Field
+    names match Session's keyword parameters, so ``Session(name=...,
+    **parts.session_kwargs(name))`` constructs it."""
 
     workspace: Path
     profile: ProviderProfile
@@ -75,22 +79,9 @@ class SessionParts:
     sandbox_settings: "SandboxSettings"
 
     def session_kwargs(self, name: str) -> dict[str, Any]:
-        """Keyword arguments for ``Session(name=..., **kwargs)``."""
-        return {
-            "name": name,
-            "workspace": self.workspace,
-            "profile": self.profile,
-            "profile_name": self.profile_name,
-            "api_key": self.api_key,
-            "config_path": self.config_path,
-            "sandbox": self.sandbox,
-            "sandbox_session": self.sandbox_session,
-            "git_info": self.git_info,
-            "auto_compact": self.auto_compact,
-            "tool_output_limit": self.tool_output_limit,
-            "sandbox_name": self.sandbox_name,
-            "sandbox_settings": self.sandbox_settings,
-        }
+        """Keyword arguments for ``Session(name=..., **kwargs)`` (shallow:
+        nested dataclasses like the sandbox config must stay objects)."""
+        return {"name": name, **{f.name: getattr(self, f.name) for f in fields(self)}}
 
 
 
@@ -181,7 +172,6 @@ class Host:
         # An existing session keeps the sandbox state it was saved with
         # (its /sandbox and /filter choices), not a fresh resolution.
         if saved_sandbox_settings is not None:
-            from .config import SandboxSettings
             settings = SandboxSettings.model_validate(saved_sandbox_settings)
             sandbox_key = saved_sandbox_name or sandbox_key
         # Tri-state CLI overrides (--network/--gpu): the flag wins over the
@@ -200,13 +190,10 @@ class Host:
         if not settings.enable_tracking:
             git_info = None
 
-        sandbox_config: SandboxConfig | None = None
-        sandbox_session: SandboxSession | None = None
         try:
-            sandbox_config = SandboxConfig.from_settings(ws, settings, git_info)
-            sandbox_session = SandboxSession(sandbox_config)
+            sandbox_config, sandbox_session = make_sandbox(ws, settings, git_info)
         except SandboxUnavailable:
-            # Same policy as the old CLI path: tools disabled, chat works.
+            # Tools disabled, chat works.
             sandbox_config = sandbox_session = None
 
         return SessionParts(
@@ -228,7 +215,6 @@ class Host:
     async def _setup_tracking(
         workspace: Path, session_name: str, allow_init: bool,
     ) -> tuple[GitInfo | None, list[str]]:
-        from . import gitwork
         try:
             return await gitwork.setup_tracking(workspace, session_name, allow_init=allow_init)
         except GitWorktreeError:
@@ -256,10 +242,8 @@ class Host:
             no_init_repo=no_init_repo, network=network, gpu=gpu,
             session_name=name,
         )
-        session = Session(**parts.session_kwargs(name))
+        session = Session(**parts.session_kwargs(name), idle_callback=self._on_session_idle)
         self.sessions[name] = session
-        session.start()
-        self.watch_session(session)
         if no_session:
             # The client asked for an unsaved conversation: nothing is ever
             # written to the session store (Session._persist no-ops).
@@ -306,10 +290,9 @@ class Host:
                 )
             except (KeyError, TypeError, ValueError):
                 pass  # keep the freshly built tracking as the fallback
-        session = Session.load(**parts.session_kwargs(name), state=state)
+        session = Session.load(**parts.session_kwargs(name), state=state,
+                               idle_callback=self._on_session_idle)
         self.sessions[name] = session
-        session.start()
-        self.watch_session(session)
         # A turn left open by a host crash or a quit mid-turn never got its
         # after-tree (finish_turn never ran). Record the workspace's current
         # state as that turn's after-tree — what finish_turn would have
@@ -335,8 +318,7 @@ class Host:
         if session is not None:
             if session.state != "idle":
                 raise SessionError("wait for the current turn to finish before deleting")
-            self.sessions.pop(name, None)
-            await session.shutdown()
+            await self._evict(session)
         deleted = session_store.delete_session(name)
         return CommandResult(cmd_id="", ok=True, payload={"deleted": deleted})
 
@@ -347,11 +329,19 @@ class Host:
         session = self.sessions.get(name)
         if session is None:
             return False
-        self.sessions.pop(name, None)
-        await session.shutdown(
+        await self._evict(
+            session,
             notice="session closed — it stays saved on disk; /sessions to reopen",
         )
         return True
+
+    async def _evict(self, session: Session, notice: str | None = None) -> None:
+        """Drop a session from the host: cancel its turn, release its
+        subscribers, close it down. The saved file is kept."""
+        if self.sessions.get(session.name) is not session:
+            return
+        self.sessions.pop(session.name, None)
+        await session.shutdown(notice=notice)
 
     def list_sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
@@ -498,14 +488,11 @@ class Host:
     # ------------------------------------------------------------------
     # lifecycle
 
-    async def serve(self) -> None:
-        """Run until shutdown: the unix socket + the grace timer."""
-        await self._run_server()
-
-    async def _run_server(self, stats_interval: float | None = None) -> None:
-        """Shared serve loop: bind the unix socket, arm the grace timer,
-        run until shutdown (or print stats every ``stats_interval`` seconds
-        in foreground mode), then tear everything down."""
+    async def serve(self, stats_interval: float | None = None) -> None:
+        """Run until shutdown: bind the unix socket, arm the grace timer,
+        run until the shutdown event (or print stats every
+        ``stats_interval`` seconds in foreground mode), then tear everything
+        down."""
         HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
         server, server_task = await _start_unix_server(self)
         self._arm_grace()
@@ -534,21 +521,10 @@ class Host:
             if self.unix_socket.exists():
                 self.unix_socket.unlink()
 
-    def is_active_session(self, session: Session) -> bool:
-        """A session is active while it is running, compacting, waiting on
-        an ask, or has an open event stream."""
-        return session.is_active
-
-    def watch_session(self, session: Session) -> None:
-        """Install the idle hook so a fully inactive session is persisted
-        and released (its sandbox shell closed) instead of lingering in
-        host.sessions; /sessions then lists it as saved."""
-        session.idle_callback = self._on_session_idle
-
     def _on_session_idle(self, session: Session) -> None:
         if self.sessions.get(session.name) is not session:
             return
-        if self.is_active_session(session):
+        if session.is_active:
             return
         session._persist()
         try:
@@ -576,7 +552,7 @@ class Host:
     def _grace_expired(self) -> None:
         if self._shutdown_event.is_set():
             return
-        if any(self.is_active_session(s) for s in self.sessions.values()):
+        if any(s.is_active for s in self.sessions.values()):
             # Still active (or active again): re-check after another grace
             # period — the next idle notification re-arms the timer too.
             self._arm_grace()
@@ -589,10 +565,9 @@ class Host:
         persisted); /sessions reopens it on demand."""
         if self.sessions.get(session.name) is not session:
             return
-        if self.is_active_session(session):
+        if session.is_active:
             return  # a client re-attached or a turn started in the meantime
-        self.sessions.pop(session.name, None)
-        await session.stop()
+        await self._evict(session)
         if session.sandbox_session is not None:
             await session.sandbox_session.close()
             session.sandbox_session = None
@@ -773,7 +748,7 @@ async def _serve_forever(host: Host) -> None:
         f"  docs:   (unix socket) GET /v1/health, /v1/server/stats, /docs",
         flush=True,
     )
-    await host._run_server(stats_interval=1.0)
+    await host.serve(stats_interval=1.0)
 
 
 def main(argv: list[str] | None = None) -> None:

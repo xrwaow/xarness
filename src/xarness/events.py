@@ -21,23 +21,10 @@ class EventBase(BaseModel):
 
     Unknown fields are ignored, not rejected: the host and client can be
     different builds across a restart, and a newer host may add event
-    fields a client doesn't know yet. Positional construction is allowed
-    (``ContentDelta("hi")``) to keep call sites terse."""
+    fields a client doesn't know yet."""
 
     seq: int = 0
     model_config = ConfigDict(extra="ignore")
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        if args:
-            if kwargs:
-                raise TypeError("pass fields positionally or by keyword, not both")
-            names = [
-                name for name in type(self).model_fields if name not in ("type", "seq")
-            ]
-            if len(args) > len(names):
-                raise TypeError(f"too many positional arguments for {type(self).__name__}")
-            kwargs = dict(zip(names, args))
-        super().__init__(**kwargs)
 
 
 class ProcessingStarted(EventBase):
@@ -98,19 +85,11 @@ class Usage(BaseModel):
     """Token usage for a turn. ``approximate`` marks locally estimated counts.
 
     A pydantic model (not a dataclass) so the very same object crosses the
-    wire in snapshots and persists losslessly. Constructed positionally in
-    many places, so ``Usage(10, 4)`` keeps working."""
+    wire in snapshots and persists losslessly."""
 
     input_tokens: int = 0
     output_tokens: int = 0
     approximate: bool = False
-
-    def __init__(
-        self, input_tokens: int = 0, output_tokens: int = 0, **kwargs: object
-    ) -> None:
-        super().__init__(
-            input_tokens=input_tokens, output_tokens=output_tokens, **kwargs
-        )
 
 
 class TurnComplete(EventBase):

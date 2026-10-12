@@ -22,9 +22,10 @@ harness process; only the agent's *tools* run sandboxed inside the
 workspace.
 
 Also home to ``check_blocked_git`` — the best-effort filter that keeps the
-agent's shell tool from rewriting the user's branch/refs (checkout/switch,
-reset --hard, branch deletion/renaming, tag deletion/forcing, update-ref,
-worktree/rebase). It is a UX safety net, not
+agent's shell tool from mutating the repo (only read-only inspection
+subcommands and ``git config --get/--list`` pass; add, commit, checkout,
+branch, tag, reset, switch, rebase, push, config writes, … are blocked).
+It is a UX safety net, not
 a security boundary: the user's history is theirs; the agent edits files,
 not refs.
 """
@@ -40,7 +41,8 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+
+from .protocol import DiffFileInfo, DiffInfo
 
 
 _GIT_TIMEOUT = 30.0
@@ -554,9 +556,9 @@ async def _diff_trees(info: GitInfo, *extra: str) -> str:
     return await _diff_tree_pair(info, info.baseline_tree, current, *extra)
 
 
-def _parse_numstat(out: str) -> list[FileDiff]:
-    """Parse ``git diff --numstat`` output into FileDiff rows."""
-    files: list[FileDiff] = []
+def _parse_numstat(out: str) -> list[DiffFileInfo]:
+    """Parse ``git diff --numstat`` output into DiffFileInfo rows."""
+    files: list[DiffFileInfo] = []
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -564,7 +566,7 @@ def _parse_numstat(out: str) -> list[FileDiff]:
         if len(parts) < 3:
             continue
         adds, dels, raw = parts
-        files.append(FileDiff(
+        files.append(DiffFileInfo(
             path=_clean_numstat_path(raw),
             additions=0 if adds == "-" else int(adds or 0),
             deletions=0 if dels == "-" else int(dels or 0),
@@ -621,7 +623,7 @@ def _created_paths(out: str, subtree: str = "") -> frozenset[str]:
     return frozenset(created)
 
 
-async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffStat:
+async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffInfo:
     """Per-file +/- counts between two snapshot trees, with ``is_new`` set
     relative to ``base_tree``."""
     out = await _numstat_between(info, base_tree, other_tree)
@@ -629,17 +631,17 @@ async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> Diff
     created = _created_paths(out, info.subtree)
     for f in files:
         f.is_new = f.path in created
-    return DiffStat(files=files)
+    return _diff_info(files)
 
 
-async def diff_stat(info: GitInfo) -> DiffStat:
+async def diff_stat(info: GitInfo) -> DiffInfo:
     """Per-file +/- line counts of everything that changed since the
     session's baseline. With a scoped subtree, limited to it, paths
     relative to it."""
     return await tree_diff_stat(info, info.baseline_tree, await snapshot_state(info))
 
 
-async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> DiffStat:
+async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> DiffInfo:
     """Pending changes since ``baseline_tree``, tagged by source.
 
     ``baseline_tree`` only ever moves via :func:`accept_changes`, so this is
@@ -671,32 +673,18 @@ async def git_diff(info: GitInfo, path: str | None = None) -> str:
 
 
 # ----------------------------------------------------------------------
-# diff summary data
+# diff summary data — the protocol's DiffInfo/DiffFileInfo models, so
+# session.diff_info can hand gitwork's result straight to clients with no
+# field-by-field copy.
 
 
-@dataclass(slots=True)
-class FileDiff:
-    path: str
-    additions: int
-    deletions: int
-    is_new: bool = False
-    # Who caused the change: "agent" (some turn's diff touched the path) or
-    # "drift" (made outside the session). A path is one or the other, never
-    # both — attribution is per-file, so there is no combined value.
-    source: Literal["agent", "drift"] = "agent"
-
-
-@dataclass(slots=True)
-class DiffStat:
-    files: list[FileDiff]
-
-    @property
-    def additions(self) -> int:
-        return sum(f.additions for f in self.files)
-
-    @property
-    def deletions(self) -> int:
-        return sum(f.deletions for f in self.files)
+def _diff_info(files: list[DiffFileInfo]) -> DiffInfo:
+    """A DiffInfo with the totals computed from ``files``."""
+    return DiffInfo(
+        files=files,
+        additions=sum(f.additions for f in files),
+        deletions=sum(f.deletions for f in files),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -730,9 +718,7 @@ _SHELL_SPLIT_RE = re.compile(r"&&|\|\||[;|&\n]")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 
-def _check_git_args(
-    args: list[str], current_branch: str | None, worktree_root: Path | None
-) -> str | None:
+def _check_git_args(args: list[str]) -> str | None:
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in _GIT_VALUE_FLAGS else 1
@@ -747,11 +733,9 @@ def _check_git_args(
     return _BLOCK_REASON
 
 
-def check_blocked_git(
-    command: str, current_branch: str | None, worktree_root: Path | None
-) -> str | None:
-    """Return a block reason if the shell command tries an identity-changing
-    git operation, else None.
+def check_blocked_git(command: str) -> str | None:
+    """Return a block reason if the shell command runs a git subcommand
+    outside the read-only allow-list, else None.
 
     Best effort: splits on shell operators and inspects each segment's
     command word (env assignments, subshell parens, sudo/env prefixes, and
@@ -773,15 +757,13 @@ def check_blocked_git(
             continue
         head = tokens[idx]
         if os.path.basename(head) == "git":
-            reason = _check_git_args(tokens[idx + 1:], current_branch, worktree_root)
+            reason = _check_git_args(tokens[idx + 1:])
             if reason:
                 return reason
         elif os.path.basename(head) in ("sh", "bash", "dash", "zsh") and "-c" in tokens[idx:]:
             inner = tokens[idx:].index("-c")
             if idx + inner + 1 < len(tokens):
-                reason = check_blocked_git(
-                    tokens[idx + inner + 1], current_branch, worktree_root
-                )
+                reason = check_blocked_git(tokens[idx + inner + 1])
                 if reason:
                     return reason
     return None

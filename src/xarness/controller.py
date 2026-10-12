@@ -26,7 +26,7 @@ from typing import Any, Callable, Protocol
 
 from .client import ChatClient
 from .config import ProviderProfile
-from .conversation import SUMMARY_PREFIX, Conversation, Message, ToolCall
+from .conversation import SUMMARY_PREFIX, Conversation, Message, ToolCall, is_summary
 from .events import (
     ContentDelta,
     ReasoningDelta,
@@ -55,16 +55,11 @@ class PartialRound:
     content_parts: list[str]
 
 
-def _is_summary(message: Message) -> bool:
-    """True for the summary user message a compaction leaves behind."""
-    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
-
-
 def _last_user_turn_index(messages: list[Message]) -> int | None:
     """Index of the last real user turn (summary placeholders don't count)
     that has a response after it, or None."""
     index = max(
-        (i for i, m in enumerate(messages) if m.role == "user" and not _is_summary(m)
+        (i for i, m in enumerate(messages) if m.role == "user" and not is_summary(m)
          and i < len(messages) - 1),
         default=None,
     )
@@ -73,7 +68,7 @@ def _last_user_turn_index(messages: list[Message]) -> int | None:
 
 def _summary_index(messages: list[Message]) -> int | None:
     """Index of the first compaction summary in the list, or None."""
-    return next((i for i, m in enumerate(messages) if _is_summary(m)), None)
+    return next((i for i, m in enumerate(messages) if is_summary(m)), None)
 
 
 def _turns_in(messages: list[Message]) -> list[TurnCheckpoint]:
@@ -236,18 +231,25 @@ class ChatController:
         )
         return True
 
-    def inject_user_message(self, text: str, images: list[ImageAttachment] | None = None) -> None:
+    def inject_user_message(
+        self, text: str, images: list[ImageAttachment] | None = None,
+        send_time: str | None = None,
+    ) -> None:
         """Add a user message mid-turn (steering).
 
         Called at a round boundary — after tool results are recorded, before
         the next round streams — so a message typed while the agent works is
         seen by the very next model call instead of waiting for the turn to
-        end. No checkpoint of its own: it belongs to the turn that is already
-        running, whose snapshot /undo restores anyway.
+        end. ``send_time`` is when the client sent it (steered messages keep
+        their original stamp). No checkpoint of its own: it belongs to the
+        turn that is already running, whose snapshot /undo restores anyway.
         """
-        self.conversation.add(Message(role="user", content=text, images=images or None))
+        message = Message(
+            role="user", content=text, images=images or None, send_time=send_time,
+        )
+        self.conversation.add(message)
         if self.on_user_message is not None:
-            self.on_user_message(self.conversation.messages[-1])
+            self.on_user_message(message)
 
     def switch_profile(self, profile: ProviderProfile, api_key: str | None) -> None:
         """Point the session at a new provider profile.
@@ -315,25 +317,10 @@ class ChatController:
         if turn_start is not None and 0 <= turn_start < len(messages) and messages[turn_start].role == "user":
             if turn_start == len(messages) - 1:
                 return None  # the turn produced no response yet
-            keep = list(messages[:turn_start])
-            user_text = messages[turn_start].content
-            # If the restore point is before the compaction (the undone turn
-            # is the one that compacted), the summary is gone from the
-            # history — the compact snapshot is no longer reachable.
-            clears = not any(_is_summary(m) for m in keep)
-            revert_from = messages[turn_start:]
-        else:
-            index = last_real
-            if index is None:
-                return None
-            keep = list(messages[:index])
-            user_text = messages[index].content
-            clears = False
-            revert_from = messages[index:]
-        return RollbackPlan(
-            user_text=user_text, revert_turns=_turns_in(revert_from),
-            keep=keep, clears_compaction=clears,
-        )
+            return self.rollback_plan_to(messages[turn_start])
+        if last_real is None:
+            return None
+        return self.rollback_plan_to(messages[last_real])
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
         """Plan a rollback to an arbitrary earlier user message (click-to-undo):
@@ -356,7 +343,7 @@ class ChatController:
             # drop) we still produce a plan: the text goes back into the
             # input.
             keep = list(messages[:index])
-            clears = not any(_is_summary(m) for m in keep)
+            clears = not any(is_summary(m) for m in keep)
             return RollbackPlan(
                 user_text=message.content, revert_turns=_turns_in(messages[index:]),
                 keep=keep, clears_compaction=clears,
@@ -556,7 +543,10 @@ class ChatController:
             elif isinstance(event, ToolCallArgumentsDone):
                 # Authoritative once the stream is done parsing; the client
                 # has already assembled the full arguments for this call.
-                done_calls.append(ToolCall(event.call_id, event.name, event.arguments_json))
+                done_calls.append(ToolCall(
+                    call_id=event.call_id, name=event.name,
+                    arguments_json=event.arguments_json,
+                ))
             elif isinstance(event, TurnComplete):
                 self._partial_round = None  # round completed; nothing partial left
                 reasoning = "".join(partial.reasoning_parts) or None
@@ -572,7 +562,6 @@ class ChatController:
                         role="assistant",
                         content="".join(partial.content_parts),
                         reasoning=reasoning,
-                        reasoning_seconds=reasoning_seconds,
                         tool_calls=done_calls or None,
                         usage=usage,
                         # Wall-clock stamps taken at the moment the round

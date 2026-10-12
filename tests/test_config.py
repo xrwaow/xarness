@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from xarness.config import (
-    ConfigError, CotStrength, SectionedConfig, SandboxSettings,
+    ConfigError, CotStrength, RefSpec, SectionedConfig, SandboxSettings,
     load_sectioned, resolve_api_key, save_preferences,
 )
 
@@ -266,7 +266,7 @@ def test_ref_spec_entries(tmp_path: Path) -> None:
         ]}},
     })
     refs = load_sectioned(path).resolve_sandbox(None)[1].auto_include_refs
-    assert refs[0] == "~/notes/api.md"
+    assert refs[0] == RefSpec(path="~/notes/api.md")
     spec = refs[1]
     assert spec.path == "docs/spec.md"
     assert spec.mount == ".venv"

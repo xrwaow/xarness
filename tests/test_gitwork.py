@@ -507,7 +507,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
     # run_bash git-command filter (unchanged behavior)
 
     def guard(self, cmd: str) -> str | None:
-        return check_blocked_git(cmd, "main", self.base)
+        return check_blocked_git(cmd)
 
     def test_blocks_any_git_mutation(self):
         assert self.guard("git checkout other-branch") is not None
@@ -552,7 +552,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert self.guard("sh -c 'git reset --hard'") is not None
 
     def test_filter_blocks_even_without_branch_info(self):
-        assert check_blocked_git("git reset --hard", None, None) is not None
+        assert check_blocked_git("git reset --hard") is not None
 
     # ------------------------------------------------------------------
     # pinned ignore exclusions (snapshots ignore .gitignore edits)

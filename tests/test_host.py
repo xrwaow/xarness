@@ -96,13 +96,13 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
             name = await _make_session(host, tmp_path, [[]])
             session = host.sessions[name]
             # No real git repo here: stub the two git-backed methods.
-            from xarness.gitwork import DiffStat, FileDiff
+            from xarness.protocol import DiffFileInfo
 
             async def fake_summary():
-                return DiffStat(files=[FileDiff(
+                return protocol.DiffInfo(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
                     source="agent",
-                )])
+                )], additions=1, deletions=0)
 
             async def fake_text(path):
                 return f"diff for {path}"
@@ -134,7 +134,7 @@ def test_host_survives_client_disconnect(tmp_path) -> None:
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta("late answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="late answer"), TurnComplete()]],
             )
             # A client sends and disconnects immediately after.
             async with _unix_http(host.unix_socket) as http:
@@ -410,7 +410,7 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta("answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="answer"), TurnComplete()]],
             )
             client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
             try:
@@ -471,7 +471,7 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
             async def create_session(**kwargs):
                 summary = await orig_create(**kwargs)
                 host.sessions[summary.name].controller._client = FakeClient(
-                    [[ContentDelta("Hello!"), TurnComplete(usage=Usage(10, 2))]]
+                    [[ContentDelta(text="Hello!"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]]
                 )
                 return summary
 
@@ -595,7 +595,7 @@ def test_host_stays_alive_while_a_client_is_attached(tmp_path) -> None:
         host = make_host(tmp_path)
         task = await _serve(host)
         try:
-            name = await _make_session(host, tmp_path, [[ContentDelta("x"), TurnComplete()]])
+            name = await _make_session(host, tmp_path, [[ContentDelta(text="x"), TurnComplete()]])
             session = host.sessions[name]
             session._subscribers.append(asyncio.Queue())
             await asyncio.sleep(GRACE_SECONDS + 1)
@@ -712,7 +712,7 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path) -> None:
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta("answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="answer"), TurnComplete()]],
             )
             session = host.sessions[name]
             snapshot, queue = session.subscribe()  # a client attaches
@@ -764,7 +764,7 @@ def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
 
         loaded = await host.load_session(name)
         assert loaded._pending_drift is None, "drift must not be computed at load"
-        assert not host.is_active_session(loaded), "host must be able to exit"
+        assert not loaded.is_active, "host must be able to exit"
         row = host.summary_for(loaded)
         assert row.state != "waiting" and row.active is False
 

@@ -6,10 +6,11 @@ run state. It runs in a host process and outlives every client: a turn
 keeps going after the TUI that started it closes, and any number of
 clients attach to the same event stream.
 
-**Single writer.** All mutation flows through one per-session inbox queue
-consumed by one loop (:meth:`run`). HTTP handlers enqueue commands and
-await the command's result — they never touch the controller directly.
-Pure read-only queries (snapshots, diffs) may bypass the inbox.
+**Single writer.** All mutation flows through one per-session command lock:
+HTTP handlers ``await session.execute(...)`` — the asyncio.Lock (FIFO)
+serializes commands, and the result goes only to the issuer. Pure
+read-only queries (snapshots, diffs) bypass the lock; they are safe
+because only the session mutates that state.
 
 **Fan-out.** :meth:`_emit` stamps every event with a monotonically
 increasing ``seq``, appends it to a bounded ring buffer and pushes it to
@@ -26,7 +27,6 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,11 +35,10 @@ from .config import (
     ConfigError, ProviderProfile, SandboxSettings, load_sectioned, resolve_api_key,
 )
 from .conversation import Conversation, Message, ToolCall
-from .conversation import SUMMARY_PREFIX
+from .conversation import turn_time_summary
 from .controller import ChatController, RollbackPlan
-from .events import StreamEvent
 from .gitwork import (
-    DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
+    GitInfo, GitWorktreeError, RevertConflict, accept_changes,
     attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
     snapshot_state,
 )
@@ -48,11 +47,13 @@ from .prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from .protocol import (
     Command, CommandResult, Event, Snapshot, StatusPayload,
 )
-from .sandbox import SandboxConfig, SandboxSession, SandboxUnavailable
+from .sandbox import (
+    SandboxConfig, SandboxSession, SandboxUnavailable, make_sandbox,
+)
 from . import session_store
 from .session_store import SessionState, load_state
 from .tools import build_registry
-from .util import format_duration, utcnow_iso as _utcnow
+from .util import utcnow_iso as _utcnow
 
 # How many recent cmd_ids are remembered for dedupe (client retries must
 # not double-send a command).
@@ -60,8 +61,13 @@ CMD_DEDUPE_LIMIT = 128
 
 State = Literal["idle", "running", "compacting"]
 
-# Internal stream events are protocol models (defined in xarness.events,
-# re-exported by xarness.protocol), so no conversion step is needed.
+# Commands that rewrite conversation/workspace state are rejected while a
+# turn or compaction is running.
+IDLE_ONLY = (
+    protocol.Undo, protocol.Retry, protocol.UndoTo, protocol.Compact,
+    protocol.SwitchModel, protocol.SetSandbox,
+    protocol.FilterAdd, protocol.FilterRemove,
+)
 
 
 class SessionError(Exception):
@@ -84,26 +90,6 @@ async def _cancel_and_wait(task: asyncio.Task[None] | None) -> None:
         pass
     except Exception:  # noqa: BLE001 - stopping must never raise
         pass
-
-
-def _parse_iso(stamp: str | None) -> "datetime | None":
-    """Parse one of the ISO stamps carried on messages (None on failure)."""
-    if not stamp:
-        return None
-    try:
-        return datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-
-
-def _is_summary_message(message: Message) -> bool:
-    """True for the summary user message a compaction leaves behind."""
-    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
-
-
-def _convert_stream_event(event: StreamEvent) -> Event:
-    """Stream events are protocol models — the conversion is the identity."""
-    return event
 
 
 class Session:
@@ -129,6 +115,7 @@ class Session:
         sandbox_settings: "SandboxSettings | None" = None,
         config_path: Path | None = None,
         no_save: bool = False,
+        idle_callback: "Callable[[Session], None] | None" = None,
     ) -> None:
         self.name = name
         self.workspace = workspace
@@ -184,7 +171,7 @@ class Session:
         # Host-provided hook: called whenever the session may have gone
         # fully inactive (idle, no subscribers, no pending ask) so the host
         # can persist and release it.
-        self.idle_callback: Callable[["Session"], None] | None = None
+        self.idle_callback: Callable[["Session"], None] | None = idle_callback
         # Resume drift is detected lazily, when the first client attaches —
         # never at load time (a drifted workspace with nobody attached must
         # not hold the host open or report "waiting").
@@ -202,9 +189,8 @@ class Session:
         self._seq = 0
         self._turn_events: list[Event] = []
 
-        # Inbox.
-        self._inbox: asyncio.Queue[tuple[str, Command, asyncio.Future[CommandResult]]] = asyncio.Queue()
-        self._inbox_task: asyncio.Task[None] | None = None
+        # Command serialization (FIFO) + dedupe of client retries.
+        self._cmd_lock = asyncio.Lock()
         self._recent_cmds: OrderedDict[str, CommandResult] = OrderedDict()
         self._closed = False
 
@@ -229,6 +215,7 @@ class Session:
         sandbox_name: str | None = None,
         sandbox_settings: "SandboxSettings | None" = None,
         state: "SessionState | None" = None,
+        idle_callback: "Callable[[Session], None] | None" = None,
     ) -> "Session":
         """Host a saved session: load its conversation and rebind tracking.
 
@@ -251,6 +238,7 @@ class Session:
             git_info=git_info, auto_compact=auto_compact,
             tool_output_limit=tool_output_limit,
             sandbox_name=sandbox_name, sandbox_settings=sandbox_settings,
+            idle_callback=idle_callback,
         )
         session.ensure_system_message()
         # A session saved mid-turn can carry tool calls with no result; give
@@ -261,31 +249,12 @@ class Session:
     # ------------------------------------------------------------------
     # lifecycle
 
-    def start(self) -> None:
-        """Start the inbox loop (idempotent, lazy when no loop is running)."""
-        if self._inbox_task is None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return  # lazily started by execute() once a loop is running
-            # A fresh queue per loop: asyncio.Queue is bound to the loop it
-            # first serves, so a restarted inbox must not reuse one.
-            self._inbox = asyncio.Queue()
-            self._inbox_task = loop.create_task(self._run_inbox())
-
     async def stop(self) -> None:
-        """Stop the inbox loop and cancel a running turn or compaction."""
+        """Cancel a running turn or compaction and flush pending writes."""
         self._closed = True
         await _cancel_and_wait(self._turn_task)
         await _cancel_and_wait(self._compact_task)
         self._compact_task = None
-        if self._inbox_task is not None:
-            self._inbox_task.cancel()
-            try:
-                await self._inbox_task
-            except asyncio.CancelledError:
-                pass
-            self._inbox_task = None
         await self._flush_persist()
         # Release the provider connection pool.
         client = getattr(self.controller, "_client", None)
@@ -383,7 +352,7 @@ class Session:
 
     def _notify_idle(self) -> None:
         """Tell the host the session may have gone fully inactive (the host
-        decides; see Host.is_active_session). Best-effort, never raises."""
+        decides; see Host._on_session_idle). Best-effort, never raises."""
         if self.idle_callback is None:
             return
         try:
@@ -400,10 +369,6 @@ class Session:
 
     def status(self) -> StatusPayload:
         last_usage = self.controller.last_usage
-        pending_ask = None
-        if self._pending_ask is not None:
-            ask_id, questions, _ = self._pending_ask
-            pending_ask = protocol.PendingAsk(ask_id=ask_id, questions=questions)
         pending_drift = None
         if self._pending_drift is not None:
             last_known, current = self._pending_drift
@@ -439,7 +404,7 @@ class Session:
             last_out=last_usage.output_tokens,
             context_used=last_usage.input_tokens + last_usage.output_tokens,
             queued=[protocol.QueuedMessage(text=text) for text, _, _ in self._queued],
-            pending_ask=pending_ask,
+            pending_ask=self.pending_ask,
             pending_drift=pending_drift,
             clients_attached=self.clients_attached,
             tools=[tool.name for tool in self.tool_registry.tools()],
@@ -467,46 +432,40 @@ class Session:
         return max(times) if times else None
 
     # ------------------------------------------------------------------
-    # inbox: the single writer
+    # commands: serialized by the per-session lock
 
-    async def _run_inbox(self) -> None:
-        while True:
-            cmd_id, command, future = await self._inbox.get()
+    async def execute(self, cmd_id: str, command: Command) -> CommandResult:
+        """Run one command under the session lock and return its result.
+
+        Duplicate ``cmd_id``s return the cached result, so a client retry
+        never double-sends."""
+        if (cached := self._recent_cmds.get(cmd_id)) is not None:
+            return cached
+        async with self._cmd_lock:
+            if (cached := self._recent_cmds.get(cmd_id)) is not None:
+                return cached
             try:
                 result = await self._dispatch(command)
             except SessionError as exc:
                 result = CommandResult(cmd_id=cmd_id, ok=False, error=str(exc))
             except (GitWorktreeError, RevertConflict) as exc:
                 result = CommandResult(cmd_id=cmd_id, ok=False, error=str(exc))
-            except Exception as exc:  # noqa: BLE001 - never kill the inbox loop
-                result = CommandResult(cmd_id=cmd_id, ok=False, error=f"{type(exc).__name__}: {exc}")
-            result.cmd_id = cmd_id
-            self._recent_cmds[cmd_id] = result
-            while len(self._recent_cmds) > CMD_DEDUPE_LIMIT:
-                self._recent_cmds.popitem(last=False)
-            if not future.done():
-                future.set_result(result)
-
-    async def execute(self, cmd_id: str, command: Command) -> CommandResult:
-        """Enqueue one command and await its result (the HTTP handler's path).
-
-        Duplicate ``cmd_id``s return the cached result, so a client retry
-        never double-sends."""
-        cached = self._recent_cmds.get(cmd_id)
-        if cached is not None:
-            return cached
-        # (Re)start the inbox if it is not running — e.g. lazily on first
-        # use, or after the loop it was bound to closed.
-        if self._inbox_task is None or self._inbox_task.done():
-            self._inbox_task = None
-            self.start()
-        assert self._inbox_task is not None
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[CommandResult] = loop.create_future()
-        await self._inbox.put((cmd_id, command, future))
-        return await future
+            except Exception as exc:  # noqa: BLE001 - never kill the caller
+                result = CommandResult(
+                    cmd_id=cmd_id, ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        result.cmd_id = cmd_id
+        self._recent_cmds[cmd_id] = result
+        while len(self._recent_cmds) > CMD_DEDUPE_LIMIT:
+            self._recent_cmds.popitem(last=False)
+        return result
 
     async def _dispatch(self, command: Command) -> CommandResult:
+        if isinstance(command, IDLE_ONLY) and self._state != "idle":
+            raise SessionError(
+                "wait for the current turn or compaction to finish first"
+            )
         match command:
             case protocol.SendMessage():
                 return await self._cmd_send(command)
@@ -521,13 +480,13 @@ class Session:
             case protocol.FlushQueued():
                 return self._cmd_flush_queued()
             case protocol.Undo():
-                return await self._require_idle_then(self._cmd_undo, resend=False)
+                return await self._cmd_undo(resend=False)
             case protocol.Retry():
-                return await self._require_idle_then(self._cmd_undo, resend=True)
+                return await self._cmd_undo(resend=True)
             case protocol.UndoTo():
-                return await self._require_idle_then(self._cmd_undo_to, command)
+                return await self._cmd_undo_to(command)
             case protocol.Compact():
-                return await self._require_idle_then(self._cmd_compact)
+                return await self._cmd_compact()
             case protocol.Accept():
                 return await self._cmd_accept()
             case protocol.Reject():
@@ -535,25 +494,15 @@ class Session:
             case protocol.SetMode():
                 return self._cmd_set_mode(command)
             case protocol.SwitchModel():
-                return await self._require_idle_then(self._cmd_switch_model, command)
+                return await self._cmd_switch_model(command)
             case protocol.SetSandbox():
-                return await self._require_idle_then(self._cmd_set_sandbox, command)
+                return await self._cmd_set_sandbox(command)
             case protocol.FilterAdd():
-                return await self._require_idle_then(self._cmd_filter, command.path, True)
+                return await self._cmd_filter(command.path, True)
             case protocol.FilterRemove():
-                return await self._require_idle_then(self._cmd_filter, command.path, False)
+                return await self._cmd_filter(command.path, False)
             case _:
                 raise SessionError(f"unsupported command: {type(command).__name__}")
-
-    async def _require_idle_then(
-        self, handler: Callable[..., Any], *args: Any, **kwargs: Any,
-    ) -> CommandResult:
-        """Rewriting commands are rejected unless the session is idle."""
-        if self._state != "idle":
-            raise SessionError(
-                "wait for the current turn or compaction to finish first"
-            )
-        return await handler(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # state
@@ -586,11 +535,11 @@ class Session:
             self._queued.append((command.text, images, _utcnow()))
             self._emit_status()
             return _ok(payload={"queued": True})
-        self._start_turn(command.text, images)
+        await self._start_turn(command.text, images)
         return _ok(payload={"started": True})
 
-    def _start_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
-        # Set synchronously, BEFORE create_task: the inbox can dispatch the
+    async def _start_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
+        # Set synchronously, BEFORE create_task: the lock can dispatch the
         # next queued command before the turn task gets its first slot, and
         # a still-"idle" state would let a back-to-back send start a second
         # turn instead of steering the first.
@@ -598,6 +547,10 @@ class Session:
         self._turn_task = asyncio.get_running_loop().create_task(
             self._run_turn(text, images)
         )
+        # Yield once so the turn task actually starts: a task cancelled
+        # before its first step never runs its cleanup (state would stick
+        # at "running" forever).
+        await asyncio.sleep(0)
 
     def _cmd_cancel(self) -> CommandResult:
         if self._state == "idle":
@@ -626,7 +579,7 @@ class Session:
     async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
         if self._pending_drift is None:
             raise SessionError("no drift prompt is pending")
-        last_known, current = self._pending_drift
+        last_known, _current = self._pending_drift
         self._pending_drift = None
         info = self.git_info
         if command.accept and info is not None:
@@ -733,7 +686,7 @@ class Session:
             note = "file edits reverted"
         if resend:
             self._emit_notice(f"retrying: {scope} rolled back ({note})")
-            self._start_turn(plan.user_text, None)
+            await self._start_turn(plan.user_text, None)
             return {"user_text": None}
         self._emit_notice(f"undone: {scope} removed ({note})")
         return {"user_text": plan.user_text}
@@ -769,7 +722,7 @@ class Session:
         if self._queued:
             queued_text, queued_images, _ = self._queued.pop(0)
             self._emit_status()
-            self._start_turn(queued_text, queued_images)
+            await self._start_turn(queued_text, queued_images)
 
     def _compaction_counts(self) -> str | None:
         counts = self.controller.last_compaction
@@ -848,10 +801,7 @@ class Session:
 
     def _cmd_set_mode(self, command: protocol.SetMode) -> CommandResult:
         self.mode = command.mode
-        if self.sandbox is not None:
-            self.sandbox.read_only = self.mode != "write"
-        self._rebuild_registry()
-        self.ensure_system_message()
+        self._rebuild_tools()
         self._emit_status()
         return _ok(payload={"mode": self.mode})
 
@@ -934,11 +884,8 @@ class Session:
         self.sandbox_settings = settings
         self.allow_git_write = settings.allow_git_write
         old_session = self.sandbox_session
-        sandbox: SandboxConfig | None = None
-        session_obj: SandboxSession | None = None
         try:
-            sandbox = SandboxConfig.from_settings(self.workspace, settings, self.git_info)
-            session_obj = SandboxSession(sandbox)
+            sandbox, session_obj = make_sandbox(self.workspace, settings, self.git_info)
         except SandboxUnavailable as exc:
             sandbox = session_obj = None
             self._emit_notice(f"warning: filesystem/bash tools disabled: {exc}", "warn")
@@ -946,12 +893,9 @@ class Session:
             await old_session.close()
         self.sandbox = sandbox
         self.sandbox_session = session_obj
-        if sandbox is not None:
-            sandbox.read_only = self.mode != "write"
         if settings.tool_output_limit is not None:
             self.tool_registry.max_output_chars = settings.tool_output_limit
-        self._rebuild_registry()
-        self.ensure_system_message()
+        self._rebuild_tools()
         self._persist()
         self._emit_status()
 
@@ -965,70 +909,10 @@ class Session:
             message.send_time = _utcnow()
         self._emit(protocol.UserMessageAdded(
             text=message.content,
-            images=[
-                protocol.ImageAttachmentModel(
-                    name=i.name, mime=i.mime, data_b64=i.data_b64,
-                    width=i.width, height=i.height,
-                )
-                for i in (message.images or [])
-            ] or None,
+            images=message.images,
             message_id=message.id,
             send_time=message.send_time,
         ))
-
-    def _turn_time_summary(self) -> str | None:
-        """The turn's timing line: total | streaming | tools | other.
-
-        Computed from the persisted wall-clock stamps, so the same string
-        can be stamped on the turn's last assistant message (reloads show
-        it) and sent in TurnFinished (the live clients show it). None when
-        the stamps are missing (old sessions, or nothing streamed).
-
-        - total: turn user message send_time → last assistant end_time
-        - streaming: per round, end_time − reasoning_start (start_time when
-          the round had no chain of thought)
-        - tools: summed tool execution durations
-        - other: what's left (per-round latency and round boundaries)
-        """
-        messages = self.conversation.messages
-        turn_user_index = next(
-            (i for i, m in reversed(list(enumerate(messages)))
-             if m.role == "user" and m.send_time and not _is_summary_message(m)),
-            None,
-        )
-        turn = messages[turn_user_index + 1:] if turn_user_index is not None else messages
-        assistants = [
-            m for m in turn if m.role == "assistant"
-            and m.start_time and m.end_time
-        ]
-        if not assistants:
-            return None
-        total_end = _parse_iso(assistants[-1].end_time)
-        total_start = (
-            _parse_iso(messages[turn_user_index].send_time)
-            if turn_user_index is not None
-            else _parse_iso(assistants[0].start_time)
-        )
-        if total_end is None or total_start is None:
-            return None
-        total = max(0.0, (total_end - total_start).total_seconds())
-        streaming = 0.0
-        for message in assistants:
-            end = _parse_iso(message.end_time)
-            first = _parse_iso(message.reasoning_start) or _parse_iso(message.start_time)
-            if end is not None and first is not None:
-                streaming += max(0.0, (end - first).total_seconds())
-        tools = 0.0
-        for message in turn:
-            if message.role != "tool":
-                continue
-            start = _parse_iso(message.start_time)
-            end = _parse_iso(message.end_time)
-            if start is not None and end is not None:
-                tools += max(0.0, (end - start).total_seconds())
-        other = max(0.0, total - streaming - tools)
-        fmt = format_duration
-        return f"{fmt(total)} | {fmt(streaming)} {fmt(tools)} {fmt(other)}"
 
     async def _run_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tools).
@@ -1044,14 +928,12 @@ class Session:
             while True:
                 done_calls: list[ToolCall] = []
                 async for event in stream:
-                    protocol_event = self._convert_stream_event(event)
-                    if isinstance(protocol_event, protocol.ToolCallArgumentsDone):
+                    if isinstance(event, protocol.ToolCallArgumentsDone):
                         done_calls.append(ToolCall(
-                            protocol_event.call_id,
-                            protocol_event.name,
-                            protocol_event.arguments_json,
+                            call_id=event.call_id, name=event.name,
+                            arguments_json=event.arguments_json,
                         ))
-                    self._emit(protocol_event)
+                    self._emit(event)
                 # A round that ended without finishing — a provider or
                 # transport error, say — still streamed something. Keep the
                 # partial answer (the controller decides what counts).
@@ -1070,7 +952,7 @@ class Session:
                 # Steering: anything queued while this round streamed is
                 # injected here — after the tool answers, before the next
                 # LLM call.
-                await self._inject_queued()
+                self._inject_queued()
                 # Round boundary: everything so far is in the history (the
                 # assistant message was stamped, tool results recorded), so
                 # the round buffer resets — a client attaching between
@@ -1083,7 +965,7 @@ class Session:
             # end-of-turn unwinding would replay the round on top of the
             # snapshot messages (double render).
             self._turn_events.clear()
-            summary = self._turn_time_summary()
+            summary = turn_time_summary(self.conversation.messages)
             if summary is not None:
                 # Stamp the turn's last assistant message: the line persists
                 # (reloads render it) and every client derives the same one.
@@ -1126,13 +1008,9 @@ class Session:
             if self._queued:
                 queued_text, queued_images, _ = self._queued.pop(0)
                 self._emit_status()
-                self._start_turn(queued_text, queued_images)
+                await self._start_turn(queued_text, queued_images)
             else:
                 self._notify_idle()
-
-    def _convert_stream_event(self, event: StreamEvent) -> Event:
-        # Stream events are protocol models — the conversion is the identity.
-        return event
 
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
@@ -1158,18 +1036,14 @@ class Session:
         )
         self._persist()
 
-    async def _inject_queued(self) -> None:
+    def _inject_queued(self) -> None:
+        """Inject the steering queue at a round boundary: the messages land
+        in the history (with their original send_time) and fire the
+        on_user_message hook, so the next LLM call sees them."""
         if not self._queued:
             return
-        for text, images, _send_time in self._queued:
-            # inject_user_message fires the on_user_message hook, which
-            # emits UserMessageAdded with the original send_time preserved.
-            message = Message(
-                role="user", content=text, images=images or None,
-                send_time=_send_time,
-            )
-            self.conversation.add(message)
-            self._on_user_message(message)
+        for text, images, send_time in self._queued:
+            self.controller.inject_user_message(text, images, send_time=send_time)
         self._queued.clear()
         self._emit_status()
 
@@ -1213,7 +1087,7 @@ class Session:
             info = self.git_info
             if info is None:
                 return None
-            return check_blocked_git(command, None, info.workspace)
+            return check_blocked_git(command)
         return guard
 
     def _rewrite_checkpoints(self, sha: str) -> None:
@@ -1232,7 +1106,7 @@ class Session:
     def turn_checkpoints(self):
         return self.controller.turn_checkpoints()
 
-    async def diff_summary(self) -> DiffStat | None:
+    async def diff_summary(self) -> protocol.DiffInfo | None:
         """The pending-changes summary (plain drift, no attribution split in
         the wire model — files are listed as they are)."""
         info = self.git_info
@@ -1298,6 +1172,14 @@ class Session:
             conversation.messages[0].content = content
         else:
             conversation.messages.insert(0, Message(role="system", content=content))
+
+    def _rebuild_tools(self) -> None:
+        """Apply the current mode/sandbox to the tooling: read-only flag,
+        tool registry, and the mode-aware system prompt."""
+        if self.sandbox is not None:
+            self.sandbox.read_only = self.mode != "write"
+        self._rebuild_registry()
+        self.ensure_system_message()
 
     def _rebuild_registry(self) -> None:
         self.tool_registry = build_registry(
@@ -1390,22 +1272,16 @@ class Session:
     async def diff_info(self, path: str | None) -> protocol.DiffInfo:
         """The /diff payload: per-file stat rows (+ the unified diff text
         for a per-file click-through; the summary poll stays cheap)."""
-        stat = await self.diff_summary()
-        info = protocol.DiffInfo()
-        if stat is None:
-            return info
-        files = stat.files
+        info = await self.diff_summary()
+        if info is None:
+            return protocol.DiffInfo()
         if path is not None:
-            files = [f for f in files if f.path == path]
-        info.files = [
-            protocol.DiffFileInfo(
-                path=f.path, additions=f.additions, deletions=f.deletions,
-                is_new=f.is_new, source=f.source,
+            files = [f for f in info.files if f.path == path]
+            filtered = protocol.DiffInfo(
+                files=files,
+                additions=sum(f.additions for f in files),
+                deletions=sum(f.deletions for f in files),
             )
-            for f in files
-        ]
-        info.additions = sum(f.additions for f in files)
-        info.deletions = sum(f.deletions for f in files)
-        if path is not None:
-            info.text = await self.diff_text(path)
+            filtered.text = await self.diff_text(path)
+            return filtered
         return info

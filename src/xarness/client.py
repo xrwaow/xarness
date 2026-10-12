@@ -178,7 +178,7 @@ class ChatClient:
                 ) as response:
                     if response.status_code != 200:
                         detail = (await response.aread()).decode(errors="replace").strip()
-                        yield StreamError(f"HTTP {response.status_code} from {url}: {detail[:500]}")
+                        yield StreamError(message=f"HTTP {response.status_code} from {url}: {detail[:500]}")
                         return
 
                     async for line in response.aiter_lines():
@@ -194,7 +194,7 @@ class ChatClient:
 
                         if isinstance(chunk.get("error"), dict):
                             message = chunk["error"].get("message") or str(chunk["error"])
-                            yield StreamError(f"stream error from {url}: {message}")
+                            yield StreamError(message=f"stream error from {url}: {message}")
                             return
 
                         reported = _usage_from_chunk(chunk)
@@ -209,7 +209,7 @@ class ChatClient:
                 # Connection-level failure. Retry only while nothing has been
                 # streamed yet — a partial answer can never be replayed.
                 if received_any or attempt == _RETRY_ATTEMPTS:
-                    yield StreamError(f"request to {url} failed: {exc}")
+                    yield StreamError(message=f"request to {url} failed: {exc}")
                     return
                 await asyncio.sleep(_RETRY_BACKOFF * attempt)
             else:
@@ -231,10 +231,10 @@ def _delta_events(chunk: dict[str, Any], tool_calls: _ToolCallAccumulator) -> li
         delta = choice.get("delta") or {}
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reasoning, str) and reasoning:
-            events.append(ReasoningDelta(reasoning))
+            events.append(ReasoningDelta(text=reasoning))
         content = delta.get("content")
         if isinstance(content, str) and content:
-            events.append(ContentDelta(content))
+            events.append(ContentDelta(text=content))
         tc_deltas = delta.get("tool_calls")
         if isinstance(tc_deltas, list) and tc_deltas:
             events.extend(tool_calls.feed(tc_deltas))

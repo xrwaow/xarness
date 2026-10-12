@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import httpx
-import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ClassVar
+
+from rich.cells import cell_len
+from rich.segment import Segment
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -22,6 +25,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
 
@@ -34,7 +38,7 @@ from ..images import ImageAttachment
 from ..protocol import (
     AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
     DiscardQueued, DriftResolved, Event, FilterAdd, FilterRemove,
-    FlushQueued, HistoryReplaced, ImageAttachmentModel, MessageModel,
+    FlushQueued, HistoryReplaced,
     Notice, ReasoningDelta, Reject, ResolveDrift,
     Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
     StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
@@ -53,9 +57,9 @@ from .flow import (
 from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
 from .resume_screen import ResumeScreen
+from .diff_summary import DiffSummary
 from .widgets import (
-    AskBar, ChatInput, DiffSummary, ErrorLine, GeneratingBar,
-    MessageLine, NoticeLine, StatusBar,
+    AskBar, ChatInput, GeneratingBar, StatusBar,
     crop_path,
     SteerQueueBar, SuggestionPopup, _stream_parts,
 )
@@ -82,45 +86,6 @@ COMPACTED_DIVIDER = (
     "— compacted: the model sees only the summary below; "
     "messages above are kept here for you —"
 )
-
-
-class ContinueHeadlessScreen(ModalScreen[bool | None]):
-    """Ctrl+C while a request is still running: continue it in the
-    background in the host, or cancel it and quit.
-
-    ``True`` = continue headless, ``False`` = stop and quit, ``None``
-    (escape) = stay in the app. Styled entirely by the existing modal CSS
-    (same conventions as ConfirmScreen — no new visual style)."""
-
-    BINDINGS = [
-        ("escape", "stay", "Stay"),
-        ("y", "continue_headless", "Continue headless"),
-        ("n", "stop_quit", "Stop and quit"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        from textual.containers import Vertical
-        from textual.widgets import Button, Label
-        with Vertical(id="confirm-modal"):
-            yield Label(
-                "A request is still running. Continue it in the background?",
-                id="confirm-title", markup=False,
-            )
-            with Horizontal(id="confirm-buttons"):
-                yield Button("Continue headless", id="confirm-yes", variant="primary")
-                yield Button("Stop and quit", id="confirm-no", variant="error")
-
-    def on_button_pressed(self, event) -> None:
-        self.dismiss(event.button.id == "confirm-yes")
-
-    def action_continue_headless(self) -> None:
-        self.dismiss(True)
-
-    def action_stop_quit(self) -> None:
-        self.dismiss(False)
-
-    def action_stay(self) -> None:
-        self.dismiss(None)
 
 
 class _RoundView:
@@ -160,18 +125,21 @@ class _RoundView:
         self.indicator = self._append(PendingItem())
         self.indicator_live = True
 
+    def _reset_round(self) -> None:
+        """A new round of the same turn (the previous one ended with tool
+        calls): the finished thinking block and settled answer belong to the
+        transcript — start fresh entries, or round 2+ CoT and answers stream
+        into finished (collapsed, dropped-text) entries and stay invisible
+        until reload."""
+        self.thinking = None
+        self.assistant = None
+        self.round_has_tools = False
+        self.had_stream_error = False
+
     async def handle(self, event: Event) -> None:
         if isinstance(event, ReasoningDelta):
             if self.thinking is not None and self.thinking.item.done:
-                # A new round of the same turn (previous round ended with
-                # tool calls): the finished thinking block and settled
-                # answer belong to the transcript — start fresh entries, or
-                # round 2+ CoT and answers stream into finished (collapsed,
-                # dropped-text) entries and stay invisible until reload.
-                self.thinking = None
-                self.assistant = None
-                self.round_has_tools = False
-                self.had_stream_error = False
+                self._reset_round()
             if self.thinking is None:
                 await self._hide_indicator()
                 self.thinking = self._append(ThinkingItem())
@@ -180,10 +148,7 @@ class _RoundView:
             self.thinking.update()
         elif isinstance(event, ContentDelta):
             if self.assistant is not None and self.assistant.item.finalized:
-                self.thinking = None
-                self.assistant = None
-                self.round_has_tools = False
-                self.had_stream_error = False
+                self._reset_round()
             if self.assistant is None:
                 await self._hide_indicator()
                 if self.thinking is not None:
@@ -254,7 +219,7 @@ class _RoundView:
                 # here, or it stays in the unselectable live tail.
                 self.assistant.item.finalize()
                 self.assistant.update()
-            self.app._post_line(ErrorLine(event.message))
+            self.app._error(event.message)
             self.had_stream_error = True
             self.app._clear_hint_lines()
 
@@ -313,22 +278,69 @@ def _args_detail(label: str, writing: WritingItem, call_id: str, text: str) -> s
 
 
 
-SLASH_COMMANDS = [
-    ("tools", "list available tools"),
-    ("model", "choose what model and reasoning effort to use"),
-    ("sessions", "resume a previous session"),
-    ("mode", "switch between plan (read-only) and write mode"),
-    ("sandbox", "choose this session's sandbox profile (idle only)"),
-    ("filter", "add/remove/list paths excluded from the sandbox mounts"),
-    ("theme", "choose a color theme"),
-    ("new", "leave this session and start a fresh chat"),
-    ("delete", "delete the current session and start a new one (your files are left exactly as they are)"),
-    ("diff", "show pending changes (optionally: /diff <path>)"),
-    ("accept", "lock in the changes made so far (they stop showing in /diff and can no longer be undone)"),
-    ("reject", "discard all changes made since the last /accept"),
-    ("undo", "drop the last turn and revert its file edits"),
-    ("retry", "revert the last turn's file edits and resend your message"),
-]
+COMMANDS = {
+    # name -> (description, handler(app, arg)); `arg` is the text after the
+    # command word ("" when absent). The popup, the dispatcher and the
+    # unknown-command error all read from this one table.
+    "tools": (
+        "list available tools",
+        lambda s, a: s._notice(
+            "tools: " + (", ".join(s.status.tools) if s.status and s.status.tools else "none")
+        ),
+    ),
+    "model": (
+        "choose what model and reasoning effort to use",
+        lambda s, a: s._pick_model(),
+    ),
+    "sessions": (
+        "resume a previous session",
+        lambda s, a: s.call_later(s._open_sessions_async),
+    ),
+    "mode": (
+        "switch between plan (read-only) and write mode",
+        lambda s, a: s._switch_mode(),
+    ),
+    "sandbox": (
+        "choose this session's sandbox profile (idle only)",
+        lambda s, a: s._pick_sandbox(),
+    ),
+    "filter": (
+        "add/remove/list paths excluded from the sandbox mounts",
+        lambda s, a: s._handle_filter_command(a),
+    ),
+    "theme": (
+        "choose a color theme",
+        lambda s, a: s._handle_theme_command(a) if a else s._pick_theme(),
+    ),
+    "new": (
+        "leave this session and start a fresh chat",
+        lambda s, a: s._start_new_session(),
+    ),
+    "delete": (
+        "delete the current session and start a new one (your files are left exactly as they are)",
+        lambda s, a: s.call_later(s._delete_async),
+    ),
+    "diff": (
+        "show pending changes (optionally: /diff <path>)",
+        lambda s, a: s._show_diff_command(a),
+    ),
+    "accept": (
+        "lock in the changes made so far (they stop showing in /diff and can no longer be undone)",
+        lambda s, a: s._post_command(Accept()),
+    ),
+    "reject": (
+        "discard all changes made since the last /accept",
+        lambda s, a: s._post_command(Reject()),
+    ),
+    "undo": (
+        "drop the last turn and revert its file edits",
+        lambda s, a: s._post_command(Undo()),
+    ),
+    "retry": (
+        "revert the last turn's file edits and resend your message",
+        lambda s, a: s._post_command(Retry()),
+    ),
+}
 
 
 # Transcript virtualization: the chat log is a textual_flowview.FlowView —
@@ -339,56 +351,76 @@ SLASH_COMMANDS = [
 class ChatFlowView(FlowView):
     """FlowView with re-entrant presentation defused.
 
-    Root cause of the intermittent ``RecursionError`` renders: ``present``
-    runs on the event loop via a Textual worker, and Textual's eager task
-    factory starts ``create_task`` coroutines *synchronously on the current
-    stack*. So when ``_present_loop`` → ``_refresh_layout`` → ``scroll_to``
-    fires the ``watch_scroll_y`` reactive → ``_present_visible`` →
-    ``_present_entry`` → ``run_worker``, the new present worker begins
-    executing immediately, ~30 frames deeper. Repeat for every entry whose
-    presentation scrolls into view and the stack marches to the recursion
-    limit mid-render (depth=989/limit=1000 in the wild).
+    ``present`` runs on the event loop via a Textual worker, and Textual's
+    eager task factory starts ``create_task`` coroutines *synchronously on
+    the current stack*. So a present kicked off from layout/scroll/compositor
+    paint re-enters the paint/present cycle on the same stack, ~30 frames
+    deeper per hop — in the wild that marched to the recursion limit
+    mid-render and permanently pinned entries to stale presentations.
 
-    The recursive cycle is bigger than one re-entrant ``_present_entry``
-    though: a present kicked off from the *compositor paint* path
-    (``_entry_strips`` → ``run_worker`` → present → layout → scroll →
-    repaint → ``_entry_strips`` …) re-enters through rendering too, and a
-    simple depth counter on ``_present_entry`` misses those hops. Verified
-    in the wild: 933 elided ancestor frames — ~30 nested paint/present
-    cycles — ending in ``RecursionError`` inside a markdown parse, which
-    permanently pinned affected entries to their last good (stale, e.g.
-    pre-theme-switch) presentation.
+    Always deferring to a fresh event-loop turn breaks every such cycle; the
+    extra frame of latency is invisible. ``_pending_present`` dedupes on
+    entry id so an entry never queues twice. (Long-term fix: in
+    textual_flowview itself.)"""
 
-    Fix: defer based on *actual current stack depth*, not a re-entrancy
-    counter. Any present requested while the stack is already deep runs
-    from a fresh event-loop turn instead; the deferred call is idempotent
-    (``_presenting`` still dedupes per entry)."""
+    can_focus = False
 
-    # Presenting on a stack shallower than this is safe (one synchronous
-    # present chain costs ~100 frames); deeper than this and we're inside
-    # a paint/present cycle that must not nest.
-    MAX_SYNC_STACK = 120
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._pending_present: set[int] = set()
 
     def _present_entry(self, entry) -> None:  # type: ignore[override]
-        # Defer when already presenting re-entrantly, or when the caller's
-        # stack is deep (e.g. we're inside a compositor repaint): either way
-        # starting the present loop inline would nest the paint/present
-        # cycle another ~30 frames, marching to the recursion limit.
-        depth = getattr(self, "_present_entry_depth", 0)
-        if depth == 0:
-            frame = sys._getframe()
-            steps = 0
-            while frame is not None and steps <= self.MAX_SYNC_STACK:
-                steps += 1
-                frame = frame.f_back
-        if depth > 0 or steps > self.MAX_SYNC_STACK:
-            self.call_after_refresh(self._present_entry, entry)
+        if entry.id in self._pending_present:
             return
-        self._present_entry_depth = depth + 1
-        try:
-            super()._present_entry(entry)
-        finally:
-            self._present_entry_depth = depth
+        self._pending_present.add(entry.id)
+        self.call_after_refresh(self._do_present_entry, entry)
+
+    def _do_present_entry(self, entry) -> None:
+        self._pending_present.discard(entry.id)
+        super()._present_entry(entry)
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        # The lib's _decorate_line applies the selection highlight with
+        # Strip.apply_style, and rich's style merge lets each cell's own
+        # bgcolor win — so rows whose cells carry an explicit background
+        # (the user-message box's surface) highlight nothing when selected.
+        # Re-apply the selection span here with the cell styles overridden.
+        selection = self.text_selection
+        if selection is None:
+            return strip
+        span = selection.get_span(y + int(self.scroll_offset.y))
+        if span is None:
+            return strip
+        width = strip.cell_length
+        if width <= 0:
+            return strip
+        body_start = min(self._left_gutter_w(), width)
+        body_end = max(body_start, width - self._right_gutter_w())
+        body_text = strip.crop(body_start, body_end).text
+        n = len(body_text)
+        # The span is in *character* offsets into the body (end == -1 means
+        # "to end of line"); convert to cells, or CJK / emoji rows highlight
+        # the wrong columns. Same conversion the lib's _decorate_line does.
+        end_c = n if span[1] == -1 else span[1]
+        start_c = max(0, min(span[0], n))
+        end_c = max(start_c, min(end_c, n))
+        start_cell = body_start + cell_len(body_text[:start_c])
+        end_cell = body_start + cell_len(body_text[:end_c])
+        if end_cell <= start_cell:
+            return strip
+        sel_style = self.selection_style
+        out = []
+        x = 0
+        for segment in strip:
+            if start_cell <= x < end_cell:
+                # ``+`` lets the right operand win: selection colors override
+                # any cell bg/fg, while meta (content offsets) is kept.
+                out.append(Segment(segment.text, segment.style + sel_style))
+            else:
+                out.append(segment)
+            x += segment.cell_length
+        return Strip(out, width)
 
 
 class AgentApp(App[None]):
@@ -449,8 +481,6 @@ class AgentApp(App[None]):
         # Transient hint lines ("press esc again …"), removed when the
         # assistant's message settles.
         self._hint_entries: list = []
-        # Per-entry shimmer animation handles, keyed by entry id.
-        self._animations: dict[int, object] = {}
         self._pump_worker: Worker | None = None
         self._ask_future: asyncio.Future[str | None] | None = None
         self._ask_id: str | None = None
@@ -503,19 +533,18 @@ class AgentApp(App[None]):
             # first use under Textual.
             try:
                 self.client = await XarnessClient.connect_unix()
-            except (ClientError, httpx.HTTPError) as exc:
-                self._post_line(ErrorLine(f"could not connect to the host: {exc}"))
+            except ClientError as exc:
+                self._error(f"could not connect to the host: {exc}")
                 return
         self.query_one("#chat-input", ChatInput).focus()
-        self._refresh_status()
+        self._refresh_bars()
         self._set_default_title()
         # Follow new output only while the user is parked at the bottom:
         # FlowView's STICKY_BOTTOM anchor does exactly that (released on a
         # scroll-up gesture, re-armed at the tail).
-        self.query_one("#chat-log", FlowView).can_focus = False
         self._load_draft_defaults()
         for notice in self.startup_notices:
-            self._post_line(NoticeLine(notice))
+            self._notice(notice)
         if self.session_name is not None:
             await self._attach(self.session_name)
 
@@ -534,16 +563,15 @@ class AgentApp(App[None]):
         self.session_name = name
         try:
             snap = await self.client.snapshot(name)
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"could not attach to {name}: {exc}"))
+        except ClientError as exc:
+            self._error(f"could not attach to {name}: {exc}")
             return
         self.status = snap.status
         self._refresh_title()
         await self._render_history(snap)
-        self._refresh_status()
-        self._refresh_steer_bar()
+        self._refresh_bars()
         if snap.status.finished_while_away:
-            self._post_line(NoticeLine("finished while you were away"))
+            self._notice("finished while you were away")
         await self.refresh_diff_summary()
         self._pump_worker = self._pump_events(name)
 
@@ -569,8 +597,6 @@ class AgentApp(App[None]):
             raise
         except (ClientError, httpx.HTTPError) as exc:
             self._view = None
-            # Recover outside this worker: _attach cancels the pump worker,
-            # and a task cannot reliably cancel and replace itself.
             self.call_later(self._recover, name, exc)
         except Exception as exc:  # noqa: BLE001 - never crash on connection loss
             self._view = None
@@ -580,7 +606,7 @@ class AgentApp(App[None]):
         """Connection loss: respawn the host if it died, reload the session
         on the (fresh) host, and reattach. One attempt: a failure is
         reported and the user reattaches via /sessions."""
-        self._post_line(ErrorLine(f"connection lost: {exc} — reconnecting"))
+        self._error(f"connection lost: {exc} — reconnecting")
         try:
             from ..clientlib import ensure_host
             await ensure_host()
@@ -590,9 +616,9 @@ class AgentApp(App[None]):
                 pass  # the fresh host may already host it (load is idempotent)
             await self._attach(name)
         except ClientError as recover_exc:
-            self._post_line(ErrorLine(
-                f"could not reconnect: {recover_exc} — /sessions to reattach",
-            ))
+            self._error(
+                f"could not reconnect: {recover_exc} — /sessions to reattach"
+            )
 
     async def _handle_event(self, event: Event) -> None:
         """Route one live event to the widgets."""
@@ -601,9 +627,7 @@ class AgentApp(App[None]):
                 "running", "compacting",
             )
             self.status = event.status
-            self._refresh_status()
-            self._refresh_steer_bar()
-            self._refresh_generating()
+            self._refresh_bars()
             # Spawned, not awaited: it is a worker (push_screen_wait needs
             # one) and must not block the event pump on its modal.
             self._maybe_prompt_drift()
@@ -621,9 +645,9 @@ class AgentApp(App[None]):
             return
         if isinstance(event, Notice):
             if event.level == "error":
-                self._post_line(ErrorLine(event.text))
+                self._error(event.text)
             else:
-                self._post_line(NoticeLine(event.text))
+                self._notice(event.text)
             return
         if isinstance(event, UserMessageAdded):
             await self._mount_user_message(event)
@@ -644,10 +668,10 @@ class AgentApp(App[None]):
             # The per-turn timing line (total | streaming | tools | other);
             # the session also persists it on the turn's last assistant
             # message, so a reload renders the identical line there.
-            self._post_line(NoticeLine(
+            self._notice(
                 f"Worked for {event.summary}" if event.summary
                 else f"Worked for {_format_duration(event.elapsed)}"
-            ))
+            )
             self._refresh_diff_summary_soon()
             return
         if isinstance(event, SessionDeleted):
@@ -666,17 +690,26 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # Commands
 
+    @contextmanager
+    def _reporting(self, prefix: str = ""):
+        """Turn a ClientError raised inside the block into an error line in
+        the transcript (prefixed)."""
+        try:
+            yield
+        except ClientError as exc:
+            self._error(f"{prefix}{exc}")
+
     async def _send_command(self, command: Command) -> dict | None:
         """Send one command to the session; returns its result payload.
 
         Errors (busy rejection, unknown target, git failure) surface as an
-        ErrorLine — the session broadcast the effects to everyone anyway."""
+        error line — the session broadcast the effects to everyone anyway."""
         if self.session_name is None:
             return None
         try:
             result = await self.client.command(self.session_name, command)
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(str(exc)))
+        except ClientError as exc:
+            self._error(str(exc))
             return None
         return result.payload
 
@@ -700,14 +733,15 @@ class AgentApp(App[None]):
         driver.write(f"\x1b]0;{title}\x07")
         driver.flush()
 
-    def _set_default_title(self) -> None:
-        """Default title: `xarness <workdir>`, path cropped like the status
-        bar (tail kept, whole components) but without the leading `...`."""
-        path = str(self.workspace or Path.cwd())
+    def _title_for(self, path: str) -> str:
+        """A workspace path for the terminal title: cropped like the status
+        bar (tail kept, whole components) but without the leading ``...``."""
         cropped = crop_path(path, _TITLE_PATH_LEN)
-        if cropped.startswith(".../"):
-            cropped = cropped[4:]
-        self._set_terminal_title(f"xarness {cropped}")
+        return cropped.removeprefix(".../")
+
+    def _set_default_title(self) -> None:
+        """Default title: `xarness <workdir>`."""
+        self._set_terminal_title(f"xarness {self._title_for(str(self.workspace or Path.cwd()))}")
 
     def _refresh_title(self) -> None:
         """Follow the attached session: its workspace in the tab title, or
@@ -717,15 +751,19 @@ class AgentApp(App[None]):
             self.session_name is not None and self.status is not None
         ) else None
         if workspace:
-            cropped = crop_path(workspace, _TITLE_PATH_LEN)
-            if cropped.startswith(".../"):
-                cropped = cropped[4:]
-            self._set_terminal_title(f"xarness {cropped}")
+            self._set_terminal_title(f"xarness {self._title_for(workspace)}")
         else:
             self._set_default_title()
 
     # ------------------------------------------------------------------
     # Status bar / bars
+
+    def _refresh_bars(self) -> None:
+        """Refresh everything driven by ``self.status``: the status bar, the
+        generating bar and the steer queue."""
+        self._refresh_status()
+        self._refresh_steer_bar()
+        self._refresh_generating()
 
     def _refresh_status(self) -> None:
         status = self.status
@@ -762,7 +800,7 @@ class AgentApp(App[None]):
             return
         try:
             self._config_cache = await self.client.config()
-        except (ClientError, httpx.HTTPError):
+        except ClientError:
             return
         if self.session_name is None:
             self._refresh_status()
@@ -858,8 +896,8 @@ class AgentApp(App[None]):
                     no_init_repo=self.no_init_repo,
                     no_session=self.no_session,
                 )
-            except (ClientError, httpx.HTTPError) as exc:
-                self._post_line(ErrorLine(f"could not start a session: {exc}"))
+            except ClientError as exc:
+                self._error(f"could not start a session: {exc}")
                 return
             self.model = None
             self.sandbox_name = None
@@ -873,15 +911,10 @@ class AgentApp(App[None]):
                 self._post_command(SetMode(mode=self._draft_mode))
             self._draft_mode = "write"
         # Pasted/dragged images ride along as base64 attachments; @path
-        # tokens in the text are resolved server-side.
-        models = [
-            ImageAttachmentModel(
-                name=i.name, mime=i.mime, data_b64=i.data_b64,
-                width=i.width, height=i.height,
-            )
-            for i in (images or [])
-        ]
-        await self._send_command(SendMessage(text=text, images=models or None))
+        # tokens in the text are resolved server-side. SendMessage and
+        # UserMessageAdded carry the same ImageAttachment shape the input
+        # produced, so they pass through unchanged.
+        await self._send_command(SendMessage(text=text, images=images or None))
 
     # ------------------------------------------------------------------
     # Ask tool (event-driven)
@@ -918,10 +951,11 @@ class AgentApp(App[None]):
             chat_input.placeholder = INPUT_PLACEHOLDER
 
     def _on_ask_resolved(self, event: AskResolved) -> None:
-        """Another client answered first: close this client's prompt."""
+        """Another client answered first: close this client's prompt.
+        Cancelling the worker unwinds the awaited future into its finally
+        block, which hides the ask bar and restores the input."""
         if self._ask_id is not None and self._ask_id == event.ask_id:
-            if self._ask_future is not None and not self._ask_future.done():
-                self._ask_future.cancel()
+            self._ask_id = None
             if self._ask_worker is not None:
                 self._ask_worker.cancel()
                 self._ask_worker = None
@@ -947,8 +981,10 @@ class AgentApp(App[None]):
         ):
             return
         self._drift_modal_open = True
+        detail = self.status.pending_drift.detail
         choice = await self.push_screen_wait(ConfirmScreen(
             "Workspace changed outside this session since it was last open:",
+            detail=detail,
             confirm_label="Accept as baseline",
             cancel_label="Keep tracking",
         ))
@@ -965,43 +1001,12 @@ class AgentApp(App[None]):
     def _handle_slash_command(self, text: str) -> None:
         parts = text[1:].split(maxsplit=1)
         cmd = parts[0] if parts else ""
-        if cmd == "tools":
-            names = ", ".join(self.status.tools) if self.status and self.status.tools else "none"
-            self._post_line(MessageLine(f"tools: {names}", kind="info"))
-        elif cmd == "sessions":
-            self._open_sessions()
-        elif cmd == "new":
-            self._start_new_session()
-        elif cmd == "delete":
-            self._start_delete()
-        elif cmd == "accept":
-            self._post_command(Accept())
-        elif cmd == "reject":
-            self._post_command(Reject())
-        elif cmd == "undo":
-            self._post_command(Undo())
-        elif cmd == "retry":
-            self._post_command(Retry())
-        elif cmd == "diff":
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            self._show_diff_command(arg)
-        elif cmd == "model":
-            self._open_model_picker()
-        elif cmd == "sandbox":
-            self._open_sandbox_picker()
-        elif cmd == "filter":
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            self._handle_filter_command(arg)
-        elif cmd == "mode":
-            self._switch_mode()
-        elif cmd == "theme":
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            if arg:
-                self._handle_theme_command(arg)
-            else:
-                self._open_theme_picker()
-        else:
-            self._post_line(ErrorLine(f"unknown command: /{cmd}"))
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        entry = COMMANDS.get(cmd)
+        if entry is None:
+            self._error(f"unknown command: /{cmd}")
+            return
+        entry[1](self, arg)
 
     def _switch_mode(self) -> None:
         """Toggle plan/write mode; shared by /mode and the Tab shortcut.
@@ -1057,10 +1062,10 @@ class AgentApp(App[None]):
         """Slash /new: leave the current session (it keeps running in the
         host) and return to a draft chat."""
         self._detach()
-        self._post_line(NoticeLine(
+        self._notice(
             "started a fresh chat — the previous session keeps running in "
             "the background (/sessions to go back)"
-        ))
+        )
 
     def _detach(self) -> None:
         """Return to a draft chat: no session attached, empty log."""
@@ -1074,42 +1079,25 @@ class AgentApp(App[None]):
         self._refresh_title()
         self._flow_model.clear()
         self._hint_entries = []
-        self._refresh_status()
-        self._refresh_steer_bar()
-        self._refresh_generating()
+        self._refresh_bars()
         self.call_later(self.refresh_diff_summary)
-
-    def _start_delete(self) -> None:
-        """Slash /delete: end the current session for good. Deleting a
-        session is pure bookkeeping — the saved session file is removed and
-        a fresh session starts; the workspace is never touched."""
-        self.call_later(self._delete_async)
 
     async def _delete_async(self) -> None:
         name = self.session_name
         self._detach()
         if name is None:
-            self._post_line(NoticeLine("no session to delete"))
+            self._notice("no session to delete")
             return
-        try:
+        with self._reporting("/delete failed: "):
             await self.client.delete_session(name)
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"/delete failed: {exc}"))
-            return
-        self._post_line(NoticeLine(
+        self._notice(
             "deleted: saved session removed — started a fresh session; "
             "your files are untouched"
-        ))
-
-    def _open_sessions(self) -> None:
-        self.call_later(self._open_sessions_async)
+        )
 
     async def _open_sessions_async(self) -> None:
-        try:
+        with self._reporting("/sessions failed: "):
             entries = await self.client.sessions()
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"/sessions failed: {exc}"))
-            return
         self.push_screen(
             ResumeScreen(
                 entries,
@@ -1123,17 +1111,12 @@ class AgentApp(App[None]):
             return
         if name == self.session_name:
             return
-        try:
+        with self._reporting(f"could not open {name}: "):
             active = {s.name: s for s in await self.client.sessions()}
             summary = active.get(name)
             if summary is None or not summary.active:
                 await self.client.load_session(name)
             await self._attach(name)
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"could not open {name}: {exc}"))
-
-    def _open_model_picker(self) -> None:
-        self._pick_model()
 
     async def _pick(
         self, names: list[str], *, current: str | None, title: str,
@@ -1148,11 +1131,8 @@ class AgentApp(App[None]):
 
     @work(group="picker", exclusive=True)
     async def _pick_model(self) -> None:
-        try:
+        with self._reporting("/model failed: "):
             self._config_cache = await self.client.config()
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"/model failed: {exc}"))
-            return
         name = await self._pick(
             [m["name"] for m in self._config_cache.models],
             current=self.status.model_name if self.status else None,
@@ -1163,16 +1143,10 @@ class AgentApp(App[None]):
         self._post_command(SwitchModel(name=name))
         self._save_preference(default_profile=name)
 
-    def _open_sandbox_picker(self) -> None:
-        self._pick_sandbox()
-
     @work(group="picker", exclusive=True)
     async def _pick_sandbox(self) -> None:
-        try:
+        with self._reporting("/sandbox failed: "):
             self._config_cache = await self.client.config()
-        except (ClientError, httpx.HTTPError) as exc:
-            self._post_line(ErrorLine(f"/sandbox failed: {exc}"))
-            return
         name = await self._pick(
             [s["name"] for s in self._config_cache.sandboxes],
             current=self.status.sandbox_name if self.status else None,
@@ -1192,20 +1166,16 @@ class AgentApp(App[None]):
         elif action == "list":
             filters = self.status.filter_list if self.status else []
             if filters:
-                self._post_line(MessageLine(
-                    "filtered out of the sandbox mounts: " + ", ".join(filters),
-                    kind="info",
-                ))
+                self._notice(
+                    "filtered out of the sandbox mounts: " + ", ".join(filters)
+                )
             else:
-                self._post_line(MessageLine("no paths filtered out", kind="info"))
+                self._notice("no paths filtered out")
         else:
-            self._post_line(ErrorLine("usage: /filter add <path> | /filter remove <path> | /filter list"))
+            self._error("usage: /filter add <path> | /filter remove <path> | /filter list")
 
     # ------------------------------------------------------------------
     # Theme (client-side preference)
-
-    def _open_theme_picker(self) -> None:
-        self._pick_theme()
 
     @work(group="picker", exclusive=True)
     async def _pick_theme(self) -> None:
@@ -1218,7 +1188,7 @@ class AgentApp(App[None]):
     def _handle_theme_command(self, arg: str) -> None:
         """Apply an explicitly named theme, or report the available ones."""
         if arg not in theme.THEMES:
-            self._post_line(ErrorLine(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}"))
+            self._error(f"unknown theme '{arg}'; available: {', '.join(theme.THEMES)}")
             return
         self._apply_theme(arg)
         self._save_preference(default_theme=arg)
@@ -1245,7 +1215,7 @@ class AgentApp(App[None]):
                 profile=profile,
             )
         except Exception as exc:  # noqa: BLE001 - preference save is best-effort
-            self._post_line(NoticeLine(f"note: could not save preference: {exc}"))
+            self._notice(f"note: could not save preference: {exc}")
 
     def _apply_theme(self, name: str) -> None:
         """Switch palette live: CSS variables, input caret, shimmers, dots,
@@ -1307,7 +1277,8 @@ class AgentApp(App[None]):
 
     def _start_anim(self, entry, item) -> None:
         """Advance the item's shimmer phase while the entry is on screen
-        (FlowView pauses the timer when it scrolls out)."""
+        (FlowView pauses the timer when it scrolls out). The handle is kept
+        on the item itself; ``_stop_anim`` owns stopping it."""
         try:
             view = self._flow_view()
         except NoMatches:
@@ -1318,25 +1289,28 @@ class AgentApp(App[None]):
             item.phase = (item.phase + theme.SHIMMER_SPEED * 0.08) % span
             e.update()
 
-        self._animations[entry.id] = view.animate_entry(entry, 0.08, tick)
+        item._anim = view.animate_entry(entry, 0.08, tick)  # type: ignore[attr-defined]
 
     def _stop_anim(self, entry) -> None:
-        handle = self._animations.pop(entry.id, None)
+        handle = getattr(entry.item, "_anim", None)
         if handle is not None:
             handle.stop()
+            entry.item._anim = None  # type: ignore[attr-defined]
 
-    def _post_line(self, widget: MessageLine) -> None:
-        """Post a one-line status message (notice/warn/error/hint).
-
-        ``widget`` is one of the light MessageLine shorthands the rest of the
-        app constructs; it is never mounted — it becomes a LineItem entry.
-        Whether it is in view is FlowView's business: it follows the tail
-        only if the user is already at the bottom."""
+    def _line(self, text: str, kind: str = "notice", hint: bool = False) -> None:
+        """Append a one-line status message (notice/warn/error/hint) to the
+        transcript. Whether it is in view is FlowView's business: it follows
+        the tail only if the user is already at the bottom."""
         self._flow_view()  # raises NoMatches when the app is shutting down
-        item = LineItem(text=widget.message_text, kind=widget.kind)
-        entry = self._flow_model.append(item)
-        if widget.hint:
+        entry = self._flow_model.append(LineItem(text=text, kind=kind))
+        if hint:
             self._hint_entries.append(entry)
+
+    def _error(self, text: str) -> None:
+        self._line(text, kind="error")
+
+    def _notice(self, text: str) -> None:
+        self._line(text)
 
     def _clear_hint_lines(self) -> None:
         """Remove transient hint lines (e.g. 'press esc again to interrupt')
@@ -1352,7 +1326,7 @@ class AgentApp(App[None]):
             view.assistant.item.finalize()
             view.assistant.update()
         elif view.thinking is None and not event.has_tool_calls:
-            self._post_line(ErrorLine("empty response from model"))
+            self._error("empty response from model")
         if view.thinking is not None:
             view._finish_thinking(event.reasoning_seconds)
         await view.finish()
@@ -1420,7 +1394,7 @@ class AgentApp(App[None]):
             pass
 
     def _append_message_items(
-        self, message: MessageModel, tool_results: dict[str, MessageModel],
+        self, message: Message, tool_results: dict[str, Message],
     ) -> None:
         """Append the transcript items for one persisted message."""
         if message.role == "user":
@@ -1431,17 +1405,13 @@ class AgentApp(App[None]):
                     message.content.removeprefix(SUMMARY_PREFIX).strip(),
                 ))
             else:
-                item = UserItem(text=message.content, images=message.images or [])
-                item.message = Message(
-                    role="user", content=message.content, id=message.id or "",
-                )
-                self._flow_model.append(item)
+                self._flow_model.append(UserItem.from_message(message))
         elif message.role == "assistant":
             if message.reasoning:
                 # Settled: a replayed block is never running.
                 thinking = ThinkingItem(
                     parts=[message.reasoning], done=True,
-                    duration=message.reasoning_seconds,
+                    duration=message.reasoning_duration,
                     expanded=False,
                 )
                 self._flow_model.append(thinking)
@@ -1482,14 +1452,11 @@ class AgentApp(App[None]):
 
     async def _mount_user_message(self, event: UserMessageAdded) -> None:
         """Land a user message in the transcript (sent or steered)."""
-        images = [
-            ImageAttachment(name=i.name, mime=i.mime, data_b64=i.data_b64,
-                            width=i.width, height=i.height)
-            for i in (event.images or [])
-        ]
-        item = UserItem(text=event.text, images=images)
-        item.message = Message(role="user", content=event.text, id=event.message_id or "")
-        self._flow_model.append(item)
+        message = Message(
+            role="user", content=event.text, id=event.message_id or "",
+            images=event.images or [],
+        )
+        self._flow_model.append(UserItem.from_message(message))
         # Track the rendered id: HistoryReplaced compares these against the
         # new history to decide between rebuild and no-op.
         if event.message_id:
@@ -1506,13 +1473,13 @@ class AgentApp(App[None]):
         q = event.query.lower()
         # Table-style rows: commands padded to a shared column, descriptions
         # dimmed — same layout language as the session list.
-        width = max(len(name) for name, _ in SLASH_COMMANDS)
+        width = max(len(name) for name in COMMANDS)
         matches = [
             (
                 name,
-                f"/{name:<{width}}  [dim]{desc}[/]",
+                f"/{name:<{width}}  [dim]{COMMANDS[name][0]}[/]",
             )
-            for name, desc in SLASH_COMMANDS
+            for name in COMMANDS
             if name.startswith(q)
         ]
         # Exact match first (stable sort keeps declaration order otherwise), so
@@ -1550,34 +1517,28 @@ class AgentApp(App[None]):
 
     def on_chat_input_popup_confirm(self, event: ChatInput.PopupConfirm) -> None:
         popup = self.query_one("#suggestion-popup", SuggestionPopup)
-        value = popup.selected_value
         chat_input = self.query_one("#chat-input", ChatInput)
         was_slash = chat_input.popup_active == "slash"
-        chat_input.popup_active = None
-        self._hide_popup()
-        chat_input.focus()
-        if value is None:
-            return
-        if was_slash:
-            # Slash commands take no arguments: complete and run in one Enter.
-            chat_input.load_text("")
-            self._handle_slash_command(f"/{value}")
-        else:
-            chat_input.insert_mention(value)
+        self._accept_popup_value(popup.selected_value, was_slash)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Mouse click on a popup option: insert it immediately, keep focus on input."""
         event.stop()
         chat_input = self.query_one("#chat-input", ChatInput)
         was_slash = chat_input.popup_active == "slash"
-        value = event.option.id
-        self._hide_popup()
+        self._accept_popup_value(event.option.id, was_slash)
+
+    def _accept_popup_value(self, value: str | None, was_slash: bool) -> None:
+        """Complete the confirmed/clicked popup value: slash commands take no
+        arguments, so they complete and run in one Enter; @-mentions are
+        inserted at the cursor."""
+        chat_input = self.query_one("#chat-input", ChatInput)
         chat_input.popup_active = None
+        self._hide_popup()
         chat_input.focus()
         if value is None:
             return
         if was_slash:
-            # Consistent with Enter: clicking a slash command runs it.
             chat_input.load_text("")
             self._handle_slash_command(f"/{value}")
         else:
@@ -1649,7 +1610,11 @@ class AgentApp(App[None]):
             if self.status is not None and self.status.clients_attached > 1:
                 self.exit()
                 return
-            choice = await self.push_screen_wait(ContinueHeadlessScreen())
+            choice = await self.push_screen_wait(ConfirmScreen(
+                "A request is still running. Continue it in the background?",
+                confirm_label="Continue headless",
+                cancel_label="Stop and quit",
+            ))
             if choice is None:
                 return  # esc: stay in the app
             if choice:
@@ -1668,7 +1633,7 @@ class AgentApp(App[None]):
             if self.session_name is not None:
                 try:
                     await self.client.close_session(self.session_name)
-                except (ClientError, httpx.HTTPError):
+                except ClientError:
                     pass  # exiting anyway; the host grace-exits on its own
             self.exit()
             return
@@ -1715,9 +1680,7 @@ class AgentApp(App[None]):
                 # First esc only arms the interrupt, so a stray keypress can't
                 # kill a turn mid-flight.
                 self._interrupt_armed = True
-                self._post_line(
-                    MessageLine("press esc again to interrupt", kind="warn", hint=True)
-                )
+                self._line("press esc again to interrupt", kind="warn", hint=True)
                 self._interrupt_timer = self.set_timer(
                     INTERRUPT_ARM_SECONDS, self._disarm_interrupt
                 )
@@ -1737,9 +1700,9 @@ class AgentApp(App[None]):
         expands the per-file list, /diff again hides it entirely. With an
         argument, /diff <path> shows that one file's unified diff."""
         if self.session_name is None:
-            self._post_line(ErrorLine(
+            self._error(
                 "/diff: no session attached — send a message first"
-            ))
+            )
             return
         widget = self.query_one("#diff-summary", DiffSummary)
         try:
@@ -1750,22 +1713,21 @@ class AgentApp(App[None]):
                     return
                 await self.refresh_diff_summary()
                 if not widget.has_class("visible"):
-                    self._post_line(NoticeLine("no pending changes to diff"))
+                    self._notice("no pending changes to diff")
                     return
                 widget.add_class("expanded")
                 return
-            await self.client.diff(self.session_name, path=arg)
             text = await self._diff_text(arg)
             if not text.strip():
-                self._post_line(NoticeLine(f"no pending changes for {arg}"))
+                self._notice(f"no pending changes for {arg}")
                 return
             # Rebuild the row list first (a previous /diff toggle may have
             # cleared it) so the active-row highlight has something to attach to.
             await self.refresh_diff_summary()
             widget.show_diff(arg, text)
-        except (ClientError, httpx.HTTPError) as exc:
+        except ClientError as exc:
             widget.hide_diff()
-            self._post_line(ErrorLine(f"/diff failed: {exc}"))
+            self._error(f"/diff failed: {exc}")
 
     async def _diff_text(self, path: str) -> str:
         """One file's unified diff (the summary endpoint gives per-file
@@ -1786,9 +1748,9 @@ class AgentApp(App[None]):
             return
         try:
             text = await self._diff_text(event.key or "")
-        except (ClientError, httpx.HTTPError) as exc:
+        except ClientError as exc:
             widget.hide_diff()
-            self._post_line(ErrorLine(f"diff failed: {exc}"))
+            self._error(f"diff failed: {exc}")
             return
         widget.show_diff(event.key, text)
 

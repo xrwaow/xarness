@@ -60,9 +60,9 @@ async def collect(controller: ChatController, text: str) -> list[Any]:
 def test_turn_builds_conversation_and_wire_messages() -> None:
     client = FakeClient(
         [
-            ReasoningDelta("let me think"),
-            ContentDelta("Hello"),
-            ContentDelta(" world"),
+            ReasoningDelta(text="let me think"),
+            ContentDelta(text="Hello"),
+            ContentDelta(text=" world"),
             TurnComplete(usage=Usage(input_tokens=12, output_tokens=3)),
         ]
     )
@@ -88,7 +88,7 @@ def test_turn_builds_conversation_and_wire_messages() -> None:
 
 
 def test_usage_fallback_is_approximate_when_absent() -> None:
-    client = FakeClient([ContentDelta("12345678"), TurnComplete(usage=None)])
+    client = FakeClient([ContentDelta(text="12345678"), TurnComplete(usage=None)])
     controller = ChatController(PROFILE, "key", client=client)
 
     events = asyncio.run(collect(controller, "abcd"))
@@ -100,7 +100,7 @@ def test_usage_fallback_is_approximate_when_absent() -> None:
 
 
 def test_stream_error_leaves_history_consistent() -> None:
-    client = FakeClient([StreamError("HTTP 500: boom")])
+    client = FakeClient([StreamError(message="HTTP 500: boom")])
     controller = ChatController(PROFILE, "key", client=client)
 
     events = asyncio.run(collect(controller, "Hi"))
@@ -111,11 +111,11 @@ def test_stream_error_leaves_history_consistent() -> None:
 
 
 def test_multi_turn_history_accumulates() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second"))
 
     # Second request carried the full running conversation.
@@ -130,10 +130,10 @@ def test_multi_turn_history_accumulates() -> None:
 def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
     client = FakeClient(
         [
-            ToolCallStarted("call_1", "fake_tool"),
-            ToolCallArgumentsDelta("call_1", '{"a"'),
-            ToolCallArgumentsDelta("call_1", ": 1}"),
-            ToolCallArgumentsDone("call_1", "fake_tool", '{"a": 1}'),
+            ToolCallStarted(call_id="call_1", name="fake_tool"),
+            ToolCallArgumentsDelta(call_id="call_1", text='{"a"'),
+            ToolCallArgumentsDelta(call_id="call_1", text=": 1}"),
+            ToolCallArgumentsDone(call_id="call_1", name="fake_tool", arguments_json='{"a": 1}'),
             TurnComplete(has_tool_calls=True),
         ]
     )
@@ -144,14 +144,16 @@ def test_tool_call_round_records_wire_shaped_tool_calls() -> None:
     assert events[-1].has_tool_calls is True
     assistant = controller.conversation.messages[1]
     assert assistant.role == "assistant"
-    assert assistant.tool_calls == [ToolCall("call_1", "fake_tool", '{"a": 1}')]
+    assert assistant.tool_calls == [ToolCall(
+        call_id="call_1", name="fake_tool", arguments_json='{"a": 1}',
+    )]
 
 
 def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> None:
     client = FakeClient(
         [
-            ToolCallStarted("call_1", "fake_tool"),
-            ToolCallArgumentsDone("call_1", "fake_tool", "{}"),
+            ToolCallStarted(call_id="call_1", name="fake_tool"),
+            ToolCallArgumentsDone(call_id="call_1", name="fake_tool", arguments_json="{}"),
             TurnComplete(has_tool_calls=True),
         ]
     )
@@ -159,7 +161,7 @@ def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> Non
     asyncio.run(collect(controller, "use the tool"))
 
     controller.record_tool_result("call_1", ToolResult(ok=True, output="success!"))
-    client.script = [ContentDelta("all done"), TurnComplete(usage=Usage(4, 2))]
+    client.script = [ContentDelta(text="all done"), TurnComplete(usage=Usage(input_tokens=4, output_tokens=2))]
     events = asyncio.run(_drain(controller.continue_after_tools()))
 
     assert events[-1].has_tool_calls is False
@@ -189,7 +191,7 @@ def test_continue_after_tools_sends_tool_result_and_omits_empty_content() -> Non
 
 
 def test_tools_schema_is_passed_to_client() -> None:
-    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    client = FakeClient([ContentDelta(text="hi"), TurnComplete()])
     controller = ChatController(
         PROFILE, "key", client=client, tool_registry=build_registry(None, None)
     )
@@ -200,7 +202,7 @@ def test_tools_schema_is_passed_to_client() -> None:
 
 
 def test_no_registry_sends_no_tools() -> None:
-    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    client = FakeClient([ContentDelta(text="hi"), TurnComplete()])
     controller = ChatController(PROFILE, "key", client=client)
 
     asyncio.run(collect(controller, "hello"))
@@ -209,13 +211,13 @@ def test_no_registry_sends_no_tools() -> None:
 
 
 def test_compact_replaces_history_with_summary() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first question"))
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second question"))
 
-    client.script = [ContentDelta("summary text"), TurnComplete()]
+    client.script = [ContentDelta(text="summary text"), TurnComplete()]
     summary = asyncio.run(controller.compact())
 
     assert summary == "summary text"
@@ -246,23 +248,23 @@ def test_compact_without_history_is_a_noop() -> None:
 
 
 def test_usage_attaches_to_messages_and_totals() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second"))
 
     messages = controller.conversation.messages
-    assert messages[1].usage == Usage(5, 3)
-    assert messages[3].usage == Usage(9, 4)
+    assert messages[1].usage == Usage(input_tokens=5, output_tokens=3)
+    assert messages[3].usage == Usage(input_tokens=9, output_tokens=4)
     # Usage is local-only: never sent over the wire.
     assert all("usage" not in m for m in client.received_wire[-1])
     assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
 
 
 def test_send_snapshots_conversation_for_undo() -> None:
-    client = FakeClient([ContentDelta("hi"), TurnComplete()])
+    client = FakeClient([ContentDelta(text="hi"), TurnComplete()])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "hello"))
 
@@ -275,7 +277,7 @@ def test_send_snapshots_conversation_for_undo() -> None:
 def test_compact_with_no_history_is_a_no_op() -> None:
     """Compacting a fresh conversation changes nothing — in particular it
     must not touch the compact snapshot or suppress a tool result."""
-    client = FakeClient([ContentDelta("summary text"), TurnComplete()])
+    client = FakeClient([ContentDelta(text="summary text"), TurnComplete()])
     controller = ChatController(PROFILE, "key", client=client)
     controller.conversation.add(Message(role="system", content="system prompt"))
 
@@ -288,11 +290,11 @@ def test_compact_with_no_history_is_a_no_op() -> None:
 
 
 def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 40))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=40))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first question"))
 
-    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
+    client.script = [ContentDelta(text="summary text"), TurnComplete(usage=Usage(input_tokens=100, output_tokens=7))]
     summary = asyncio.run(controller.compact())
 
     assert summary == "summary text"
@@ -301,27 +303,27 @@ def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
     # The summarization round's own spend is part of the session total.
     assert controller.usage_total == Usage(input_tokens=105, output_tokens=47)
     # The summary message carries the summarizer's usage (for /undo).
-    assert controller.conversation.messages[1].usage == Usage(100, 7)
+    assert controller.conversation.messages[1].usage == Usage(input_tokens=100, output_tokens=7)
 
 
 def test_undo_across_compaction_after_later_turn() -> None:
     """Auto-compaction at a turn boundary, later turns after it: /undo
     first removes the later turn, then a second /undo restores the
     pre-compaction history."""
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
     # Turn 2: a normal answer; compaction then runs at the turn boundary.
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(4, 1))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=4, output_tokens=1))]
     asyncio.run(collect(controller, "second"))
-    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
+    client.script = [ContentDelta(text="summary text"), TurnComplete(usage=Usage(input_tokens=100, output_tokens=7))]
     asyncio.run(controller.compact())
 
     # Later turns happen after the compaction.
-    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
+    client.script = [ContentDelta(text="final"), TurnComplete(usage=Usage(input_tokens=6, output_tokens=2))]
     asyncio.run(collect(controller, "third"))
-    client.script = [ContentDelta("fourth answer"), TurnComplete(usage=Usage(7, 2))]
+    client.script = [ContentDelta(text="fourth answer"), TurnComplete(usage=Usage(input_tokens=7, output_tokens=2))]
     asyncio.run(collect(controller, "fourth"))
     assert [m.role for m in controller.conversation.messages] == [
         "user", "user", "user", "assistant", "user", "assistant",
@@ -390,17 +392,17 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     from xarness.conversation import SUMMARY_PREFIX
 
     session_store.SESSIONS_DIR = tmp_path
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
 
     # Turn 2: a normal answer; compaction then runs at the turn boundary,
     # and one more turn happens after it.
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(4, 1))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=4, output_tokens=1))]
     asyncio.run(collect(controller, "second"))
-    client.script = [ContentDelta("summary text"), TurnComplete(usage=Usage(100, 7))]
+    client.script = [ContentDelta(text="summary text"), TurnComplete(usage=Usage(input_tokens=100, output_tokens=7))]
     asyncio.run(controller.compact())
-    client.script = [ContentDelta("final"), TurnComplete(usage=Usage(6, 2))]
+    client.script = [ContentDelta(text="final"), TurnComplete(usage=Usage(input_tokens=6, output_tokens=2))]
     asyncio.run(collect(controller, "third"))
 
     session_store.save_state("s", session_store.SessionState(controller.conversation, "test-model"))
@@ -438,10 +440,10 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
 def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:
     """Both /undo and /retry truncate to before the turn's user message;
     /retry re-sends the text (with a fresh checkpoint) via send()."""
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second"))
 
     plan = controller.rollback_plan()
@@ -462,11 +464,11 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     Its persisted before/after trees drive the file revert."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     controller.conversation.add(Message(role="user", content="old"))
-    controller.conversation.add(Message(role="assistant", content="a", usage=Usage(5, 3)))
+    controller.conversation.add(Message(role="assistant", content="a", usage=Usage(input_tokens=5, output_tokens=3)))
     controller.conversation.add(
         Message(role="user", content="last", checkpoint_sha="abc123", after_tree="def456")
     )
-    controller.conversation.add(Message(role="assistant", content="b", usage=Usage(9, 4)))
+    controller.conversation.add(Message(role="assistant", content="b", usage=Usage(input_tokens=9, output_tokens=4)))
     controller.usage_total = Usage(input_tokens=14, output_tokens=7)
 
     plan = controller.rollback_plan()
@@ -489,12 +491,12 @@ def test_rollback_is_a_noop_without_a_finished_turn() -> None:
 def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
     """Click-to-undo truncates at any earlier user message, restoring its
     checkpoint and subtracting every dropped turn's usage."""
-    client = FakeClient([ContentDelta("one"), TurnComplete(usage=Usage(5, 3))])
+    client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "first"))
-    client.script = [ContentDelta("two"), TurnComplete(usage=Usage(9, 4))]
+    client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second"))
-    client.script = [ContentDelta("three"), TurnComplete(usage=Usage(7, 2))]
+    client.script = [ContentDelta(text="three"), TurnComplete(usage=Usage(input_tokens=7, output_tokens=2))]
     asyncio.run(collect(controller, "third"))
 
     first_user = controller.conversation.messages[0]

@@ -21,12 +21,15 @@ FlowView's model:
 from __future__ import annotations
 
 import io
+import re
 import time
+import traceback
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual.strip import Strip
@@ -35,6 +38,7 @@ from textual_flowview import Presentation
 from .. import images, theme
 from ..conversation import Message as ConversationMessage
 from ..events import ToolCallStatus
+from ..images import token_text
 from .widgets import (
     _json_tool_args,
     _lerp_hex,
@@ -80,70 +84,16 @@ _RENDER_LOG = Path("~/.local/state/xarness/tui-render.log").expanduser()
 
 
 def _log_render_traceback(item, exc: BaseException) -> None:
-    """Append the full traceback of a failed item render to a log file.
+    """Append the traceback of a failed item render to a log file.
 
     FlowView's error panel keeps only `{type}: {exc}`; without this the
     traceback is lost and render bugs can't be diagnosed from a crash
-    report. The exception is passed in explicitly from ``except ... as exc``
-    — no reliance on implicit thread exception state."""
-    import sys
-    import traceback
+    report. Never raises."""
     try:
         _RENDER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        # Formatting a RecursionError can itself hit the (still nearly full)
-        # recursion limit and die silently — give ourselves headroom and a
-        # frame cap, and never let logging raise or recurse.
-        old_limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(max(old_limit, 3000))
-        try:
-            lines = traceback.format_exception(
-                type(exc), exc, exc.__traceback__, limit=200,
-            )
-        finally:
-            sys.setrecursionlimit(old_limit)
-        with open(_RENDER_LOG, "a", encoding="utf-8") as handle:
-            # Diagnostic: how deep is the Python stack right now? A huge
-            # depth means the stack really is exhausted above us (tb was
-            # cut); a small depth with RecursionError means the C-level
-            # recursion budget (Py_C_RECURSION_LIMIT, fixed per version,
-            # NOT controlled by setrecursionlimit) was exhausted by
-            # C-recursive code, or the frame budget was leaked earlier.
-            depth = 0
-            frame = sys._getframe()
-            while frame is not None:
-                depth += 1
-                frame = frame.f_back
-            handle.write(
-                f"--- render failed for {type(item).__name__} "
-                f"(depth={depth}, limit={sys.getrecursionlimit()}) ---\n"
-            )
-            # The exception's traceback only covers frames BELOW present()
-            # (it was caught here); the ~depth frames ABOVE are the actual
-            # recursion. Log the ancestor chain, compressing consecutive
-            # repeats so a recursive cycle shows as 'xN'.
-            ancestors: list[str] = []
-            frame = sys._getframe()
-            while frame is not None:
-                code = frame.f_code
-                loc = f"{code.co_filename.rsplit('/', 1)[-1]}:{code.co_firstlineno} in {code.co_qualname}"
-                if ancestors and ancestors[-1][0] == loc:
-                    ancestors[-1] = (loc, ancestors[-1][1] + 1)
-                else:
-                    ancestors.append((loc, 1))
-                frame = frame.f_back
-            handle.write("ancestors (outermost first):\n")
-            shown = list(reversed(ancestors[1:]))
-            if len(shown) > 60:
-                shown = (shown[:30] + [(f"... {len(shown) - 55} more ...", 0), *shown[-25:]])
-            for loc, n in shown:
-                handle.write(f"  {loc}" + (f"  x{n}" if n > 1 else "") + "\n")
-            lines = "".join(lines).splitlines(True)
-            # A RecursionError's trace can be thousands of frames; keep
-            # both ends so the raising frame and the entry point survive.
-            if len(lines) > 120:
-                lines = lines[:40] + [f"... {len(lines) - 100} frames elided ...\n"] + lines[-80:]
-            handle.writelines(lines)
-            handle.flush()
+        with open(_RENDER_LOG, "a", encoding="utf-8") as f:
+            f.write(f"--- render failed for {type(item).__name__} ---\n")
+            f.write(traceback.format_exc(limit=50))
     except BaseException:  # noqa: BLE001 - logging must never raise
         pass
 
@@ -151,7 +101,7 @@ def _log_render_traceback(item, exc: BaseException) -> None:
 def shimmer_text(
     label: str, base_color: str, peak_color: str, phase: float, suffix: str = "",
 ) -> Text:
-    """One frame of the shimmer sweep (ported from ShimmerText)."""
+    """One frame of the shimmer sweep (the former ShimmerText widget)."""
     text = Text()
     peak = phase - theme.SHIMMER_BAND_WIDTH
     half_band = max(theme.SHIMMER_BAND_WIDTH / 2, 1e-6)
@@ -180,6 +130,18 @@ class UserItem:
     undo_armed: bool = False
     message: ConversationMessage | None = None
     _cache: tuple = field(default=(), repr=False)
+
+    @classmethod
+    def from_message(cls, message: ConversationMessage) -> "UserItem":
+        """Build the transcript item for a persisted (or just-landed) user
+        message, carrying the message itself for click-to-undo."""
+        return cls(
+            text=message.content,
+            images=message.images or [],
+            message=ConversationMessage(
+                role="user", content=message.content, id=message.id or "",
+            ),
+        )
 
     def undo_row(self, height: int) -> int | None:
         """Row index of the "↩ undo to here" affordance, when armed.
@@ -318,22 +280,13 @@ class ToolItem:
             if isinstance(path, str) and path and isinstance(content, str):
                 body = highlight_code(content, path=path)
                 if self.output:
-                    body = body + body.__class__("\n" + self.output)
+                    body.append("\n" + self.output)
                 return body
+        body = self.args
         if self.name == "run_bash":
             command = self.bash_command()
             if command:
-                rendered = Text(command, style=theme.PALETTE["text"])
-                if self.output:
-                    rendered.append("\n" + self.output, style=theme.PALETTE["muted"])
-                split = _split_tool_diff(
-                    command + ("\n" + self.output if self.output else "")
-                )
-                if split is None:
-                    return rendered
-                rendered.append_text(_render_diff(split[1]))
-                return rendered
-        body = self.args
+                body = command
         if self.output:
             body = f"{body}\n{self.output}" if body else self.output
         split = _split_tool_diff(body)
@@ -354,7 +307,7 @@ class ToolItem:
         ):
             detail = _header_detail_text(self.name, self.header)
             if detail is None:
-                detail = _tool_header_detail(self.name, self.args, self.output)
+                detail = _tool_header_detail(self.name, self.args)
             if detail is not None:
                 summary.append_text(detail)
         return summary
@@ -443,12 +396,16 @@ class Presenter:
         leading = self._leading_blanks(entry, item)
         if leading:
             strips = [Strip.blank(width) for _ in range(leading)] + strips
-        # Give every cell an explicit palette base. Cells without their own
-        # fg/bg would otherwise fall through to the TERMINAL's default colors
-        # (dark bg / light fg on most terminals) — indistinguishable from the
-        # dark palettes by luck, and glaringly wrong on light ones. Cell
-        # styles win, so user pads, diff tints and syntax colors are kept.
-        base = Style(color=theme.PALETTE["text"], bgcolor=theme.PALETTE["bg"])
+        # Give every cell an explicit *foreground* base. Text cells must NOT
+        # carry an explicit background: rich's style merge lets cell styles
+        # win over any later-applied style, so a baked bgcolor would defeat
+        # Textual's ``screen--selection`` highlight (a drag-select would
+        # extract text but highlight nothing). The background comes from the
+        # widget CSS instead (#chat-log { background: $c-bg }), and blank
+        # padding strips below carry their own explicit bg where needed (the
+        # user-message box's surface pads). Diff tints and syntax colors keep
+        # their own bg, and remain visible through the selection.
+        base = Style(color=theme.PALETTE["text"])
         strips = [s.apply_style(base) for s in strips]
         return Presentation(height=len(strips), strips=strips)
 
@@ -506,38 +463,38 @@ class Presenter:
     def _user(self, item: UserItem, width: int) -> list[Strip]:
         key = (self.epoch, width, item.text, item.suffix, item.undo_armed,
                len(item.images))
-        if item._cache and item._cache[0] == key:
-            return item._cache[1]
-        p = theme.PALETTE
-        body = Text(item.text, style=p["text"])
-        token_style = Style(bgcolor=p["border"], color=p["muted"])
-        for match in images.IMAGE_TOKEN_RE.finditer(item.text):
-            body.stylize(token_style, match.start(), match.end())
-        if item.suffix:
-            body.append(" " + item.suffix, style=p["muted"])
-        rows: list = [body]
-        from .widgets import token_text
-        for image in item.images:
-            if token_text(image) in item.text:
-                continue  # the token itself already shows the attachment
-            rows.append(Text(token_text(image), style=p["muted"]))
-        if item.undo_armed and item.message is not None:
-            rows.append(Text("↩ undo to here", style=f"italic {p['accent']}"))
-        # First row carries the "›" marker; wrapped lines hang-indent under it.
-        # Every row gets the surface background (the old UserMessage CSS:
-        # `background: $c-surface`), padded to the full view width.
-        bg = Style(bgcolor=p["surface"])
-        strips: list[Strip] = []
-        for i, r in enumerate(rows):
-            block = _indent_strips(render_strips(r, width - 2), width, 2)
-            if i == 0:
-                block[0] = Strip.join([
-                    Strip([_seg("› ", p["muted"])], 2),
-                    block[0].crop(2, width),
-                ])
-            strips.extend(s.apply_style(bg) for s in block)
-        item._cache = (key, strips)
-        return strips
+
+        def build():
+            p = theme.PALETTE
+            body = Text(item.text, style=p["text"])
+            token_style = Style(bgcolor=p["border"], color=p["muted"])
+            for match in images.IMAGE_TOKEN_RE.finditer(item.text):
+                body.stylize(token_style, match.start(), match.end())
+            if item.suffix:
+                body.append(" " + item.suffix, style=p["muted"])
+            rows: list = [body]
+            for image in item.images:
+                if token_text(image) in item.text:
+                    continue  # the token itself already shows the attachment
+                rows.append(Text(token_text(image), style=p["muted"]))
+            if item.undo_armed and item.message is not None:
+                rows.append(Text("↩ undo to here", style=f"italic {p['accent']}"))
+            # First row carries the "›" marker; wrapped lines hang-indent under
+            # it. Every row gets the surface background (the old UserMessage
+            # CSS: `background: $c-surface`), padded to the full view width.
+            bg = Style(bgcolor=p["surface"])
+            strips: list[Strip] = []
+            for i, r in enumerate(rows):
+                block = _prefix_strips(render_strips(r, width - 2), width)
+                if i == 0:
+                    block[0] = Strip.join([
+                        Strip([_seg("› ", p["muted"])], 2),
+                        block[0].crop(2, width),
+                    ])
+                strips.extend(s.apply_style(bg) for s in block)
+            return strips
+
+        return _cached(item, key, build)
 
     # -- assistant ------------------------------------------------------------
 
@@ -559,7 +516,7 @@ class Presenter:
             return []
         # Marker sits on the first body line ('• text…'), wrapped lines
         # hang-indent under it at column 2 — the old assistant-marker row.
-        body = _indent_strips(body, width, 2)
+        body = _prefix_strips(body, width)
         marker = Strip.join([
             Strip([_seg("• ", p["muted"])], 2),
             body[0].crop(2, width),
@@ -572,28 +529,29 @@ class Presenter:
         p = theme.PALETTE
         key = (self.epoch, width, item.expanded, len(item.reasoning),
                item.done, item.duration, item.phase)
-        if item._cache and item._cache[0] == key:
-            return item._cache[1]
-        if item.done:
-            pill = Text(
-                item.summary_text(),
-                style=f"italic {p['muted']}",
-            )
-        else:
-            pill = shimmer_text(
-                item.summary_text(), *theme.SHIMMER_THINKING, phase=item.phase,
-            )
-        strips = render_strips(pill, width)
-        if item.expanded:
-            strips.extend(_indent_strips(
-                render_strips(
-                    Text(item.reasoning, style=f"italic {p['reasoning']}"),
-                    width - 2,
-                ),
-                width, 2,
-            ))
-        item._cache = (key, strips)
-        return strips
+
+        def build():
+            if item.done:
+                pill = Text(
+                    item.summary_text(),
+                    style=f"italic {p['muted']}",
+                )
+            else:
+                pill = shimmer_text(
+                    item.summary_text(), *theme.SHIMMER_THINKING, phase=item.phase,
+                )
+            strips = render_strips(pill, width)
+            if item.expanded:
+                strips.extend(_prefix_strips(
+                    render_strips(
+                        Text(item.reasoning, style=f"italic {p['reasoning']}"),
+                        width - 2,
+                    ),
+                    width,
+                ))
+            return strips
+
+        return _cached(item, key, build)
 
     # -- tool call ----------------------------------------------------------
 
@@ -601,26 +559,28 @@ class Presenter:
         p = theme.PALETTE
         key = (self.epoch, width, item.expanded, item.status, len(item.args),
                len(item.output), item.header, item.phase)
-        if item._cache and item._cache[0] == key:
-            return item._cache[1]
-        if item.status is ToolCallStatus.MAKING_CALL:
-            name, detail = _stream_parts(item.name, item.args)
-            dot = Text("•", style=p["warning"])
-            head = shimmer_text(
-                f"Running {name}", *theme.SHIMMER_THINKING,
-                phase=item.phase, suffix=detail,
-            )
-        else:
-            dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
-            head = item.summary_text()
-        dot_strips = render_strips(Text.assemble(dot, " ", head), width)
-        strips = list(dot_strips)
-        if item.expanded:
-            strips.extend(_bar_strips(
-                render_strips(item.body_renderable(), width - 2), width,
-            ))
-        item._cache = (key, strips)
-        return strips
+
+        def build():
+            if item.status is ToolCallStatus.MAKING_CALL:
+                name, detail = _stream_parts(item.name, item.args)
+                dot = Text("•", style=p["warning"])
+                head = shimmer_text(
+                    f"Running {name}", *theme.SHIMMER_THINKING,
+                    phase=item.phase, suffix=detail,
+                )
+            else:
+                dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
+                head = item.summary_text()
+            dot_strips = render_strips(Text.assemble(dot, " ", head), width)
+            strips = list(dot_strips)
+            if item.expanded:
+                strips.extend(_prefix_strips(
+                    render_strips(item.body_renderable(), width - 2), width,
+                    _seg("│ ", p["border"]),
+                ))
+            return strips
+
+        return _cached(item, key, build)
 
     # -- shimmering single-row items ----------------------------------------
 
@@ -667,12 +627,10 @@ def _settled_strips(text: str, width: int) -> list[Strip]:
         if prose.strip():
             # rich.markdown collapses single newlines into spaces; make them
             # hard breaks so "line1\nline2" renders as two lines.
-            import re as _re
-            prose = _re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
+            prose = re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
             parts.append((RichMarkdown(prose), True))
 
-    import re as _re
-    for match in _re.finditer(r"```([^\n`]*)\n(.*?)```", text, _re.DOTALL):
+    for match in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
         add_prose(text[pos: match.start()])
         parts.append((highlight_code(match.group(2), language=match.group(1).strip()), False))
         pos = match.end()
@@ -696,25 +654,27 @@ def _settled_strips(text: str, width: int) -> list[Strip]:
     return strips
 
 
-def _indent_strips(strips: list[Strip], width: int, indent: int) -> list[Strip]:
-    """Indent already-rendered body strips by ``indent`` cells to ``width``."""
-    out = []
-    for s in strips:
-        out.append(Strip.join([Strip.blank(indent), s]).adjust_cell_length(width))
-    return out
+def _cached(item, key, build):
+    """Per-item strip cache: return the strips cached under ``key``, or build
+    them (and cache) via ``build()``. Items carry a single ``_cache`` slot —
+    a fresh key (width/epoch/content change) misses and rebuilds."""
+    if item._cache and item._cache[0] == key:
+        return item._cache[1]
+    value = build()
+    item._cache = (key, value)
+    return value
 
 
-def _bar_strips(strips: list[Strip], width: int) -> list[Strip]:
-    """Prefix expanded-body strips with the '│' expand bar (the old
-    toolcall-row's border-left): one bar cell + one space, full width."""
-    bar = _seg("│ ", theme.PALETTE["border"])
-    out = []
-    for s in strips:
-        prefixed = Strip.join([Strip([bar], 2), s]).adjust_cell_length(width)
-        out.append(prefixed)
-    return out
+def _prefix_strips(
+    strips: list[Strip], width: int, prefix_seg: Segment | None = None,
+) -> list[Strip]:
+    """Prefix already-rendered body strips (rendered at ``width - 2``) with a
+    two-cell column to ``width``: a blank indent when ``prefix_seg`` is None
+    (the hanging indent under a marker row), otherwise the given two-cell
+    segment — e.g. the '│ ' expand bar of an expanded tool body."""
+    prefix = Strip.blank(2) if prefix_seg is None else Strip([prefix_seg], 2)
+    return [Strip.join([prefix, s]).adjust_cell_length(width) for s in strips]
 
 
-def _seg(text: str, style) -> object:
-    from rich.segment import Segment
+def _seg(text: str, style) -> Segment:
     return Segment(text, Style.parse(style) if isinstance(style, str) else style)

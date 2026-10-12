@@ -21,14 +21,14 @@ from textual.widgets import Button, Label, Static
 class ConfirmScreen(ModalScreen[bool | None]):
     """Ask a yes/no question, dismissing with the user's choice.
 
-    ``True`` is the affirmative; ``False`` and ``None`` (escape, via the app's
-    modal-cancel binding) both mean cancel. ``y``/the confirm button choose
-    true, ``n``/the cancel button choose false.
+    ``True`` is the affirmative; ``False`` (``n``/the cancel button) means
+    cancel and ``None`` (escape) means dismiss without choosing — e.g. the
+    ctrl+c prompt distinguishes "stay in the app" from "stop and quit".
     """
 
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
-        ("n", "cancel", "No"),
+        ("n", "no", "No"),
         ("y", "confirm", "Yes"),
     ]
 
@@ -64,5 +64,8 @@ class ConfirmScreen(ModalScreen[bool | None]):
     def action_confirm(self) -> None:
         self.dismiss(True)
 
-    def action_cancel(self) -> None:
+    def action_no(self) -> None:
         self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

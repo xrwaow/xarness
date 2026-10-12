@@ -16,7 +16,6 @@ Typical use::
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -48,7 +47,19 @@ RECONNECT_MAX = 4.0
 
 
 class ClientError(Exception):
-    """The API returned an error (bad request, unknown session, …)."""
+    """The API returned an error (bad request, unknown session, …).
+
+    Transport failures (``httpx.HTTPError``) are wrapped into this too, so
+    callers catch one exception type; the SSE reader's reconnect loop is the
+    one place that still needs the raw httpx error and reads it directly."""
+
+
+async def _wrap_http(coro):
+    """Await an HTTP request, folding transport errors into ClientError."""
+    try:
+        return await coro
+    except httpx.HTTPError as exc:
+        raise ClientError(str(exc) or type(exc).__name__) from exc
 
 
 class XarnessClient:
@@ -57,26 +68,24 @@ class XarnessClient:
     def __init__(self, http: httpx.AsyncClient) -> None:
         self._http = http
 
-    async def _with_host_retry(self, send):
-        """Run one request; on a dead/unreachable socket, respawn the host
+    async def _request(
+        self, method: str, path: str, *, stream: bool = False, **kwargs: Any,
+    ) -> httpx.Response:
+        """Send one request; on a dead/unreachable socket, respawn the host
         and retry once.
 
         The host exits when nothing is active (grace) — a client sitting on
-        a draft screen can outlive it, and the next request must transparently
-        bring the host back instead of surfacing a raw ConnectError."""
+        a draft screen can outlive it, and the next request must
+        transparently bring the host back instead of surfacing a raw
+        ConnectError. ``stream=True`` connects here (unlike httpx.stream(),
+        whose request only goes out at __aenter__), so the retry covers SSE
+        too."""
+        request = self._http.build_request(method, path, **kwargs)
         try:
-            result = send()
-            # send() may return a coroutine (awaitable request) or an async
-            # context manager (httpx.stream) — handle both.
-            if inspect.isawaitable(result):
-                return await result
-            return result
+            return await self._http.send(request, stream=stream)
         except httpx.ConnectError:
             await ensure_host()
-            result = send()
-            if inspect.isawaitable(result):
-                return await result
-            return result
+            return await self._http.send(request, stream=stream)
 
     @classmethod
     async def connect_unix(
@@ -153,16 +162,11 @@ class XarnessClient:
         no_session: bool = False,
         first_message: str | None = None,
     ) -> SessionSummary:
-        body: dict[str, Any] = {"no_init_repo": no_init_repo}
-        if no_session:
-            body["no_session"] = True
-        for key, value in [
-            ("workspace", workspace), ("model", model), ("sandbox", sandbox),
-            ("preset", preset), ("network", network), ("gpu", gpu),
-            ("first_message", first_message),
-        ]:
-            if value is not None:
-                body[key] = value
+        body = protocol.CreateSessionRequest(
+            workspace=workspace, model=model, sandbox=sandbox, preset=preset,
+            network=network, gpu=gpu, no_init_repo=no_init_repo,
+            no_session=no_session, first_message=first_message,
+        ).model_dump(exclude_none=True)
         return SessionSummary.model_validate(await self._post("/v1/sessions", body))
 
     async def load_session(self, name: str) -> SessionSummary:
@@ -180,8 +184,11 @@ class XarnessClient:
         )
 
     async def delete_session(self, name: str) -> CommandResult:
-        response = await self._http.delete(f"/v1/sessions/{name}")
-        return CommandResult.model_validate(self._json(response))
+        return CommandResult.model_validate(
+            self._json(
+                await _wrap_http(self._request("DELETE", f"/v1/sessions/{name}"))
+            )
+        )
 
     async def close_session(self, name: str) -> CommandResult:
         """Stop hosting the session: cancel + unload; the saved file stays."""
@@ -195,10 +202,10 @@ class XarnessClient:
     async def command(self, name: str, command: Command) -> CommandResult:
         """Send one command; the reply goes only to this client."""
         envelope = CommandEnvelope(cmd_id=uuid.uuid4().hex, command=command)
-        response = await self._http.post(
-            f"/v1/sessions/{name}/commands", json=envelope.model_dump(),
-        )
-        result = CommandResult.model_validate(self._json(response))
+        result = CommandResult.model_validate(self._json(await self._request(
+            "POST", f"/v1/sessions/{name}/commands",
+            json=envelope.model_dump(),
+        )))
         if not result.ok:
             raise ClientError(result.error or "command failed")
         return result
@@ -226,17 +233,12 @@ class XarnessClient:
 
     async def _stream_once(self, name: str) -> AsyncIterator[Snapshot | Event]:
         headers = {"Accept": "text/event-stream"}
-        # send(stream=True) connects here (unlike httpx.stream(), whose
-        # request only goes out at __aenter__), so a dead-socket ConnectError
-        # is raised inside _with_host_retry and the host gets respawned.
-        request = self._http.build_request(
-            "GET", f"/v1/sessions/{name}/events", headers=headers,
-        )
 
         @asynccontextmanager
         async def _response_cm() -> AsyncIterator[httpx.Response]:
-            response = await self._with_host_retry(
-                lambda: self._http.send(request, stream=True),
+            response = await self._request(
+                "GET", f"/v1/sessions/{name}/events",
+                headers=headers, stream=True,
             )
             try:
                 yield response
@@ -260,16 +262,10 @@ class XarnessClient:
     # plumbing
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = await self._with_host_retry(
-            lambda: self._http.get(path, params=params)
-        )
-        return self._json(response)
+        return self._json(await _wrap_http(self._request("GET", path, params=params)))
 
     async def _post(self, path: str, body: dict[str, Any]) -> Any:
-        response = await self._with_host_retry(
-            lambda: self._http.post(path, json=body)
-        )
-        return self._json(response)
+        return self._json(await _wrap_http(self._request("POST", path, json=body)))
 
     @staticmethod
     def _json(response: httpx.Response) -> Any:

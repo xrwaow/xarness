@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .conversation import Conversation, Message
 from .util import utcnow_iso as _utcnow_iso
 
@@ -140,16 +142,15 @@ def save_state(name: str, state: SessionState) -> None:
         data["sandbox_name"] = state.sandbox_name
     if state.sandbox_settings is not None:
         data["sandbox_settings"] = state.sandbox_settings
-    data["meta"] = _meta_block(
+    _atomic_write_json(session_path(name), data)
+    _atomic_write_json(meta_path(name), _meta_block(
         conversation,
         profile=state.profile,
         workspace=state.workspace,
         updated_at=data["updated_at"],
         sandbox_name=state.sandbox_name,
         tracking=state.git is not None,
-    )
-    _atomic_write_json(session_path(name), data)
-    _atomic_write_json(meta_path(name), data["meta"])
+    ))
 
 
 def load_state(name: str) -> SessionState:
@@ -176,29 +177,30 @@ def list_sessions() -> list[str]:
     )
 
 
-def _meta_from_data(data: dict[str, Any]) -> dict[str, Any] | None:
-    """The meta block, or None when the file predates the meta block."""
-    meta = data.get("meta")
-    return meta if isinstance(meta, dict) else None
-
-
 def load_meta(name: str) -> dict[str, Any] | None:
-    """The saved session's small meta block (no conversation parsing)."""
+    """The saved session's small meta block (no conversation parsing).
+
+    The sidecar is the only live copy; when it is missing (older save, or an
+    interrupted write) the meta block is rebuilt once from the full session
+    file."""
     try:
         meta = json.loads(meta_path(name).read_text(encoding="utf-8"))
         if isinstance(meta, dict):
             return meta
     except (OSError, json.JSONDecodeError):
         pass
-    # Fall back to the meta block inside the session file (written by
-    # something other than save_state, or an interrupted save).
     try:
-        data = json.loads(session_path(name).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        state = load_state(name)
+    except (OSError, json.JSONDecodeError, KeyError, ValidationError):
         return None
-    if not isinstance(data, dict):
-        return None
-    return _meta_from_data(data)
+    return _meta_block(
+        state.conversation,
+        profile=state.profile,
+        workspace=state.workspace,
+        updated_at=state.updated_at or "",
+        sandbox_name=state.sandbox_name,
+        tracking=state.git is not None,
+    )
 
 
 def delete_session(name: str) -> bool:
