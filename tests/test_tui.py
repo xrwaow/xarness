@@ -938,10 +938,11 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
 class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
     """Mouse drag over the transcript must both highlight and extract text.
 
-    Regression: the presenter used to bake a bgcolor into every text cell,
-    and rich's style merge lets cell styles win over the later-applied
-    ``screen--selection`` component style — so a drag selected text (copy
-    worked) but highlighted nothing."""
+    The presenter bakes an explicit palette bg into every cell (bg-less
+    cells would fall through to the terminal's default colors), and rich's
+    style merge lets cell styles win over the lib's own ``_decorate_line``
+    selection pass — so ChatFlowView.render_line re-applies the selection
+    span with cell styles overridden. This test guards that override."""
 
     async def test_drag_selects_and_highlights_transcript_text(self) -> None:
         from xarness import theme

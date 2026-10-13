@@ -18,6 +18,7 @@ from typing import ClassVar
 
 from rich.cells import cell_len
 from rich.segment import Segment
+from rich.style import Style
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -396,6 +397,14 @@ class ChatFlowView(FlowView):
 
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
+        # Empty/unstyled cells (blank rows of an empty or partially-filled
+        # log) carry no bg and fall through to the TERMINAL's default colors
+        # — the widget CSS background does not reach raw strip cells. Fill
+        # them with the palette so e.g. a fresh draft chat doesn't show the
+        # terminal's (dark) background after a /theme switch. Cell styles
+        # win, so presenter-painted rows are untouched.
+        if any(seg.style is None or seg.style.bgcolor is None for seg in strip):
+            strip = strip.apply_style(Style(bgcolor=theme.PALETTE["bg"]))
         # The lib's _decorate_line applies the selection highlight with
         # Strip.apply_style, and rich's style merge lets each cell's own
         # bgcolor win — so rows whose cells carry an explicit background

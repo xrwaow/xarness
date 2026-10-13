@@ -372,20 +372,24 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     padding: 0;
 }
 
-#resume-list > Option, #resume-list > ListItem,
-#picker-list > ListItem {
+#resume-list, #picker-list {
+    /* Options are NOT DOM widgets (virtual rows) — an "#resume-list > Option"
+       selector never matches and unstyled option text falls back to
+       Textual's own theme color. Style the rows via the list's component
+       classes instead. */
+    color: $c-text;
+}
+
+#resume-list > .option-list--option {
     background: $c-surface;
     color: $c-text;
     padding: 0 1;
 }
 
-/* Highlighted rows get a distinct background; the rebuild-on-filter case
-   (resume search) re-anchors the cursor so the -highlight class
-   is always managed by the list itself. */
-#resume-list > Option.-highlight,
-#resume-list > Option.-hovered,
-#resume-list > ListItem.-highlight,
-#resume-list > ListItem.-hovered,
+/* Highlighted rows get a distinct background. (ListView's ListItem -highlight
+   class is a real widget class and still works via the ListItem rules.) */
+#resume-list > .option-list--option-hover,
+#resume-list > .option-list--option-highlighted,
 #picker-list > ListItem.-highlight,
 #picker-list > ListItem.-hovered {
     background: $c-border;
@@ -393,7 +397,10 @@ ResumeScreen, PickerScreen, ConfirmScreen {
     text-style: bold;
 }
 
-#resume-list > Option, #resume-list > ListItem {
+#picker-list > ListItem {
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
     height: auto;
 }
 

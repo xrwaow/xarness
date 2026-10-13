@@ -381,7 +381,12 @@ class Presenter:
         # Every non-user row carries the old `padding: 0 1` left inset.
         # User rows are the full-width surface box and skip it (a transparent
         # gutter column would punch a hole in the box's background).
-        base_style = Style(color=theme.PALETTE["text"])
+        # Cells MUST carry an explicit bg: FlowView's strip path does not
+        # route transparent cells through the widget CSS, so bg-less cells
+        # fall through to the TERMINAL's default colors (dark bg / light fg
+        # on most terminals) — indistinguishable from the dark palettes by
+        # luck, glaringly wrong on light ones.
+        base_style = Style(color=theme.PALETTE["text"], bgcolor=theme.PALETTE["bg"])
         if not isinstance(item, UserItem):
             inset = Strip.blank(1, base_style)
             strips = [
@@ -401,17 +406,11 @@ class Presenter:
             strips = [
                 Strip.blank(width, base_style) for _ in range(leading)
             ] + strips
-        # Give every cell an explicit *foreground* base. Text cells must NOT
-        # carry an explicit background: rich's style merge lets cell styles
-        # win over any later-applied style, so a baked bgcolor would defeat
-        # Textual's ``screen--selection`` highlight (a drag-select would
-        # extract text but highlight nothing). The background comes from the
-        # widget CSS instead (#chat-log { background: $c-bg }), and blank
-        # padding strips below carry their own explicit bg where needed (the
-        # user-message box's surface pads). Diff tints and syntax colors keep
-        # their own bg, and remain visible through the selection.
-        base = Style(color=theme.PALETTE["text"])
-        strips = [s.apply_style(base) for s in strips]
+        # Give every cell an explicit palette base (fg AND bg). Cell styles
+        # win, so user pads, diff tints and syntax colors are kept. The
+        # drag-selection highlight is unaffected: ChatFlowView.render_line
+        # re-applies the selection span with cell styles overridden.
+        strips = [s.apply_style(base_style) for s in strips]
         return Presentation(height=len(strips), strips=strips)
 
     def _leading_blanks(self, entry, item) -> int:
