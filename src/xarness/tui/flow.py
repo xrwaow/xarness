@@ -14,8 +14,10 @@ FlowView's model:
   flips the item's ``expanded`` flag and calls ``entry.update()``;
 * streaming — deltas mutate the item and bump the entry; the presenter keeps
   per-item strip caches so a flush re-renders only the live tail;
-* the shimmer ("Thinking", "Running <tool>", "Processing") — a phase the app
-  advances via ``FlowView.animate_entry`` (ticks only while on screen).
+* the shimmer ("Thinking", "Running <tool>", "Processing") — pure style:
+  the sweep phase is derived from the shared wall-time clock at render time
+  (``shimmer_now``); ``FlowView.animate_entry`` ticks only drive repaints
+  (and only while the entry is on screen).
 """
 
 from __future__ import annotations
@@ -54,7 +56,8 @@ from .widgets import (
 
 __all__ = [
     "AssistantItem", "DividerItem", "LineItem", "PendingItem", "Presenter",
-    "ThinkingItem", "ToolItem", "ToolCallStatus", "UserItem", "WritingItem",
+    "shimmer_now",
+    "ThinkingItem", "ToolItem", "ToolCallStatus", "UserItem",
     "render_strips",
 ]
 
@@ -96,6 +99,12 @@ def _log_render_traceback(item, exc: BaseException) -> None:
             f.write(traceback.format_exc(limit=50))
     except BaseException:  # noqa: BLE001 - logging must never raise
         pass
+
+
+def shimmer_now(span: float) -> float:
+    """Shared shimmer clock — phase derived from wall time, so the sweep is
+    pure presentation: no per-item state to advance, reset, or leak."""
+    return (time.monotonic() * theme.SHIMMER_SPEED) % span
 
 
 def shimmer_text(
@@ -197,7 +206,6 @@ class ThinkingItem:
     done: bool = False
     duration: float | None = None
     expanded: bool = True
-    phase: float = 0.0
     # True while the duration is provisional (unknown): a later finish with
     # the session-recorded seconds overrides it.
     _estimated: bool = False
@@ -241,7 +249,6 @@ class ToolItem:
     header: str = ""
     status: ToolCallStatus = ToolCallStatus.MAKING_CALL
     expanded: bool = False
-    phase: float = 0.0
     _cache: tuple = field(default=(), repr=False)
 
     STATUS_COLOR_KEY = {
@@ -314,24 +321,14 @@ class ToolItem:
 
 
 @dataclass
-class WritingItem:
-    """Shared "Running <tool>" shimmer while tool arguments stream."""
-
-    label: str = "Running"
-    detail: str = ""
-    phase: float = 0.0
-    # Streamed argument fragments per call_id (the detail after the shimmer).
-    args_parts: dict = field(default_factory=dict, repr=False)
-
-
-@dataclass
 class PendingItem:
-    """Busy state shown until the first token of any kind arrives."""
+    """The ephemeral "Processing · esc to interrupt" strip, shown while a
+    round waits on the provider. Owned by the app's phase machine — never
+    persisted or replayed; the shimmer comes from the shared clock."""
 
     label: str = "Processing"
     hint: str = "esc to interrupt"
-    started: float = field(default_factory=time.monotonic)
-    phase: float = 0.0
+    _cache: tuple = field(default=(), repr=False)
 
 
 @dataclass
@@ -428,7 +425,7 @@ class Presenter:
         if isinstance(item, UserItem):
             prev = self._previous_item(entry)
             return 0 if prev is None or isinstance(prev, LineItem) else 1
-        if isinstance(item, (ToolItem, WritingItem, PendingItem)):
+        if isinstance(item, (ToolItem, PendingItem)):
             return isinstance(self._previous_item(entry), UserItem)
         if isinstance(item, LineItem):
             return 1
@@ -459,7 +456,7 @@ class Presenter:
             return self._thinking(item, width)
         if isinstance(item, ToolItem):
             return self._tool(item, width)
-        if isinstance(item, (WritingItem, PendingItem)):
+        if isinstance(item, PendingItem):
             return self._shimmering(item, width)
         if isinstance(item, LineItem):
             return self._line(item, width)
@@ -537,8 +534,13 @@ class Presenter:
 
     def _thinking(self, item: ThinkingItem, width: int) -> list[Strip]:
         p = theme.PALETTE
+        # Shimmer phase derives at render time; settled items keep a stable
+        # cache key (phase None).
+        phase = None if item.done else shimmer_now(
+            len(item.summary_text()) + 2 * theme.SHIMMER_BAND_WIDTH
+        )
         key = (self.epoch, width, item.expanded, len(item.reasoning),
-               item.done, item.duration, item.phase)
+               item.done, item.duration, phase)
 
         def build():
             if item.done:
@@ -548,7 +550,7 @@ class Presenter:
                 )
             else:
                 pill = shimmer_text(
-                    item.summary_text(), *theme.SHIMMER_THINKING, phase=item.phase,
+                    item.summary_text(), *theme.SHIMMER_THINKING, phase=phase,
                 )
             strips = render_strips(pill, width)
             if item.expanded:
@@ -567,8 +569,13 @@ class Presenter:
 
     def _tool(self, item: ToolItem, width: int) -> list[Strip]:
         p = theme.PALETTE
+        label = f"Running {item.name}"
+        phase = (
+            shimmer_now(len(label) + 2 * theme.SHIMMER_BAND_WIDTH)
+            if item.status is ToolCallStatus.MAKING_CALL else None
+        )
         key = (self.epoch, width, item.expanded, item.status, len(item.args),
-               len(item.output), item.header, item.phase)
+               len(item.output), item.header, phase)
 
         def build():
             if item.status is ToolCallStatus.MAKING_CALL:
@@ -576,7 +583,7 @@ class Presenter:
                 dot = Text("•", style=p["warning"])
                 head = shimmer_text(
                     f"Running {name}", *theme.SHIMMER_THINKING,
-                    phase=item.phase, suffix=detail,
+                    phase=phase, suffix=detail,
                 )
             else:
                 dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
@@ -592,25 +599,16 @@ class Presenter:
 
         return _cached(item, key, build)
 
-    # -- shimmering single-row items ----------------------------------------
+    # -- the pending strip ---------------------------------------------------
 
-    def _shimmering(self, item, width: int) -> list[Strip]:
+    def _shimmering(self, item: PendingItem, width: int) -> list[Strip]:
         p = theme.PALETTE
-        if isinstance(item, WritingItem):
-            # Old look: amber • dot, then the shimmering label + args detail.
-            dot = Text("• ", style=p["warning"])
-            text = shimmer_text(
-                item.label, *theme.SHIMMER_THINKING,
-                phase=item.phase, suffix=item.detail,
-            )
-            return render_strips(Text.assemble(dot, text), width)
-        # PendingItem
-        elapsed = time.monotonic() - item.started
-        detail = (
-            f"{elapsed:.0f}s · {item.hint}" if item.hint else f"{elapsed:.0f}s"
+        head = shimmer_text(
+            item.label, *theme.SHIMMER_PROCESSING,
+            phase=shimmer_now(len(item.label) + 2 * theme.SHIMMER_BAND_WIDTH),
         )
-        head = shimmer_text(item.label, *theme.SHIMMER_PROCESSING, phase=item.phase)
-        head.append(f"  ({detail})", style=p["muted"])
+        if item.hint:
+            head.append(f"  ({item.hint})", style=p["muted"])
         return render_strips(head, width)
 
     # -- one-liners -----------------------------------------------------------

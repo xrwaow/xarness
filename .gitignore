@@ -2,3 +2,4 @@
 *_cache*
 *__pycache__*
 uv.lock
+target-sandbox/

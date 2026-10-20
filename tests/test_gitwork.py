@@ -4,6 +4,7 @@ checkpoints, revert, diff) and the run_bash git-command filter.
 Uses a real temp git repo (git is a hard dependency of the feature anyway).
 """
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -19,9 +20,10 @@ from xarness.gitwork import (
 )
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
+def _git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False,
+        env=env,
     )
     if check:
         assert result.returncode == 0, f"git {' '.join(args)}: {result.stderr}"
@@ -58,20 +60,74 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert info.root == repo.resolve()
 
     async def test_setup_tracking_auto_initializes_non_repo(self):
-        """No git init from the user: the harness sets everything up itself."""
+        """No git init from the user: the harness tracks via an external
+        snapshot store — and never drops a .git into the workspace."""
         workspace = self.base / "plain"
         workspace.mkdir()
         (workspace / "notes.txt").write_text("user's file\n")
 
-        info, notes = await setup_tracking(workspace, "sess1")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "state")}):
+            info, notes = await setup_tracking(workspace, "sess1")
 
         assert info is not None
         assert info.workspace == workspace.resolve()
-        # The user's file is untouched, and the repo is harness-managed.
+        assert info.external
+        with self.assertRaises(ValueError):
+            info.git_dir.relative_to(workspace.resolve())  # store is outside
+        # No .git appears in the workspace; the user's files are untouched.
+        assert not (workspace / ".git").exists()
         assert (workspace / "notes.txt").read_text() == "user's file\n"
-        assert any("initialized" in n for n in notes)
-        out = _git(workspace, "config", "xarness.managed")
+        assert any("no .git created" in n for n in notes)
+        env = {**os.environ, "GIT_DIR": str(info.git_dir)}
+        out = _git(workspace, "config", "xarness.managed", env=env)
         assert out.strip() == "true"
+        # Snapshots/diffs work against the external store.
+        (workspace / "notes.txt").write_text("agent edited\n")
+        stat = await diff_stat(info)
+        assert [f.path for f in stat.files] == ["notes.txt"]
+
+    async def test_external_store_revert_works(self):
+        """In gitless (external-store) mode the full cycle works: snapshot,
+        edit, and revert — with no .git ever created in the workspace."""
+        workspace = self.base / "plain2"
+        workspace.mkdir()
+        (workspace / "doc.txt").write_text("base\n")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "state")}):
+            info, _ = await setup_tracking(workspace, "sess2")
+        assert info is not None
+
+        before = await snapshot_state(info)
+        (workspace / "doc.txt").write_text("agent edit\n")
+        (workspace / "new.txt").write_text("created\n")
+        after = await snapshot_state(info)
+
+        conflict = await revert_turn(info, before, after)
+
+        assert conflict is None
+        assert (workspace / "doc.txt").read_text() == "base\n"
+        assert not (workspace / "new.txt").exists()
+        assert not (workspace / ".git").exists()
+
+    async def test_snapshots_skip_media_and_oversized_files(self):
+        """Binary/media types and files over 1 MB never enter snapshots:
+        not in /diff, not reverted by /undo."""
+        repo = self.make_repo()
+        (repo / "pic.png").write_bytes(b"\x89PNG\r\n")
+        (repo / "clip.mp4").write_bytes(b"0" * 16)
+        (repo / "big.bin").write_bytes(b"0" * (1024 * 1024 + 1))
+        (repo / "small.txt").write_text("tracked\n")
+
+        info, notes = await setup_tracking(repo, "sess3")
+        assert info is not None
+        (repo / "small.txt").write_text("edited\n")
+        (repo / "pic.png").write_bytes(b"changed")
+        (repo / "big.bin").write_bytes(b"1" * (1024 * 1024 + 1))
+
+        stat = await diff_stat(info)
+        assert [f.path for f in stat.files] == ["small.txt"]
+        # The oversized files were pinned as ignored at session start.
+        assert "big.bin" in info.ignored_paths
+        assert any("1 MB" in n for n in notes)
 
     async def test_setup_tracking_snapshots_uncommitted_state(self):
         """The baseline tree captures uncommitted + untracked files, so /diff
@@ -352,6 +408,35 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert by_path["agent.txt"].source == "agent"
         assert by_path["manual.txt"].source == "drift"
         assert by_path["manual.txt"].is_new
+
+    async def test_attributed_diff_tags_open_turn_as_agent(self):
+        """Mid-turn (after_tree not yet recorded), the in-flight turn's edits
+        are tagged agent — not drift, and not flipping at end of streaming."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+
+        before = await snapshot_state(info)
+        (repo / "agent.txt").write_text("in flight\n")
+
+        # No completed turns; the open turn is folded in via open_before.
+        stat = await attributed_diff_stat(info, [], open_before=before)
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["agent.txt"].source == "agent"
+        # Coarse by design: mid-turn, anything changed since the turn's
+        # before tree counts as the turn's (same as end-of-turn tagging,
+        # where the before→after diff folds manual mid-turn edits in too).
+        (repo / "manual.txt").write_text("manual\n")
+        stat = await attributed_diff_stat(info, [], open_before=before)
+        by_path = {f.path: f for f in stat.files}
+        assert by_path["manual.txt"].source == "agent"
+
+        # Once the turn finishes, normal attribution resumes.
+        after = await snapshot_state(info)
+        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        (repo / "stray.txt").write_text("outside\n")
+        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        assert {f.path: f for f in stat.files}["stray.txt"].source == "drift"
 
     async def test_attributed_diff_keeps_drift_after_a_later_turn(self):
         """Drift is anchored to baseline_tree, not the last turn: a file made

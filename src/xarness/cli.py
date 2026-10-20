@@ -140,7 +140,9 @@ def _run_chat(args: argparse.Namespace) -> None:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
 
-    workspace = args.workspace or Path.cwd()
+    # Resolve client-side: the host may be a persistent daemon whose cwd is
+    # not this shell's, so a relative path would land somewhere else there.
+    workspace = (args.workspace or Path.cwd()).expanduser().resolve()
 
     from .tui.app import AgentApp
 

@@ -322,8 +322,78 @@ DiffSummary.expanded #diff-body {
     color: $c-bg;
 }
 
-ResumeScreen, PickerScreen, ConfirmScreen {
+ResumeScreen, PickerScreen, ConfirmScreen, RefsScreen {
     align: center middle;
+}
+
+#refs-modal {
+    width: 72;
+    height: auto;
+    max-height: 24;
+    background: $c-surface;
+    padding: 1 2;
+}
+
+#refs-title {
+    color: $c-muted;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#refs-add-label {
+    color: $c-muted;
+}
+
+#refs-input {
+    height: 1;
+    border: none;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#refs-input > .input--placeholder, #refs-empty, .refs-mount {
+    color: $c-muted;
+}
+
+#refs-input:focus {
+    background-tint: transparent;
+}
+
+#refs-list {
+    height: auto;
+    max-height: 16;
+    overflow-y: auto;
+}
+
+.refs-row {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+.refs-row-top {
+    height: 1;
+}
+
+.refs-path {
+    width: 1fr;
+    color: $c-text;
+}
+
+.refs-remove {
+    width: 3;
+    height: 1;
+    padding: 0;
+    border: none;
+    background: $c-surface;
+    color: $c-muted;
+}
+
+.refs-remove:hover, .refs-remove:focus, .refs-remove.-active {
+    background: $c-border;
+    color: $c-text;
 }
 
 #resume-modal, #picker-modal {

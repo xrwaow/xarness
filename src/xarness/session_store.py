@@ -3,10 +3,15 @@
 :class:`SessionState` is the whole persisted shape (profile, workspace,
 messages, turn marker, git block) in memory; :func:`load_state` parses the
 file once and returns it, so callers never re-read per field.
+
+Per-workspace state (the external reference paths managed with ``/refs``)
+lives beside the sessions, keyed by the resolved workspace path, so every
+session opened in the same directory shares it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -21,6 +26,39 @@ from .conversation import Conversation, Message
 from .util import utcnow_iso as _utcnow_iso
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
+WORKSPACES_DIR = Path("~/.local/share/xarness/workspaces").expanduser()
+
+
+def _workspace_path(workspace: str) -> Path:
+    """Settings file for a workspace, keyed by its resolved path."""
+    key = hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:16]
+    return WORKSPACES_DIR / f"{key}.json"
+
+
+def load_workspace_refs(workspace: str) -> list[str]:
+    """Reference paths saved for this workspace (shared by its sessions)."""
+    try:
+        data = json.loads(_workspace_path(workspace).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    refs = data.get("refs")
+    if not isinstance(refs, list):
+        return []
+    return [ref for ref in refs if isinstance(ref, str) and ref.strip()]
+
+
+def save_workspace_refs(workspace: str, refs: list[str]) -> None:
+    """Persist the workspace's refs; an empty list drops the file."""
+    refs = [ref for ref in refs if isinstance(ref, str) and ref.strip()]
+    path = _workspace_path(workspace)
+    if not refs:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"workspace": str(workspace), "refs": refs}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def session_path(name: str) -> Path:

@@ -17,6 +17,7 @@ from xarness.config import RefSpec, SandboxSettings
 from xarness.sandbox import (
     CACHE_ANCHOR,
     REFS_ANCHOR,
+    SANDBOX_CARGO_TARGET_DIR,
     SandboxConfig,
     SandboxResult,
     SandboxSession,
@@ -305,6 +306,23 @@ class ContainerMountsTest(SandboxArgvTest):
             self.assertEqual(env["HOME"], "/tmp")
             if "PATH" in env:
                 self.assertNotIn(str(Path.home()), env["PATH"])
+
+    def test_cargo_target_dir_is_sandbox_local(self):
+        """Cargo must not share the host's ./target: fingerprints embed
+        absolute source paths that differ between host and sandbox, so a
+        shared dir triggers a full rebuild on every host<->sandbox switch."""
+        for config in (self.config(), self.rich_config()):
+            argv = config.build_argv(["/bin/sh"])
+            self.assertEqual(argv_env(argv)["CARGO_TARGET_DIR"],
+                             SANDBOX_CARGO_TARGET_DIR)
+            # It lives inside the container's view of the real workspace and
+            # the workspace is bound read-write, so cargo can create it.
+            self.assertEqual(SANDBOX_CARGO_TARGET_DIR,
+                             "/workspace/target-sandbox")
+            binds = argv_binds(argv)
+            flag, src, dest = next(b for b in binds if b[2] == "/workspace")
+            self.assertEqual(flag, "--bind")
+            self.assertEqual(src, str(self.workspace))
 
     def test_venv_hash_scheme(self):
         env = argv_env(self.argv())
@@ -681,6 +699,7 @@ class ConfigFlagsTest(SandboxArgvTest):
 
         git_info = mock.Mock()
         git_info.git_dir = git_dir
+        git_info.external = False
         matrices = [
             SandboxSettings(),
             SandboxSettings(allow_network=True),

@@ -40,9 +40,10 @@ from ..protocol import (
     AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
     DiscardQueued, DriftResolved, Event, FilterAdd, FilterRemove,
     FlushQueued, HistoryReplaced,
-    Notice, ReasoningDelta, Reject, ResolveDrift,
+    Notice, ProcessingStarted, ReasoningDelta, Reject, ResolveDrift,
     Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
     StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
+    RefAdd, RefRemove,
     ToolCallArgumentsDelta, ToolCallArgumentsDone, ToolCallStarted,
     ToolExecStarted, ToolFinished, ToolOutputDelta, TurnComplete,
     TurnFinished, Undo, UndoTo, UserMessageAdded,
@@ -53,22 +54,17 @@ from ..util import format_duration as _format_duration
 from . import flow as tflow
 from .flow import (
     AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
-    UserItem, WritingItem,
+    UserItem,
 )
 from .confirm_screen import ConfirmScreen
 from .picker_screen import PickerScreen
+from .refs_screen import RefsScreen
 from .resume_screen import ResumeScreen
 from .diff_summary import DiffSummary
 from .widgets import (
     AskBar, ChatInput, GeneratingBar, StatusBar,
-    crop_path,
-    SteerQueueBar, SuggestionPopup, _stream_parts,
+    SteerQueueBar, SuggestionPopup,
 )
-
-
-# Max characters of the workspace path shown in the terminal title —
-# matches the status bar's crop_path default.
-_TITLE_PATH_LEN = 16
 
 INPUT_PLACEHOLDER = (
     "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
@@ -90,9 +86,10 @@ COMPACTED_DIVIDER = (
 
 
 def _item_streaming(item) -> bool:
-    """True while the item is still actively streaming (drives its shimmer).
-    Pending/Writing entries live only while they stream — they are removed
-    the moment they settle — so they are always "streaming" here."""
+    """True while the item is still actively streaming (drives its shimmer
+    repaints). The pending strip lives only while it is relevant — the phase
+    machine removes it the moment content arrives — so it is always
+    "streaming" here."""
     if isinstance(item, tflow.ThinkingItem):
         return not item.done
     if isinstance(item, tflow.ToolItem):
@@ -101,22 +98,15 @@ def _item_streaming(item) -> bool:
 
 
 class _RoundView:
-    """Flow-entry state for one streaming round: pending indicator, thinking
-    block, assistant answer, tool-writing shimmer, tool-call blocks. Fed by
-    the event pump; the session drives pacing. Each element is one entry in
-    the transcript's FlowModel — the presenter renders it."""
+    """Flow-entry state for one streaming round: thinking block, assistant
+    answer, tool-call blocks. The pending strip is not here — the app's
+    phase machine owns it, so dropping a round view can't orphan it."""
 
     def __init__(self, app: "AgentApp") -> None:
         self.app = app
-        self.indicator = None            # Entry[PendingItem] | None
-        self.indicator_live = False
         self.thinking = None             # Entry[ThinkingItem] | None
         self.assistant = None            # Entry[AssistantItem] | None
-        self.writing = None              # Entry[WritingItem] | None
-        self.pending_writes = 0
         self.tool_blocks: dict[str, object] = {}
-        self.round_has_tools = False
-        self.had_stream_error = False
         # Set by cancel(): entries created afterwards (a cancelled event still
         # landing) remove themselves — checked via self.cancelled on creation.
         self.cancelled = False
@@ -129,14 +119,6 @@ class _RoundView:
             self.app._remove_entry(entry)
         return entry
 
-    def _remove(self, entry) -> None:
-        if entry is not None:
-            self.app._remove_entry(entry)
-
-    async def mount(self) -> None:
-        self.indicator = self._append(PendingItem())
-        self.indicator_live = True
-
     def _reset_round(self) -> None:
         """A new round of the same turn (the previous one ended with tool
         calls): the finished thinking block and settled answer belong to the
@@ -145,15 +127,13 @@ class _RoundView:
         until reload."""
         self.thinking = None
         self.assistant = None
-        self.round_has_tools = False
-        self.had_stream_error = False
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, ReasoningDelta):
             if self.thinking is not None and self.thinking.item.done:
                 self._reset_round()
             if self.thinking is None:
-                await self._hide_indicator()
+                self.app._phase_streaming()
                 self.thinking = self._append(ThinkingItem())
             item: ThinkingItem = self.thinking.item
             item.parts.append(event.text)
@@ -162,7 +142,7 @@ class _RoundView:
             if self.assistant is not None and self.assistant.item.finalized:
                 self._reset_round()
             if self.assistant is None:
-                await self._hide_indicator()
+                self.app._phase_streaming()
                 if self.thinking is not None:
                     self._finish_thinking(duration=None)
                 self.assistant = self._append(AssistantItem())
@@ -170,33 +150,24 @@ class _RoundView:
             item.append_delta(event.text)
             self.assistant.update()
         elif isinstance(event, ToolCallStarted):
-            await self._hide_indicator()
+            self.app._phase_streaming()
             if self.thinking is not None:
                 self._finish_thinking(duration=None)
-            # One shared "Writing <tool>" entry while arguments stream; the
-            # item accumulates the streamed args itself. Per-call entries
-            # appear once args are complete.
-            self.pending_writes += 1
-            if self.writing is None:
-                self.writing = self._append(WritingItem(label=f"Running {event.name}"))
-            writing: WritingItem = self.writing.item
-            writing.label = f"Running {event.name}"
-            self.writing.update()
-        elif isinstance(event, ToolCallArgumentsDelta):
-            if self.writing is not None:
-                writing: WritingItem = self.writing.item
-                writing.detail = _args_detail(writing.label, writing, event.call_id, event.text)
-                self.writing.update()
-        elif isinstance(event, ToolCallArgumentsDone):
-            block = self._append(ToolItem(
-                call_id=event.call_id, name=event.name,
-                args=event.arguments_json,
-            ))
+            # One ToolItem per call, created at once: MAKING_CALL renders the
+            # "Running <tool>" shimmer; streamed args accumulate in it.
+            block = self._append(ToolItem(call_id=event.call_id, name=event.name))
             self.tool_blocks[event.call_id] = block
-            self.pending_writes = max(0, self.pending_writes - 1)
-            if self.pending_writes == 0 and self.writing is not None:
-                self._remove(self.writing)
-                self.writing = None
+        elif isinstance(event, ToolCallArgumentsDelta):
+            block = self.tool_blocks.get(event.call_id)
+            if block is not None:
+                item: ToolItem = block.item
+                item.args += event.text
+                block.update()
+        elif isinstance(event, ToolCallArgumentsDone):
+            block = self.tool_blocks.get(event.call_id)
+            if block is not None:
+                block.item.args = event.arguments_json
+                block.update()
         elif isinstance(event, ToolExecStarted):
             pass  # the block's amber "Running" dot is already showing
         elif isinstance(event, ToolOutputDelta):
@@ -222,10 +193,9 @@ class _RoundView:
                 item.header = event.header
                 entry.update()
         elif isinstance(event, TurnComplete):
-            self.round_has_tools = event.has_tool_calls
             await self.app._complete_round(event, self)
         elif isinstance(event, StreamError):
-            await self._hide_indicator()
+            self.app._phase_idle()
             if self.thinking is not None:
                 # No TurnComplete follows an error: settle the cot here, or
                 # it keeps shimmering next to the error line.
@@ -236,7 +206,6 @@ class _RoundView:
                 self.assistant.item.finalize()
                 self.assistant.update()
             self.app._error(event.message)
-            self.had_stream_error = True
             self.app._clear_hint_lines()
 
     def _finish_thinking(self, duration: float | None) -> None:
@@ -247,27 +216,13 @@ class _RoundView:
         self.thinking.update()
         self.app._stop_anim(self.thinking)
 
-    async def _hide_indicator(self) -> None:
-        if self.indicator_live:
-            self._remove(self.indicator)
-            self.indicator_live = False
-
-    async def finish(self) -> None:
-        """Dismiss the round's transient indicators at the round's end."""
-        if self.writing is not None:
-            self._remove(self.writing)
-            self.writing = None
-        await self._hide_indicator()
 
     async def cancel(self) -> None:
         """Settle the round's entries for an interrupted turn."""
         # Flip first: any entry created afterwards (an event whose landing
         # was cancelled mid-flight) removes itself via _append.
         self.cancelled = True
-        if self.writing is not None:
-            self._remove(self.writing)
-            self.writing = None
-        await self._hide_indicator()
+        self.app._phase_idle()
         if self.thinking is not None and not self.thinking.item.done:
             self._finish_thinking(duration=None)
         if self.assistant is not None:
@@ -283,14 +238,6 @@ class _RoundView:
                 item.output = item.output or "interrupted"
                 item.header = item.header or ""
                 entry.update()
-
-
-def _args_detail(label: str, writing: WritingItem, call_id: str, text: str) -> str:
-    """Accumulate streamed argument fragments and return the static detail
-    ('g.py +4', 'git stat…') shown after the shimmering tool name."""
-    writing.args_parts[call_id] = writing.args_parts.get(call_id, "") + text
-    _, detail = _stream_parts(label[len("Running "):], writing.args_parts[call_id])
-    return detail
 
 
 
@@ -323,6 +270,10 @@ COMMANDS = {
     "filter": (
         "add/remove/list paths excluded from the sandbox mounts",
         lambda s, a: s._handle_filter_command(a),
+    ),
+    "refs": (
+        "add/remove this workspace's external reference paths",
+        lambda s, a: s._handle_refs_command(a),
     ),
     "theme": (
         "choose a color theme",
@@ -522,9 +473,39 @@ class AgentApp(App[None]):
         self._interrupt_timer = None
         self._at_search_timer = None
         self._config_cache = None
+        # Live phase — the single owner of the ephemeral pending strip.
+        # pending = a round is waiting on the provider (turn start and every
+        # post-tools round); the transitions below are the strip's only
+        # append/remove sites, so a dropped _RoundView can never orphan it.
+        self._phase = "idle"
+        self._pending_entry = None
         # Draft-chat state (before any session exists): the mode Tab toggles
         # locally and is applied to the session once it is created.
         self._draft_mode = "write"
+
+    # -- live phase (the pending strip's only owner) ---------------------
+
+    def _phase_pending(self) -> None:
+        """A round is waiting on the provider: show the strip."""
+        if self._phase == "pending":
+            return
+        self._phase = "pending"
+        self._pending_entry = self._append_item(PendingItem())
+
+    def _phase_streaming(self) -> None:
+        """Content is arriving: the strip's job is done."""
+        self._phase = "streaming"
+        self._drop_pending()
+
+    def _phase_idle(self) -> None:
+        """Nothing in flight: no strip."""
+        self._phase = "idle"
+        self._drop_pending()
+
+    def _drop_pending(self) -> None:
+        if self._pending_entry is not None:
+            self._remove_entry(self._pending_entry)
+            self._pending_entry = None
 
     # ------------------------------------------------------------------
     # layout
@@ -602,6 +583,7 @@ class AgentApp(App[None]):
         self._refresh_bars()
         if snap.status.finished_while_away:
             self._notice("finished while you were away")
+            self._set_title_state("finished")
         await self.refresh_diff_summary()
         self._pump_worker = self._pump_events(name)
 
@@ -658,20 +640,22 @@ class AgentApp(App[None]):
             )
             self.status = event.status
             self._refresh_bars()
+            self._sync_refs_screen()
             # Spawned, not awaited: it is a worker (push_screen_wait needs
             # one) and must not block the event pump on its modal.
             self._maybe_prompt_drift()
-            if (
-                was_streaming and self.status.state not in ("running", "compacting")
-                and self._view is not None
-            ):
+            if was_streaming and self.status.state not in ("running", "compacting"):
                 # The turn ended without a TurnComplete for this client —
                 # an interrupt (esc / stop-and-quit) or a forced steer
                 # cancelling it. Settle the live round, or the Thinking
-                # shimmer (and a half-streamed tool's writing shimmer)
+                # shimmer (and a half-streamed tool's Running shimmer)
                 # keeps animating next to the "interrupted" error line.
-                await self._view.cancel()
-                self._view = None
+                if self._view is not None:
+                    await self._view.cancel()
+                    self._view = None
+                self._phase_idle()
+                # Interrupted, not completed: back to the plain workspace title.
+                self._set_default_title()
             return
         if isinstance(event, Notice):
             if event.level == "error":
@@ -705,6 +689,7 @@ class AgentApp(App[None]):
                 if event.summary
                 else f"Worked for {_format_duration(event.elapsed)}"
             )
+            self._set_title_state("finished")
             self._refresh_diff_summary_soon()
             return
         if isinstance(event, SessionDeleted):
@@ -712,10 +697,16 @@ class AgentApp(App[None]):
             # client — a Notice with the specifics precedes this event).
             self._detach()
             return
+        if isinstance(event, ProcessingStarted):
+            # A round opened and is waiting on the provider: the strip goes
+            # up (this is the start of a turn AND every post-tools round).
+            self._phase_pending()
+            # Clear a stale "finished" suffix as soon as the next turn starts.
+            self._set_default_title()
+            return
         # Everything else is a streaming-round event.
         if self._view is None:
             self._view = _RoundView(self)
-            await self._view.mount()
         await self._view.handle(event)
         if isinstance(event, ToolFinished):
             self._refresh_diff_summary_soon()
@@ -767,26 +758,36 @@ class AgentApp(App[None]):
         driver.flush()
 
     def _title_for(self, path: str) -> str:
-        """A workspace path for the terminal title: cropped like the status
-        bar (tail kept, whole components) but without the leading ``...``."""
-        cropped = crop_path(path, _TITLE_PATH_LEN)
-        return cropped.removeprefix(".../")
+        """The workspace's own directory name for the terminal title.
+
+        The status bar can afford a cropped path; a tab title cannot, and
+        two workspaces named ``xarness`` under different parents must read
+        the same (``xarness xarness``, not ``xarness projects/xarness``)."""
+        name = Path(path.rstrip("/")).name
+        return name or path
+
+    def _base_title(self) -> str:
+        """`xarness <workdir>` for the attached session, or the local draft."""
+        workspace = self.status.workspace if (
+            self.session_name is not None and self.status is not None
+        ) else None
+        path = workspace or str(self.workspace or Path.cwd())
+        return f"xarness {self._title_for(path)}"
 
     def _set_default_title(self) -> None:
-        """Default title: `xarness <workdir>`."""
-        self._set_terminal_title(f"xarness {self._title_for(str(self.workspace or Path.cwd()))}")
+        """Default title: `xarness <workdir>` (no activity suffix)."""
+        self._set_terminal_title(self._base_title())
+
+    def _set_title_state(self, state: str) -> None:
+        """`xarness <workdir> - <state>` (finished / ask), always derived from
+        the current base so states never stack up."""
+        self._set_terminal_title(f"{self._base_title()} - {state}")
 
     def _refresh_title(self) -> None:
         """Follow the attached session: its workspace in the tab title, or
         the default when detached — otherwise switching to a session in a
         different workspace keeps the stale title."""
-        workspace = self.status.workspace if (
-            self.session_name is not None and self.status is not None
-        ) else None
-        if workspace:
-            self._set_terminal_title(f"xarness {self._title_for(workspace)}")
-        else:
-            self._set_default_title()
+        self._set_default_title()
 
     # ------------------------------------------------------------------
     # Status bar / bars
@@ -802,14 +803,30 @@ class AgentApp(App[None]):
         status = self.status
         if status is None:
             # Draft chat: the backend tells us what a fresh session starts
-            # with (/config defaults), so show that instead of a dash.
+            # with (/config defaults), so show that instead of a dash. A
+            # /model picked before the first message lives in ``self.model``
+            # — reflect it here immediately instead of waiting for the
+            # session that the first message creates.
             config = self._config_cache
-            self.query_one("#status-bar", StatusBar).update_status(
-                shown_name=(
+            target = self.model or (config.default_model if config else None)
+            entry = next(
+                (m for m in (config.models if config else []) if m.get("name") == target),
+                None,
+            )
+            if entry is not None:
+                shown_name = entry.get("display_name") or entry.get("name") or "—"
+                effort = entry.get("cot_strength") or "medium"
+                max_context = entry.get("max_context") or 128_000
+            else:
+                shown_name = (
                     config.default_model_display_name if config else None
-                ) or "—",
-                effort="medium", mode=self._draft_mode,
-                total_in=0, total_out=0, context_used=0, max_context=128_000,
+                ) or "—"
+                effort = "medium"
+                max_context = 128_000
+            self.query_one("#status-bar", StatusBar).update_status(
+                shown_name=shown_name,
+                effort=effort, mode=self._draft_mode,
+                total_in=0, total_out=0, context_used=0, max_context=max_context,
                 workspace=str(self.workspace) if self.workspace else None,
             )
             return
@@ -914,35 +931,44 @@ class AgentApp(App[None]):
         when UserMessageAdded arrives, identically for every client."""
         self.call_later(self._submit_async, text, images)
 
+    async def _ensure_session(self) -> bool:
+        """Create the draft's session if it does not exist yet. Returns
+        False when the session could not be started (error already shown)."""
+        if self.session_name is not None:
+            return True
+        try:
+            summary = await self.client.create_session(
+                workspace=str(self.workspace) if self.workspace else None,
+                model=self.model,
+                sandbox=self.sandbox_name,
+                preset=self.preset,
+                network=self.network,
+                gpu=self.gpu,
+                no_init_repo=self.no_init_repo,
+                no_session=self.no_session,
+            )
+        except ClientError as exc:
+            self._error(f"could not start a session: {exc}")
+            return False
+        self.model = None
+        self.sandbox_name = None
+        self.preset = None
+        self.network = None
+        self.gpu = None
+        await self._attach(summary.name)
+        # Carry the draft-mode toggle (Tab before any message) into the
+        # freshly created session.
+        if self._draft_mode != "write":
+            self._post_command(SetMode(mode=self._draft_mode))
+        self._draft_mode = "write"
+        return True
+
     async def _submit_async(self, text: str, images: list[ImageAttachment] | None) -> None:
         if self.session_name is None:
             # Draft chat: the session comes into existence on the server with
             # the first message.
-            try:
-                summary = await self.client.create_session(
-                    workspace=str(self.workspace) if self.workspace else None,
-                    model=self.model,
-                    sandbox=self.sandbox_name,
-                    preset=self.preset,
-                    network=self.network,
-                    gpu=self.gpu,
-                    no_init_repo=self.no_init_repo,
-                    no_session=self.no_session,
-                )
-            except ClientError as exc:
-                self._error(f"could not start a session: {exc}")
+            if not await self._ensure_session():
                 return
-            self.model = None
-            self.sandbox_name = None
-            self.preset = None
-            self.network = None
-            self.gpu = None
-            await self._attach(summary.name)
-            # Carry the draft-mode toggle (Tab before any message) into the
-            # freshly created session.
-            if self._draft_mode != "write":
-                self._post_command(SetMode(mode=self._draft_mode))
-            self._draft_mode = "write"
         # Pasted/dragged images ride along as base64 attachments; @path
         # tokens in the text are resolved server-side. SendMessage and
         # UserMessageAdded carry the same ImageAttachment shape the input
@@ -958,6 +984,7 @@ class AgentApp(App[None]):
         through the normal chat input (Enter submits, Esc skips all). The
         collected answers go back as one ``answer_ask`` command — any client
         may answer; first answer wins."""
+        self._set_title_state("ask")
         ask_bar = self.query_one("#ask-bar", AskBar)
         chat_input = self.query_one("#chat-input", ChatInput)
         answers: list[str] = []
@@ -982,6 +1009,7 @@ class AgentApp(App[None]):
             self._ask_id = None
             ask_bar.hide()
             chat_input.placeholder = INPUT_PLACEHOLDER
+            self._set_default_title()
 
     def _on_ask_resolved(self, event: AskResolved) -> None:
         """Another client answered first: close this client's prompt.
@@ -1168,13 +1196,39 @@ class AgentApp(App[None]):
             self._config_cache = await self.client.config()
         name = await self._pick(
             [m["name"] for m in self._config_cache.models],
-            current=self.status.model_name if self.status else None,
+            current=(
+                self.status.model_name if self.status
+                else self.model or (
+                    self._config_cache.default_model if self._config_cache else None
+                )
+            ),
             title="Switch model",
         )
         if not name:
             return
-        self._post_command(SwitchModel(name=name))
+        if self.session_name is None:
+            # Draft chat: there is no session to switch yet. Remember the
+            # choice (the first message passes it to create_session) and
+            # repaint the status bar now, so the new model is visible
+            # before the user sends anything.
+            self.model = name
+            self._refresh_status()
+        else:
+            self._post_command(SwitchModel(name=name))
         self._save_preference(default_profile=name)
+        # The choice is now the config's default for the next session, so
+        # keep the cached config in step: a later /new (which drops back to
+        # a draft) read its status from here.
+        config = self._config_cache
+        if config is not None:
+            entry = next(
+                (m for m in config.models if m.get("name") == name), None,
+            )
+            config.default_model = name
+            config.default_model_display_name = (
+                (entry or {}).get("display_name") or name
+            )
+            self._refresh_status()
 
     @work(group="picker", exclusive=True)
     async def _pick_sandbox(self) -> None:
@@ -1206,6 +1260,44 @@ class AgentApp(App[None]):
                 self._notice("no paths filtered out")
         else:
             self._error("usage: /filter add <path> | /filter remove <path> | /filter list")
+
+    # ------------------------------------------------------------------
+    # External references (per workspace)
+
+    def _handle_refs_command(self, arg: str) -> None:
+        if arg:
+            self._error("usage: /refs")
+        else:
+            self._open_refs()
+
+    @work(group="refs", exit_on_error=False)
+    async def _open_refs(self) -> None:
+        """Open the manager; a draft gets its session started first."""
+        if not await self._ensure_session():
+            return
+        self.push_screen(RefsScreen(
+            list(self.status.refs) if self.status else [],
+            lambda path: self._ref_update(True, path),
+            lambda path: self._ref_update(False, path),
+        ))
+
+    def _sync_refs_screen(self) -> None:
+        """Keep an open RefsScreen in step with the session's status."""
+        if isinstance(self.screen, RefsScreen):
+            self.screen.set_refs(self.status.refs if self.status else [])
+
+    @work(group="refs", exit_on_error=False)
+    async def _ref_update(self, add: bool, path: str) -> None:
+        if not await self._ensure_session():
+            return
+        command = RefAdd(path=path) if add else RefRemove(path=path)
+        try:
+            result = await self.client.command(self.session_name, command)
+        except ClientError as exc:
+            self._error(str(exc))
+            return
+        if not result.ok:
+            self._error(result.error or "could not update references")
 
     # ------------------------------------------------------------------
     # Theme (client-side preference)
@@ -1295,9 +1387,9 @@ class AgentApp(App[None]):
 
     def _append_item(self, item):
         """Append one transcript item to the FlowModel, registering shimmer
-        animations for the items that have one."""
+        repaints for the items that have one."""
         entry = self._flow_model.append(item)
-        if isinstance(item, (PendingItem, WritingItem)) or (
+        if isinstance(item, PendingItem) or (
             isinstance(item, (ThinkingItem, ToolItem)) and _item_streaming(item)
         ):
             self._start_anim(entry, item)
@@ -1309,9 +1401,9 @@ class AgentApp(App[None]):
             entry.remove()
 
     def _start_anim(self, entry, item) -> None:
-        """Advance the item's shimmer phase while the entry is on screen
-        (FlowView pauses the timer when it scrolls out). The handle is kept
-        on the item itself; ``_stop_anim`` owns stopping it."""
+        """Repaint the shimmering entry while on screen (FlowView pauses the
+        timer offscreen). Phase comes from the shared clock at render time
+        (flow.shimmer_now), so the tick only invalidates."""
         try:
             view = self._flow_view()
         except NoMatches:
@@ -1325,8 +1417,6 @@ class AgentApp(App[None]):
                 self._stop_anim(entry)
                 e.update()
                 return
-            span = len(getattr(item, "label", "Thinking")) + 2 * theme.SHIMMER_BAND_WIDTH
-            item.phase = (item.phase + theme.SHIMMER_SPEED * 0.08) % span
             e.update()
 
         item._anim = view.animate_entry(entry, 0.08, tick)  # type: ignore[attr-defined]
@@ -1369,7 +1459,12 @@ class AgentApp(App[None]):
             self._error("empty response from model")
         if view.thinking is not None:
             view._finish_thinking(event.reasoning_seconds)
-        await view.finish()
+        if event.has_tool_calls:
+            # The turn continues with another round: back to waiting on the
+            # provider — the strip reappears below the settled tool blocks.
+            self._phase_pending()
+        else:
+            self._phase_idle()
         self._refresh_status()
 
     async def _on_history_replaced(self, event: HistoryReplaced) -> None:

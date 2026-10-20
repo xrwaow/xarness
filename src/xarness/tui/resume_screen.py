@@ -5,8 +5,8 @@ listing all **active** sessions across all workspaces, then saved sessions
 for the current workspace. Each row shows the session name, the dimmed age
 of its last user message and — for loaded sessions only — a state dot:
 waiting=accent, running/compacting (active)=success green, idle=the plain
-message gray. Saved (not loaded) sessions show no dot. Both sections sort
-by ``last_user_message_at``, newest first.
+message gray. Saved (not loaded) sessions show no state word. Both sections
+sort by ``last_user_message_at``, newest first.
 
 Filtering rebuilds the OptionList wholesale on every keystroke —
 ``clear_options()`` + ``add_options()`` is cheap and, unlike mounted
@@ -29,14 +29,17 @@ from .. import theme
 from ..protocol import SessionSummary
 from ..util import format_duration
 
-# Row-dot palette key per session state; states not listed here (saved /
-# not loaded) get no dot.
-_DOT_COLORS = {
-    "waiting": "accent",
-    "running": "success",
-    "compacting": "success",
-    "idle": "muted",
+# State word per session state, colored with this palette key; states not
+# listed here (saved / not loaded) get no state word.
+_STATE_WORDS = {
+    "waiting": ("waiting", "accent"),
+    "running": ("running", "success"),
+    "compacting": ("compacting", "success"),
+    "idle": ("idle", "muted"),
 }
+
+# Right-aligned state column: padded to the longest state word.
+_STATE_WIDTH = max(len(word) for word, _ in _STATE_WORDS.values())
 
 
 def _relative_time(iso: str | None) -> str:
@@ -98,13 +101,15 @@ class ResumeScreen(ModalScreen[str | None]):
         self.query_one("#resume-search", Input).focus()
 
     def _row(self, summary: SessionSummary) -> Option:
-        """One row as a single Text: name, dimmed age, state dot."""
+        """One row as a single Text: name, dimmed age, right-aligned state word."""
         row = Text(summary.name)
         row.append(f"  {_relative_time(summary.last_user_message_at)}",
                    style=theme.PALETTE["muted"])
-        dot_key = _DOT_COLORS.get(summary.state)
-        if dot_key is not None:
-            row.append("  ●", style=theme.PALETTE[dot_key])
+        state_word = _STATE_WORDS.get(summary.state)
+        if state_word is not None:
+            word, color_key = state_word
+            row.append("  " + word.rjust(_STATE_WIDTH),
+                       style=theme.PALETTE[color_key])
         return Option(row, id=summary.name)
 
     def _refilter(self, query: str) -> None:

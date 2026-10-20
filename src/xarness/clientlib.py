@@ -109,11 +109,24 @@ class XarnessClient:
         client = cls(http)
         info = await client.health()
         if info.protocol_version != protocol.PROTOCOL_VERSION:
+            # An old host is still running from a previous build. With no
+            # active sessions it is safe to replace it; otherwise tell the
+            # user rather than killing their work.
+            active = []
+            try:
+                active = await client.sessions(active=True)
+            except ClientError:
+                pass
             await http.aclose()
-            raise ClientError(
-                f"protocol version mismatch: host speaks v{info.protocol_version}, "
-                f"this client speaks v{protocol.PROTOCOL_VERSION}"
-            )
+            if active:
+                raise ClientError(
+                    f"host speaks v{info.protocol_version}, this client speaks "
+                    f"v{protocol.PROTOCOL_VERSION}; finish its {len(active)} active "
+                    "session(s) and restart the host"
+                )
+            from .host import stop_host
+            await asyncio.to_thread(stop_host, info.pid, path)
+            return await cls.connect_unix(socket_path, spawn=spawn)
         return client
 
     async def aclose(self) -> None:

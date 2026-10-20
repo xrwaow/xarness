@@ -81,6 +81,10 @@ _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
 # where the workspace bind is read-only.) Agent-facing tool paths keep the
 # workspace-relative '.refs/<alias>' spelling; this is where they land.
 REFS_ANCHOR = "/tmp/refs"
+# Container path the external (no-.git) snapshot store is bound at, when a
+# session tracks a workspace that has no repo of its own. GIT_DIR/GIT_WORK
+# _TREE are set to point here so the agent's read-only git reads work.
+EXTERNAL_GIT_ANCHOR = "/.xarness-snapshot-store"
 _REFS_PREFIX = ".refs"
 
 # Container anchor for shared toolchain state (caches, uv-managed pythons,
@@ -95,6 +99,16 @@ _REFS_PREFIX = ".refs"
 # workspace's own files — .venv/pyvenv.cfg, .git/config — may contain host
 # paths too; that is the user's data.)
 CACHE_ANCHOR = "/cache"
+
+# Container path of the sandbox's own cargo target directory. Cargo records
+# absolute source paths in its build fingerprints, and the host sees the
+# project at its real location (e.g. ~/code/... with ~/.cargo) while the
+# sandbox sees /workspace and /cache/cargo. Sharing ./target makes every
+# registry crate report "Dirty: the path to the source changed" whenever a
+# build switches between host and sandbox, forcing a full rebuild. A
+# sandbox-only target dir keeps the two build graphs (and their absolute
+# paths) disjoint; host builds keep using ./target.
+SANDBOX_CARGO_TARGET_DIR = "/workspace/target-sandbox"
 
 # Host paths bwrap creates as bind mountpoints inside the workspace (a
 # custom ref's target, e.g. a dropped-in ``.venv``). They are empty; removed
@@ -250,6 +264,12 @@ class SandboxConfig:
     # read-only: the agent never commits — the harness checkpoints on the
     # host (gitwork), so only it touches the index and object store.
     git_dir: Path | None = None
+    # External snapshot-store mode (tracked with no .git in the workspace):
+    # git_dir lives outside the workspace by design; bind it at
+    # EXTERNAL_GIT_ANCHOR and point GIT_DIR/GIT_WORK_TREE at it. (A scoped
+    # subtree of a real repo also has its git_dir outside the workspace,
+    # but there it stays unbound — useless to the agent.)
+    git_external: bool = False
 
     def __post_init__(self) -> None:
         if self.use_container and shutil.which("bwrap") is None:
@@ -326,6 +346,7 @@ class SandboxConfig:
                 workspace, settings.auto_include_refs,
             ),
             git_dir=git_info.git_dir if git_info is not None else None,
+            git_external=git_info.external if git_info is not None else False,
         )
 
     @staticmethod
@@ -447,6 +468,13 @@ class SandboxConfig:
             ("npm_config_cache", "npm"),
         ):
             argv += ["--setenv", var, f"{anchor}/{sub}"]
+        # Never share the host's ./target: cargo fingerprints embed absolute
+        # source paths, which differ between the host and the /workspace,
+        # /cache/cargo view inside the container (every registry crate would
+        # be 'Dirty: the path to the source changed' on each switch). The
+        # workspace is bound read-write, so this directory is created on the
+        # first build and persists alongside the user's sources.
+        argv += ["--setenv", "CARGO_TARGET_DIR", SANDBOX_CARGO_TARGET_DIR]
         argv += ["--setenv", "UV_LINK_MODE", "copy"]
         # The shell must not inherit a HOME that names a host path: '~' would
         # point somewhere that looks meaningful but is empty (or, worse, a
@@ -670,17 +698,21 @@ class SandboxConfig:
             # Never bound at its host path: that destination would make
             # bwrap recreate /home/<user>/... inside the container, leaking
             # the host layout and giving the agent a fake project root.
-            # Only bindable when it lives inside the mounted workspace: when
-            # the workspace is a subtree of a bigger repo, the git dir is
-            # outside the mount — and useless to the agent anyway, since it
-            # isn't an ancestor of /workspace — so skip it.
-            try:
-                rel_git = self.git_dir.relative_to(self.workspace)
-            except ValueError:
-                pass
+            if self.git_external:
+                # External snapshot store (tracked-with-no-.git mode): bind
+                # at a fixed anchor and point git at it explicitly, so the
+                # agent's read-only git status/diff see the tracked state.
+                argv += ["--ro-bind", str(self.git_dir), EXTERNAL_GIT_ANCHOR]
+                argv += ["--setenv", "GIT_DIR", EXTERNAL_GIT_ANCHOR]
+                argv += ["--setenv", "GIT_WORK_TREE", "/workspace"]
             else:
-                argv += ["--ro-bind", str(self.git_dir),
-                         f"{self.tool_root}/{rel_git}"]
+                try:
+                    rel_git = self.git_dir.relative_to(self.workspace)
+                except ValueError:
+                    pass  # scoped subtree of a bigger repo: unbindable, useless
+                else:
+                    argv += ["--ro-bind", str(self.git_dir),
+                             f"{self.tool_root}/{rel_git}"]
         argv += self._cache_binds_and_env()
         argv += self._ref_binds()
         argv += ["--chdir", chdir, "--unshare-all"]

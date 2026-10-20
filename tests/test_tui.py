@@ -363,6 +363,52 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.is_running)
 
 
+class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
+    """The /refs manager lists container mounts (`.refs/<alias>`) and
+    dispatches add/remove without ever touching the worktree."""
+
+    async def test_lists_mounts_and_dispatches_remove(self) -> None:
+        from xarness.protocol import RefInfo
+        from xarness.tui.app import AgentApp
+        from xarness.tui.refs_screen import RefsScreen
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            added: list[str] = []
+            removed: list[str] = []
+            refs = [RefInfo(path="/tmp/notes.md", mount=".refs/notes.md")]
+            app.push_screen(RefsScreen(refs, added.append, removed.append))
+            await pilot.pause()
+            screen = app.screen
+            self.assertIsInstance(screen, RefsScreen)
+            # The dimmed line is the container path the model uses; the
+            # worktree never gets a .refs directory.
+            self.assertEqual(screen._refs, refs)
+            await pilot.click("#refs-remove-0")
+            await pilot.pause()
+            self.assertEqual(removed, ["/tmp/notes.md"])
+            # Typing a path in the input dispatches an add.
+            for key in "/tmp/other.md":
+                await pilot.press(key)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(added, ["/tmp/other.md"])
+
+    async def test_slash_command_opens_the_manager(self) -> None:
+        from xarness.tui.app import AgentApp
+        from xarness.tui.refs_screen import RefsScreen
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._handle_slash_command("/refs")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, RefsScreen)
+
+
 class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
     """The pump attaches to the session by name; reconnects always deliver
     a fresh Snapshot (which re-renders the history exactly once — the
@@ -439,9 +485,10 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
-    """Session popup rows: {title} {age}, with a state dot on the right for
-    loaded sessions — waiting=accent, running/compacting=success, idle=muted;
-    saved (not loaded) rows show no dot at all."""
+    """Session popup rows: {title} {age}, with a right-aligned state word
+    (padded to the longest state word) for loaded sessions — waiting=accent,
+    running/compacting=success, idle=muted; saved (not loaded) rows show no
+    state word at all."""
 
     def _summaries(self):
         def s(name, state, active, attached=0):
@@ -457,18 +504,18 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             s("saved-one", "saved", False),
         ]
 
-    def test_dot_color_per_state(self) -> None:
-        from xarness.tui.resume_screen import _DOT_COLORS
+    def test_state_word_color_per_state(self) -> None:
+        from xarness.tui.resume_screen import _STATE_WORDS
         from xarness import theme
         expected = {
             "waiting": "accent", "running": "success",
             "compacting": "success", "idle": "muted",
         }
         for state, key in expected.items():
-            self.assertEqual(_DOT_COLORS.get(state), key)
+            self.assertEqual(_STATE_WORDS.get(state), (state, key))
             self.assertIn(key, theme.PALETTE)
-        # Saved / not loaded sessions show no dot at all.
-        self.assertIsNone(_DOT_COLORS.get("saved"))
+        # Saved / not loaded sessions show no state word at all.
+        self.assertIsNone(_STATE_WORDS.get("saved"))
 
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
@@ -490,9 +537,20 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 for i in range(option_list.option_count)
             ]
             self.assertEqual(len(prompts), 5)
-            # Only loaded sessions get a dot; saved-one shows none.
-            dotted = sum("●" in p for p in prompts)
-            self.assertEqual(dotted, 4)
+            # Only loaded sessions get a state word; saved-one shows none.
+            from xarness.tui.resume_screen import _STATE_WIDTH
+            for state, name in (("waiting", "waiting-one"),
+                                ("running", "running-one"),
+                                ("compacting", "compacting-one"),
+                                ("idle", "idle-one")):
+                row = next(p for p in prompts if name in p)
+                # State word is right-aligned: padded to the column width.
+                self.assertIn(state.rjust(_STATE_WIDTH), row,
+                              f"{name} missing right-aligned '{state}'")
+            saved_row = next(p for p in prompts if "saved-one" in p)
+            self.assertFalse(
+                any(state.rjust(_STATE_WIDTH) in saved_row
+                    for state in ("waiting", "running", "compacting", "idle")))
             for name in ("waiting-one", "running-one", "compacting-one",
                          "idle-one", "saved-one"):
                 self.assertTrue(
@@ -555,10 +613,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             )
             client.snapshot_data = snap
             await app._attach("other")
-            self.assertTrue(
-                any("/other/ws" in t for t in written),
-                f"title not updated on attach: {written}",
-            )
+            self.assertIn("xarness ws", written, f"title not updated on attach: {written}")
             written.clear()
             app._detach()
             self.assertTrue(written, "title not restored on detach")
@@ -568,6 +623,54 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             await script(pilot, client, app)
+
+    async def test_finished_suffix_clears_when_the_next_turn_starts(self) -> None:
+        from xarness.events import ProcessingStarted
+        from xarness.protocol import TurnFinished
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            written: list[str] = []
+            app._set_terminal_title = written.append  # type: ignore[method-assign]
+            snap = make_snapshot()
+            object.__setattr__(
+                snap, "status",
+                StatusPayload(
+                    state="idle", session_name="other",
+                    workspace="/workspace/projects/xarness",
+                    mode="write", model_name="m", model_display_name="m", model_id="m",
+                ),
+            )
+            client.snapshot_data = snap
+            await app._attach("other")
+            self.assertEqual(written[-1], "xarness xarness")
+
+            await app._handle_event(TurnFinished(elapsed=1.0, summary=""))
+            self.assertEqual(written[-1], "xarness xarness - finished")
+
+            # A new round/turn clears the stale suffix.
+            await app._handle_event(ProcessingStarted())
+            self.assertEqual(written[-1], "xarness xarness")
+
+
+class TerminalTitlePathTest(unittest.IsolatedAsyncioTestCase):
+    """The tab title uses the workspace's own directory name, never a
+    cropped multi-component path: ``/workspace/projects/xarness`` and
+    ``/home/me/xarness`` must both read ``xarness xarness``."""
+
+    async def test_title_for_uses_the_last_path_component(self) -> None:
+        from xarness.tui.app import AgentApp
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app._title_for("/workspace/projects/xarness"), "xarness")
+            self.assertEqual(app._title_for("/home/me/larkspur"), "larkspur")
+            self.assertEqual(app._title_for("/home/me/larkspur/"), "larkspur")
+            self.assertEqual(app._title_for("/"), "/")
 
 
 class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
@@ -612,12 +715,23 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
+            # The call starts waiting: pending strip first, then the tool's
+            # Running shimmer replaces it (one ToolItem per call, created at
+            # ToolCallStarted; streamed args accumulate in it).
+            q.put_nowait(protocol.ProcessingStarted())
+            await pilot.pause()
+            self.assertTrue([e for e in app._flow_model.entries
+                             if isinstance(e.item, tflow.PendingItem)])
+            self.assertEqual(app._phase, "pending")
             q.put_nowait(protocol.ToolCallStarted(call_id="c1", name="read_file"))
             q.put_nowait(protocol.ToolCallArgumentsDelta(call_id="c1", text='{"f"'))
             await pilot.pause()
             await pilot.pause()
-            self.assertTrue([e for e in app._flow_model.entries
-                             if isinstance(e.item, tflow.WritingItem)])
+            blocks = [e for e in app._flow_model.entries
+                      if isinstance(e.item, tflow.ToolItem)]
+            self.assertEqual(len(blocks), 1)
+            self.assertEqual(blocks[0].item.args, '{"f"')
+            self.assertIsNone(app._pending_entry, "strip outlived the first content")
             q.put_nowait(protocol.Notice(text="interrupted", level="error"))
             q.put_nowait(protocol.StatusChanged(
                 status=StatusPayload(
@@ -626,14 +740,36 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                 )
             ))
             await pilot.pause()
+            # The half-streamed call settles as failed — no eternal shimmer.
+            self.assertEqual(blocks[0].item.status, ToolCallStatus.CALL_FAILED)
+            self.assertEqual(app._phase, "idle")
             self.assertFalse(
                 [e for e in app._flow_model.entries
-                 if isinstance(e.item, tflow.WritingItem) and e.alive],
-                "tool-writing shimmer outlived the interrupt")
-            # A half-streamed call never reached ArgumentsDone, so no
-            # ToolItem exists — the shimmer was the only artifact.
+                 if isinstance(e.item, tflow.PendingItem) and e.alive],
+                "pending strip outlived the interrupt")
+
+    async def test_pending_strip_reappears_between_tool_rounds(self) -> None:
+        """After a round ends with tool calls, the strip is back while the
+        next round waits on the provider — then goes away on first delta."""
+        from xarness.tui.app import AgentApp
+
+        async def script(pilot: Pilot, client: FakeClient, app):
+            q = client.queue
+            q.put_nowait(protocol.ProcessingStarted())
+            q.put_nowait(protocol.ContentDelta(text="hi"))
+            q.put_nowait(protocol.TurnComplete(has_tool_calls=True))
+            await pilot.pause()
+            self.assertTrue([e for e in app._flow_model.entries
+                             if isinstance(e.item, tflow.PendingItem)])
+            self.assertEqual(app._phase, "pending")
+            q.put_nowait(protocol.ContentDelta(text="again"))
+            await pilot.pause()
+            self.assertEqual(app._phase, "streaming")
             self.assertFalse([e for e in app._flow_model.entries
-                              if isinstance(e.item, tflow.ToolItem)])
+                              if isinstance(e.item, tflow.PendingItem) and e.alive])
+            q.put_nowait(protocol.TurnComplete(has_tool_calls=False))
+            await pilot.pause()
+            self.assertEqual(app._phase, "idle")
 
         client = FakeClient(make_snapshot(state="running"))
         app = AgentApp(client, workspace=None, session_name="s1")
@@ -825,6 +961,54 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
             # Draft state is spent.
             self.assertEqual(app._draft_mode, "write")
 
+    async def test_draft_model_switch_updates_status_before_message(self) -> None:
+        """Picking a model in a draft chat repaints the status bar right
+        away (and remembers the choice for the first message), rather than
+        leaving the old default until a message creates the session."""
+        from xarness.tui.app import AgentApp
+
+        snap = make_snapshot()
+        client = FakeClient(snap)
+
+        async def config():
+            return protocol.ConfigInfo(
+                models=[
+                    {"name": "glm-flash", "display_name": "GLM Flash"},
+                    {"name": "other", "display_name": "Other Model",
+                     "cot_strength": "high", "max_context": 200_000},
+                ],
+                sandboxes=[{"name": "default"}],
+                presets=["default"], themes=[],
+                default_model="glm-flash",
+                default_model_display_name="GLM Flash",
+            )
+
+        client.config = config
+        # config_path=None keeps the preference save off the real config file.
+        app = AgentApp(client, workspace=None, session_name=None, config_path=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            bar = app.query_one("#status-bar")
+            self.assertIn("GLM Flash", str(bar.render()))
+
+            async def pick(names, current=None, title=""):
+                return "other"
+
+            app._pick = pick
+            worker = app._pick_model()
+            await worker.wait()
+            await pilot.pause()
+
+            # No session exists, so nothing was sent to the host...
+            self.assertEqual(app.session_name, None)
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "switch_model"], [])
+            # ...but the header already shows the picked model, and the
+            # first message will create the session on it.
+            self.assertEqual(app.model, "other")
+            self.assertIn("Other Model", str(bar.render()))
+
 
 class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
     """Reloaded history must mount no shimmer at all (the block arrives
@@ -982,3 +1166,53 @@ class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
             )
 
 
+
+
+class DiffSummaryIncrementalTest(unittest.IsolatedAsyncioTestCase):
+    """Refreshing the pending-changes panel must reconcile rows, not tear the
+    whole list down and remount it on every tool finish."""
+
+    async def test_same_files_update_in_place_and_add_remove_reconcile(self) -> None:
+        from xarness.protocol import DiffFileInfo, DiffInfo
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import DiffSummary
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            summary = app.query_one("#diff-summary", DiffSummary)
+
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=2, deletions=1, source="agent"),
+            ]))
+            first_row = next(iter(summary.query(".diff-file-row")))
+            first_row.add_class("active")
+
+            # Same file, new counts + source: the row object survives and its
+            # values are updated in place (the active highlight too).
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
+            ]))
+            rows = list(summary.query(".diff-file-row"))
+            self.assertIs(rows[0], first_row)
+            self.assertTrue(first_row.has_class("active"))
+            self.assertIn("+9", first_row.query_one(".diff-file-add").render().plain)
+            self.assertIn("drift", first_row.query_one(".diff-file-source").render().plain)
+
+            # A new file mounts one extra row; the existing row is untouched.
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
+                DiffFileInfo(path="b.py", additions=1, deletions=0, is_new=True, source="agent"),
+            ]))
+            rows = list(summary.query(".diff-file-row"))
+            self.assertEqual(len(rows), 2)
+            self.assertIs(rows[0], first_row)
+            self.assertIn("new", rows[1].query_one(".diff-file-new").render().plain)
+
+            # Dropping a file removes exactly its row.
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
+            ]))
+            rows = list(summary.query(".diff-file-row"))
+            self.assertEqual(len(rows), 1)
+            self.assertIs(rows[0], first_row)

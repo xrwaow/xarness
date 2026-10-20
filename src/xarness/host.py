@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -155,7 +156,16 @@ class Host:
             raise SessionError(str(exc)) from exc
         ws = Path(workspace).expanduser().resolve() if workspace else Path.cwd()
         if not ws.exists():
-            raise SessionError(f"workspace does not exist: {ws}")
+            # A new workspace is a fine thing to start a session on: create
+            # it (mkdir -p) instead of refusing — a failed mkdir surfaces as
+            # the session-start error, so permission problems still show.
+            try:
+                ws.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SessionError(
+                    f"workspace does not exist and could not be created "
+                    f"({exc}): {ws}"
+                ) from None
 
         preset_name = preset or sectioned.default_preset
         preset_settings = sectioned.presets.get(preset_name)
@@ -174,6 +184,16 @@ class Host:
         if saved_sandbox_settings is not None:
             settings = SandboxSettings.model_validate(saved_sandbox_settings)
             sandbox_key = saved_sandbox_name or sandbox_key
+        else:
+            # References are per workspace: seed a new session with the
+            # paths every session in this directory should see.
+            workspace_refs = session_store.load_workspace_refs(str(ws))
+            if workspace_refs:
+                settings = settings.model_copy(update={
+                    "auto_include_refs": [
+                        *settings.auto_include_refs, *workspace_refs,
+                    ],
+                })
         # Tri-state CLI overrides (--network/--gpu): the flag wins over the
         # sandbox profile when given.
         if network is not None or gpu is not None:
@@ -677,6 +697,27 @@ def _wait_for_socket(timeout: float) -> None:
             return
         time.sleep(0.1)
     raise TimeoutError(f"host socket did not appear within {timeout}s: {SOCKET_PATH}")
+
+
+def stop_host(
+    pid: int, socket_path: Path = SOCKET_PATH, timeout: float = SPAWN_TIMEOUT,
+) -> None:
+    """Terminate a stale host and wait for its socket to disappear.
+
+    Used when a client finds a host speaking an older protocol: with no
+    active sessions, the old process is replaced so the next connect gets
+    the current command set."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _socket_alive_at(socket_path):
+            socket_path.unlink(missing_ok=True)
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"stale host (pid {pid}) did not exit within {timeout}s")
 
 
 def run_foreground() -> None:

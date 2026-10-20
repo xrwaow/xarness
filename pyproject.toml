@@ -17,7 +17,7 @@ dependencies = [
     "pillow>=10.0",
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "textual-flowview",
+    "textual-flowview @ git+https://github.com/tya5/textual-flowview.git",
 ]
 
 [project.optional-dependencies]
@@ -28,11 +28,12 @@ dev = [
 [project.scripts]
 xarness = "xarness.cli:main"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/xarness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.uv.sources]
-textual-flowview = { git = "https://github.com/tya5/textual-flowview.git" }

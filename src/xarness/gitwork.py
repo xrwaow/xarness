@@ -33,6 +33,7 @@ not refs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import shlex
@@ -65,6 +66,9 @@ class RepoInfo:
 
     root: Path
     git_common_dir: Path  # shared .git dir — bound into the sandbox read-write
+    # Tracked-with-no-.git mode: the git dir lives outside the workspace and
+    # every git call sets GIT_DIR/GIT_WORK_TREE explicitly.
+    external: bool = False
 
 
 @dataclass(slots=True)
@@ -88,6 +92,17 @@ class GitInfo:
     # the worktree's .gitignore), so what /diff and /undo track is pinned for
     # the whole session.
     ignored_paths: tuple[str, ...] = ()
+    external: bool = False
+
+    def git_env(self, **extra: str) -> dict[str, str]:
+        """Env for a git subprocess: external mode addresses the store via
+        GIT_DIR/GIT_WORK_TREE; otherwise cwd picks up the worktree's .git."""
+        env = {**os.environ}
+        if self.external:
+            env["GIT_DIR"] = str(self.git_dir)
+            env["GIT_WORK_TREE"] = str(self.workspace)
+        env.update(extra)
+        return env
 
     @property
     def agent_workspace(self) -> Path:
@@ -111,6 +126,7 @@ class GitInfo:
             subtree=block.get("subtree", ""),
             baseline_tree=block.get("baseline_tree", ""),
             ignored_paths=tuple(block.get("ignored_paths", ())),
+            external=block.get("external", False),
         )
 
 
@@ -180,26 +196,36 @@ async def detect_repo(path: Path) -> RepoInfo | None:
     )
 
 
-async def init_managed_repo(workspace: Path) -> RepoInfo:
-    """``git init`` a workspace that has no repo, so change tracking works
-    with zero setup from the user.
+def _managed_store_dir(workspace: Path) -> Path:
+    """Xarness-owned git dir for ``workspace``, outside the workspace so
+    tracking a gitless directory never drops a ``.git`` into it. Keyed on
+    the resolved path (snapshots are content-addressed trees, no refs, so
+    reuse is harmless)."""
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    key = hashlib.sha1(str(workspace).encode()).hexdigest()[:16]
+    return Path(state) / "xarness" / "repos" / key
 
-    This only creates ``.git/`` — the user's files are not touched. The repo
-    is marked ``xarness.managed`` so it's identifiable later. If the user
-    runs their own ``git init`` afterwards it's a no-op; if they already had
-    a repo we never get here.
-    """
+
+async def init_external_repo(workspace: Path) -> RepoInfo:
+    """Track a workspace that has no repo WITHOUT creating ``.git`` in it:
+    init a store under xarness's state dir; later calls address it via
+    :meth:`GitInfo.git_env`. The store only ever holds unreachable trees."""
     workspace = Path(workspace).resolve()
-    rc, _, err = await _run_git(["init", "-q", "-b", "main"], cwd=workspace)
+    store = _managed_store_dir(workspace)
+    store.mkdir(parents=True, exist_ok=True)
+    rc, _, err = await _run_git(["init", "-q", "-b", "main"], cwd=store)
     if rc != 0:  # older git without -b
-        rc, _, err = await _run_git(["init", "-q"], cwd=workspace)
+        rc, _, err = await _run_git(["init", "-q"], cwd=store)
     if rc != 0:
-        raise GitWorktreeError(f"could not initialize a git repo in {workspace}: {err.strip()}")
-    await _run_git(["config", "xarness.managed", "true"], cwd=workspace)
-    repo = await detect_repo(workspace)
-    if repo is None:  # pragma: no cover — init just succeeded
-        raise GitWorktreeError(f"repo detection failed right after git init in {workspace}")
-    return repo
+        raise GitWorktreeError(
+            f"could not initialize the snapshot store for {workspace}: {err.strip()}"
+        )
+    git_dir = store / ".git"
+    await _run_git(
+        ["config", "xarness.managed", "true"],
+        cwd=store, env={**os.environ, "GIT_DIR": str(git_dir)},
+    )
+    return RepoInfo(root=workspace, git_common_dir=git_dir, external=True)
 
 
 # ----------------------------------------------------------------------
@@ -225,21 +251,73 @@ def _temp_index():
             pass
 
 
-async def _git_ignored_paths(root: Path) -> tuple[str, ...]:
+async def _git_ignored_paths(
+    root: Path, env: dict[str, str] | None = None,
+) -> tuple[str, ...]:
     """Repo-root-relative paths the repo's ignore rules flag at a moment in
     time (directories collapsed to single entries), for pinning snapshot
     semantics in :class:`GitInfo`. Empty when git can't answer."""
     rc, out, _ = await _run_git(
         ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
-        cwd=root,
+        cwd=root, env=env,
     )
     if rc != 0:
         return ()
     return tuple(line.rstrip("/") for line in out.splitlines() if line)
 
 
+# File types snapshots never track (noise diffs, store bloat) — applied as
+# exclude pathspecs on every snapshot, no pinning needed.
+_UNTRACKED_EXTS: tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico", ".icns",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mp3", ".wav", ".flac", ".ogg",
+    ".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".iso",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".class", ".jar", ".o", ".a",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".db", ".sqlite", ".sqlite3", ".psd", ".blend", ".pyc",
+)
+
+# Files larger than this are excluded from tracking (snapshots/diffs/undo).
+_MAX_TRACKED_SIZE = 1024 * 1024
+
+
+def _oversized_paths(
+    root: Path, subtree: str, ignored: Iterable[str],
+    limit: int = _MAX_TRACKED_SIZE,
+) -> tuple[str, ...]:
+    """Repo-root-relative paths of files over ``limit`` bytes, pinned into
+    the session's exclusion set (so mid-session growth past the limit keeps
+    the semantics of one that started large). Best-effort walk of the scoped
+    subtree, skipping pinned dirs and symlinks."""
+    base = root / subtree if subtree else root
+    skip_dirs = {p for p in ignored if (root / p).is_dir()}
+    oversized: list[str] = []
+    stack = [base]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            rel = Path(entry.path).relative_to(root).as_posix()
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                if rel not in skip_dirs and rel != ".git":
+                    stack.append(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                try:
+                    if entry.stat(follow_symlinks=False).st_size > limit:
+                        oversized.append(rel)
+                except OSError:
+                    pass
+    return tuple(sorted(oversized))
+
+
 async def snapshot_tree(
-    root: Path, subtree: str = "", exclude: Iterable[str] = ()
+    root: Path, subtree: str = "", exclude: Iterable[str] = (),
+    env_base: dict[str, str] | None = None,
 ) -> str:
     """Tree sha capturing the workspace's *current* state.
 
@@ -249,17 +327,18 @@ async def snapshot_tree(
     a tree object. Ignored files are excluded — they are not reverted by
     /undo and don't show in /diff, matching classic git semantics.
 
-    Exclusion is two-layered: git's own ignore rules apply as always, and
-    ``exclude`` (repo-root-relative paths captured at session start) is
-    passed as explicit negative pathspecs — so mid-session edits to
-    .gitignore files cannot change what snapshots track.
+    Exclusion is three-layered: git's own ignore rules; ``exclude``
+    (session-start paths, pinned as explicit pathspecs so mid-session
+    .gitignore edits can't change what's tracked); and the always-on
+    :data:`_UNTRACKED_EXTS` media/binary excludes.
 
     With ``subtree`` (repo-root relative), only that subtree is captured;
-    the resulting tree's paths are still repo-root relative.
+    paths stay repo-root relative. ``env_base`` carries GIT_DIR/
+    GIT_WORK_TREE for external snapshot stores.
     """
     root = Path(root).resolve()
     with _temp_index() as index:
-        env = {**os.environ, "GIT_INDEX_FILE": index}
+        env = {**(env_base if env_base is not None else os.environ), "GIT_INDEX_FILE": index}
         args = ["add", "-A"]
         pathspecs: list[str] = []
         if subtree:
@@ -272,6 +351,8 @@ async def snapshot_tree(
         for p in exclude:
             kind = "/**" if (root / p).is_dir() and not (root / p).is_symlink() else ""
             pathspecs.append(f":(exclude,glob)**/{p}{kind}")
+        for ext in _UNTRACKED_EXTS:
+            pathspecs.append(f":(exclude,glob)**/*{ext}")
         if pathspecs:
             args += ["--", *pathspecs]
         rc, _, err = await _run_git(args, cwd=root, env=env)
@@ -303,10 +384,11 @@ async def setup_tracking(
     if repo is None:
         if not allow_init:
             return None, notes
-        repo = await init_managed_repo(workspace)
+        repo = await init_external_repo(workspace)
         notes.append(
-            "no git repo here — initialized one (files untouched) so the "
-            "agent's changes can be tracked and undone"
+            "no git repo here — tracking changes with a private snapshot "
+            "store (no .git created) so the agent's changes can be "
+            "tracked and undone"
         )
     subtree = ""
     if repo.root != workspace:
@@ -320,10 +402,24 @@ async def setup_tracking(
             "(the rest of the repo isn't mounted in the sandbox and is "
             "never touched by diffs or reverts)"
         )
+    # External store: explicit GIT_DIR/GIT_WORK_TREE for the setup-time git
+    # calls (later calls go through GitInfo.git_env).
+    env = (
+        {**os.environ, "GIT_DIR": str(repo.git_common_dir),
+         "GIT_WORK_TREE": str(repo.root)}
+        if repo.external else None
+    )
     # Pin what snapshots track up front so ignore rules are not re-read
     # per snapshot (mid-session .gitignore edits stay out of the picture).
-    ignored = await _git_ignored_paths(repo.root)
-    baseline = await snapshot_tree(repo.root, subtree, exclude=ignored)
+    ignored = await _git_ignored_paths(repo.root, env=env)
+    oversized = _oversized_paths(repo.root, subtree, ignored)
+    ignored = (*ignored, *oversized)
+    if oversized:
+        notes.append(
+            f"{len(oversized)} file(s) over 1 MB are not tracked "
+            "(excluded from /diff and /undo)"
+        )
+    baseline = await snapshot_tree(repo.root, subtree, exclude=ignored, env_base=env)
     info = GitInfo(
         session_id=session_id,
         workspace=repo.root,
@@ -331,6 +427,7 @@ async def setup_tracking(
         subtree=subtree,
         baseline_tree=baseline,
         ignored_paths=ignored,
+        external=repo.external,
     )
     notes.append(f"tracking edits to {info.agent_workspace} with git snapshots")
     return info, notes
@@ -343,7 +440,10 @@ async def setup_tracking(
 async def snapshot_state(info: GitInfo) -> str:
     """:func:`snapshot_tree` for a session's workspace, with its pinned
     ignore exclusions applied."""
-    return await snapshot_tree(info.workspace, info.subtree, exclude=info.ignored_paths)
+    return await snapshot_tree(
+        info.workspace, info.subtree, exclude=info.ignored_paths,
+        env_base=info.git_env(),
+    )
 
 
 async def accept_changes(info: GitInfo) -> str:
@@ -376,13 +476,15 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
     re-snapshot. Only reverts files — anything run_bash did outside the
     workspace (installs, background jobs, network calls) is not undone."""
     root = info.workspace
+    env = info.git_env()
     if current is None:
         current = await snapshot_state(info)
 
     # Paths present now but absent in the target: created since the
     # checkpoint. diff-tree current→tree reports them as deletions (D).
     rc, out, err = await _run_git(
-        ["diff-tree", "-r", "--name-only", "--diff-filter=D", current, tree], cwd=root
+        ["diff-tree", "-r", "--name-only", "--diff-filter=D", current, tree],
+        cwd=root, env=env,
     )
     if rc != 0:
         raise GitWorktreeError(f"could not compare against the checkpoint: {err.strip()}")
@@ -397,7 +499,7 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
 
     # Write the target tree's files back over the working tree.
     with _temp_index() as index:
-        env = {**os.environ, "GIT_INDEX_FILE": index}
+        env = info.git_env(GIT_INDEX_FILE=index)
         rc, _, err = await _run_git(["read-tree", tree], cwd=root, env=env)
         if rc != 0:
             raise GitWorktreeError(
@@ -410,7 +512,7 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
             )
 
 
-async def _wrap_commit(root: Path, tree: str, parent: str | None = None) -> str:
+async def _wrap_commit(info: GitInfo, tree: str, parent: str | None = None) -> str:
     """Wrap a bare tree sha in a throwaway, unreachable commit object.
 
     ``git merge-tree`` operates on commit-ish, not bare trees, so a snapshot
@@ -420,17 +522,16 @@ async def _wrap_commit(root: Path, tree: str, parent: str | None = None) -> str:
     supplied via the environment so this works in a repo with no
     ``user.name``/``user.email`` configured.
     """
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "xarness",
-        "GIT_AUTHOR_EMAIL": "xarness@localhost",
-        "GIT_COMMITTER_NAME": "xarness",
-        "GIT_COMMITTER_EMAIL": "xarness@localhost",
-    }
+    env = info.git_env(
+        GIT_AUTHOR_NAME="xarness",
+        GIT_AUTHOR_EMAIL="xarness@localhost",
+        GIT_COMMITTER_NAME="xarness",
+        GIT_COMMITTER_EMAIL="xarness@localhost",
+    )
     args = ["commit-tree", tree, "-m", "checkpoint"]
     if parent:
         args += ["-p", parent]
-    rc, out, err = await _run_git(args, cwd=root, env=env)
+    rc, out, err = await _run_git(args, cwd=info.workspace, env=env)
     if rc != 0:
         raise GitWorktreeError(f"could not wrap checkpoint: {err.strip()}")
     return out.strip()
@@ -481,13 +582,13 @@ async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str |
     root = info.workspace
     current_tree = await snapshot_state(info)
 
-    base = await _wrap_commit(root, after_tree)     # state right after the turn
-    theirs = await _wrap_commit(root, before_tree)  # target: state before the turn
-    ours = await _wrap_commit(root, current_tree)   # live now, incl. manual edits
+    base = await _wrap_commit(info, after_tree)     # state right after the turn
+    theirs = await _wrap_commit(info, before_tree)  # target: state before the turn
+    ours = await _wrap_commit(info, current_tree)   # live now, incl. manual edits
 
     rc, out, err = await _run_git(
         ["merge-tree", "--write-tree", f"--merge-base={base}", ours, theirs],
-        cwd=root,
+        cwd=root, env=info.git_env(),
     )
     if rc != 0:
         # Conflict: merge-tree still prints a (conflict-marked) tree, but we
@@ -543,6 +644,7 @@ async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra
     rc, out, err = await _run_git(
         [*args, *extra],
         cwd=root / info.subtree if info.subtree else root,
+        env=info.git_env(),
     )
     if rc != 0:
         raise GitWorktreeError(f"git diff failed: {err.strip()}")
@@ -641,7 +743,10 @@ async def diff_stat(info: GitInfo) -> DiffInfo:
     return await tree_diff_stat(info, info.baseline_tree, await snapshot_state(info))
 
 
-async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> DiffInfo:
+async def attributed_diff_stat(
+    info: GitInfo, turns: list[TurnCheckpoint],
+    open_before: str | None = None,
+) -> DiffInfo:
     """Pending changes since ``baseline_tree``, tagged by source.
 
     ``baseline_tree`` only ever moves via :func:`accept_changes`, so this is
@@ -650,6 +755,9 @@ async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> Di
     in between. Turn diffs are used only to *tag* paths within that total as
     agent-caused; anything else in the total is drift (made outside the
     session — manual edits, or edits from a prior harness run).
+
+    ``open_before`` is the still-open turn's before tree: without it the
+    in-flight turn's edits would show as drift until end of streaming.
     """
     current = await snapshot_state(info)
     total = await tree_diff_stat(info, info.baseline_tree, current)
@@ -657,6 +765,9 @@ async def attributed_diff_stat(info: GitInfo, turns: list[TurnCheckpoint]) -> Di
     agent_touched: set[str] = set()
     for turn in turns:
         for f in (await tree_diff_stat(info, turn.before_tree, turn.after_tree)).files:
+            agent_touched.add(f.path)
+    if open_before:
+        for f in (await tree_diff_stat(info, open_before, current)).files:
             agent_touched.add(f.path)
 
     for f in total.files:

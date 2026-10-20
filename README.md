@@ -302,6 +302,7 @@ xarness --network false --gpu false  # fully offline, no device access
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
+| `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `.refs/<alias>` (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
 | `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |

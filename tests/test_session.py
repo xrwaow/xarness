@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from xarness import protocol, session_store
+from xarness import gitwork, protocol, session_store
 from xarness.config import ProviderProfile
 from xarness.conversation import Message, turn_time_summary
 from xarness.events import (
@@ -13,7 +13,7 @@ from xarness.events import (
     ToolCallArgumentsDone, ToolCallStarted, TurnComplete, Usage,
 )
 from xarness.protocol import (
-    AnswerAsk, Cancel, Compact, Retry, SendMessage, Undo, UndoTo,
+    Accept, AnswerAsk, Cancel, Compact, Reject, Retry, SendMessage, Undo, UndoTo,
 )
 from xarness.session import Session
 from xarness.tools import ToolRegistry, ToolResult, tool
@@ -655,6 +655,41 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
+    """Refs added via the command bind read-only under .refs/<alias> and are
+    persisted per workspace; a missing path is rejected and nothing is
+    created in the worktree (or at .refs)."""
+    from xarness import session_store
+    from xarness.config import SandboxSettings
+
+    monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "workspaces")
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session.sandbox_settings = SandboxSettings()
+    (tmp_path / "spec.md").write_text("x")
+    expected = str((tmp_path / "spec.md").resolve())
+
+    async def go():
+        bad = await session.execute("r0", protocol.RefAdd(path="ghost.md"))
+        assert not bad.ok and "no such path" in (bad.error or "")
+        # Never mkdir a reference (and never create the container anchor).
+        assert not (tmp_path / "ghost.md").exists()
+        assert not (tmp_path / ".refs").exists()
+
+        added = await session.execute("r1", protocol.RefAdd(path="spec.md"))
+        assert added.ok
+        assert session.sandbox_settings.auto_include_refs == [expected]
+        refs = session.status().refs
+        assert [(r.path, r.mount) for r in refs] == [(expected, ".refs/spec.md")]
+        assert session_store.load_workspace_refs(str(tmp_path)) == [expected]
+
+        removed = await session.execute("r2", protocol.RefRemove(path="spec.md"))
+        assert removed.ok
+        assert session.sandbox_settings.auto_include_refs == []
+        assert session_store.load_workspace_refs(str(tmp_path)) == []
+
+    asyncio.run(go())
+
+
 def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
     """After an /undo (a rewrite) an attaching client's snapshot has empty
     turn_events: the history is rendered exactly once — the HistoryReplaced
@@ -873,3 +908,219 @@ def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
     session.conversation.add(Message(role="user", content="hi"))
     session.conversation.add(Message(role="assistant", content="hello"))
     assert turn_time_summary(session.conversation.messages) is None
+
+
+# ----------------------------------------------------------------------
+# mid-turn change attribution (/diff source tags)
+
+
+async def _tracked_session(tmp_path, script, registry=None):
+    """A session with real git snapshot tracking and a system message.
+
+    The tracked workspace is a subdirectory so the (test-local) session
+    files, which live directly under ``tmp_path``, are not themselves
+    tracked as drift."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    info, _notes = await gitwork.setup_tracking(ws, "test", allow_init=True)
+    assert info is not None
+    session = Session(
+        name="test", workspace=ws, profile=PROFILE, profile_name="test",
+        api_key="key", client=FakeClient(script),
+    )
+    if registry is not None:
+        session.tool_registry = registry
+        session.controller.tools = registry
+    session.git_info = info
+    session.controller.git_info = info
+    session.conversation.add(Message(role="system", content="sys"))
+    return session, info
+
+
+def _blocking_edit(tmp_path, name="a.txt"):
+    """An edit tool that writes ``name`` and then blocks, so tests can act
+    while the turn is still generating."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @tool("edit", "edit a file")
+    async def edit(args) -> ToolResult:
+        (tmp_path / name).write_text("agent\n")
+        started.set()
+        await release.wait()
+        return ToolResult(ok=True, output="ok")
+
+    registry = ToolRegistry()
+    registry.register(edit)
+    return registry, started, release
+
+
+def _tool_round(call_id="c1"):
+    return [
+        ToolCallStarted(call_id=call_id, name="edit"),
+        ToolCallArgumentsDone(call_id=call_id, name="edit", arguments_json="{}"),
+        TurnComplete(has_tool_calls=True),
+    ]
+
+
+def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch) -> None:
+    """A mid-turn /accept rewrites the open turn's before tree, but the turn
+    is still open: edits it makes afterwards stay tagged agent, not drift,
+    and it still records its real after tree at the end."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        registry, started, release = _blocking_edit(tmp_path / "ws")
+        session, _info = await _tracked_session(tmp_path, [
+            _tool_round(),
+            [ContentDelta(text="done"), TurnComplete()],
+        ], registry)
+        session.subscribe()
+        await session.execute("s1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        stat = await session.diff_summary()
+        by_path = {f.path: f.source for f in stat.files}
+        assert by_path["a.txt"] == "agent"
+
+        result = await session.execute("acc", Accept())
+        assert result.ok
+        assert session._state == "running"
+
+        # The turn keeps editing after the accept.
+        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        stat = await session.diff_summary()
+        by_path = {f.path: f.source for f in stat.files}
+        assert by_path == {"b.txt": "agent"}, by_path
+
+        release.set()
+        await wait_idle(session)
+
+        stat = await session.diff_summary()
+        by_path = {f.path: f.source for f in stat.files}
+        assert by_path["b.txt"] == "agent"
+        # finish_turn still recorded the open turn's real after tree.
+        turns = session.turn_checkpoints()
+        assert len(turns) == 1 and turns[0].after_tree
+
+    asyncio.run(go())
+
+
+def test_mid_turn_reject_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch) -> None:
+    """Same as the accept case for /reject, which rewrites every checkpoint
+    to the baseline tree."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        registry, started, release = _blocking_edit(tmp_path / "ws")
+        session, _info = await _tracked_session(tmp_path, [
+            _tool_round(),
+            [ContentDelta(text="done"), TurnComplete()],
+        ], registry)
+        session.subscribe()
+        await session.execute("s1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        result = await session.execute("rej", Reject())
+        assert result.ok
+        assert not (tmp_path / "ws" / "a.txt").exists()
+
+        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        stat = await session.diff_summary()
+        by_path = {f.path: f.source for f in stat.files}
+        assert by_path == {"b.txt": "agent"}, by_path
+
+        release.set()
+        await wait_idle(session)
+        turns = session.turn_checkpoints()
+        assert len(turns) == 1 and turns[0].after_tree
+
+    asyncio.run(go())
+
+
+def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -> None:
+    """Compaction moves the open turn's message into compact_snapshot. Its
+    before tree must survive so remaining edits stay agent, and finish_turn
+    must still give it an after tree (so /undo can reverse it)."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        registry, started, release = _blocking_edit(tmp_path / "ws")
+        session, _info = await _tracked_session(tmp_path, [
+            _tool_round(),
+            [ContentDelta(text="done"), TurnComplete()],
+        ], registry)
+        session.subscribe()
+        await session.execute("s1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        async def fake_summarize(_transcript):
+            return "handoff summary", None
+
+        session.controller._summarize = fake_summarize
+        await session.controller.compact()
+        assert session.controller.open_turn_before() is not None
+
+        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        stat = await session.diff_summary()
+        by_path = {f.path: f.source for f in stat.files}
+        assert by_path["a.txt"] == "agent"
+        assert by_path["b.txt"] == "agent"
+
+        release.set()
+        await wait_idle(session)
+
+        # The open turn survived compaction and now has a reversible diff.
+        turns = session.turn_checkpoints()
+        assert len(turns) == 1 and turns[0].after_tree
+        stat = await session.diff_summary()
+        assert {f.path: f.source for f in stat.files}["b.txt"] == "agent"
+
+    asyncio.run(go())
+
+
+def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch) -> None:
+    """If a turn's before-snapshot fails, finish_turn must not write that
+    turn's after tree onto the previous (already closed) turn."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        registry, started, release = _blocking_edit(tmp_path / "ws", "b.txt")
+        session, _info = await _tracked_session(tmp_path, [
+            [ContentDelta(text="first"), TurnComplete()],
+            _tool_round(),
+            [ContentDelta(text="done"), TurnComplete()],
+        ], registry)
+        session.subscribe()
+
+        await session.execute("s1", SendMessage(text="first"))
+        await wait_idle(session)
+        first_turn = session.conversation.messages[1]
+        assert first_turn.role == "user" and first_turn.content == "first"
+        first_after = first_turn.after_tree
+        assert first_after
+
+        async def fail_checkpoint():
+            return None
+
+        session.controller._take_checkpoint = fail_checkpoint
+        await session.execute("s2", SendMessage(text="second"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        # The failing checkpoint means this turn cannot be attributed yet,
+        # but the previous, closed turn must not be touched.
+        assert first_turn.after_tree == first_after
+
+        release.set()
+        await wait_idle(session)
+
+        assert first_turn.after_tree == first_after
+        second_turn = next(
+            m for m in session.conversation.messages
+            if m.role == "user" and m.content == "second"
+        )
+        assert second_turn.checkpoint_sha is None
+        assert second_turn.after_tree is None
+        assert len(session.turn_checkpoints()) == 1
+
+    asyncio.run(go())

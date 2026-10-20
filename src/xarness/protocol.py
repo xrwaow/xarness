@@ -32,7 +32,7 @@ from .events import (
 )
 from .images import ImageAttachment
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # primitives
@@ -60,6 +60,15 @@ class PendingDrift(BaseModel):
     detail: str = ""
 
 
+class RefInfo(BaseModel):
+    """One external reference bound into the sandbox: the host ``path`` and
+    the workspace-relative ``mount`` the model addresses it by (normally
+    ``.refs/<alias>``; nothing is created there in the worktree)."""
+
+    path: str
+    mount: str
+
+
 class StatusPayload(BaseModel):
     """Everything a client needs for its status bar / steer bar / prompts."""
 
@@ -76,6 +85,8 @@ class StatusPayload(BaseModel):
     use_container: bool = True
     enable_tracking: bool = True
     filter_list: list[str] = Field(default_factory=list)
+    # External reference paths currently bound into the sandbox.
+    refs: list[RefInfo] = Field(default_factory=list)
     total_in: int = 0
     total_out: int = 0
     last_in: int = 0
@@ -387,6 +398,16 @@ class FilterRemove(CommandBase):
     path: str
 
 
+class RefAdd(CommandBase):
+    type: Literal["ref_add"] = "ref_add"
+    path: str
+
+
+class RefRemove(CommandBase):
+    type: Literal["ref_remove"] = "ref_remove"
+    path: str
+
+
 Command = Annotated[
     Union[
         SendMessage,
@@ -406,6 +427,8 @@ Command = Annotated[
         SetSandbox,
         FilterAdd,
         FilterRemove,
+        RefAdd,
+        RefRemove,
     ],
     Field(discriminator="type"),
 ]

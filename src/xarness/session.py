@@ -35,13 +35,13 @@ from .config import (
     ConfigError, ProviderProfile, SandboxSettings, load_sectioned, resolve_api_key,
 )
 from .conversation import Conversation, Message, ToolCall
-from .conversation import turn_time_summary
+from .conversation import is_summary, turn_time_summary
 from .controller import ChatController, RollbackPlan
 from .events import Usage
 from .gitwork import (
     GitInfo, GitWorktreeError, RevertConflict, accept_changes,
     attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
-    snapshot_state,
+    snapshot_state, tree_diff_stat,
 )
 from .images import ImageAttachment
 from .prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
@@ -68,6 +68,7 @@ IDLE_ONLY = (
     protocol.Undo, protocol.Retry, protocol.UndoTo, protocol.Compact,
     protocol.SwitchModel, protocol.SetSandbox,
     protocol.FilterAdd, protocol.FilterRemove,
+    protocol.RefAdd, protocol.RefRemove,
 )
 
 
@@ -131,6 +132,9 @@ class Session:
         if sandbox is not None:
             sandbox.read_only = mode != "write"
         self.auto_compact = auto_compact
+        # The usage object the last auto-compaction fired on: never compact
+        # twice on the same round (loop guard).
+        self._compacted_on_usage: Usage | None = None
         # Per-session sandbox settings (resolved at creation from the
         # config's sandbox profiles; fixed except via /sandbox or /filter).
         self.sandbox_name = sandbox_name
@@ -405,6 +409,7 @@ class Session:
                 list(self.sandbox_settings.filter_list)
                 if self.sandbox_settings is not None else []
             ),
+            refs=self._ref_infos(),
             use_container=self.sandbox.use_container if self.sandbox else True,
             enable_tracking=self.git_info is not None,
             total_in=self.controller.usage_total.input_tokens,
@@ -510,6 +515,10 @@ class Session:
                 return await self._cmd_filter(command.path, True)
             case protocol.FilterRemove():
                 return await self._cmd_filter(command.path, False)
+            case protocol.RefAdd():
+                return await self._cmd_ref(command.path, True)
+            case protocol.RefRemove():
+                return await self._cmd_ref(command.path, False)
             case _:
                 raise SessionError(f"unsupported command: {type(command).__name__}")
 
@@ -877,6 +886,80 @@ class Session:
         )
         return _ok(payload={"filter_list": filters})
 
+    # ------------------------------------------------------------------
+    # External references
+
+    def _ref_path(self, entry) -> Path:
+        """Host path of one ``auto_include_refs`` entry (str or RefSpec)."""
+        raw = entry if isinstance(entry, str) else entry.path
+        path = Path(raw).expanduser()
+        return (path if path.is_absolute() else self.workspace / path).resolve()
+
+    def _ref_specs(self) -> list:
+        settings = self.sandbox_settings
+        return list(settings.auto_include_refs) if settings is not None else []
+
+    def _ref_infos(self) -> list[protocol.RefInfo]:
+        """The refs currently bound, for the client's status payload."""
+        external = (
+            self.sandbox.external_refs if self.sandbox is not None
+            else SandboxConfig.resolve_auto_refs(self.workspace, self._ref_specs())
+        )
+        return [
+            protocol.RefInfo(path=str(ref.host), mount=ref.mount)
+            for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
+        ]
+
+    async def _cmd_ref(self, path: str, add: bool) -> CommandResult:
+        """Add/remove an external reference path for this workspace.
+
+        It is bound read-only under the container-only refs tmpfs and saved
+        per workspace. Nothing is ever created in the worktree (or at
+        ``.refs``) — the mount exists only inside the container namespace."""
+        raw = path.strip()
+        settings = self.sandbox_settings
+        if not raw or settings is None:
+            raise SessionError("references need a path and a sandbox")
+        host = self._ref_path(raw)
+
+        specs = self._ref_specs()
+        if add:
+            if not host.exists():
+                # Never mkdir a reference: a typo should fail, not plant a
+                # directory in the user's home or the workspace.
+                raise SessionError(f"no such path: {raw}")
+            if not any(self._ref_path(entry) == host for entry in specs):
+                specs.append(str(host))
+        else:
+            kept = [entry for entry in specs if self._ref_path(entry) != host]
+            if len(kept) == len(specs):
+                raise SessionError(f"no such reference: {raw}")
+            specs = kept
+
+        settings = settings.model_copy(update={"auto_include_refs": specs})
+        await self._apply_sandbox_settings(self.sandbox_name, settings)
+
+        try:
+            saved = session_store.load_workspace_refs(str(self.workspace))
+            if add and str(host) not in saved:
+                saved.append(str(host))
+            elif not add:
+                saved = [ref for ref in saved if self._ref_path(ref) != host]
+            session_store.save_workspace_refs(str(self.workspace), saved)
+        except OSError:
+            pass  # a read-only data dir must not block this session's ref
+
+        self._emit_status()
+        verb = "added to" if add else "removed from"
+        self._emit_notice(
+            f"{host} {verb} the workspace references"
+            + (" — the persistent shell restarted"
+               if self.sandbox_session is not None else "")
+        )
+        return _ok(payload={
+            "refs": [info.model_dump() for info in self._ref_infos()],
+        })
+
     def _resolve_sandbox_profile(self, name: str | None):
         """Resolve a sandbox profile from the config (with inheritance)."""
         if self.config_path is None:
@@ -954,6 +1037,12 @@ class Session:
                 # _set_state would not emit).
                 self._emit_status()
                 if not done_calls:
+                    # Threshold crossed on the model's final round: compact
+                    # and keep the turn going — the model picks the work back
+                    # up from the handoff summary, no user send needed.
+                    if await self._maybe_auto_compact():
+                        stream = self.controller.continue_after_tools()
+                        continue
                     break
                 # Execute the calls this round requested, in stream order.
                 for call in done_calls:
@@ -968,6 +1057,11 @@ class Session:
                 # rounds renders the history only, never a replay of a
                 # round the snapshot already contains.
                 self._turn_events.clear()
+                # Per-round auto-compact: the threshold is checked at every
+                # round boundary (tool results recorded, assistant stamped),
+                # not only when the whole turn ends — a long tool loop must
+                # not overshoot the context window.
+                await self._maybe_auto_compact()
                 stream = self.controller.continue_after_tools()
             # The turn's content is in the history now; the buffer must be
             # empty before TurnFinished, or a client attaching during the
@@ -989,9 +1083,6 @@ class Session:
                 elapsed=time.monotonic() - turn_start,
                 summary=summary or "",
             ))
-            # Auto-compact fires at the turn boundary: the history has no
-            # pending tool calls to break pairing.
-            await self._maybe_auto_compact()
         except asyncio.CancelledError:
             # Keep whatever the model had produced before the interruption.
             if self.controller.save_interrupted_round():
@@ -1103,16 +1194,20 @@ class Session:
 
     def _rewrite_checkpoints(self, sha: str) -> None:
         """Point every turn's checkpoints at ``sha`` (the accepted tree), so
-        /undo //retry can no longer revert file state past an accept."""
-        for message in self.conversation.messages:
-            if message.role == "user" and message.checkpoint_sha is not None:
-                message.checkpoint_sha = sha
-                message.after_tree = sha
-        if self.conversation.compact_snapshot:
-            for message in self.conversation.compact_snapshot:
+        /undo //retry can no longer revert file state past an accept.
+
+        The still-open turn keeps ``after_tree = None``: a mid-turn /accept
+        (or /reject) moves its *before* tree to the accepted state, but
+        finish_turn still has to record where the turn itself ended. Stamping
+        ``after_tree`` here would make the turn look closed, so its remaining
+        edits were tagged drift until the end of streaming."""
+        open_turn = self.controller.open_turn
+        for messages in (self.conversation.messages, self.conversation.compact_snapshot or []):
+            for message in messages:
                 if message.role == "user" and message.checkpoint_sha is not None:
                     message.checkpoint_sha = sha
-                    message.after_tree = sha
+                    if message is not open_turn:
+                        message.after_tree = sha
 
     def turn_checkpoints(self):
         return self.controller.turn_checkpoints()
@@ -1124,7 +1219,10 @@ class Session:
         if info is None:
             return None
         try:
-            return await attributed_diff_stat(info, self.turn_checkpoints())
+            return await attributed_diff_stat(
+                info, self.turn_checkpoints(),
+                open_before=self.controller.open_turn_before(),
+            )
         except GitWorktreeError:
             return None
 
@@ -1150,9 +1248,27 @@ class Session:
         last_known = turns[-1].after_tree if turns else info.baseline_tree
         try:
             current = await snapshot_state(info)
+            if current == last_known:
+                return None
+            # A turn may be generating right now (a client attached or
+            # reconnected mid-turn). Its in-flight edits are not drift: only
+            # report a change if something outside the turn's own
+            # before→current diff also moved.
+            open_before = self.controller.open_turn_before()
+            if open_before is not None:
+                since_open = {
+                    f.path for f in (
+                        await tree_diff_stat(info, open_before, current)
+                    ).files
+                }
+                since_last_known = {
+                    f.path for f in (
+                        await tree_diff_stat(info, last_known, current)
+                    ).files
+                }
+                if since_last_known <= since_open:
+                    return None
         except GitWorktreeError:
-            return None
-        if current == last_known:
             return None
         return last_known, current
 
@@ -1255,9 +1371,21 @@ class Session:
                 pass
             self._persist_task = None
 
-    async def _maybe_auto_compact(self) -> None:
+    async def _maybe_auto_compact(self) -> bool:
+        """Compact when the context nears the window.
+
+        Called at every round boundary (and on the turn's final round), so a
+        long multi-round turn cannot overshoot ``max_context``. Returns True
+        when a compaction happened — the caller keeps the turn going, so the
+        model continues from the handoff summary without a user send.
+        """
         if not self.auto_compact:
-            return
+            return False
+        # The handoff summary carries the summarization round's own usage
+        # (its input is the full pre-compaction transcript): compacting on
+        # it would loop forever. Wait for the next real round's usage.
+        if self.conversation.messages and is_summary(self.conversation.messages[-1]):
+            return False
         last_usage = next(
             (m.usage for m in reversed(self.conversation.messages) if m.usage), None
         )
@@ -1265,21 +1393,31 @@ class Session:
             last_usage.output_tokens if last_usage else 0
         )
         if used < self.profile.auto_compact_threshold * self.profile.max_context:
-            return
+            return False
+        if last_usage is not None and last_usage is self._compacted_on_usage:
+            # Same round we already compacted on (e.g. the compaction did not
+            # land a fresh usage in the history): never compact twice on it.
+            return False
         # Stay in a non-idle state: only the turn's finally sets idle, so a
         # send arriving during the compaction (or the finish_turn unwind) is
         # queued, never started mid-teardown.
         self._set_state("compacting")
         try:
             await self.controller.compact()
+            self._compacted_on_usage = last_usage
         except RuntimeError as exc:
             self._emit_notice(f"auto-compact failed: {exc}", "warn")
-            return
+            self._set_state("running")
+            return False
+        # Mid-turn compaction goes back to streaming; the turn's finally
+        # still owns the transition to idle.
+        self._set_state("running")
         self._persist()
         await self._flush_persist()
         self._emit_history()
         counts = self._compaction_counts()
         self._emit_notice(f"auto-compacted: {counts}" if counts else "auto-compacted: nothing to compact yet")
+        return True
 
     # ------------------------------------------------------------------
     # stats row

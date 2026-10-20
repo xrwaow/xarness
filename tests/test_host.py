@@ -17,6 +17,7 @@ from xarness import protocol, session_store
 from xarness.conversation import Message
 from xarness.events import ContentDelta, TurnComplete, Usage
 from xarness.host import GRACE_SECONDS, Host
+from xarness.session import SessionError
 from xarness.protocol import SendMessage, Snapshot
 
 
@@ -82,6 +83,29 @@ async def _make_session(host: Host, tmp_path, script) -> str:
     session = host.sessions[summary.name]
     session.controller._client = FakeClient(script)
     return session.name
+
+
+def test_create_session_creates_missing_workspace(tmp_path) -> None:
+    """A workspace path that doesn't exist yet is created (mkdir -p), not
+    refused — starting a session on a brand-new directory is normal."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            missing = tmp_path / "data" / "new_ws"
+            summary = await host.create_session(workspace=str(missing))
+            assert missing.is_dir()
+            assert host.sessions[summary.name].workspace == missing.resolve()
+            # An uncreatable path still fails with a readable error.
+            blocked = tmp_path / "file.txt" / "under"
+            (tmp_path / "file.txt").write_text("x")
+            with pytest.raises(SessionError, match="could not be created"):
+                await host.create_session(workspace=str(blocked))
+        finally:
+            task.cancel()
+
+    asyncio.run(go())
 
 
 def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:

@@ -150,6 +150,12 @@ class ChatController:
         # Live view of the round currently streaming. Cleared when the round
         # completes; read by save_interrupted_round() when a turn is cancelled.
         self._partial_round: PartialRound | None = None
+        # The user message that opened the turn currently being generated, or
+        # None between turns. Explicit state (not inferred from after_tree)
+        # because a mid-turn /accept //reject rewrites every checkpoint, and a
+        # mid-turn compaction moves this message into compact_snapshot — both
+        # would hide the still-open turn from a message-list scan.
+        self._open_turn: Message | None = None
         # Optional hook, called with each user message as it lands in the
         # history (send and inject_user_message). The session uses it to emit
         # UserMessageAdded — there is no local echo in the client.
@@ -160,14 +166,15 @@ class ChatController:
 
         ``images`` are base64 attachments carried on the user message and
         resent with the history on every round."""
-        self.conversation.add(
-            Message(
-                role="user",
-                content=user_text,
-                images=images or None,
-                checkpoint_sha=await self._take_checkpoint(),
-            )
+        message = Message(
+            role="user",
+            content=user_text,
+            images=images or None,
+            checkpoint_sha=await self._take_checkpoint(),
         )
+        self.conversation.add(message)
+        # The turn is open from here until finish_turn records its after tree.
+        self._open_turn = message
         # Snapshot marker for /undo //retry: the index of this turn's user
         # message. The turn snapshot is the messages[:turn_start + 1] prefix,
         # so restoring it rolls back the whole turn — even one that compacted
@@ -378,22 +385,46 @@ class ChatController:
             # dropped too.
             self.conversation.compact_snapshot = None
 
+    @property
+    def open_turn(self) -> Message | None:
+        """The user message of the turn being generated, or None.
+
+        /accept and /reject rewrite every checkpoint mid-turn; the open turn
+        is identified by identity, not by scanning the message list."""
+        return self._open_turn
+
     async def finish_turn(self) -> None:
         """Record the workspace state after the turn's edits as ``after_tree``
         on the turn's user message, so /undo can reverse exactly this turn's
         diff later. Called by the app once a turn's rounds and tools have
         finished (including on interruption). No-op without git tracking, when
-        no turn is open, or when the snapshot fails."""
+        no turn is open, or when the snapshot fails.
+
+        Uses the explicitly-open turn, not ``last_turn_message``: a turn whose
+        checkpoint failed must not restamp the previous (closed) turn with the
+        new after tree."""
+        turn = self._open_turn
+        self._open_turn = None
         info = self.git_info
-        if info is None:
-            return
-        turn = self.conversation.last_turn_message()
-        if turn is None:
+        if info is None or turn is None or not turn.checkpoint_sha:
             return
         try:
             turn.after_tree = await git_snapshot_state(info)
         except GitWorktreeError:
             return
+
+    def open_turn_before(self) -> str | None:
+        """The still-open turn's before tree, or None.
+
+        /diff attribution folds this into the agent-touched set so the
+        in-flight turn's edits are not shown as drift while streaming — even
+        after a mid-turn /accept //reject rewrote the checkpoint, or a
+        mid-turn compaction moved the message into ``compact_snapshot``.
+        """
+        turn = self._open_turn
+        if turn is None or not turn.checkpoint_sha:
+            return None
+        return turn.checkpoint_sha
 
     def turn_checkpoints(self) -> list[TurnCheckpoint]:
         """The reversible turns since the baseline, oldest first.
@@ -425,8 +456,9 @@ class ChatController:
     async def compact(self) -> str:
         """Summarize the conversation and replace older messages with it.
 
-        Compaction runs at a turn boundary (auto-compact), so there are no
-        pending tool calls to break pairing. Keeps the system prompt;
+        Auto-compact runs at a round boundary (every tool result recorded,
+        every assistant message stamped), so there are no pending tool calls
+        to break pairing. Keeps the system prompt;
         everything after it becomes a single handoff summary user message
         (task, what's known so far, what to do next). Returns the summary
         text; the before/after token counts are left in
@@ -453,6 +485,10 @@ class ChatController:
         # on entry) so an empty compaction never clobbers an older snapshot.
         self.conversation.compact_snapshot = list(messages)
         self.conversation.messages = [messages[0], summary_message]
+        # The turn snapshot prefix must stay valid mid-turn: anchor it on the
+        # summary message, so /undo //retry never slice past the compacted
+        # history with the pre-compaction index.
+        self.conversation.turn_start = len(self.conversation.messages) - 1
         self.last_compaction = (before_tokens, self._message_tokens(summary_message))
         return summary
 

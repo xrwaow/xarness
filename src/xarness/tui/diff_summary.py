@@ -212,7 +212,13 @@ class DiffSummary(Vertical):
             self.post_message(self.DiffRequested(cast("str | None", key)))
 
     async def set_summary(self, stat: DiffStat) -> None:
-        """Rebuild the summary + per-file rows; becomes visible."""
+        """Update the summary + per-file rows in place; becomes visible.
+
+        The panel refreshes on every tool finish, so a full teardown/mount of
+        the row list makes the widget flicker and loses scroll/highlight
+        state. Reconcile instead: drop rows whose file disappeared, mount rows
+        for new files, and update the existing rows' numbers/source in place
+        when only the counts changed."""
         self._stat = stat
         count = len(stat.files)
         # Colors are CSS ($c-* variables) applied to the Statics — keep the
@@ -224,35 +230,102 @@ class DiffSummary(Vertical):
         self.query_one("#diff-summary-del", Static).update(Text(f"-{stat.deletions}"))
 
         files = self.query_one("#diff-files", Vertical)
-        await files.remove_children()
         # Pad the +/- counts to a uniform width across the file list so the
         # right-aligned tail (and the "new" badge) sits at the same column
         # on every row regardless of digit count.
-        add_w = max(len(f"+{f.additions}") for f in stat.files)
-        del_w = max(len(f"-{f.deletions}") for f in stat.files)
+        add_w = max((len(f"+{f.additions}") for f in stat.files), default=1)
+        del_w = max((len(f"-{f.deletions}") for f in stat.files), default=1)
+
+        # Reconcile against the rows already mounted (keyed by diff_key).
+        rows: dict[str, Horizontal] = {
+            row.diff_key: row  # type: ignore[attr-defined]
+            for row in files.children
+            if isinstance(row, Horizontal) and hasattr(row, "diff_key")
+        }
+        wanted = {f.path for f in stat.files}
+        for path, row in list(rows.items()):
+            if path not in wanted:
+                await row.remove()
+                rows.pop(path)
+
+        ordered: list[Horizontal] = []
         for f in stat.files:
-            # Row layout: name  [new]  {source}  +N -M — the whole row is
-            # and requests that file's unified diff. The "new" badge gets
-            # its own column so it never wraps the file name.
-            row = Horizontal(classes="diff-file-row")
-            row.diff_key = f.path  # type: ignore[attr-defined]
-            await files.mount(row)
-            row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
-            if f.is_new:
-                row.mount(Static(Text("new"), classes="diff-file-new", markup=False))
-            # Source tag: "agent" for a turn's edits, "drift" for changes
-            # made outside the session.
-            source_class = "drift" if "drift" in f.source else "agent"
-            row.mount(Static(
-                Text(f.source), classes=f"diff-file-source {source_class}", markup=False,
-            ))
-            row.mount(Static(
-                Text(f"+{f.additions}".rjust(add_w)), classes="diff-file-add", markup=False,
-            ))
-            row.mount(Static(
-                Text(f"-{f.deletions}".rjust(del_w)), classes="diff-file-del", markup=False,
-            ))
+            row = rows.get(f.path)
+            if row is None:
+                row = await self._mount_file_row(files, f, add_w, del_w)
+            else:
+                await self._update_file_row(row, f, add_w, del_w)
+            ordered.append(row)
+
+        # Keep DOM order matching the stat order (a row may have moved when
+        # the diff list is re-sorted), without touching rows already placed.
+        for index, row in enumerate(ordered):
+            if files.children.index(row) != index:
+                files.move_child(row, before=index)
+
+        # Re-apply the open diff's highlight: rows that survived kept it, but
+        # if the active file disappeared no row should stay highlighted. With
+        # no diff open, leave the existing classes alone.
+        if self.diff_shown:
+            active = self._active_key
+            self._mark_active_row(active if isinstance(active, str) else None)
         self.add_class("visible")
+
+    async def _mount_file_row(
+        self, files: Vertical, f, add_w: int, del_w: int,
+    ) -> Horizontal:
+        """Create and mount one per-file row, returning it."""
+        # Row layout: name  [new]  {source}  +N -M — the whole row is
+        # clickable and requests that file's unified diff. The "new" badge
+        # gets its own column so it never wraps the file name.
+        row = Horizontal(classes="diff-file-row")
+        row.diff_key = f.path  # type: ignore[attr-defined]
+        await files.mount(row)
+        await row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
+        if f.is_new:
+            await row.mount(Static(
+                Text("new"), classes="diff-file-new", markup=False,
+            ))
+        # Source tag: "agent" for a turn's edits, "drift" for changes made
+        # outside the session.
+        source_class = "drift" if "drift" in f.source else "agent"
+        await row.mount(Static(
+            Text(f.source), classes=f"diff-file-source {source_class}", markup=False,
+        ))
+        await row.mount(Static(
+            Text(f"+{f.additions}".rjust(add_w)), classes="diff-file-add", markup=False,
+        ))
+        await row.mount(Static(
+            Text(f"-{f.deletions}".rjust(del_w)), classes="diff-file-del", markup=False,
+        ))
+        return row
+
+    async def _update_file_row(
+        self, row: Horizontal, f, add_w: int, del_w: int,
+    ) -> None:
+        """Refresh one existing row's values without remounting it."""
+        row.query_one(".diff-file-name", Static).update(Text(f.path))
+        source = row.query_one(".diff-file-source", Static)
+        source.update(Text(f.source))
+        source.set_classes(
+            "diff-file-source " + ("drift" if "drift" in f.source else "agent")
+        )
+        row.query_one(".diff-file-add", Static).update(
+            Text(f"+{f.additions}".rjust(add_w))
+        )
+        row.query_one(".diff-file-del", Static).update(
+            Text(f"-{f.deletions}".rjust(del_w))
+        )
+        # The "new" badge can appear/disappear when the baseline moves (e.g.
+        # /accept), but the row itself survives: add/remove only the badge.
+        badge = next(iter(row.query(".diff-file-new")), None)
+        if f.is_new and badge is None:
+            await row.mount(
+                Static(Text("new"), classes="diff-file-new", markup=False),
+                before=source,
+            )
+        elif not f.is_new and badge is not None:
+            await badge.remove()
 
     async def clear(self) -> None:
         """Hide entirely — no pending changes (or no worktree)."""
