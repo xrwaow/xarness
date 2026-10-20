@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import (
-    AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    BaseModel, ConfigDict, Field, ValidationError, field_validator,
     model_validator,
 )
 
@@ -79,11 +79,8 @@ class ProviderProfile(BaseModel):
     model_id: str
     # The key in the config's "models" section; set when parsing.
     name: str | None = None
-    # User-facing label; accepts the legacy config key ``shown_name``.
-    display_name: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("display_name", "shown_name"),
-    )
+    # User-facing label shown in the status bar and pickers.
+    display_name: str | None = None
     max_context: int = Field(default=128_000, gt=0)
     cot_strength: CotStrength = CotStrength.MEDIUM
     # Send assistant reasoning back to the model on later rounds.

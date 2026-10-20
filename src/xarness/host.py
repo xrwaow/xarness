@@ -587,7 +587,7 @@ class Host:
         ]
         sandboxes = [{"name": name} for name in sectioned.sandboxes]
         presets = list(sectioned.presets)
-        from .themes import THEMES
+        from .theme import THEMES
         default_model = sectioned.default_preset_model()
         return protocol.ConfigInfo(
             models=models, sandboxes=sandboxes, presets=presets,

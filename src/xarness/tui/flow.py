@@ -38,7 +38,7 @@ from textual.strip import Strip
 from textual_flowview import Presentation
 
 from .. import images, theme
-from ..images import legacy_token_text, token_text
+from ..images import token_text
 from .tool_view import (
     ToolCallView, body_renderable, live_parts as _stream_parts,
     summary_text as _tool_summary_text,
@@ -47,7 +47,7 @@ from .transcript import (
     AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
     ToolStatus, UserItem,
 )
-from ..themes import blend_hex as _lerp_hex
+from ..theme import blend_hex as _lerp_hex
 from .widgets import highlight_code
 
 __all__ = [
@@ -240,10 +240,7 @@ class Presenter:
                 body.stylize(token_style, match.start(), match.end())
             rows: list = [body]
             for image in item.images:
-                if (
-                    token_text(image) in item.text
-                    or legacy_token_text(image) in item.text
-                ):
+                if token_text(image) in item.text:
                     continue  # the token itself already shows the attachment
                 rows.append(Text(token_text(image), style=p["muted"]))
             if item.undo_armed and item.message_id:

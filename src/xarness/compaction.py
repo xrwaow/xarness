@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from .client import StreamClient
 from .conversation import SUMMARY_PREFIX, Conversation, Message
+from .prompts import compaction_prompt
 from .protocol import ContentDelta, StreamError, TurnComplete, Usage
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
@@ -62,21 +63,7 @@ async def summarize(
     Returns the handoff text and the round's usage, so its cost can be folded
     into the session totals instead of being silently dropped.
     """
-    prompt = (
-        "You are handing this conversation off to a fresh context. Write "
-        "the handoff the next assistant instance needs to continue the "
-        "work seamlessly. Cover, in this order:\n"
-        "1. The task: what the user is trying to accomplish, in their "
-        "terms.\n"
-        "2. What's known so far: key decisions, file paths, relevant "
-        "commands and their results, constraints discovered.\n"
-        "3. What's next: the current state of any work in progress and "
-        "the immediate next steps.\n"
-        "Be concise — a few short paragraphs at most. Reply with the "
-        "handoff only.\n\n"
-        "--- conversation ---\n"
-        f"{transcript}"
-    )
+    prompt = compaction_prompt(transcript)
     parts: list[str] = []
     usage: Usage | None = None
     async for event in client.stream([{"role": "user", "content": prompt}]):

@@ -23,13 +23,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from .gitwork import TurnCheckpoint
-from .images import (
-    IMAGE_TOKEN_RE,
-    ImageAttachment,
-    ImageRef,
-    legacy_token_text,
-    token_text,
-)
+from .images import IMAGE_TOKEN_RE, ImageAttachment, ImageRef, token_text
 
 # Prefix of the summary user message compaction leaves behind. Identifying
 # it by content (not identity) keeps working across a session save/load.
@@ -69,7 +63,7 @@ def build_parts(
 ) -> list[MessagePart]:
     """Build ordered text/image parts from a user message.
 
-    The text carries one ``[🖼 name W×H]`` token per attachment; parts are
+    The text carries one ``[🖼 name W×H #id]`` token per attachment; parts are
     emitted in token order so ``compare [img1] with [img2]`` keeps its
     meaning. A token without a matching attachment stays text, and an
     attachment without a token is appended at the end. ``store`` (an object
@@ -79,7 +73,6 @@ def build_parts(
     if not images:
         return [TextPart(text=text)] if text else []
     by_token = {token_text(image): image for image in images}
-    legacy = {legacy_token_text(image): image for image in images}
     used: set[int] = set()
     parts: list[MessagePart] = []
 
@@ -94,7 +87,7 @@ def build_parts(
         chunk = text[last:match.start()]
         if chunk:
             parts.append(TextPart(text=chunk))
-        image = by_token.get(match.group(0)) or legacy.get(match.group(0))
+        image = by_token.get(match.group(0))
         if image is not None and id(image) not in used:
             used.add(id(image))
             add_image(image)

@@ -21,7 +21,7 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from .. import theme
-from ..themes import blend_hex
+from ..theme import blend_hex
 
 
 def _fmt_tokens(count: int) -> str:
@@ -187,27 +187,6 @@ def _split_tool_diff(text: str) -> tuple[str, str] | None:
     return text[: match.start()], text[match.start() :]
 
 
-_LEGACY_DIFF_BREAK_RE = re.compile(
-    r"(?<!\n)(?=(?:--- [ab]/|\+\+\+ [ab]/|@@ -\d))"
-)
-_LEGACY_HUNK_END_RE = re.compile(
-    r"(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)(?=[^\n])"
-)
-
-
-def _normalize_legacy_diff(text: str) -> str:
-    """Re-break the malformed one-line diffs older edit_file calls stored.
-
-    A previous generator joined ``difflib`` output with ``""`` after passing
-    keepends lines, collapsing the ``---``/``+++``/``@@`` headers and the
-    first changed line together. Replaying such a session must still render
-    the hunk, so split those headers back onto their own lines. Valid diffs
-    are untouched (their headers already follow a newline).
-    """
-    text = _LEGACY_DIFF_BREAK_RE.sub("\n", text)
-    return _LEGACY_HUNK_END_RE.sub(r"\1\n", text)
-
-
 def _render_diff(text: str, show_headers: bool = True) -> Text:
     """Unified diff as GitHub-style rich text.
 
@@ -218,7 +197,6 @@ def _render_diff(text: str, show_headers: bool = True) -> Text:
     muted gutter. ``show_headers=False`` drops the per-file header line —
     used for edit_file, whose path is already in the summary row. Plain
     stateful parse — no external diff library."""
-    text = _normalize_legacy_diff(text)
     p = theme.PALETTE
     out = Text()
     header_path: str | None = None
@@ -381,7 +359,7 @@ class StatusBar(Static):
     def update_status(
         self,
         *,
-        shown_name: str,
+        display_name: str,
         effort: str,
         mode: str,
         total_in: int,
@@ -394,7 +372,7 @@ class StatusBar(Static):
         percent_left = max(0, round(100 * (1 - context_used / max_context))) if max_context else 100
 
         line = Text()
-        line.append(shown_name, style=f"bold {palette['status']}")
+        line.append(display_name, style=f"bold {palette['status']}")
         line.append(f" · effort {effort}", style=palette["muted"])
         line.append(f" · {mode}", style=palette["accent2"] if mode == "write" else palette["text"])
         line.append("  │  ", style=palette["border"])

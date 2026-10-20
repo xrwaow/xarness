@@ -360,9 +360,8 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         )
         if result.exit_code != 0:
             return _exec_error(result, "write failed")
-        first_line, _, _rest = result.stdout.partition("\n")
+        first_line = result.stdout.partition("\n")[0]
         verb = "overwrote" if first_line == "existing" else "created"
-        loc = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return ToolResult(
             ok=True,
             output=f"{verb} {path} ({len(content)} bytes)",
@@ -521,14 +520,6 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             return _exec_error(write_result, "write failed")
         plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
         diff = _format_edit_diff(path, current, updated)
-        adds = sum(
-            1 for line in diff.splitlines()
-            if line.startswith("+") and not line.startswith("+++")
-        )
-        dels = sum(
-            1 for line in diff.splitlines()
-            if line.startswith("-") and not line.startswith("---")
-        )
         return ToolResult(
             ok=True,
             output=f"applied {plural} to {path}\n{diff}",

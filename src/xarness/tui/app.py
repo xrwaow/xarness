@@ -677,7 +677,7 @@ class AgentApp(App[None]):
     def _refresh_status(self) -> None:
         status = self.view_status
         self.query_one("#status-bar", StatusBar).update_status(
-            shown_name=status.model_display_name,
+            display_name=status.model_display_name,
             effort=status.cot_strength,
             mode=status.mode,
             total_in=status.total_in,
@@ -702,11 +702,11 @@ class AgentApp(App[None]):
             None,
         )
         if entry is not None:
-            shown_name = entry.get("display_name") or entry.get("name") or "—"
+            display_name = entry.get("display_name") or entry.get("name") or "—"
             effort = entry.get("cot_strength") or "medium"
             max_context = entry.get("max_context") or 128_000
         else:
-            shown_name = (
+            display_name = (
                 config.default_model_display_name if config else None
             ) or "—"
             effort = "medium"
@@ -715,7 +715,7 @@ class AgentApp(App[None]):
             state="idle",
             mode=self._draft_mode,
             model_name=target or "",
-            model_display_name=shown_name,
+            model_display_name=display_name,
             cot_strength=effort,
             max_context=max_context,
             workspace=str(self.workspace) if self.workspace else None,

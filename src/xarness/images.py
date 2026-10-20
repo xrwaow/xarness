@@ -32,11 +32,9 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 # The placeholder an attached image leaves in the input text (and the
 # transcript). One token per image, deleted atomically in the editor. The
 # ``#id`` suffix (content-hash prefix) keeps two differently-named/sized
-# images from colliding: same name and dimensions no longer means the same
-# token. Older sessions carry the suffix-less legacy form, still matched by
-# ``IMAGE_TOKEN_RE``.
+# images from colliding: same name and dimensions does not mean the same
+# token.
 _TOKEN_TEXT = "[🖼 {name} {width}×{height} #{id}]"
-_LEGACY_TOKEN_TEXT = "[🖼 {name} {width}×{height}]"
 # Single source of truth for the token shape (see conversation.to_wire).
 IMAGE_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
 
@@ -123,13 +121,6 @@ def token_text(image: ImageRef | ImageAttachment) -> str:
     return _TOKEN_TEXT.format(
         name=image.name, width=image.width, height=image.height,
         id=_token_id(image),
-    )
-
-
-def legacy_token_text(image: ImageRef | ImageAttachment) -> str:
-    """The pre-T1.11 token form (no ``#id``), for reading old sessions."""
-    return _LEGACY_TOKEN_TEXT.format(
-        name=image.name, width=image.width, height=image.height,
     )
 
 

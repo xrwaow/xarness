@@ -6,8 +6,8 @@ and no accept/reject step. Git is used purely as an undo log:
 
   - at session start the workspace state is snapshotted as a tree object
     (the session's ``baseline_tree``) — the base /diff measures against
-  - each turn records two snapshots on its user message: ``checkpoint_sha``
-    (before the turn's edits) and ``after_tree`` (once they finish)
+  - each turn records two snapshots: ``before_tree`` (before the turn's
+    edits) and ``after_tree`` (once they finish)
   - /undo and /retry reverse the turn's own diff (before → after) onto the
     live workspace with a 3-way merge, so edits made outside the session
     since the turn are preserved rather than clobbered
