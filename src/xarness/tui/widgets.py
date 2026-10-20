@@ -421,13 +421,6 @@ def _tool_header_detail(tool_name: str, args_text: str) -> Text | None:
         detail = Text(" ")
         detail.append(_shorten(first, 80), style=muted)
         return detail
-    if tool_name == "web_search":
-        query = as_str(args.get("query"))
-        if not query:
-            return None
-        detail = Text(" ")
-        detail.append(_shorten(query), style=muted)
-        return detail
     return None
 
 

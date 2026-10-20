@@ -279,9 +279,11 @@ class ToolItem:
             return Text(self.output)
         args = _json_tool_args(self.args)
         path = args.get("path")
-        if self.name == "read_file" and isinstance(path, str) and path:
-            if self.status is ToolCallStatus.CALL_SUCCEEDED:
-                return _render_read_file(path, self.output)
+        if (
+            self.name == "read_file" and isinstance(path, str) and path
+            and self.status is ToolCallStatus.CALL_SUCCEEDED
+        ):
+            return _render_read_file(path, self.output)
         if self.name == "write_file":
             content = args.get("content")
             if isinstance(path, str) and path and isinstance(content, str):
@@ -435,17 +437,18 @@ class Presenter:
             return 0 if flush else 1
         return 0
 
-    @staticmethod
-    def _previous_item(entry) -> object | None:
-        """The item of the entry immediately above ``entry`` in document
-        order, or None. (FlowModel.entries is a cached preorder flatten, so
-        this is a cheap index lookup.)"""
+    def _previous_item(self, entry) -> object | None:
+        """The item immediately above ``entry`` (O(1) per entry via index cache)."""
         try:
             flat = entry._model.entries
-            i = flat.index(entry)
-            return flat[i - 1].item if i > 0 else None
-        except (AttributeError, ValueError):
+        except AttributeError:
             return None
+        cache = getattr(self, "_index_cache", None)
+        if cache is None or cache[0] is not flat:
+            cache = (flat, {id(e): i for i, e in enumerate(flat)})
+            self._index_cache = cache
+        i = cache[1].get(id(entry), 0)
+        return flat[i - 1].item if i else None
 
     def _present_item(self, item, width: int) -> list[Strip]:
         if isinstance(item, UserItem):
@@ -509,6 +512,8 @@ class Presenter:
         p = theme.PALETTE
         body_w = width - 2
         body: list[Strip] = []
+        if len(item.chunk_cache) > 2_000:
+            item.chunk_cache.clear()
         for i, chunk in enumerate(item.chunks):
             key = (i, self.epoch, width)
             cached = item.chunk_cache.get(key)

@@ -24,8 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .events import Usage
 from .util import format_duration
-from .images import IMAGE_TOKEN_RE
-from .images import ImageAttachment
+from .images import IMAGE_TOKEN_RE, ImageAttachment, token_text
 
 
 # Prefix of the summary user message compaction leaves behind. Identifying
@@ -282,19 +281,21 @@ class Message(BaseModel):
             # through: text parts first, unmatched images appended at the end.
             parts: list[dict[str, Any]] = []
             last = 0
-            index = 0
+            # Match tokens by placeholder text, not ordinal: an unknown or
+            # duplicate token must not shift later images.
+            by_token = {token_text(image): image for image in self.images}
+            used: set[int] = set()
             for match in _TOKEN_RE.finditer(self.content):
                 chunk = self.content[last:match.start()]
                 if chunk:
                     parts.append({"type": "text", "text": chunk})
-                if index < len(self.images):
-                    image = self.images[index]
-                    index += 1
+                image = by_token.get(match.group(0))
+                if image is not None and id(image) not in used:
+                    used.add(id(image))
                     parts.append(
                         {"type": "image_url", "image_url": {"url": image.data_url()}}
                     )
                 else:
-                    # More tokens than attachments: keep the marker text.
                     parts.append({"type": "text", "text": match.group(0)})
                 last = match.end()
             chunk = self.content[last:]
@@ -302,7 +303,7 @@ class Message(BaseModel):
                 parts.append({"type": "text", "text": chunk})
             parts.extend(
                 {"type": "image_url", "image_url": {"url": image.data_url()}}
-                for image in self.images[index:]
+                for image in self.images if id(image) not in used
             )
             message["content"] = parts
         if include_reasoning and self.role == "assistant" and self.reasoning is not None:

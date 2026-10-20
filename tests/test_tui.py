@@ -1216,3 +1216,18 @@ class DiffSummaryIncrementalTest(unittest.IsolatedAsyncioTestCase):
             rows = list(summary.query(".diff-file-row"))
             self.assertEqual(len(rows), 1)
             self.assertIs(rows[0], first_row)
+
+
+class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_undo_puts_the_user_text_back_in_the_input(self) -> None:
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import ChatInput
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._run_undo()
+            await pilot.pause()
+            self.assertEqual(app.query_one("#chat-input", ChatInput).text, "put back")
+            self.assertIn("undo", [command.type for _, command in client.commands])

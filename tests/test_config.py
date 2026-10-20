@@ -283,6 +283,17 @@ def test_ref_spec_bad_mount_rejected(tmp_path: Path) -> None:
         load_sectioned(path)
 
 
+def test_filter_list_rejects_dot_dotdot_and_absolute(tmp_path: Path) -> None:
+    for i, bad in enumerate((".", "..", "/etc", "a/../b")):
+        directory = tmp_path / str(i)
+        directory.mkdir()
+        path = write(directory, {
+            "sandboxes": {"default": {"filter_list": [bad]}},
+        })
+        with pytest.raises(ConfigError, match="filter path"):
+            load_sectioned(path)
+
+
 def test_sandbox_unknown_key_rejected(tmp_path: Path) -> None:
     path = write(tmp_path, {
         "sandboxes": {"default": {"netwrok": True}},

@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from PIL import Image
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 # Hard pixel budget per image; anything larger is downsampled once, on load.
 MAX_PIXELS = 1_000_000
@@ -57,8 +57,12 @@ class ImageAttachment(BaseModel):
     width: int
     height: int
 
+    _data_url_cache: str | None = PrivateAttr(default=None)
+
     def data_url(self) -> str:
-        return f"data:{self.mime};base64,{self.data_b64}"
+        if self._data_url_cache is None:
+            self._data_url_cache = f"data:{self.mime};base64,{self.data_b64}"
+        return self._data_url_cache
 
 
 def token_text(image: ImageAttachment) -> str:

@@ -46,6 +46,18 @@ STARTER_CONFIG: dict[str, Any] = {
 }
 
 
+def validate_filter_path(entry: str) -> str:
+    """Return a workspace-relative filter path, or raise ValueError.
+
+    Shared by config validation and the live /filter command so both accept
+    exactly the same set of paths."""
+    raw = entry.strip()
+    parts = Path(raw).parts
+    if not raw or Path(raw).is_absolute() or not parts or ".." in parts:
+        raise ValueError(f"invalid filter path: {entry!r}")
+    return raw
+
+
 class ConfigError(Exception):
     """Raised when the config file is missing, malformed, or invalid."""
 
@@ -173,6 +185,13 @@ class SandboxSettings(BaseModel):
     # conversation-only; no auto-init of a repo.
     enable_tracking: bool = True
 
+    @field_validator("filter_list")
+    @classmethod
+    def _validate_filter_list(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            validate_filter_path(entry)
+        return value
+
     @field_validator("auto_include_refs", mode="before")
     @classmethod
     def _normalize_refs(cls, value: Any) -> Any:
@@ -186,7 +205,8 @@ class SandboxSettings(BaseModel):
 
     def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
         """Inheritance: keys this profile sets explicitly win over ``base``."""
-        merged = base.model_copy()
+        # Deep copy: inherited list fields must not be shared with the cache.
+        merged = base.model_copy(deep=True)
         for name in type(self).model_fields:
             if name in self.model_fields_set:
                 setattr(merged, name, getattr(self, name))
@@ -384,8 +404,10 @@ def save_preferences(
         if target is None:
             raise ConfigError("no model named to write auto_compact onto")
         data.setdefault("models", {}).setdefault(target, {})["auto_compact"] = auto_compact
+    tmp = path.with_suffix(f".json.tmp-{os.getpid()}")
     try:
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
     except OSError as exc:
         raise ConfigError(f"could not write {path}: {exc}") from exc
 

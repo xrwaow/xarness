@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, load_sectioned
+from .config import (
+    DEFAULT_CONFIG_PATH, ConfigError, ensure_config, load_sectioned,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,6 +131,9 @@ def _run_chat(args: argparse.Namespace) -> None:
     from . import theme
 
     try:
+        # First run: create the starter config before loading it. Its
+        # notices are surfaced in the TUI instead of being silently lost.
+        startup_notices = ensure_config(DEFAULT_CONFIG_PATH)
         sectioned = load_sectioned(DEFAULT_CONFIG_PATH)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -160,6 +165,7 @@ def _run_chat(args: argparse.Namespace) -> None:
         gpu=args.gpu,
         no_init_repo=args.no_init_repo,
         no_session=args.no_session,
+        startup_notices=startup_notices,
     )
 
     app.run()

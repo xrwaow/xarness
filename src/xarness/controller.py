@@ -109,6 +109,7 @@ class RollbackPlan:
     user_text: str  # the turn's user message (input box / resend)
     revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
     keep: list[Message]  # what the conversation becomes
+    images: list[ImageAttachment] | None = None
     # True when the restore point is before the most recent compaction, so
     # apply_rollback must drop the compact snapshot (the summary it covers
     # is no longer part of the history).
@@ -353,7 +354,7 @@ class ChatController:
             clears = not any(is_summary(m) for m in keep)
             return RollbackPlan(
                 user_text=message.content, revert_turns=_turns_in(messages[index:]),
-                keep=keep, clears_compaction=clears,
+                keep=keep, clears_compaction=clears, images=message.images,
             )
         snapshot = self.conversation.compact_snapshot
         if snapshot is None:
@@ -367,7 +368,7 @@ class ChatController:
         revert = _turns_in([*snapshot[idx:], *messages])
         return RollbackPlan(
             user_text=message.content, revert_turns=revert,
-            keep=keep, clears_compaction=True,
+            keep=keep, clears_compaction=True, images=message.images,
         )
 
     def apply_rollback(self, plan: RollbackPlan) -> None:

@@ -13,24 +13,23 @@ When a filesystem sandbox is available, the model gets:
 | Tool | Mode | What it does |
 | --- | --- | --- |
 | `read_file` | plan + write | Read a file (large files return a structural outline; read sections with `start_line`/`end_line`) |
-| `ls` | plan | List a directory's immediate entries (ignore rules applied) |
-| `glob` | plan | Find files by glob pattern |
-| `grep` | plan | Search file contents by regex |
 | `write_file` | write | Create or overwrite a file |
 | `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
-| `run_bash` | write | Run a shell command in a persistent sandboxed shell (cwd, env vars, and background jobs survive across calls) |
+| `run_bash` | plan + write | Run a shell command in a persistent sandboxed shell (cwd and env vars survive across calls). In plan mode the workspace is mounted read-only |
 | `ask_user` | plan + write | Ask you a clarifying question in the TUI |
 
-`web_search` is disabled for now (the implementation isn't good enough to
-ship). Compaction is not a tool the model can call — it's automatic
-(`auto_compact`): when the context window crosses the configured threshold,
-the conversation is summarized into a handoff (the task, what's known so
-far, and what to do next) that continues as the next user message.
+There is no `ls`, `glob`, `grep`, or `web_search` tool: use `run_bash`
+with `rg`/`find`/`ls` (pipe search output through `head`). Compaction is not
+a tool the model can call — it's automatic (`auto_compact`): when the context
+window crosses the configured threshold, the conversation is summarized into
+a handoff (the task, what's known so far, and what to do next) that continues
+as the next user message.
 
 Switch between modes with `/mode`:
 
-- **plan** — read-only: the model can inspect files (`read_file`, `ls`,
-  `glob`, `grep`), but cannot edit or run state-changing commands.
+- **plan** — read-only: the model can inspect files with `read_file` and run
+  read-only shell commands, but cannot edit files or write through the
+  sandbox mount.
 - **write** — the model can read, edit, and run shell commands.
 
 ### Sandbox
@@ -40,7 +39,7 @@ Filesystem and shell tools run inside [bubblewrap](https://github.com/containers
 mostly-empty container root, and only what xarness explicitly mounts exists
 inside it. Install `bwrap` first (e.g. `sudo dnf install bubblewrap` on
 Fedora); without it, filesystem/bash tools are disabled and the model just
-chats. Disable them explicitly with `--no-fs-tools`.
+chats.
 
 Everything the model can reach:
 
@@ -68,9 +67,9 @@ commands cannot change files either.
 **Live adjustments.** Everything mount-affecting (plan/write mode, refs) is
 fingerprinted; when a setting changes at runtime (`/mode`),
 the persistent shell restarts with the new mounts on its next command.
-Network and GPU access are fixed at launch: `xarness --network false --gpu
-false` runs the sandbox fully offline and without device access (both
-default to `true`).
+Network and GPU access are fixed at launch: `xarness --no-network --no-gpu`
+runs the sandbox fully offline and without device access (both default to
+the sandbox profile's settings, which default to `true`).
 
 **Git guard.** On top of the mounts, `run_bash` vetoes ref-identity
 git commands: `checkout <ref>`, `switch`, `worktree`, `rebase`,
@@ -84,9 +83,11 @@ refs are never written from inside the sandbox, and what counts as "ignored"
 for change tracking is pinned at session start, so editing ignore files in
 the container cannot shift what `/diff` tracks.
 
-Expose external files read-only to the agent with `--ref ALIAS=PATH`
-(repeatable); the model addresses them as `.refs/ALIAS` in tool calls (and
-`/tmp/refs/ALIAS` in shell commands) and they are read-only by convention.
+Expose external files to the agent with `/refs add <path>` (or the
+`auto_include_refs` sandbox setting); the model addresses them as
+`.refs/<alias>` in tool calls (and `/tmp/refs/<alias>` in shell commands).
+Plain entries are read-only; a `RefSpec` object can choose a different
+mount and mark it writable.
 
 ## Change tracking and undo
 
@@ -162,13 +163,12 @@ turn to reverse, `/undo` is a no-op on the filesystem.
 ## Sessions
 
 Conversations autosave under `~/.local/share/xarness/sessions/` (disable with
-`--no-session`, or name one with `--session NAME`). Resume in the TUI with
-`/sessions`, or from the command line:
+`--no-session`). Resume with `/sessions` in the TUI, or attach/load by name
+at startup:
 
 ```sh
-xarness chat --session my-session   # resume if it exists, else start it
-xarness sessions list
-xarness sessions delete my-session
+xarness --session my-session   # attach to an active session or load a saved one
+xarness --sessions             # print active sessions and exit
 ```
 
 Resuming reconnects to the session's change tracking (the persisted baseline
@@ -200,47 +200,29 @@ On first run xarness autogenerates a starter config at
 defaults) — edit it to point at your provider. If an existing config omits
 optional values, xarness notes which defaults apply at startup.
 
-Config is JSON at `~/.config/xarness/config.json` by default; override with
-`--config`. Fields:
+Config is JSON at `~/.config/xarness/config.json` (override with
+`--config`). The layout is sectioned:
 
-- `default_profile` — which profile to use when `--profile` is not passed
-  (defaults to the only profile if exactly one is defined).
-- `default_theme` — startup color theme; optional, defaults to `ayu-darker`.
-  Options: `"ayu-darker"`, `"one-light"`; `/theme` switches it
-  live.
-- `container` — sandbox settings for the tools the model runs, read from
-  the config at startup (all optional; there is no runtime popup):
+```json
+{
+  "models": {
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model_id": "gpt-4.1",
+      "supports_vision": true
+    }
+  },
+  "sandboxes": {
+    "default": {"allow_network": true, "gpu_access": true}
+  },
+  "presets": {"default": {"model": "openai", "sandbox": "default"}},
+  "ui": {"theme": "ayu-darker"},
+  "defaults": {"preset": "default"}
+}
+```
 
-  ```json
-  "container": {
-    "auto_include_refs": [
-      "docs/spec.md",
-      {"path": "~/prebuilt/venv", "mount": ".venv", "read_only": false}
-    ]
-  }
-  ```
-
-  - `auto_include_refs` — host paths bound into the container at runtime, so
-    the model can consult (or reuse) material outside the workspace. Two
-    entry forms:
-    - a plain path — bound **read-only** under the container-only refs tmpfs
-      (addressed as `.refs/<alias>` in tool calls, `/tmp/refs/<alias>` in the
-      shell; nothing is ever created in your worktree);
-    - an object `{"path", "mount", "read_only"}` — mount the host path at any
-      workspace-relative `mount`, optionally writable (e.g. drop a host-built
-      `.venv` into the project; writable mounts are forced read-only in plan
-      mode).
-
-    Paths may be absolute, `~`-expanded, or workspace-relative. The alias is
-    the path's basename; two same-named files from different paths are
-    disambiguated by prepending parent segments (`docs/spec.md` and
-    `~/notes/spec.md` become `.refs/spec.md` and `.refs/notes-spec.md`).
-    Missing paths are skipped.
-  - `tool_output_limit` — per-tool output cap in chars the model receives
-    (default 32768; must be at least 256).
-- `profiles` — list of profiles; switch with `--profile` (or `/model` in the
-  TUI, which also sets reasoning effort). Each profile needs a unique `name`
-  plus:
+- `models` — named provider/model profiles. Each entry needs:
   - `base_url` — OpenAI-compatible endpoint (must be http/https).
   - `api_key_env` — environment variable holding the API key; never stored in
     the config itself. Set to `null` for providers that need no key (e.g.
@@ -248,49 +230,47 @@ Config is JSON at `~/.config/xarness/config.json` by default; override with
   - `model_id` — the model to request.
   - `shown_name` — optional display name in the UI.
   - `max_context` — context-window size used for compaction (default 128000).
-  - `cot_strength` — reasoning effort: `off`, `low`, `medium`, or `high`.
+  - `cot_strength` — reasoning effort sent to the provider: `off`, `low`,
+    `medium`, or `high` (no interactive picker; set it here).
   - `keep_reasoning` — send assistant reasoning back to the model on later
     rounds (default `true`).
   - `supports_vision` — the model accepts image attachments (default
-    `false`). When `true`, you can attach images by pasting an image file
-    path into the input or `@`-mentioning it: each image becomes a
-    `[🖼 name W×H]` token in the text (deletable as one unit), and the
-    content parts are sent in token order. Images are downsampled to at
-    most 1 megapixel and sent as base64 on every round.
-  - `auto_compact` — compact automatically after each turn once the context
-    estimate passes `auto_compact_threshold` of `max_context` (default
-    `false`).
+    `false`). The TUI refuses to attach images when this is false. When
+    `true`, paste an image file path into the input or `@`-mention it: each
+    image becomes a `[🖼 name W×H]` token in the text (deletable as one
+    unit). Images are downsampled to at most 1 megapixel and sent as base64
+    on every round.
+  - `auto_compact` — compact automatically when the context estimate passes
+    `auto_compact_threshold` of `max_context` (default `false`).
   - `auto_compact_threshold` — fraction of the context window that triggers
     auto-compaction, e.g. `0.9` = 90% full; must be in (0, 1]
     (default `0.9`).
   - `provider` — optional OpenRouter provider routing, sent verbatim as the
-    request's `provider` field, e.g.
-    `{"order": ["openai", "together"], "allow_fallbacks": false}`.
+    request's `provider` field.
+- `sandboxes` — named sandbox profiles. `default` is the base; other
+  profiles inherit from it and list only overrides. Fields include
+  `allow_network`, `gpu_access`, `allow_git_write`, `use_container`,
+  `enable_tracking`, `auto_include_refs`, `filter_list`, `tool_output_limit`
+  (default 32768; at least 256), and `default_timeout`.
+- `presets` — named `{model, sandbox}` pairs; `defaults.preset` chooses one.
+- `ui.theme` — startup color theme (`ayu-darker`, `one-light`); `/theme`
+  switches it live.
 
-A flat single-profile form (a `provider` object instead of `profiles`) also
-works:
-
-```json
-{
-  "provider": {
-    "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY",
-    "model_id": "gpt-4.1",
-    "shown_name": "GPT-4.1",
-    "max_context": 128000,
-    "cot_strength": "medium",
-    "keep_reasoning": true
-  }
-}
-```
+Switch model/sandbox at runtime with `/model` and `/sandbox`; they write the
+choice back as the default preset/model.
 
 ## Run
 
 ```sh
-xarness                    # default profile
-xarness --profile deepseek
-xarness --workspace ./some-project    # sandbox root (default: cwd)
-xarness --network false --gpu false  # fully offline, no device access
+xarness                              # default preset
+xarness --model deepseek             # named model profile
+xarness --sandbox offline            # named sandbox profile
+xarness --preset work                # named preset
+xarness --workspace ./some-project   # sandbox root (default: cwd)
+xarness --no-network --no-gpu        # fully offline, no device access
+xarness --session my-session         # attach/load a saved session
+xarness --sessions                   # list active sessions
+xarness --server                     # run the host in the foreground
 ```
 
 ## Slash commands
@@ -298,7 +278,9 @@ xarness --network false --gpu false  # fully offline, no device access
 | Command | Action |
 | --- | --- |
 | `/tools` | List the tools the model currently has |
-| `/model` | Choose the model and reasoning effort |
+| `/model` | Choose the model profile |
+| `/sandbox` | Choose this session's sandbox profile (idle only) |
+| `/filter add <path>` / `/filter remove <path>` / `/filter list` | Add or remove a workspace path excluded from the sandbox mounts |
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
@@ -364,9 +346,12 @@ src/xarness/
   client.py       async httpx SSE client, reasoning-effort mapping
   events.py       typed stream events (the client/UI contract)
   controller.py   conversation state + event enrichment (no UI imports)
+  host.py         session host: FastAPI over a unix socket, lifecycle, config resolution
+  api.py          HTTP/SSE endpoints used by the TUI and other clients
+  clientlib.py    async client used by the TUI (host spawn + API calls)
   conversation.py plain message history, wire-format faithful
   prompts.py      system prompts (general + plan/write mode clauses)
-  tools.py        tool registry: read/write/edit, run_bash, ls/glob/grep, ask_user
+  tools.py        tool registry: read/write/edit, run_bash, ask_user
   sandbox.py      bubblewrap sandbox: one-shot file tools + persistent shell
   session_store.py  save/load conversations as JSON, keyed by session name
   file_search.py  bounded filename search backing @-mention autocomplete

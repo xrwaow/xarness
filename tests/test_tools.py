@@ -7,7 +7,9 @@ import shutil
 import pytest
 
 from xarness.sandbox import SandboxConfig
-from xarness.tools import Tool, ToolRegistry, ToolResult, build_registry
+from xarness.tools import (
+    Tool, ToolRegistry, ToolResult, _truncate_output, build_registry,
+)
 
 
 async def _ok(args: dict) -> ToolResult:
@@ -279,6 +281,21 @@ def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     assert result.output.startswith("applied edit to f.txt")
     assert "-beta" in result.output
     assert "+BETA" in result.output
+
+
+def test_edit_file_newline_only_change_is_reported(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("alpha")
+    args = {"path": "f.txt", "edits": [{"old_string": "alpha", "new_string": "alpha\n"}]}
+    result = asyncio.run(_registry_for(tmp_path).call("edit_file", json.dumps(args)))
+    assert result.ok and "(no textual change)" not in result.output
+    assert (tmp_path / "f.txt").read_text() == "alpha\n"
+
+
+def test_truncate_output_never_exceeds_the_limit() -> None:
+    assert all(
+        len(_truncate_output("x" * 1000, limit)) <= limit
+        for limit in (1, 10, 64, 100)
+    )
 
 
 def test_edit_file_rejects_bare_top_level_pair(tmp_path) -> None:

@@ -53,10 +53,12 @@ class DiffText(VerticalScroll):
         key = summary._active_key
         if not isinstance(key, str):
             # Full multi-file diff open: right steps into the first file.
-            if key is None and delta == 1 and summary._stat is not None:
-                if summary._stat.files:
-                    summary.post_message(summary.DiffRequested(summary._stat.files[0].path))
-                    return True
+            if (
+                key is None and delta == 1 and summary._stat is not None
+                and summary._stat.files
+            ):
+                summary.post_message(summary.DiffRequested(summary._stat.files[0].path))
+                return True
             return False
         return summary._request_neighbour(key, delta)
 

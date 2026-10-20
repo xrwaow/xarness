@@ -15,11 +15,14 @@ import asyncio
 import heapq
 import os
 import subprocess
+import time
 from pathlib import Path
 
 _MAX_WALK = 20_000
 _MAX_RESULTS = 50
 _GIT_TIMEOUT = 5.0
+_CANDIDATE_TTL = 2.0
+_candidate_cache: dict[Path, tuple[float, list[str]]] = {}
 
 
 def _git_candidates(root: Path) -> list[str] | None:
@@ -51,10 +54,14 @@ def _walk_bounded(root: Path) -> list[str]:
 
 
 def _candidates(root: Path) -> list[str]:
-    tracked = _git_candidates(root)
-    if tracked is not None:
-        return tracked
-    return _walk_bounded(root)
+    root = Path(root).resolve()
+    now = time.monotonic()
+    cached = _candidate_cache.get(root)
+    if cached is None or now - cached[0] >= _CANDIDATE_TTL:
+        tracked = _git_candidates(root)
+        cached = (now, tracked if tracked is not None else _walk_bounded(root))
+        _candidate_cache[root] = cached
+    return cached[1]
 
 
 def _best(paths: list[str], query: str) -> list[str]:

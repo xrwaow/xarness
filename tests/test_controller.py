@@ -20,6 +20,7 @@ from xarness.events import (
     Usage,
 )
 from xarness.gitwork import TurnCheckpoint
+from xarness.images import ImageAttachment
 from xarness.tools import ToolResult, build_registry
 
 PROFILE = ProviderProfile(
@@ -574,3 +575,30 @@ def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:
 
 async def _drain(stream: AsyncIterator[Any]) -> list[Any]:
     return [event async for event in stream]
+
+
+def _image(name: str = "cat.png") -> ImageAttachment:
+    return ImageAttachment(
+        name=name, mime="image/png", data_b64=name.encode().hex(),
+        width=1, height=1,
+    )
+
+
+def test_rollback_plan_keeps_images() -> None:
+    controller = ChatController(PROFILE, "key", client=FakeClient([]))
+    image = _image()
+    controller.conversation.add(Message(role="user", content="look", images=[image]))
+    controller.conversation.add(Message(role="assistant", content="ok"))
+    plan = controller.rollback_plan()
+    assert plan is not None and plan.images == [image]
+
+
+def test_image_token_maps_by_text_not_ordinal() -> None:
+    msg = Message(
+        role="user", content="[🖼 stale 1×1] mid [🖼 cat.png 1×1] end",
+        images=[_image()],
+    )
+    parts = msg.to_wire()["content"]
+    image_at = next(i for i, p in enumerate(parts) if p["type"] == "image_url")
+    before = "".join(p["text"] for p in parts[:image_at] if p["type"] == "text")
+    assert "stale" in before and "cat.png" not in before

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,22 +55,32 @@ def save_workspace_refs(workspace: str, refs: list[str]) -> None:
     if not refs:
         path.unlink(missing_ok=True)
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     path.write_text(
         json.dumps({"workspace": str(workspace), "refs": refs}, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
+_SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+
+
+def _validate_session_name(name: str) -> str:
+    """Reject names that could escape the sessions directory."""
+    if not isinstance(name, str) or not _SAFE_SESSION_NAME.match(name) or ".." in name:
+        raise ValueError(f"invalid session name: {name!r}")
+    return name
+
+
 def session_path(name: str) -> Path:
-    return SESSIONS_DIR / f"{name}.json"
+    return SESSIONS_DIR / f"{_validate_session_name(name)}.json"
 
 
 def meta_path(name: str) -> Path:
     """Sidecar holding the small meta block, so listing / last-used lookups
     never parse (or even read) the full session file with its base64
     images."""
-    return SESSIONS_DIR / f"{name}.meta.json"
+    return SESSIONS_DIR / f"{_validate_session_name(name)}.meta.json"
 
 
 def new_session_name() -> str:
@@ -98,6 +109,7 @@ class SessionState:
     total_out: int = 0
     last_in: int = 0
     last_out: int = 0
+    mode: str | None = None
 
 
 def _message_from(raw: dict) -> Message:
@@ -154,7 +166,8 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     # Unique tmp name: concurrent writers must not clobber each other
     # before the os.replace.
     tmp = path.with_suffix(f".json.tmp-{uuid.uuid4().hex}")
-    with open(tmp, "w", encoding="utf-8") as handle:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         # No indent: the file can hold base64 images; compact JSON halves
         # the serialization and write cost of every persist.
         handle.write(json.dumps(data))
@@ -169,7 +182,7 @@ def save_state(name: str, state: SessionState) -> None:
     Written to a temp file in the same directory, fsynced, then ``os.replace``d
     over the target, so a crash mid-write never leaves a truncated session
     file behind (a reader would see either the old or the new state)."""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     conversation = state.conversation
     data: dict[str, Any] = {
         "profile": state.profile,
@@ -193,6 +206,8 @@ def save_state(name: str, state: SessionState) -> None:
     if state.last_in or state.last_out:
         data["last_in"] = state.last_in
         data["last_out"] = state.last_out
+    if state.mode is not None:
+        data["mode"] = state.mode
     _atomic_write_json(session_path(name), data)
     _atomic_write_json(meta_path(name), _meta_block(
         conversation,
@@ -220,6 +235,7 @@ def load_state(name: str) -> SessionState:
         total_out=data.get("total_out") or 0,
         last_in=data.get("last_in") or 0,
         last_out=data.get("last_out") or 0,
+        mode=data.get("mode") if data.get("mode") in ("plan", "write") else None,
     )
 
 

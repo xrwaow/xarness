@@ -77,6 +77,8 @@ INTERRUPT_ARM_SECONDS = 2.5
 # How long to wait for a cancel command to unwind before exiting anyway.
 CANCEL_TIMEOUT = 2.0
 
+MAX_LIVE_TOOL_OUTPUT = 65_536
+
 # Divider mounted in the chat log at every compaction point (live and on
 # /resume): everything above is history the model no longer sees verbatim.
 COMPACTED_DIVIDER = (
@@ -174,7 +176,9 @@ class _RoundView:
             entry = self.tool_blocks.get(event.call_id)
             if entry is not None:
                 item: ToolItem = entry.item
-                item.output += event.text
+                if len(item.output) < MAX_LIVE_TOOL_OUTPUT:
+                    room = MAX_LIVE_TOOL_OUTPUT - len(item.output)
+                    item.output += event.text[:room]
                 entry.update()
         elif isinstance(event, ToolFinished):
             # The ToolCallStatus mapping lives here (client-side): the
@@ -301,7 +305,7 @@ COMMANDS = {
     ),
     "undo": (
         "drop the last turn and revert its file edits",
-        lambda s, a: s._post_command(Undo()),
+        lambda s, a: s.call_later(s._run_undo),
     ),
     "retry": (
         "revert the last turn's file edits and resend your message",
@@ -472,6 +476,7 @@ class AgentApp(App[None]):
         self._interrupt_armed = False
         self._interrupt_timer = None
         self._at_search_timer = None
+        self._diff_timer = None
         self._config_cache = None
         # Live phase — the single owner of the ephemeral pending strip.
         # pending = a round is waiting on the provider (turn start and every
@@ -578,6 +583,7 @@ class AgentApp(App[None]):
             self._error(f"could not attach to {name}: {exc}")
             return
         self.status = snap.status
+        self._set_vision(snap.status.supports_vision)
         self._refresh_title()
         await self._render_history(snap)
         self._refresh_bars()
@@ -597,6 +603,7 @@ class AgentApp(App[None]):
             async for item in self.client.attach(name):
                 if isinstance(item, Snapshot):
                     self.status = item.status
+                    self._set_vision(item.status.supports_vision)
                     # The attach flow already rendered this exact snapshot
                     # (GET /snapshot); only rebuild when the stream's
                     # snapshot is newer (reconnect after missed events).
@@ -639,6 +646,7 @@ class AgentApp(App[None]):
                 "running", "compacting",
             )
             self.status = event.status
+            self._set_vision(event.status.supports_vision)
             self._refresh_bars()
             self._sync_refs_screen()
             # Spawned, not awaited: it is a worker (push_screen_wait needs
@@ -660,6 +668,8 @@ class AgentApp(App[None]):
         if isinstance(event, Notice):
             if event.level == "error":
                 self._error(event.text)
+            elif event.level == "warn":
+                self._line(event.text, kind="warn")
             else:
                 self._notice(event.text)
             return
@@ -853,7 +863,32 @@ class AgentApp(App[None]):
         except ClientError:
             return
         if self.session_name is None:
+            self._sync_vision_from_config(self.model)
             self._refresh_status()
+
+    def _set_vision(self, supported: bool) -> None:
+        try:
+            self.query_one("#chat-input", ChatInput).supports_vision = supported
+        except NoMatches:
+            pass
+
+    def _sync_vision_from_config(self, model: str | None = None) -> None:
+        config = self._config_cache
+        if config is None:
+            return
+        name = model or config.default_model
+        entry = next((m for m in config.models if m.get("name") == name), None)
+        if entry is not None:
+            self._set_vision(bool(entry.get("supports_vision")))
+
+    def on_chat_input_image_refused(
+        self, event: ChatInput.ImageRefused,
+    ) -> None:
+        self._line(
+            f"{event.name}: the active model does not support image input "
+            "(supports_vision is false in the config)",
+            kind="warn",
+        )
 
     def _refresh_generating(self) -> None:
         try:
@@ -878,8 +913,12 @@ class AgentApp(App[None]):
         bar.update_items([q.text for q in queued])
 
     def _refresh_diff_summary_soon(self) -> None:
-        """Recompute the pending-changes bar soon (debounced per event)."""
-        self.set_timer(0.05, lambda: self.call_later(self.refresh_diff_summary))
+        """Recompute the pending-changes bar, coalescing bursts of events."""
+        if self._diff_timer is not None:
+            self._diff_timer.stop()
+        self._diff_timer = self.set_timer(
+            0.05, lambda: self.call_later(self.refresh_diff_summary)
+        )
 
     async def refresh_diff_summary(self) -> None:
         """Recompute the pending-changes bar (hidden when empty or gitless)."""
@@ -964,11 +1003,10 @@ class AgentApp(App[None]):
         return True
 
     async def _submit_async(self, text: str, images: list[ImageAttachment] | None) -> None:
-        if self.session_name is None:
-            # Draft chat: the session comes into existence on the server with
-            # the first message.
-            if not await self._ensure_session():
-                return
+        # Draft chat: the session comes into existence on the server with
+        # the first message.
+        if self.session_name is None and not await self._ensure_session():
+            return
         # Pasted/dragged images ride along as base64 attachments; @path
         # tokens in the text are resolved server-side. SendMessage and
         # UserMessageAdded carry the same ImageAttachment shape the input
@@ -1087,15 +1125,20 @@ class AgentApp(App[None]):
         payload = await self._send_command(UndoTo(message_id=message_id))
         self._put_back_user_text(payload)
 
+    async def _run_undo(self) -> None:
+        self._put_back_user_text(await self._send_command(Undo()))
+
     def _put_back_user_text(self, payload: dict | None) -> None:
-        """The user text an /undo wants back in the input box (the command
-        result goes only to the issuer — everyone else just saw the
-        HistoryReplaced broadcast)."""
-        user_text = (payload or {}).get("user_text")
-        if user_text:
-            chat_input = self.query_one("#chat-input", ChatInput)
-            chat_input.load_text(user_text)
-            chat_input.focus()
+        """Restore an undone message's text and images to the input box."""
+        data = payload or {}
+        if not data.get("user_text"):
+            return
+        images = [
+            ImageAttachment.model_validate(raw) for raw in data.get("images", ())
+        ]
+        chat_input = self.query_one("#chat-input", ChatInput)
+        chat_input.restore(data["user_text"], images)
+        chat_input.focus()
 
     def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
         """In-transcript clicks: expand/collapse tool calls and thinking
@@ -1157,8 +1200,11 @@ class AgentApp(App[None]):
         )
 
     async def _open_sessions_async(self) -> None:
+        entries = []
         with self._reporting("/sessions failed: "):
             entries = await self.client.sessions()
+        if not entries:
+            return
         self.push_screen(
             ResumeScreen(
                 entries,
@@ -1194,6 +1240,8 @@ class AgentApp(App[None]):
     async def _pick_model(self) -> None:
         with self._reporting("/model failed: "):
             self._config_cache = await self.client.config()
+        if self._config_cache is None:
+            return
         name = await self._pick(
             [m["name"] for m in self._config_cache.models],
             current=(
@@ -1212,6 +1260,7 @@ class AgentApp(App[None]):
             # repaint the status bar now, so the new model is visible
             # before the user sends anything.
             self.model = name
+            self._sync_vision_from_config(name)
             self._refresh_status()
         else:
             self._post_command(SwitchModel(name=name))
@@ -1234,6 +1283,8 @@ class AgentApp(App[None]):
     async def _pick_sandbox(self) -> None:
         with self._reporting("/sandbox failed: "):
             self._config_cache = await self.client.config()
+        if self._config_cache is None:
+            return
         name = await self._pick(
             [s["name"] for s in self._config_cache.sandboxes],
             current=self.status.sandbox_name if self.status else None,

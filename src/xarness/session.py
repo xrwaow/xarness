@@ -23,6 +23,7 @@ and then replays the live stream.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 import uuid
 from collections import OrderedDict
@@ -32,7 +33,8 @@ from typing import Any, Literal
 
 from . import protocol
 from .config import (
-    ConfigError, ProviderProfile, SandboxSettings, load_sectioned, resolve_api_key,
+    ConfigError, ProviderProfile, SandboxSettings, load_sectioned,
+    resolve_api_key, validate_filter_path,
 )
 from .conversation import Conversation, Message, ToolCall
 from .conversation import is_summary, turn_time_summary
@@ -243,6 +245,7 @@ class Session:
             git_info=git_info, auto_compact=auto_compact,
             tool_output_limit=tool_output_limit,
             sandbox_name=sandbox_name, sandbox_settings=sandbox_settings,
+            mode=state.mode or "write",
             idle_callback=idle_callback,
         )
         session.ensure_system_message()
@@ -341,10 +344,24 @@ class Session:
             if self._state != "idle" and not isinstance(
                 event, (protocol.UserMessageAdded, protocol.TurnFinished)
             ):
-                self._turn_events.append(event)
+                self._buffer_turn_event(event)
         for queue in self._subscribers:
             queue.put_nowait(event)
         return event
+
+    TURN_EVENT_LIMIT = 500
+
+    def _buffer_turn_event(self, event: Event) -> None:
+        """Buffer a turn event, coalescing tool output and bounding the list."""
+        if isinstance(event, protocol.ToolOutputDelta) and self._turn_events:
+            last = self._turn_events[-1]
+            if isinstance(last, protocol.ToolOutputDelta) and last.call_id == event.call_id:
+                self._turn_events[-1] = last.model_copy(
+                    update={"text": last.text + event.text}
+                )
+                return
+        self._turn_events.append(event)
+        del self._turn_events[: -self.TURN_EVENT_LIMIT]
 
     def subscribe(self) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
@@ -420,6 +437,7 @@ class Session:
             queued=[protocol.QueuedMessage(text=text) for text, _, _ in self._queued],
             pending_ask=self.pending_ask,
             pending_drift=pending_drift,
+            supports_vision=self.profile.supports_vision,
             clients_attached=self.clients_attached,
             tools=[tool.name for tool in self.tool_registry.tools()],
             finished_while_away=self._finished_while_away,
@@ -597,7 +615,6 @@ class Session:
     async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
         if self._pending_drift is None:
             raise SessionError("no drift prompt is pending")
-        last_known, _current = self._pending_drift
         self._pending_drift = None
         info = self.git_info
         if command.accept and info is not None:
@@ -631,12 +648,14 @@ class Session:
         return _ok(payload={"discarded": 1, "text": text})
 
     def _cmd_flush_queued(self) -> CommandResult:
-        """Send the oldest queued message now: cancel the running turn; the
-        turn loop's cleanup starts the queued message immediately."""
+        """Send the oldest queued message now: cancel the running turn or
+        compaction; the cleanup starts the queued message immediately."""
         if self._state == "idle" or not self._queued:
             return _ok(payload={"flushed": False})
         if self._turn_task is not None:
             self._turn_task.cancel()
+        if self._compact_task is not None:
+            self._compact_task.cancel()
         return _ok(payload={"flushed": True})
 
     async def _cmd_undo(self, resend: bool) -> CommandResult:
@@ -704,10 +723,13 @@ class Session:
             note = "file edits reverted"
         if resend:
             self._emit_notice(f"retrying: {scope} rolled back ({note})")
-            await self._start_turn(plan.user_text, None)
+            await self._start_turn(plan.user_text, plan.images)
             return {"user_text": None}
         self._emit_notice(f"undone: {scope} removed ({note})")
-        return {"user_text": plan.user_text}
+        return {
+            "user_text": plan.user_text,
+            "images": [image.model_dump() for image in plan.images or ()],
+        }
 
     async def _cmd_compact(self) -> CommandResult:
         """Start a manual compaction as a task: the inbox stays free (cancel
@@ -722,25 +744,31 @@ class Session:
     async def _run_compact(self) -> None:
         try:
             summary = await self.controller.compact()
-        except RuntimeError as exc:
-            self._set_state("idle")
-            self._emit_notice(f"compaction failed: {exc}", "error")
-            return
         except asyncio.CancelledError:
             self._set_state("idle")
+            await self._start_queued()
             raise
+        except Exception as exc:  # noqa: BLE001 - compaction must not strand the session
+            self._set_state("idle")
+            self._emit_notice(f"compaction failed: {exc}", "error")
+            await self._start_queued()
+            return
         self._persist()
         self._set_state("idle")
         self._emit_history()
         counts = self._compaction_counts()
         text = f"compacted: {counts}\n{summary}" if counts else summary
         self._emit_notice(text)
-        # Drain the steering queue: a message sent during compaction starts
-        # now, exactly like at the end of a turn.
-        if self._queued:
-            queued_text, queued_images, _ = self._queued.pop(0)
-            self._emit_status()
-            await self._start_turn(queued_text, queued_images)
+        await self._start_queued()
+
+    async def _start_queued(self) -> bool:
+        """Start the oldest queued message unless the session is closed."""
+        if not self._queued or self._closed:
+            return False
+        text, images, _ = self._queued.pop(0)
+        self._emit_status()
+        await self._start_turn(text, images)
+        return True
 
     def _compaction_counts(self) -> str | None:
         counts = self.controller.last_compaction
@@ -856,9 +884,10 @@ class Session:
     async def _cmd_filter(self, path: str, add: bool) -> CommandResult:
         """Add/remove a mount exclusion (idle only). Saved in the session
         file; the shell restarts so the new mounts take effect."""
-        rel = path.strip().strip("/")
-        if not rel or ".." in Path(rel).parts:
-            raise SessionError(f"invalid filter path: {path!r}")
+        try:
+            rel = validate_filter_path(path).strip("/")
+        except ValueError as exc:
+            raise SessionError(str(exc)) from exc
         if self.git_info is not None and (rel == ".git" or rel.startswith(".git/")):
             raise SessionError(
                 ".git cannot be filtered while change tracking is on — the "
@@ -985,9 +1014,7 @@ class Session:
             await old_session.close()
         self.sandbox = sandbox
         self.sandbox_session = session_obj
-        if settings.tool_output_limit is not None:
-            self.tool_registry.max_output_chars = settings.tool_output_limit
-        self._rebuild_tools()
+        self._rebuild_tools(output_limit=settings.tool_output_limit)
         self._persist()
         self._emit_status()
 
@@ -1047,6 +1074,7 @@ class Session:
                 # Execute the calls this round requested, in stream order.
                 for call in done_calls:
                     await self._execute_call(call)
+                self._persist()
                 # Steering: anything queued while this round streamed is
                 # injected here — after the tool answers, before the next
                 # LLM call.
@@ -1089,6 +1117,11 @@ class Session:
                 self._persist()
             self._repair_tool_calls()
             self._emit_notice("interrupted", "error")
+        except Exception as exc:  # noqa: BLE001 - surface turn failures
+            if self.controller.save_interrupted_round():
+                self._persist()
+            self._repair_tool_calls()
+            self._emit_notice(f"turn failed: {type(exc).__name__}: {exc}", "error")
         finally:
             # Record where the turn left the workspace so /undo //retry can
             # reverse exactly this turn's diff later (interruptions included).
@@ -1105,11 +1138,7 @@ class Session:
                 self._finished_while_away = True
             # A queued message sent at the exact end of the turn (or a
             # "send queued now" cancel) starts immediately.
-            if self._queued:
-                queued_text, queued_images, _ = self._queued.pop(0)
-                self._emit_status()
-                await self._start_turn(queued_text, queued_images)
-            else:
+            if not await self._start_queued():
                 self._notify_idle()
 
     async def _execute_call(self, call: ToolCall) -> None:
@@ -1117,9 +1146,19 @@ class Session:
         self._emit(protocol.ToolExecStarted(call_id=call.call_id))
         start = _utcnow()
         call_id = call.call_id
+        remaining = self.tool_registry.max_output_chars
 
         def sink(text: str) -> None:
-            self._emit(protocol.ToolOutputDelta(call_id=call_id, text=text))
+            nonlocal remaining
+            if remaining <= 0:
+                return
+            chunk = text[:remaining]
+            remaining -= len(chunk)
+            self._emit(protocol.ToolOutputDelta(call_id=call_id, text=chunk))
+            if not remaining:
+                self._emit(protocol.ToolOutputDelta(
+                    call_id=call_id, text="\n[live output truncated]\n",
+                ))
 
         # ToolRegistry.call already converts any tool exception into a
         # failed ToolResult, so no try/except is needed here.
@@ -1136,7 +1175,6 @@ class Session:
         self.controller.record_tool_result(
             call_id, result, start_time=start, end_time=end,
         )
-        self._persist()
 
     def _inject_queued(self) -> None:
         """Inject the steering queue at a round boundary: the messages land
@@ -1294,27 +1332,28 @@ class Session:
         """Make sure the conversation leads with the mode-aware system prompt,
         updated in place (exactly one, at index 0)."""
         conversation = self.conversation
-        content = system_prompt_for(GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox)
+        content = system_prompt_for(
+            GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox,
+            tracking=self.git_info is not None,
+        )
         if conversation.messages and conversation.messages[0].role == "system":
             conversation.messages[0].content = content
         else:
             conversation.messages.insert(0, Message(role="system", content=content))
 
-    def _rebuild_tools(self) -> None:
-        """Apply the current mode/sandbox to the tooling: read-only flag,
-        tool registry, and the mode-aware system prompt."""
+    def _rebuild_tools(self, output_limit: int | None = None) -> None:
+        """Rebuild tools for the current mode/sandbox, preserving the output cap."""
         if self.sandbox is not None:
             self.sandbox.read_only = self.mode != "write"
-        self._rebuild_registry()
-        self.ensure_system_message()
-
-    def _rebuild_registry(self) -> None:
+        limit = output_limit if output_limit is not None else self.tool_registry.max_output_chars
         self.tool_registry = build_registry(
             self.sandbox, self.sandbox_session, mode=self.mode,
             ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
+        self.tool_registry.max_output_chars = limit
         self.controller.tools = self.tool_registry
+        self.ensure_system_message()
 
     def _persist(self) -> None:
         """Persist the session (profile key, not model_id; atomic write).
@@ -1339,7 +1378,9 @@ class Session:
 
     def _persist_state(self) -> SessionState:
         return SessionState(
-            conversation=self.conversation,
+            # Detached snapshot: save_state runs in a worker thread.
+            conversation=copy.deepcopy(self.conversation),
+            mode=self.mode,
             profile=self.profile_name,
             workspace=str(self.workspace),
             git=self.git_info.to_block() if self.git_info else None,

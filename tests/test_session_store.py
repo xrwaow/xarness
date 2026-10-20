@@ -69,6 +69,15 @@ def test_usage_totals_round_trip(tmp_path, monkeypatch) -> None:
     assert (empty.total_in, empty.total_out, empty.last_in, empty.last_out) == (0, 0, 0, 0)
 
 
+def test_mode_round_trips(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    conversation = Conversation()
+    session_store.save_state("s", session_store.SessionState(
+        conversation, "m", mode="plan",
+    ))
+    assert session_store.load_state("s").mode == "plan"
+
+
 def test_to_wire_drops_unpaired_tool_calls() -> None:
     """A tool call without a recorded result (turn interrupted mid-execution,
     session saved) must not reach the wire as an unpaired call: providers

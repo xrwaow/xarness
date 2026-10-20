@@ -270,6 +270,7 @@ class SandboxConfig:
     # subtree of a real repo also has its git_dir outside the workspace,
     # but there it stays unbound — useless to the agent.)
     git_external: bool = False
+    _argv_prefix_cache: tuple[tuple, list[str]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.use_container and shutil.which("bwrap") is None:
@@ -283,8 +284,6 @@ class SandboxConfig:
             raise SandboxUnavailable(f"workspace directory does not exist: {self.workspace}")
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
-    def ref_path(self, alias: str) -> str:
-        return f"{REFS_ANCHOR}/{alias}"
 
     @property
     def mount_key(self) -> tuple:
@@ -388,7 +387,7 @@ class SandboxConfig:
 
         Unsandboxed mode (use_container=False) has no container mount: paths
         resolve to the real workspace on the host."""
-        norm = "." if path in ("", ".") else (path[2:] if path.startswith("./") else path)
+        norm = "." if path in ("", ".") else path.removeprefix("./")
         if not self.use_container:
             resolved = self.workspace if norm == "." else self.workspace / norm
             return str(resolved)
@@ -606,7 +605,7 @@ class SandboxConfig:
             # nodes are missing/unreadable. Shadow the caps directory so
             # NVML falls back to direct device access, like on hosts
             # without exposed caps — direct ioctls are unaffected.
-            empty_file, empty_dir = _shadow_placeholders()
+            _, empty_dir = _shadow_placeholders()
             argv += ["--bind", empty_dir, "/proc/driver/nvidia/capabilities"]
         return argv
 
@@ -637,7 +636,7 @@ class SandboxConfig:
         REFS_ANCHOR note there for why the workspace bind must come first)."""
         argv: list[str] = []
         refs_anchor = False
-        for alias, ref in self.external_refs.items():
+        for ref in self.external_refs.values():
             if ref.mount == _REFS_PREFIX or ref.mount.startswith(_REFS_PREFIX + "/"):
                 # The references area is a tmpfs nested under the
                 # container-only /tmp tmpfs (mounted at the top of
@@ -663,6 +662,15 @@ class SandboxConfig:
             # no bwrap, no mount isolation. The persistent shell starts in
             # the workspace (see SandboxSession._ensure_started).
             return list(command)
+        proxies = tuple(
+            os.environ.get(var)
+            for var in ("http_proxy", "https_proxy", "no_proxy",
+                        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
+        )
+        cache_key = (self.mount_key, proxies)
+        cached = self._argv_prefix_cache
+        if cached is not None and cached[0] == cache_key:
+            return [*cached[1], "--", *command]
         argv = ["bwrap"]
         # Clear the host environment before anything else: everything the
         # toolchain needs is set explicitly below (see
@@ -726,8 +734,9 @@ class SandboxConfig:
                 if var in os.environ:
                     argv += ["--setenv", var, os.environ[var]]
             argv += ["--share-net"]
-        argv += ["--die-with-parent", "--", *command]
-        return argv
+        argv += ["--die-with-parent"]
+        self._argv_prefix_cache = (cache_key, list(argv))
+        return [*argv, "--", *command]
 
 
 @dataclass(slots=True)

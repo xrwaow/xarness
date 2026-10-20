@@ -63,6 +63,13 @@ class ChatInput(TextArea):
     class ModeToggle(Message):
         """Tab pressed with no popup active — toggle plan/write mode."""
 
+    class ImageRefused(Message):
+        """The active model does not accept image input."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            super().__init__()
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "newline", "Newline", priority=True, show=False),
@@ -75,6 +82,7 @@ class ChatInput(TextArea):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.popup_active: str | None = None
+        self.supports_vision = True
         # Attached images, kept in token order (the editor's image segments).
         # Synced against the document on every edit: deleting a token drops
         # its attachment.
@@ -205,11 +213,21 @@ class ChatInput(TextArea):
         event.stop()
         self.insert_image(attachment)
 
-    def insert_image(self, attachment: ImageAttachment) -> None:
-        """Attach an image and insert its placeholder token at the cursor."""
+    def insert_image(self, attachment: ImageAttachment) -> bool:
+        """Attach an image; false (with a notice) when vision is unsupported."""
+        if not self.supports_vision:
+            self.post_message(self.ImageRefused(attachment.name))
+            return False
         if attachment not in self.attachments:
             self.attachments.append(attachment)
         self.insert(token_text(attachment))
+        return True
+
+    def restore(self, text: str, images: list[ImageAttachment] | None = None) -> None:
+        """Put an undone message (text and attachments) back in the input."""
+        self.load_text(text)
+        self.attachments = list(images or [])
+        self._refresh_token_highlights()
 
     def _sync_attachments(self) -> None:
         """Drop attachments whose token is no longer in the document."""
@@ -280,9 +298,8 @@ class ChatInput(TextArea):
         token replaces the typed ``@query``."""
         attachment = self._try_load_mention_image(value)
         if attachment is not None:
-            self.attachments.append(attachment)
-            self.insert(token_text(attachment))
             self.popup_active = None
+            self.insert_image(attachment)
             return
         row, col = self.cursor_location
         line = self.document.get_line(row)

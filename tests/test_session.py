@@ -13,8 +13,10 @@ from xarness.events import (
     ToolCallArgumentsDone, ToolCallStarted, TurnComplete, Usage,
 )
 from xarness.protocol import (
-    Accept, AnswerAsk, Cancel, Compact, Reject, Retry, SendMessage, Undo, UndoTo,
+    Accept, AnswerAsk, Cancel, Compact, FilterAdd, Reject, Retry, SendMessage,
+    SetMode, Undo, UndoTo,
 )
+from xarness.images import ImageAttachment
 from xarness.session import Session
 from xarness.tools import ToolRegistry, ToolResult, tool
 
@@ -58,6 +60,51 @@ async def wait_idle(session: Session, timeout: float = 10.0) -> None:
         while session._state != "idle" or session._pending_ask is not None:
             await asyncio.sleep(0.005)
     await asyncio.wait_for(_wait(), timeout=timeout)
+
+
+def _image() -> ImageAttachment:
+    return ImageAttachment(
+        name="cat.png", mime="image/png", data_b64="636174", width=1, height=1,
+    )
+
+
+def _round(text: str = "ok") -> list[Any]:
+    return [ContentDelta(text=text), TurnComplete(usage=Usage(input_tokens=1, output_tokens=1))]
+
+
+def test_undo_and_retry_keep_images(tmp_path) -> None:
+    session = make_session([_round("one"), _round("two")], tmp_path)
+
+    async def go():
+        await session.execute("s1", SendMessage(text="look [x]", images=[_image()]))
+        await wait_idle(session)
+        await session.execute("r1", Retry())
+        await wait_idle(session)
+        return await session.execute("u1", Undo())
+
+    undone = asyncio.run(go())
+    assert undone.payload["images"][0]["name"] == "cat.png"
+    wire = session.controller._client.received_wire[-1]
+    assert any(
+        isinstance(m["content"], list)
+        and any(p.get("type") == "image_url" for p in m["content"])
+        for m in wire if m["role"] == "user"
+    )
+
+
+def test_rebuilds_preserve_output_limit_and_reject_bad_filters(tmp_path) -> None:
+    session = Session(
+        name="test", workspace=tmp_path, profile=PROFILE, profile_name="test",
+        api_key="key", client=FakeClient([]), tool_output_limit=4096,
+    )
+
+    async def go():
+        await session.execute("m1", SetMode(mode="plan"))
+        for i, bad in enumerate((".", "..", "/etc")):
+            assert not (await session.execute(f"f{i}", FilterAdd(path=bad))).ok
+        assert session.tool_registry.max_output_chars == 4096
+
+    asyncio.run(go())
 
 
 def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:

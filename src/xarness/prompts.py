@@ -18,25 +18,27 @@ Ground rules:
 - File paths in tool calls are relative to the workspace root.
 - External references are read-only: address them as '.refs/<alias>' in tool calls; in shell commands they live at /tmp/refs/<alias>. Nothing is ever created in the worktree for them.
 - read_file returns a structural outline for large files; read specific sections of those with start_line/end_line instead of guessing at contents.
-- Use ask_user when you need a decision that cannot be infered from context.
+- Use ask_user when you need a decision that cannot be inferred from context.
 - Pipe search output (rg/find/grep) through '| head -n' so results stay sane.
 """
 
 MODE_CLAUSE = {
     "plan": """You are in PLAN mode: the workspace is mounted read-only. Produce a plan or answer, not changes.""",
     "write": """You are in WRITE mode:
-- Verify your changes before reporting success, scaling the effort to the change: a quick tarteged check is enough for small changes, and save full test runs for larger or riskier ones.
+- Verify your changes before reporting success, scaling the effort to the change: a quick targeted check is enough for small changes, and save full test runs for larger or riskier ones.
 - Prefer to put every change to the same file in one edit_file call.
 """,
 }
 
 
-def system_prompt_for(base: str, mode: str, sandbox: "SandboxConfig | None" = None) -> str:
-    """Assemble the full system prompt for the given mode.
-
-    With a sandbox, append the working-directory facts: where the sandboxed
-    tools are rooted.
-    """
+def system_prompt_for(
+    base: str,
+    mode: str,
+    sandbox: "SandboxConfig | None" = None,
+    *,
+    tracking: bool = True,
+) -> str:
+    """Assemble the mode-aware system prompt; include tracking only when on."""
     prompt = f"{base}\n\n{MODE_CLAUSE[mode]}"
     if sandbox is not None:
         prompt += (
@@ -47,7 +49,8 @@ def system_prompt_for(base: str, mode: str, sandbox: "SandboxConfig | None" = No
             "inside run_bash without network. Run tests and builds with "
             "run_bash."
         )
-        prompt += TRACKING_CLAUSE
+        if tracking:
+            prompt += TRACKING_CLAUSE
     return prompt
 
 

@@ -81,6 +81,7 @@ class StatusPayload(BaseModel):
     model_id: str = ""
     cot_strength: str = "medium"
     max_context: int = 128_000
+    supports_vision: bool = False
     sandbox_name: str | None = None
     use_container: bool = True
     enable_tracking: bool = True

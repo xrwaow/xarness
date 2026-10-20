@@ -34,7 +34,7 @@ from typing import Any
 from . import __version__, protocol, session_store
 from .config import (
     DEFAULT_CONFIG_PATH, ConfigError, ProviderProfile, SandboxSettings,
-    SectionedConfig, load_sectioned, resolve_api_key,
+    SectionedConfig, ensure_config, load_sectioned, resolve_api_key,
 )
 from . import gitwork
 from .gitwork import GitInfo, GitWorktreeError
@@ -98,6 +98,11 @@ class Host:
     ) -> None:
         self.persistent = persistent
         self.config_path = config_path
+        # A directly spawned host or --server must not fail on first run.
+        try:
+            ensure_config(config_path)
+        except ConfigError:
+            pass
         self.unix_socket = unix_socket
         self.sessions: dict[str, Session] = {}
         self._started_at = time.monotonic()
@@ -614,7 +619,17 @@ async def _start_unix_server(host: Host):
     config = uvicorn.Config(app, log_level="warning", uds=str(host.unix_socket))
     server = uvicorn.Server(config)
     task = asyncio.get_running_loop().create_task(server.serve())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10.0
     while not server.started:
+        if task.done():
+            task.result()
+            raise RuntimeError("the host server exited before it started")
+        if server.should_exit:
+            raise RuntimeError("the host server was asked to exit before it started")
+        if loop.time() >= deadline:
+            task.cancel()
+            raise RuntimeError("timed out waiting for the host server to start")
         await asyncio.sleep(0.05)
     os.chmod(host.unix_socket, 0o600)
     return server, task

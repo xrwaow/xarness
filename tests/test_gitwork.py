@@ -390,6 +390,26 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert not (repo / "one.txt").exists()
         assert not (repo / "two.txt").exists()
 
+    async def test_revert_turns_conflict_leaves_every_file_untouched(self):
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        before1 = await snapshot_state(info)
+        (repo / "one.txt").write_text("one\n")
+        after1 = await snapshot_state(info)
+        before2 = await snapshot_state(info)
+        (repo / "two.txt").write_text("two\n")
+        after2 = await snapshot_state(info)
+        (repo / "one.txt").write_text("manual\n")  # makes the older revert conflict
+
+        conflict = await gitwork.revert_turns(info, [
+            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+        ])
+
+        assert conflict is not None
+        assert (repo / "two.txt").read_text() == "two\n"
+        assert (repo / "one.txt").read_text() == "manual\n"
+
     # ------------------------------------------------------------------
     # attributed diff
 

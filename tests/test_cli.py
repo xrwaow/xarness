@@ -1,5 +1,6 @@
 """CLI flag parsing: model/sandbox/preset selection and tri-state overrides."""
 
+from xarness import cli
 from xarness.cli import build_parser
 
 
@@ -38,3 +39,22 @@ def test_session_and_server_flags() -> None:
     assert args.sessions is True
     args = build_parser().parse_args(["--server"])
     assert args.server is True
+
+
+def test_chat_startup_creates_a_starter_config(tmp_path, monkeypatch) -> None:
+    from xarness.tui import app as tui_app
+
+    config_path = tmp_path / ".config" / "xarness" / "config.json"
+    captured: dict = {}
+
+    class FakeApp:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(tui_app, "AgentApp", FakeApp)
+    cli._run_chat(build_parser().parse_args(["--workspace", str(tmp_path / "ws")]))
+    assert config_path.exists() and captured["startup_notices"]

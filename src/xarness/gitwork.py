@@ -579,13 +579,31 @@ async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str |
     if before_tree == after_tree:
         return None  # the turn made no edits — nothing to reverse
 
-    root = info.workspace
     current_tree = await snapshot_state(info)
+    conflict, result_tree = await _revert_turn_tree(
+        info, before_tree, after_tree, current_tree
+    )
+    if conflict is not None:
+        return conflict
+    # Safe: reverting to the merge RESULT, not a raw historical snapshot. The
+    # current tree is passed through so revert_to_tree needn't re-snapshot.
+    await revert_to_tree(info, result_tree, current_tree)
+    return None
 
+
+async def _revert_turn_tree(
+    info: GitInfo, before_tree: str, after_tree: str, current_tree: str,
+) -> tuple[str | None, str]:
+    """Compute the merge result of reversing one turn without applying it.
+
+    Returns ``(conflict, result_tree)``; ``result_tree`` is meaningless (an
+    empty string) when ``conflict`` is set."""
+    if before_tree == after_tree:
+        return None, current_tree
+    root = info.workspace
     base = await _wrap_commit(info, after_tree)     # state right after the turn
     theirs = await _wrap_commit(info, before_tree)  # target: state before the turn
     ours = await _wrap_commit(info, current_tree)   # live now, incl. manual edits
-
     rc, out, err = await _run_git(
         ["merge-tree", "--write-tree", f"--merge-base={base}", ours, theirs],
         cwd=root, env=info.git_env(),
@@ -593,30 +611,35 @@ async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str |
     if rc != 0:
         # Conflict: merge-tree still prints a (conflict-marked) tree, but we
         # must not apply it. Surface a readable summary and leave files alone.
-        return _conflict_summary(out) or err.strip() or "merge conflict"
+        return _conflict_summary(out) or err.strip() or "merge conflict", ""
     lines = out.strip().splitlines()
     if not lines:
         raise GitWorktreeError(f"merge produced no tree: {err.strip()}")
-    result_tree = lines[0]
-    # Safe: reverting to the merge RESULT, not a raw historical snapshot. The
-    # current tree is passed through so revert_to_tree needn't re-snapshot.
-    await revert_to_tree(info, result_tree, current_tree)
-    return None
+    return None, lines[0]
 
 
 async def revert_turns(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None:
-    """Reverse a range of turns, newest first.
+    """Reverse a range of turns, newest first, all-or-nothing.
 
-    Each turn is reversed against the live state left by the previous call,
-    so a multi-turn drop undoes the most recent turn's diff first. Returns
-    conflict text on the first unresolvable overlap (leaving the workspace
-    as it stood before that turn's revert), or None when all reverted
-    cleanly. An empty list is a no-op.
+    Every turn's merge is preflighted against the tree produced by the
+    previous step; only when all are clean is the final tree applied to the
+    workspace once. A conflict on any turn therefore leaves every file (and
+    the caller's history) untouched, instead of partially reverting the
+    newer turns and then reporting failure. An empty list is a no-op.
     """
+    if not turns:
+        return None
+    current_tree = await snapshot_state(info)
+    original_tree = current_tree
     for turn in reversed(turns):
-        conflict = await revert_turn(info, turn.before_tree, turn.after_tree)
+        conflict, result_tree = await _revert_turn_tree(
+            info, turn.before_tree, turn.after_tree, current_tree
+        )
         if conflict is not None:
             return conflict
+        current_tree = result_tree
+    if current_tree != original_tree:
+        await revert_to_tree(info, current_tree, original_tree)
     return None
 
 
@@ -718,9 +741,7 @@ def _created_paths(out: str, subtree: str = "") -> frozenset[str]:
         if line.startswith(" create mode "):
             path = line.rsplit(" ", 1)[-1]
             if subtree:
-                prefix = subtree + "/"
-                if path.startswith(prefix):
-                    path = path[len(prefix):]
+                path = path.removeprefix(subtree + "/")
             created.add(path)
     return frozenset(created)
 

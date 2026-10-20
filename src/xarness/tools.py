@@ -17,6 +17,7 @@ import json
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .sandbox import SandboxConfig, SandboxSession, run_in_sandbox
@@ -82,7 +83,7 @@ def _truncate_output(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     note = f"\n[output truncated at {limit} chars — raise tool_output_limit in the config]"
-    return text[: max(limit - len(note), 0)] + note
+    return (text[: max(limit - len(note), 0)] + note)[:limit]
 
 
 def _bad(error: str) -> ToolResult:
@@ -244,20 +245,23 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error="start_line is 1-based", parse_error=True)
 
         target = sandbox.tool_path(path)
-        # One bwrap spawn does the whole read: the first output line is the
-        # total line count (awk's NR counts lines regardless of a trailing
-        # newline — wc -l counts newlines and undercounts files that don't
-        # end with one), the rest is the requested slice.
-        # A huge end just prints to EOF; it is clamped once total is known.
-        result = await run_in_sandbox(
-            sandbox,
-            [
-                "bash", "-c",
-                'total=$(awk \'END{print NR}\' "$1"); printf "%d\\n" "$total"; '
-                'sed -n "${2},${3}p" "$1"',
+        ranged = args.get("start_line") is not None or args.get("end_line") is not None
+        count = 'total=$(awk \'END{print NR}\' "$1"); printf "%d\\n" "$total"; '
+        if ranged:
+            command = [
+                "bash", "-c", count + 'sed -n "${2},${3}p" "$1"',
                 "read", target, str(start), str(end if end is not None else 10**9),
-            ],
-        )
+            ]
+        else:
+            # Read large non-Python files only up to the 200-line preview.
+            command = [
+                "bash", "-c",
+                count + 'if [ "$total" -le "$2" ] || [ "$3" = 1 ]; then cat -- "$1"; '
+                'else sed -n \'1,200p\' -- "$1"; fi',
+                "read", target, str(OUTLINE_THRESHOLD),
+                str(int(Path(path).suffix.lower() == ".py")),
+            ]
+        result = await run_in_sandbox(sandbox, command)
         if result.exit_code != 0:
             return _exec_error(result, "read failed")
         first_nl = result.stdout.find("\n")
@@ -269,7 +273,6 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error=f"could not count lines in {path}")
         contents = result.stdout[first_nl + 1:]
 
-        ranged = args.get("start_line") is not None or args.get("end_line") is not None
         if not ranged:
             if total_lines <= OUTLINE_THRESHOLD:
                 return ToolResult(ok=True, output=contents, header=path)
@@ -355,8 +358,8 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         result = await run_in_sandbox(
             sandbox,
             ["sh", "-c",
-             'if [ -e "$1" ]; then echo existing; else echo new; fi; '
-             'tee -- "$1" >/dev/null',
+             ('if [ -e "$1" ]; then echo existing; else echo new; fi; '
+              'tee -- "$1" >/dev/null'),
              "write_file", target],
             input_bytes=content.encode(),
         )
@@ -439,10 +442,11 @@ def _format_edit_diff(path: str, before: str, after: str) -> str:
     actually changed) and the TUI (expanding the tool block) can see the
     changed lines rather than just an "applied" acknowledgement.
     """
+    # keepends distinguishes "x" from "x\n" (newline-only edits).
     lines = list(
         difflib.unified_diff(
-            before.splitlines(),
-            after.splitlines(),
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
             fromfile=f"a/{path}",
             tofile=f"b/{path}",
             n=3,
@@ -453,9 +457,9 @@ def _format_edit_diff(path: str, before: str, after: str) -> str:
         return "(no textual change)"
     if len(lines) > _MAX_EDIT_DIFF_LINES:
         lines = lines[:_MAX_EDIT_DIFF_LINES] + [
-            f"[... diff truncated at {_MAX_EDIT_DIFF_LINES} lines]"
+            f"\n[... diff truncated at {_MAX_EDIT_DIFF_LINES} lines]"
         ]
-    return f"diff --git a/{path} b/{path}\n" + "\n".join(lines)
+    return f"diff --git a/{path} b/{path}\n" + "".join(lines)
 
 
 def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
@@ -511,7 +515,9 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             return ToolResult(ok=False, error=failure)
 
         write_result = await run_in_sandbox(
-            sandbox, ["tee", sandbox.tool_path(path)], input_bytes=updated.encode()
+            sandbox,
+            ["sh", "-c", 'tee -- "$1" >/dev/null', "edit_file", sandbox.tool_path(path)],
+            input_bytes=updated.encode(),
         )
         if write_result.exit_code != 0:
             return _exec_error(write_result, "write failed")
@@ -568,8 +574,8 @@ def _make_run_bash_tool(
         command="string",
         timeout_seconds=(
             "integer",
-            "kill the command after this many seconds (default: the session "
-            "timeout, 120); on timeout the shell is restarted",
+            ("kill the command after this many seconds (default: the session "
+             "timeout, 120); on timeout the shell is restarted"),
         ),
     )
     async def run_bash(args: dict[str, Any]) -> ToolResult:
