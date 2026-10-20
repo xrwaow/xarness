@@ -343,10 +343,10 @@ class Presenter:
             if item.status is ToolStatus.MAKING_CALL else None
         )
         key = (self.epoch, width, item.expanded, item.status, len(item.args),
-               len(item.output), item.header, phase)
+               len(item.output), phase)
         view = ToolCallView(
             name=item.name, args=item.args, output=item.output,
-            header=item.header, status=item.status, expanded=item.expanded,
+            status=item.status, expanded=item.expanded,
         )
         if item.status is ToolStatus.MAKING_CALL:
             cached = self._args_cache.get(id(entry))

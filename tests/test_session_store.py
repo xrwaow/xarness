@@ -3,10 +3,10 @@
 import asyncio
 
 from xarness import session_store
-from xarness.conversation import Conversation, Message, Timing, ToolCall
-from xarness.events import ContentDelta, TurnComplete, Usage
-from xarness.controller import ChatController
 from xarness.config import CotStrength, ProviderProfile
+from xarness.controller import ChatController
+from xarness.conversation import Conversation, Message, Timing, ToolCall
+from xarness.protocol import ContentDelta, TurnComplete, Usage
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1",
@@ -164,6 +164,7 @@ async def _send(controller: ChatController, text: str) -> None:
 
 def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monkeypatch) -> None:
     import json
+
     from xarness import session_store as store
 
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
@@ -175,9 +176,10 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
         sandbox_name="sb",
     ))
     data = json.loads((tmp_path / "sessions" / "s.json").read_text())
-    # The meta block lives only in the sidecar, never in the session file.
+    # The meta block lives only in the shared index, never in the session file.
     assert "meta" not in data
-    meta_file = json.loads((tmp_path / "sessions" / "s.meta.json").read_text())
+    index = json.loads((tmp_path / "sessions" / "index.json").read_text())
+    meta_file = index["sessions"]["s"]
     assert meta_file["workspace"] == "/w"
     assert meta_file["message_count"] == 2
     assert meta_file["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
@@ -314,9 +316,27 @@ def test_newer_schema_is_rejected(tmp_path, monkeypatch) -> None:
         session_store.load_state("future")
 
 
-def test_meta_sidecar_written_and_removed(tmp_path, monkeypatch) -> None:
-    """save_state writes a meta sidecar so listing lookups never read the
-    full session file; deleting the session removes both files."""
+def test_legacy_meta_sidecar_seeds_the_index(tmp_path, monkeypatch) -> None:
+    """An old .meta.json is folded into the index once and then removed."""
+    import json
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    conversation = Conversation()
+    conversation.add(Message(role="user", content="q"))
+    session_store.save_state("s", session_store.SessionState(conversation, "m"))
+    index_file = tmp_path / "index.json"
+    index_file.unlink()
+    sidecar = tmp_path / "s.meta.json"
+    sidecar.write_text(json.dumps({"workspace": "/legacy", "message_count": 1}))
+
+    assert session_store.load_meta("s")["workspace"] == "/legacy"
+    assert not sidecar.exists()
+    assert json.loads(index_file.read_text())["sessions"]["s"]["workspace"] == "/legacy"
+
+
+def test_meta_index_written_and_removed(tmp_path, monkeypatch) -> None:
+    """save_state folds metadata into one index; deleting the session drops
+    its entry and the session file."""
     import json
 
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
@@ -324,14 +344,15 @@ def test_meta_sidecar_written_and_removed(tmp_path, monkeypatch) -> None:
     conversation.add(Message(role="user", content="q", timing=Timing(send="2026-01-01T00:00:00+00:00")))
     session_store.save_state("s", session_store.SessionState(conversation, "m", workspace="/w"))
 
-    sidecar = tmp_path / "s.meta.json"
-    assert sidecar.exists()
-    meta = json.loads(sidecar.read_text())
+    index_file = tmp_path / "index.json"
+    assert index_file.exists()
+    assert not (tmp_path / "s.meta.json").exists()
+    meta = json.loads(index_file.read_text())["sessions"]["s"]
     assert meta["workspace"] == "/w" and meta["message_count"] == 1
-    # The sidecar is not picked up as a session by list_sessions.
+    # The index is not picked up as a session by list_sessions.
     assert session_store.list_sessions() == ["s"]
     assert session_store.load_meta("s")["workspace"] == "/w"
 
     assert session_store.delete_session("s") is True
-    assert not sidecar.exists()
     assert not (tmp_path / "s.json").exists()
+    assert session_store.load_metas() == {}

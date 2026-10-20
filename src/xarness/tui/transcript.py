@@ -15,9 +15,9 @@ from enum import Enum
 
 from ..protocol import (
     SUMMARY_PREFIX, ContentDelta, Level, Message as ConversationMessage,
-    ReasoningDelta, StreamError, ToolCallArgumentsDelta, ToolCallArgumentsDone,
-    ToolCallStarted, ToolFinished, ToolOutputDelta, TurnComplete,
-    UserMessageAdded, image_refs, is_summary,
+    ProcessingStarted, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
+    ToolCallArgumentsDone, ToolCallStarted, ToolFinished, ToolOutputDelta,
+    TurnComplete, UserMessageAdded, image_refs, is_summary,
 )
 from ..util import format_duration
 
@@ -254,7 +254,6 @@ class ToolItem(TranscriptItem):
     name: str
     args: str = ""
     output: str = ""
-    header: str = ""
     status: ToolStatus = ToolStatus.MAKING_CALL
     expanded: bool = False
 
@@ -387,7 +386,6 @@ class Transcript:
                         else ToolStatus.CALL_FAILED
                     )
                     item.output = result.content
-                    item.header = result.header or ""
                 else:
                     item.status = ToolStatus.CALL_FAILED
                     item.output = "interrupted"
@@ -419,7 +417,6 @@ class Transcript:
             item.name = call.name or item.name
             item.args = call.arguments
             item.output = call.output
-            item.header = call.header
             if call.ok is None:
                 item.status = ToolStatus.MAKING_CALL
             elif call.parse_error:
@@ -443,11 +440,6 @@ class Transcript:
         self.cancelled = False
         self._reasoning_t = None
 
-    def _reset_round(self) -> None:
-        self.thinking = None
-        self.assistant = None
-        self._reasoning_t = None
-
     def _add(self, item):
         self.items.append(item)
         return item
@@ -460,19 +452,18 @@ class Transcript:
                 images=list(event.images or []),
                 message_id=event.message_id,
             ))]
+        if isinstance(event, ProcessingStarted):
+            self.start_round()
+            return []
         if self.cancelled:
             return []
         if isinstance(event, ReasoningDelta):
-            if self.thinking is not None and self.thinking.done:
-                self._reset_round()
             if self.thinking is None:
                 self.thinking = self._add(ThinkingItem())
                 self._reasoning_t = event.t
             self.thinking.parts.append(event.text)
             return [self.thinking]
         if isinstance(event, ContentDelta):
-            if self.assistant is not None and self.assistant.finalized:
-                self._reset_round()
             if self.assistant is None:
                 if self.thinking is not None:
                     self.thinking.finish(None)
@@ -515,19 +506,18 @@ class Transcript:
             else:
                 item.status = ToolStatus.CALL_FAILED
             item.output = event.output or event.error
-            item.header = event.header
             return [item]
         if isinstance(event, TurnComplete):
             duration = (
                 event.t - self._reasoning_t
                 if self._reasoning_t is not None else None
             )
-            return self._settle(duration)
+            return self.settle(duration)
         if isinstance(event, StreamError):
-            return self._settle(None)
+            return self.settle(None)
         return []
 
-    def _settle(self, duration: float | None) -> list:
+    def settle(self, duration: float | None) -> list:
         changed = []
         if self.thinking is not None:
             self.thinking.finish(duration)
@@ -540,4 +530,4 @@ class Transcript:
     def cancel(self) -> list:
         """Settle the round for an interrupted turn; ignore later events."""
         self.cancelled = True
-        return self._settle(None)
+        return self.settle(None)

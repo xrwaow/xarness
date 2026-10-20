@@ -37,8 +37,8 @@ from .config import (
 )
 from . import gitwork
 from .gitwork import GitInfo, GitWorktreeError
-from .protocol import CommandResult, SessionSummary, ServerInfo, ServerStats
-from .sandbox import make_sandbox, SandboxUnavailable
+from .protocol import SessionSummary, ServerInfo, ServerStats
+from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable
 from .session import Session, SessionError, SessionParts
 from .util import utcnow_iso as _utcnow
 
@@ -90,10 +90,7 @@ class Host:
         of this directory — the workspace's last choice. Reads only the
         small meta block, never the full conversation."""
         best: tuple[str | None, str | None, str] | None = None
-        for name in session_store.list_sessions():
-            meta = session_store.load_meta(name)
-            if not meta:
-                continue
+        for meta in session_store.load_metas().values():
             saved_ws = meta.get("workspace")
             if not saved_ws:
                 continue
@@ -198,10 +195,12 @@ class Host:
             git_info = None
 
         try:
-            sandbox_config, sandbox_session = make_sandbox(ws, settings, git_info)
+            sandbox = SandboxRuntime.make(
+                ws, settings, git_info, name=sandbox_key,
+            )
         except SandboxUnavailable:
             # Tools disabled, chat works.
-            sandbox_config = sandbox_session = None
+            sandbox = SandboxRuntime(name=sandbox_key, settings=settings)
 
         return SessionParts(
             workspace=ws,
@@ -209,13 +208,10 @@ class Host:
             profile_name=profile_name,
             api_key=api_key,
             config_path=self.config_path,
-            sandbox=sandbox_config,
-            sandbox_session=sandbox_session,
+            sandbox=sandbox,
             git_info=git_info,
             auto_compact=profile.auto_compact,
             tool_output_limit=settings.tool_output_limit,
-            sandbox_name=sandbox_key,
-            sandbox_settings=settings,
         )
 
     # ------------------------------------------------------------------
@@ -315,14 +311,14 @@ class Host:
         # alive.
         return session
 
-    async def delete_session(self, name: str) -> CommandResult:
+    async def delete_session(self, name: str) -> protocol.DeleteResult:
         session = self.sessions.get(name)
         if session is not None:
             if session.state != "idle":
                 raise SessionError("wait for the current turn to finish before deleting")
             await self._evict(session)
         deleted = session_store.delete_session(name)
-        return CommandResult(cmd_id="", ok=True, payload={"deleted": deleted})
+        return protocol.DeleteResult(deleted=deleted)
 
     async def unload_session(self, name: str) -> bool:
         """Stop hosting a session ("stop and quit"): the turn is cancelled,
@@ -355,18 +351,186 @@ class Host:
             summaries.append(session.summary())
         if active is None or active is False:
             hosted_names = set(self.sessions)
-            for name in session_store.list_sessions():
+            for name, meta in session_store.load_metas().items():
                 if name in hosted_names:
                     continue
-                if workspace is not None:
-                    meta = session_store.load_meta(name)
-                    if not meta or meta.get("workspace") != workspace:
-                        continue
-                summaries.append(session_store.saved_summary(name))
+                if workspace is not None and meta.get("workspace") != workspace:
+                    continue
+                summaries.append(session_store.saved_summary(name, meta))
         if active is True:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
         return summaries
+
+    # ------------------------------------------------------------------
+    # read-only views of saved sessions
+
+    def _saved_state(self, name: str) -> session_store.SessionState:
+        """Load a saved session without hosting it (no sandbox, no git scan)."""
+        if not session_store.session_path(name).exists():
+            raise SessionError(f"no saved session named {name!r}")
+        try:
+            return session_store.load_state(name)
+        except (OSError, ValueError, KeyError) as exc:
+            raise SessionError(f"could not read the saved session: {exc}") from exc
+
+    def _saved_status(
+        self, name: str, state: session_store.SessionState,
+    ) -> protocol.StatusPayload:
+        """Best-effort status for a saved session: config metadata, but no
+        sandbox construction and no workspace scan."""
+        profile = None
+        profile_name = state.profile
+        try:
+            profile_name, profile = load_sectioned(self.config_path).resolve_model(
+                state.profile,
+            )
+        except ConfigError:
+            pass
+        settings = None
+        if state.sandbox_settings is not None:
+            try:
+                settings = SandboxSettings.model_validate(state.sandbox_settings)
+            except ValueError:
+                settings = None
+        refs: list[protocol.RefInfo] = []
+        if settings is not None and state.workspace:
+            external = SandboxConfig.resolve_auto_refs(
+                Path(state.workspace), settings.auto_include_refs,
+            )
+            refs = [
+                protocol.RefInfo(path=str(ref.host), mount=ref.mount)
+                for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
+            ]
+        return protocol.StatusPayload(
+            state="idle",
+            session_name=name,
+            workspace=state.workspace,
+            mode=state.mode or "write",
+            model_name=profile_name or "",
+            model_display_name=(
+                (profile.display_name or profile.model_id) if profile else ""
+            ),
+            model_id=profile.model_id if profile else "",
+            cot_strength=profile.cot_strength.value if profile else "medium",
+            max_context=profile.max_context if profile else 128_000,
+            supports_vision=profile.supports_vision if profile else False,
+            sandbox_name=state.sandbox_name,
+            use_container=settings.use_container if settings else True,
+            enable_tracking=state.git is not None,
+            filter_list=list(settings.filter_list) if settings else [],
+            refs=refs,
+            total_in=state.total_in,
+            total_out=state.total_out,
+            last_in=state.last_in,
+            last_out=state.last_out,
+            context_used=state.last_in + state.last_out,
+        )
+
+    def saved_snapshot(self, name: str) -> protocol.Snapshot:
+        """Snapshot of a saved session read straight from the store."""
+        state = self._saved_state(name)
+        visible = state.conversation.visible_messages()
+        visible_ids = {id(m) for m in visible}
+        return protocol.Snapshot(
+            messages=list(visible),
+            history=[
+                m for m in state.conversation.messages if id(m) not in visible_ids
+            ],
+            status=self._saved_status(name, state),
+        )
+
+    @staticmethod
+    def _workspace_ref_infos(
+        workspace: Path, specs: list[str],
+    ) -> list[protocol.RefInfo]:
+        external = SandboxConfig.resolve_auto_refs(workspace, specs)
+        return [
+            protocol.RefInfo(path=str(ref.host), mount=ref.mount)
+            for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
+        ]
+
+    def workspace_refs(self, workspace: str) -> list[protocol.RefInfo]:
+        """Canonical workspace refs, without hosting a session."""
+        ws = Path(workspace).expanduser().resolve()
+        return self._workspace_ref_infos(
+            ws, session_store.load_workspace_refs(str(ws)),
+        )
+
+    async def update_workspace_refs(
+        self, update: protocol.WorkspaceRefUpdate,
+    ) -> list[protocol.RefInfo]:
+        """Add/remove one workspace ref and push the canonical list to every
+        hosted session in that workspace."""
+        ws = Path(update.workspace).expanduser().resolve()
+        raw = update.path.strip()
+        if not raw:
+            raise SessionError("references need a path")
+        host = Path(raw).expanduser()
+        host = (host if host.is_absolute() else ws / host).resolve()
+        specs = session_store.load_workspace_refs(str(ws))
+        if update.add:
+            if not host.exists():
+                raise SessionError(f"no such path: {raw}")
+            if str(host) not in specs:
+                specs.append(str(host))
+        else:
+            kept = [ref for ref in specs if str(Path(ref).expanduser().resolve()) != host]
+            if len(kept) == len(specs):
+                raise SessionError(f"no such reference: {raw}")
+            specs = kept
+        try:
+            session_store.save_workspace_refs(str(ws), specs)
+        except OSError as exc:
+            raise SessionError(f"could not save references: {exc}") from exc
+        for session in self.sessions.values():
+            if session.workspace.resolve() == ws:
+                await session.apply_ref_specs(specs)
+        return self._workspace_ref_infos(ws, specs)
+
+    async def saved_diff_info(
+        self, name: str, path: str | None,
+    ) -> protocol.DiffInfo:
+        """Diff for a saved session, using only the persisted git block and
+        turn checkpoints — no hosted session and no sandbox."""
+        state = self._saved_state(name)
+        block = state.git if isinstance(state.git, dict) else None
+        if not block:
+            return protocol.DiffInfo(tracking=False)
+        try:
+            info = GitInfo.from_block(block)
+        except (KeyError, TypeError, ValueError):
+            return protocol.DiffInfo(tracking=False)
+        turns = [
+            gitwork.TurnCheckpoint(t.before_tree, t.after_tree)
+            for t in state.conversation.turns
+            if not t.locked and t.before_tree and t.after_tree
+        ]
+        try:
+            current = await gitwork.snapshot_state(info) if path is not None else None
+            stat = await gitwork.attributed_diff_stat(info, turns, current=current)
+        except GitWorktreeError:
+            return protocol.DiffInfo(tracking=False)
+        files = [
+            protocol.DiffFileInfo(
+                path=f.path, additions=f.additions, deletions=f.deletions,
+                is_new=f.is_new, source=f.source or "agent",
+            )
+            for f in stat.files
+            if path is None or f.path == path
+        ]
+        result = protocol.DiffInfo(
+            files=files,
+            additions=sum(f.additions for f in files),
+            deletions=sum(f.deletions for f in files),
+            tracking=True,
+        )
+        if path is not None:
+            try:
+                result.text = await gitwork.git_diff(info, path, current=current)
+            except GitWorktreeError as exc:
+                raise SessionError(f"diff failed: {exc}") from exc
+        return result
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(
@@ -446,13 +610,12 @@ class Host:
             if session.is_active:
                 active[path] = active.get(path, 0) + 1
         hosted_names = set(self.sessions)
-        for name in session_store.list_sessions():
+        for name, meta in session_store.load_metas().items():
             # Hosted sessions are persisted at creation; skip them so they
             # aren't double-counted (as list_sessions already does).
             if name in hosted_names:
                 continue
-            meta = session_store.load_meta(name)
-            if meta and meta.get("workspace"):
+            if meta.get("workspace"):
                 ws = meta["workspace"]
                 counts[ws] = counts.get(ws, 0) + 1
         return [

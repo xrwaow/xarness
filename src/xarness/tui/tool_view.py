@@ -1,4 +1,4 @@
-"""Per-tool presentation: live label, settled header detail and body.
+"""Per-tool presentation: live label, settled detail and body.
 
 Each tool name needing special display is described once in ``TOOL_VIEWS``;
 the transcript item and the live labels look the result up instead of
@@ -88,6 +88,21 @@ def _muted(value: str) -> Text:
     return Text(value, style=theme.PALETTE["muted"])
 
 
+def _counts_detail(
+    adds: int, dels: int | None, path: str,
+) -> Text:
+    """The settled '+N [-M] path' detail, styled like the live label."""
+    detail = Text(" ")
+    detail.append(f"+{adds}", style=theme.PALETTE["diff_add"])
+    if dels is not None:
+        detail.append(" ")
+        detail.append(f"-{dels}", style=theme.PALETTE["diff_del"])
+    if path:
+        detail.append(" ")
+        detail.append(path, style=theme.PALETTE["muted"])
+    return detail
+
+
 def _write_loc(args_text: str) -> int | None:
     content = json_tool_args(args_text).get("content")
     if isinstance(content, str):
@@ -96,7 +111,7 @@ def _write_loc(args_text: str) -> int | None:
     return None if raw is None else _lines(raw.replace("\\\\", "").replace("\\n", "\n"))
 
 
-def _edit_counts(args_text: str) -> str | None:
+def _edit_totals(args_text: str) -> tuple[int, int] | None:
     args = json_tool_args(args_text)
     edits = args.get("edits")
     if not isinstance(edits, list):
@@ -130,6 +145,14 @@ def _edit_counts(args_text: str) -> str | None:
         ))
         adds += sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
         dels += sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    return adds, dels
+
+
+def _edit_counts(args_text: str) -> str | None:
+    totals = _edit_totals(args_text)
+    if totals is None:
+        return None
+    adds, dels = totals
     return f"+{adds} -{dels}" if adds or dels else None
 
 
@@ -140,41 +163,20 @@ class ToolCallView:
     name: str
     args: str
     output: str = ""
-    header: str = ""
     status: object = None
     expanded: bool = False
 
 
-# live(args) -> (tool name, static detail); header(stored header) and
-# settled(args) -> dimmed detail Text; body(call) -> expanded renderable.
+# live(args) -> (tool name, static detail); settled(args) -> dimmed detail
+# Text; body(call) -> expanded renderable.
 ToolView = tuple[
     Callable[[str], tuple[str, str]],
-    Callable[[str], Text | None],
     Callable[[str], Text | None],
     Callable[[ToolCallView], RenderableType],
 ]
 
 
 # -- shared pieces ---------------------------------------------------------
-
-_COUNTS = {
-    "edit_file": re.compile(r"^(\+\d+) (-\d+) (.+)$"),
-    "write_file": re.compile(r"^(\+\d+) (.+)$"),
-}
-
-
-def _count_header(tool_name: str, header: str) -> Text | None:
-    pattern = _COUNTS.get(tool_name)
-    match = pattern.match(header) if pattern else None
-    if match is None:
-        return None
-    *counts, path = match.groups()
-    detail = Text(" ")
-    for value, key in zip(counts, ("diff_add", "diff_del")):
-        detail.append(value, style=theme.PALETTE[key])
-        detail.append(" ")
-    detail.append(path, style=theme.PALETTE["muted"])
-    return detail
 
 
 def _path_settled(args_text: str) -> Text | None:
@@ -264,7 +266,7 @@ def _plain_body(call: ToolCallView) -> RenderableType:
 
 def _bash_settled(args_text: str) -> Text | None:
     command = _command(args_text)
-    return _muted(" " + _shorten(command.splitlines()[0], 80)) if command else None
+    return _muted(" " + _shorten(command, 80)) if command else None
 
 
 def _plain_live(args_text: str) -> tuple[str, str]:
@@ -276,24 +278,27 @@ def _bash_live(args_text: str) -> tuple[str, str]:
     return "run_bash", command.splitlines()[0] if command else ""
 
 
-_DEFAULT: ToolView = (_plain_live, _muted, lambda a: None, _plain_body)
+def _write_settled(args_text: str) -> Text | None:
+    loc, path = _write_loc(args_text), _path(args_text)
+    if loc is None:
+        return _path_settled(args_text)
+    return _counts_detail(loc, None, path)
+
+
+def _edit_settled(args_text: str) -> Text | None:
+    totals = _edit_totals(args_text)
+    if totals is None:
+        return _path_settled(args_text)
+    adds, dels = totals
+    return _counts_detail(adds, dels, _path(args_text))
+
+
+_DEFAULT: ToolView = (_plain_live, lambda a: None, _plain_body)
 TOOL_VIEWS: dict[str, ToolView] = {
-    "write_file": (
-        _write_live, lambda h: _count_header("write_file", h),
-        _path_settled, _write_body,
-    ),
-    "edit_file": (
-        _edit_live, lambda h: _count_header("edit_file", h),
-        _path_settled, _edit_body,
-    ),
-    "read_file": (
-        _read_live, lambda h: _muted(" " + _shorten(h)),
-        _read_settled, _read_body,
-    ),
-    "run_bash": (
-        _bash_live, lambda h: _muted(" " + _shorten(h, 80)),
-        _bash_settled, _bash_body,
-    ),
+    "write_file": (_write_live, _write_settled, _write_body),
+    "edit_file": (_edit_live, _edit_settled, _edit_body),
+    "read_file": (_read_live, _read_settled, _read_body),
+    "run_bash": (_bash_live, _bash_settled, _bash_body),
 }
 
 
@@ -307,10 +312,8 @@ def summary_text(call: ToolCallView) -> Text:
     """Settled one-line summary after the status verb."""
     if getattr(call.status, "name", "") != "CALL_SUCCEEDED":
         return Text(call.name)
-    _, header, settled, _ = TOOL_VIEWS.get(call.name, _DEFAULT)
-    detail = header(call.header) if call.header else None
-    if detail is None:
-        detail = settled(call.args)
+    _, settled, _ = TOOL_VIEWS.get(call.name, _DEFAULT)
+    detail = settled(call.args)
     text = Text(call.name)
     if detail is not None:
         text.append_text(detail)
@@ -318,4 +321,4 @@ def summary_text(call: ToolCallView) -> Text:
 
 
 def body_renderable(call: ToolCallView) -> RenderableType:
-    return TOOL_VIEWS.get(call.name, _DEFAULT)[3](call)
+    return TOOL_VIEWS.get(call.name, _DEFAULT)[2](call)

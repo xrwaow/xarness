@@ -146,6 +146,24 @@ class XarnessClient:
             "/v1/workspaces/files", params={"workspace": workspace, "q": q},
         ))
 
+    async def workspace_refs(self, workspace: str) -> list[protocol.RefInfo]:
+        return [
+            protocol.RefInfo.model_validate(item)
+            for item in await self._get(
+                "/v1/workspaces/refs", params={"workspace": workspace},
+            )
+        ]
+
+    async def update_workspace_refs(
+        self, workspace: str, path: str, add: bool,
+    ) -> list[protocol.RefInfo]:
+        return [
+            protocol.RefInfo.model_validate(item)
+            for item in await self._post("/v1/workspaces/refs", {
+                "workspace": workspace, "path": path, "add": add,
+            })
+        ]
+
     # ------------------------------------------------------------------
     # sessions
 
@@ -182,16 +200,16 @@ class XarnessClient:
             await self._get(f"/v1/sessions/{name}/diff", params=params)
         )
 
-    async def delete_session(self, name: str) -> CommandResult:
-        return CommandResult.model_validate(
+    async def delete_session(self, name: str) -> protocol.DeleteResult:
+        return protocol.DeleteResult.model_validate(
             self._json(
                 await _wrap_http(self._request("DELETE", f"/v1/sessions/{name}"))
             )
         )
 
-    async def close_session(self, name: str) -> CommandResult:
+    async def close_session(self, name: str) -> protocol.CloseResult:
         """Stop hosting the session: cancel + unload; the saved file stays."""
-        return CommandResult.model_validate(
+        return protocol.CloseResult.model_validate(
             await self._post(f"/v1/sessions/{name}/close", {})
         )
 

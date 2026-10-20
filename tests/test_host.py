@@ -15,10 +15,9 @@ import pytest
 from xarness import host as host_mod
 from xarness import protocol, session_store
 from xarness.conversation import Message
-from xarness.events import ContentDelta, TurnComplete, Usage
 from xarness.host import GRACE_SECONDS, Host
+from xarness.protocol import ContentDelta, SendMessage, Snapshot, TurnComplete, Usage
 from xarness.session import SessionError
-from xarness.protocol import SendMessage, Snapshot
 
 
 class FakeClient:
@@ -28,7 +27,7 @@ class FakeClient:
         self.script = list(script)
 
     async def stream(self, wire_messages, tools=None):
-        from xarness.events import ProcessingStarted
+        from xarness.protocol import ProcessingStarted
         yield ProcessingStarted()
         for event in (self.script.pop(0) if self.script else []):
             yield event
@@ -152,6 +151,40 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
     assert per_file["files"][0]["path"] == "a.txt"
 
 
+def test_saved_session_reads_do_not_host_or_build_a_sandbox(tmp_path, monkeypatch) -> None:
+    """GET /sessions/{name} and /diff must serve an unloaded session from
+    the store: no Session object, no sandbox construction."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [[]])
+            await host.unload_session(name)
+            assert name not in host.sessions
+
+            def boom(*args, **kwargs):
+                raise AssertionError("saved read built a sandbox")
+
+            monkeypatch.setattr("xarness.sandbox.make_sandbox", boom)
+            async with _unix_http(host.unix_socket) as http:
+                snap_resp = await http.get(f"/v1/sessions/{name}")
+                diff_resp = await http.get(f"/v1/sessions/{name}/diff")
+                assert snap_resp.status_code == 200, snap_resp.text
+                assert diff_resp.status_code == 200, diff_resp.text
+                snap = snap_resp.json()
+                assert snap["status"]["session_name"] == name
+                assert snap["status"]["state"] == "idle"
+                assert diff_resp.json()["tracking"] is True
+            # Still saved-only: neither GET re-hosted the session.
+            assert name not in host.sessions
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_host_survives_client_disconnect(tmp_path) -> None:
     async def go():
         host = make_host(tmp_path)
@@ -211,7 +244,7 @@ def test_host_stays_alive_while_turn_runs(tmp_path) -> None:
                 return ToolResult(ok=True)
 
             name = await _make_session(host, tmp_path, [[
-                __import__("xarness.events", fromlist=["ToolCallArgumentsDone"])
+                __import__("xarness.protocol", fromlist=["ToolCallArgumentsDone"])
                 .ToolCallArgumentsDone(call_id="c1", name="blocker", arguments_json="{}"),
                 TurnComplete(has_tool_calls=True),
             ]])
@@ -584,8 +617,8 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         assert session.git_info is not None
         saved_tree = session.git_info.baseline_tree
         # A distinct saved sandbox state.
-        session.sandbox_name = "default"
-        session.sandbox_settings = SandboxSettings(allow_git_write=True)
+        session.sandbox.name = "default"
+        session.sandbox.settings = SandboxSettings(allow_git_write=True)
         session._persist()
         await host.unload_session(name)
 
@@ -593,16 +626,16 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         monkeypatch.chdir(tmp_path / "elsewhere")
         loaded = await host.load_session(name)
         assert loaded.workspace == (tmp_path / "ws").resolve()
-        assert loaded.sandbox_name == "default"
-        assert loaded.sandbox_settings is not None
-        assert loaded.sandbox_settings.allow_git_write is True
+        assert loaded.sandbox.name == "default"
+        assert loaded.sandbox.settings is not None
+        assert loaded.sandbox.settings.allow_git_write is True
         assert loaded.git_info is not None
         assert loaded.git_info.workspace == (tmp_path / "ws").resolve()
         # The SAVED git block won: the baseline is the session's own, not a
         # fresh snapshot of the (possibly changed) workspace.
         assert loaded.git_info.baseline_tree == saved_tree
-        if loaded.sandbox is not None:
-            assert loaded.sandbox.workspace == (tmp_path / "ws").resolve()
+        if loaded.sandbox.config is not None:
+            assert loaded.sandbox.config.workspace == (tmp_path / "ws").resolve()
         return host
 
     asyncio.run(go())
@@ -689,6 +722,7 @@ def test_session_listing_uses_meta_not_conversations(tmp_path, monkeypatch) -> N
         def explode(*args, **kwargs):
             raise AssertionError("full conversation parsed")
         monkeypatch.setattr(session_store, "load_state", explode)
+        monkeypatch.setattr(session_store, "load_meta", explode)
 
         summaries = host.list_sessions()
         saved = [s for s in summaries if s.name == name and not s.active]
@@ -698,6 +732,11 @@ def test_session_listing_uses_meta_not_conversations(tmp_path, monkeypatch) -> N
             (tmp_path / "ws").resolve(),
         )
         assert last_model == "test"
+        assert any(
+            info.session_count == 1
+            for info in host.workspaces()
+            if info.path == str((tmp_path / "ws").resolve())
+        )
 
     asyncio.run(go())
 
@@ -851,7 +890,7 @@ def test_unload_closes_sandbox_session(tmp_path) -> None:
                 self.closed = True
 
         shell = FakeShell()
-        session.sandbox_session = shell
+        session.sandbox.shell = shell
         await host.unload_session(summary.name)
         assert shell.closed
     asyncio.run(go())

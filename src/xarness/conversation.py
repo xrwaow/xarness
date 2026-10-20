@@ -22,11 +22,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .events import Usage
+from .gitwork import TurnCheckpoint
 from .images import (
-    IMAGE_TOKEN_RE, ImageAttachment, ImageRef, legacy_token_text, token_text,
+    IMAGE_TOKEN_RE,
+    ImageAttachment,
+    ImageRef,
+    legacy_token_text,
+    token_text,
 )
-
 
 # Prefix of the summary user message compaction leaves behind. Identifying
 # it by content (not identity) keeps working across a session save/load.
@@ -138,6 +141,17 @@ class ToolCall(BaseModel):
         )
 
 
+class Usage(BaseModel):
+    """Token usage for a turn. ``approximate`` marks locally estimated counts.
+
+    A pydantic model (not a dataclass) so the very same object crosses the
+    wire in snapshots and persists losslessly."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    approximate: bool = False
+
+
 class Timing(BaseModel):
     """When a message happened and (for a turn's last answer) how long it took.
 
@@ -181,10 +195,6 @@ class Message(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] | None = None
-    # Local-only: the tool call's one-line header summary (tool-role messages
-    # only) — computed by the tool, persisted so /resume renders the same
-    # headers. Never sent over the wire.
-    header: str | None = None
     # Ordered text/image segments of a user message. Images are stored by
     # content hash (see ImageRef); the provider wire format is assembled in
     # to_wire, so persistence and snapshots carry no base64 payloads.
@@ -249,6 +259,26 @@ class Turn(BaseModel):
 
 
 @dataclass(slots=True)
+class RollbackPlan:
+    """What /undo or /retry needs to do, computed by
+    :meth:`Conversation.rollback_plan`.
+
+    Usage totals are monotonic (they count everything ever spent, including
+    undone turns), so a plan carries no usage bookkeeping."""
+
+    user_text: str  # the turn's user message (input box / resend)
+    revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
+    keep: list[Message]  # what the conversation becomes
+    images: list[ImageRef] | None = None
+    # Epoch to restore (undoing a compaction flips it back instead of
+    # restoring a second copy of the history).
+    epoch: int = 0
+    # True for a compaction-only undo: no messages are dropped, the turn
+    # stays intact, no files are reverted, and the input box is not touched.
+    compaction_only: bool = False
+
+
+@dataclass(slots=True)
 class Conversation:
     """Ordered message history; the single source of truth for the chat.
 
@@ -278,6 +308,78 @@ class Conversation:
         turn = Turn(user_message_id=user_message.id, before_tree=before_tree)
         self.turns.append(turn)
         return turn
+
+    # -- rollback planning ------------------------------------------------
+
+    def message_by_id(self, message_id: str) -> Message | None:
+        return next((m for m in self.messages if m.id == message_id), None)
+
+    def rollback_plan(self) -> RollbackPlan | None:
+        """Plan the rollback of the last user turn, or None if there is
+        nothing to undo (no user message, or no response to it yet).
+
+        If the most recent thing that happened is a compaction (a summary in
+        the visible history, no real user turn after it), /undo //retry undo
+        the compaction itself first by flipping the epoch back; the turn that
+        triggered it stays intact and no files are touched."""
+        visible = self.visible_messages()
+        if self.epoch > 0 and visible and is_summary(visible[-1]):
+            return RollbackPlan(
+                user_text="", revert_turns=[], keep=list(self.messages),
+                epoch=self.epoch - 1, compaction_only=True,
+            )
+        turn = self.turns[-1] if self.turns else None
+        message = self.message_by_id(turn.user_message_id) if turn else None
+        if message is None:
+            # Legacy session without a tracked turn: fall back to the last
+            # real user message that has a response after it.
+            message = next(
+                (m for m in reversed(visible)
+                 if m.role == "user" and not is_summary(m) and m is not visible[-1]),
+                None,
+            )
+        if message is None or (visible and message is visible[-1]):
+            return None  # the turn produced no response yet
+        return self.rollback_plan_to(message)
+
+    def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
+        """Plan a rollback to an arbitrary earlier user message
+        (click-to-undo): drop that message and everything after it, restoring
+        the workspace to the checkpoint taken when it was sent.
+
+        Searches the full append-only history, so messages the last compaction
+        summarized away are found too (the epoch simply drops back to theirs).
+        Returns None when the message is not a user turn in this conversation.
+        """
+        if message.role != "user" or is_summary(message):
+            return None
+        index = next(
+            (i for i, m in enumerate(self.messages) if m is message), None,
+        )
+        if index is None:
+            return None
+        dropped_ids = {m.id for m in self.messages[index:]}
+        # Revert only closed, unlocked turns that are being dropped; their
+        # file edits can still be undone.
+        revert = [
+            TurnCheckpoint(t.before_tree, t.after_tree)
+            for t in reversed(self.turns)
+            if t.user_message_id in dropped_ids and not t.locked
+            and t.before_tree and t.after_tree
+        ]
+        return RollbackPlan(
+            user_text=message.content, revert_turns=revert[::-1],
+            keep=list(self.messages[:index]), epoch=message.epoch,
+            images=image_refs(message) or None,
+        )
+
+    def apply_rollback(self, plan: RollbackPlan) -> None:
+        """Truncate the conversation to the plan. File edits are reversed
+        separately, so a conflict can abort before the conversation changes."""
+        self.messages = list(plan.keep)
+        self.epoch = plan.epoch
+        kept = {m.id for m in self.messages}
+        self.turns = [t for t in self.turns if t.user_message_id in kept]
 
     def lock_turns(self, tree: str) -> None:
         """Point every turn's checkpoints at ``tree`` (an accepted/rejected

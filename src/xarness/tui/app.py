@@ -40,12 +40,12 @@ from ..protocol import (
     AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
     CreateSessionRequest, DiffChanged, DiscardQueued, DriftDetected,
     DriftResolved, Event, CompactionDone, RollbackApplied,
+    CommandPayload, RollbackResult,
     FilterAdd, FilterRemove,
     FlushQueued, HistoryReplaced,
     Notice, ProcessingStarted, ReasoningDelta, Reject, ResolveDrift,
     Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
     StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
-    RefAdd, RefRemove,
     ToolCallStarted, TurnComplete,
     TurnEnded, TurnFinished, Undo, UndoTo, UserMessageAdded,
 )
@@ -528,7 +528,8 @@ class AgentApp(App[None]):
         if isinstance(event, ProcessingStarted):
             # A round opened and is waiting on the provider: the strip goes
             # up (this is the start of a turn AND every post-tools round).
-            self._transcript.start_round()
+            # The reducer opens the live round; there is no app-side reset.
+            self._sync_entries(self._transcript.apply(event))
             self._phase_pending()
             # Clear a stale "finished" suffix as soon as the next turn starts.
             self._set_default_title()
@@ -590,7 +591,7 @@ class AgentApp(App[None]):
         except ClientError as exc:
             self._error(f"{prefix}{exc}")
 
-    async def _send_command(self, command: Command) -> dict | None:
+    async def _send_command(self, command: Command) -> CommandPayload | None:
         """Send one command to the session; returns its result payload.
 
         Errors (busy rejection, unknown target, git failure) surface as an
@@ -1028,16 +1029,12 @@ class AgentApp(App[None]):
     async def _run_undo(self) -> None:
         self._put_back_user_text(await self._send_command(Undo()))
 
-    def _put_back_user_text(self, payload: dict | None) -> None:
+    def _put_back_user_text(self, payload: CommandPayload | None) -> None:
         """Restore an undone message's text and images to the input box."""
-        data = payload or {}
-        if not data.get("user_text"):
+        if not isinstance(payload, RollbackResult) or not payload.user_text:
             return
-        images = [
-            ImageAttachment.model_validate(raw) for raw in data.get("images", ())
-        ]
         chat_input = self.query_one("#chat-input", ChatInput)
-        chat_input.restore(data["user_text"], images)
+        chat_input.restore(payload.user_text, list(payload.images or ()))
         chat_input.focus()
 
     def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
@@ -1206,10 +1203,17 @@ class AgentApp(App[None]):
 
     @work(group="refs", exit_on_error=False)
     async def _open_refs(self) -> None:
-        """Open the manager; a draft gets its session started first."""
-        if not await self._ensure_session():
+        """Open the manager from the workspace, without creating a session."""
+        workspace = self.view_status.workspace or str(Path.cwd())
+        if not workspace:
+            self._error("no workspace to manage references for")
             return
-        self.push_screen(RefsScreen(list(self.view_status.refs)))
+        try:
+            refs = await self.client.workspace_refs(workspace)
+        except ClientError as exc:
+            self._error(str(exc))
+            return
+        self.push_screen(RefsScreen(refs))
 
     def on_refs_screen_add_ref(self, event: RefsScreen.AddRef) -> None:
         self._ref_update(True, event.path)
@@ -1226,13 +1230,20 @@ class AgentApp(App[None]):
 
     @work(group="refs", exit_on_error=False)
     async def _ref_update(self, add: bool, path: str) -> None:
-        if not await self._ensure_session():
+        workspace = self.view_status.workspace or str(Path.cwd())
+        if not workspace:
+            self._error("no workspace to manage references for")
             return
-        command = RefAdd(path=path) if add else RefRemove(path=path)
         try:
-            await self.client.command(self.session_name, command)
+            refs = await self.client.update_workspace_refs(workspace, path, add)
         except ClientError as exc:
             self._error(str(exc))
+            return
+        if self.status is not None:
+            self.status.refs = refs
+            self._refresh_bars()
+        if isinstance(self.screen, RefsScreen):
+            self.screen.post_message(RefsScreen.RefsChanged(refs))
 
     # ------------------------------------------------------------------
     # Theme (client-side preference)

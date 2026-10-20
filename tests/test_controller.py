@@ -6,10 +6,11 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from xarness.config import CotStrength, ProviderProfile
-from xarness.controller import ChatController
-from xarness.conversation import Message, ToolCall
-from xarness.controller import PartialRound
-from xarness.events import (
+from xarness.controller import ChatController, PartialRound
+from xarness.conversation import Message, ToolCall, build_parts
+from xarness.gitwork import TurnCheckpoint
+from xarness.images import ImageAttachment
+from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
     ReasoningDelta,
@@ -20,9 +21,6 @@ from xarness.events import (
     TurnComplete,
     Usage,
 )
-from xarness.gitwork import TurnCheckpoint
-from xarness.conversation import build_parts
-from xarness.images import ImageAttachment
 from xarness.tools import ToolResult, build_registry
 
 PROFILE = ProviderProfile(

@@ -1,6 +1,7 @@
 """Session tests: single-writer, fan-out, atomic save, tool repair, undo."""
 
 import asyncio
+import base64
 from typing import Any
 
 import pytest
@@ -8,20 +9,31 @@ import pytest
 from xarness import gitwork, protocol, session_store
 from xarness.config import ProviderProfile
 from xarness.conversation import SUMMARY_PREFIX, Message, Timing, Turn
-from xarness.tui.transcript import turn_time_summary
-from xarness.events import (
-    ContentDelta, ProcessingStarted, ReasoningDelta, StreamError,
-    ToolCallArgumentsDone, ToolCallStarted, TurnComplete, Usage,
-)
-from xarness.protocol import (
-    Accept, AnswerAsk, Cancel, Compact, FilterAdd, Reject, Retry, SendMessage,
-    SetMode, Undo, UndoTo,
-)
-import base64
-
 from xarness.images import ImageAttachment
+from xarness.protocol import (
+    Accept,
+    AnswerAsk,
+    Cancel,
+    Compact,
+    ContentDelta,
+    FilterAdd,
+    ProcessingStarted,
+    ReasoningDelta,
+    Reject,
+    Retry,
+    SendMessage,
+    SetMode,
+    StreamError,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
+    TurnComplete,
+    Undo,
+    UndoTo,
+    Usage,
+)
 from xarness.session import Session
 from xarness.tools import ToolRegistry, ToolResult, tool
+from xarness.tui.transcript import turn_time_summary
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1", model_id="test-model", max_context=1000,
@@ -87,7 +99,7 @@ def test_undo_and_retry_keep_images(tmp_path) -> None:
         return await session.execute("u1", Undo())
 
     undone = asyncio.run(go())
-    assert undone.payload["images"][0]["name"] == "cat.png"
+    assert undone.payload.images[0].name == "cat.png"
     wire = session.controller._client.received_wire[-1]
     assert any(
         isinstance(m["content"], list)
@@ -143,9 +155,12 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
     noop = tool("noop", "does nothing")(lambda: "ok")
     session = make_session(
         [
-            [ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=100, output_tokens=10)),
-             ToolCallStarted(call_id="c1", name="noop"),
-             ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}")],
+            [
+                ContentDelta(text="one"),
+                ToolCallStarted(call_id="c1", name="noop"),
+                ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
+                TurnComplete(usage=Usage(input_tokens=100, output_tokens=10)),
+            ],
             [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=200, output_tokens=20))],
         ],
         tmp_path, tools=ToolRegistry([noop]),
@@ -211,7 +226,7 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
         session.subscribe()
         await session.execute("c1", SendMessage(text="go"))
         result = await session.execute("c2", SendMessage(text="steer me"))
-        assert result.ok and result.payload == {"queued": True}
+        assert result.ok and result.payload.queued is True
         assert session._queued, "message should be queued while running"
         release.set()
         await wait_idle(session)
@@ -354,7 +369,7 @@ def test_undo_to_by_message_id(tmp_path) -> None:
 
     result = asyncio.run(go())
     assert result.ok
-    assert (result.payload or {}).get("user_text") == "first question"
+    assert result.payload.user_text == "first question"
     # The turn was dropped: nothing remains.
     assert session.conversation.messages == []
 
@@ -405,7 +420,7 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
         await wait_idle(session)
         undo = await session.execute("u1", Undo())
         assert undo.ok, undo.error
-        assert (undo.payload or {}).get("user_text") == "second question"
+        assert undo.payload.user_text == "second question"
         return session
 
     undone = asyncio.run(go())
@@ -471,7 +486,7 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
         # Auto-compact ran; the session is NOT idle while finish_turn blocks.
         assert session._state != "idle"
         second = await session.execute("c2", SendMessage(text="go again"))
-        assert second.ok and second.payload == {"queued": True}
+        assert second.ok and second.payload.queued is True
         assert session._queued and session._queued[0][0] == "go again"
         finish_gate.set()
         await first
@@ -501,14 +516,14 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
         result = await asyncio.wait_for(
             session.execute("c1", Compact()), timeout=2,
         )
-        assert result.ok and (result.payload or {}).get("started") is True
+        assert result.ok and result.payload.started is True
         assert session._state == "compacting"
         assert session._compact_task is not None
         # The inbox is still responsive while compaction runs.
         sent = await asyncio.wait_for(
             session.execute("c2", SendMessage(text="after compact")), timeout=2,
         )
-        assert sent.ok and sent.payload == {"queued": True}
+        assert sent.ok and sent.payload.queued is True
         gate.set()
         await wait_idle(session)
 
@@ -570,8 +585,8 @@ def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> Non
     from xarness.config import SandboxSettings
 
     session = make_session([], tmp_path)
-    session.sandbox_name = "netless"
-    session.sandbox_settings = SandboxSettings(filter_list=["secrets"])
+    session.sandbox.name = "netless"
+    session.sandbox.settings = SandboxSettings(filter_list=["secrets"])
     session._pending_drift = ("aaa", "bbb", ["a.txt"])
     status = session.status()
     assert status.sandbox_name == "netless"
@@ -601,8 +616,8 @@ def test_resume_drift_uses_accepted_turns_too(tmp_path, monkeypatch) -> None:
     """A locked (/accepted) turn is not undoable, but it is still the last
     known workspace state. Comparing against the older baseline made a clean
     accept look like external drift on the next resume."""
-    from xarness.gitwork import GitInfo
     import xarness.session as session_mod
+    from xarness.gitwork import GitInfo
 
     session = make_session([], tmp_path)
     session.git_info = GitInfo(
@@ -624,8 +639,8 @@ def test_resume_drift_uses_accepted_turns_too(tmp_path, monkeypatch) -> None:
 
 
 def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
-    from xarness.gitwork import GitInfo
     import xarness.session as session_mod
+    from xarness.gitwork import GitInfo
 
     session = make_session([], tmp_path)
 
@@ -712,8 +727,8 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
         # Back-to-back: no awaiting of turn progress between the two sends.
         first = await session.execute("c1", SendMessage(text="one"))
         second = await session.execute("c2", SendMessage(text="two"))
-        assert first.ok and first.payload == {"started": True}
-        assert second.ok and second.payload == {"queued": True}, (
+        assert first.ok and first.payload.started is True
+        assert second.ok and second.payload.queued is True, (
             "back-to-back send must steer, not start a second turn"
         )
         release.set()
@@ -782,10 +797,10 @@ def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
         assert call.output == "body"
         assert call.ok is None  # still running
         session._emit(protocol.ToolFinished(
-            call_id="c1", ok=True, output="full body", header="+1",
+            call_id="c1", ok=True, output="full body",
         ))
         call = session.snapshot().partial_round.tool_calls[0]
-        assert call.ok is True and call.header == "+1"
+        assert call.ok is True
 
     asyncio.run(go())
 
@@ -809,7 +824,7 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
     from xarness.config import SandboxSettings
 
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
-    session.sandbox_settings = SandboxSettings()
+    session.sandbox.settings = SandboxSettings()
     (tmp_path / "real.txt").write_text("x")
 
     async def go():
@@ -818,7 +833,7 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
         assert not (tmp_path / "ghost.txt").exists()
         ok = await session.execute("f2", protocol.FilterAdd(path="real.txt"))
         assert ok.ok
-        assert session.sandbox_settings.filter_list == ["real.txt"]
+        assert session.sandbox.settings.filter_list == ["real.txt"]
 
     asyncio.run(go())
 
@@ -832,7 +847,7 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "workspaces")
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
-    session.sandbox_settings = SandboxSettings()
+    session.sandbox.settings = SandboxSettings()
     (tmp_path / "spec.md").write_text("x")
     expected = str((tmp_path / "spec.md").resolve())
 
@@ -845,14 +860,14 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
 
         added = await session.execute("r1", protocol.RefAdd(path="spec.md"))
         assert added.ok
-        assert session.sandbox_settings.auto_include_refs == [expected]
+        assert session.sandbox.settings.auto_include_refs == [expected]
         refs = session.status().refs
         assert [(r.path, r.mount) for r in refs] == [(expected, ".refs/spec.md")]
         assert session_store.load_workspace_refs(str(tmp_path)) == [expected]
 
         removed = await session.execute("r2", protocol.RefRemove(path="spec.md"))
         assert removed.ok
-        assert session.sandbox_settings.auto_include_refs == []
+        assert session.sandbox.settings.auto_include_refs == []
         assert session_store.load_workspace_refs(str(tmp_path)) == []
 
     asyncio.run(go())
@@ -947,7 +962,7 @@ def test_forced_steer_saves_partial_cot(tmp_path) -> None:
         await asyncio.wait_for(started.wait(), timeout=5)
         await session.execute("c2", SendMessage(text="second"))  # queued
         result = await session.execute("c3", protocol.FlushQueued())
-        assert result.ok and result.payload == {"flushed": True}
+        assert result.ok and result.payload.flushed is True
         release.set()
         await wait_idle(session)
 

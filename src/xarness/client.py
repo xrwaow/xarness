@@ -2,7 +2,7 @@
 
 Streaming over SSE via httpx. This module knows nothing about the UI: it
 consumes wire-format message dicts and yields typed stream events from
-``xarness.events``.
+``xarness.protocol``.
 """
 
 from __future__ import annotations
@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from .config import CotStrength, ProviderProfile
-from .events import (
+from .protocol import (
     ContentDelta,
     ProcessingStarted,
     ReasoningDelta,
@@ -94,6 +94,16 @@ class _ToolCallAccumulator:
     @property
     def has_calls(self) -> bool:
         return bool(self._order)
+
+
+class StreamClient(Protocol):
+    """Anything that can stream a round; ChatClient is the real implementation."""
+
+    def stream(
+        self,
+        wire_messages: Sequence[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]: ...
 
 
 class ChatClient:

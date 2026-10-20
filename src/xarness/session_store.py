@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -148,10 +149,17 @@ def load_blob(name: str, image_id: str) -> bytes | None:
 
 
 def meta_path(name: str) -> Path:
-    """Sidecar holding the small meta block, so listing / last-used lookups
-    never parse (or even read) the full session file with its base64
-    images."""
+    """Legacy per-session metadata sidecar (read only for migration)."""
     return SESSIONS_DIR / f"{_validate_session_name(name)}.meta.json"
+
+
+def index_path() -> Path:
+    """One small file holding every session's listing metadata."""
+    return SESSIONS_DIR / "index.json"
+
+
+_INDEX_VERSION = 1
+_INDEX_LOCK = threading.Lock()
 
 
 def new_session_name() -> str:
@@ -483,11 +491,106 @@ def serialize_state(state: SessionState) -> tuple[dict[str, Any], dict[str, Any]
     return data, meta
 
 
+def _seal_meta(name: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Attach the session file's size/mtime so a stale index entry is
+    detectable without parsing the whole file."""
+    sealed = dict(meta)
+    try:
+        stat = session_path(name).stat()
+    except OSError:
+        return sealed
+    sealed["_file"] = [stat.st_size, stat.st_mtime_ns]
+    return sealed
+
+
+def _entry_fresh(name: str, meta: dict[str, Any]) -> bool:
+    stamp = meta.get("_file")
+    if not (isinstance(stamp, list) and len(stamp) == 2):
+        return False
+    try:
+        stat = session_path(name).stat()
+    except OSError:
+        return False
+    return [stat.st_size, stat.st_mtime_ns] == stamp
+
+
+def _read_index_unlocked() -> dict[str, dict[str, Any]]:
+    """The index's session → meta map, rebuilding it once when absent."""
+    try:
+        raw = json.loads(index_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict) and isinstance(raw.get("sessions"), dict):
+        return raw["sessions"]
+    return _rebuild_index_unlocked()
+
+
+def _write_index_unlocked(sessions: dict[str, dict[str, Any]]) -> None:
+    SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _atomic_write_json(
+        index_path(), {"version": _INDEX_VERSION, "sessions": sessions},
+    )
+
+
+def _legacy_meta(name: str) -> dict[str, Any] | None:
+    """Meta for one session from the old sidecar or the session file."""
+    try:
+        sidecar = json.loads(meta_path(name).read_text(encoding="utf-8"))
+        if isinstance(sidecar, dict):
+            return sidecar
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        state = load_state(name)
+    except (OSError, json.JSONDecodeError, KeyError, ValidationError):
+        return None
+    return _meta_block(
+        state.conversation,
+        profile=state.profile,
+        workspace=state.workspace,
+        updated_at=state.updated_at or "",
+        sandbox_name=state.sandbox_name,
+        tracking=state.git is not None,
+    )
+
+
+def _rebuild_index_unlocked() -> dict[str, dict[str, Any]]:
+    """Rebuild the index from session files / legacy sidecars (once)."""
+    sessions: dict[str, dict[str, Any]] = {}
+    if SESSIONS_DIR.exists():
+        for path in SESSIONS_DIR.glob("*.json"):
+            if path.stem.endswith(".meta") or path.name == "index.json":
+                continue
+            meta = _legacy_meta(path.stem)
+            if meta is not None:
+                sessions[path.stem] = _seal_meta(path.stem, meta)
+            # Retire the legacy sidecar now that its data is in the index.
+            meta_path(path.stem).unlink(missing_ok=True)
+    _write_index_unlocked(sessions)
+    return sessions
+
+
+def load_metas() -> dict[str, dict[str, Any]]:
+    """All listing metadata from the single index (one file read), healing
+    any entry whose session file changed since the index was written."""
+    with _INDEX_LOCK:
+        sessions = _read_index_unlocked()
+        if any(not _entry_fresh(name, meta) for name, meta in sessions.items()):
+            sessions = _rebuild_index_unlocked()
+        return dict(sessions)
+
+
 def write_state(name: str, data: dict[str, Any], meta: dict[str, Any]) -> None:
-    """Write pre-serialized dicts atomically (safe in a worker thread)."""
+    """Write the session and fold its meta into the single index."""
     SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     _atomic_write_json(session_path(name), data)
-    _atomic_write_json(meta_path(name), meta)
+    sealed = _seal_meta(name, meta)
+    with _INDEX_LOCK:
+        sessions = _read_index_unlocked()
+        sessions[name] = sealed
+        _write_index_unlocked(sessions)
+    # The old sidecar is retired; remove it so it cannot drift.
+    meta_path(name).unlink(missing_ok=True)
 
 
 def save_state(name: str, state: SessionState) -> None:
@@ -517,43 +620,28 @@ def load_state(name: str) -> SessionState:
 
 
 def list_sessions() -> list[str]:
-    if not SESSIONS_DIR.exists():
-        return []
-    return sorted(
-        p.stem for p in SESSIONS_DIR.glob("*.json")
-        if not p.stem.endswith(".meta")
-    )
+    return sorted(load_metas())
 
 
 def load_meta(name: str) -> dict[str, Any] | None:
-    """The saved session's small meta block (no conversation parsing).
-
-    The sidecar is the only live copy; when it is missing (older save, or an
-    interrupted write) the meta block is rebuilt once from the full session
-    file."""
-    try:
-        meta = json.loads(meta_path(name).read_text(encoding="utf-8"))
-        if isinstance(meta, dict):
-            return meta
-    except (OSError, json.JSONDecodeError):
-        pass
-    try:
-        state = load_state(name)
-    except (OSError, json.JSONDecodeError, KeyError, ValidationError):
-        return None
-    return _meta_block(
-        state.conversation,
-        profile=state.profile,
-        workspace=state.workspace,
-        updated_at=state.updated_at or "",
-        sandbox_name=state.sandbox_name,
-        tracking=state.git is not None,
-    )
+    """One saved session's small meta block from the shared index."""
+    with _INDEX_LOCK:
+        sessions = _read_index_unlocked()
+        meta = sessions.get(name)
+        # An index that predates the file, or whose file changed since the
+        # index was sealed, heals from the session itself.
+        if meta is None or not _entry_fresh(name, meta):
+            sessions = _rebuild_index_unlocked()
+            meta = sessions.get(name)
+        return meta
 
 
-def saved_summary(name: str) -> SessionSummary:
+def saved_summary(
+    name: str, meta: dict[str, Any] | None = None,
+) -> SessionSummary:
     """The list row for a session that is only on disk."""
-    meta = load_meta(name)
+    if meta is None:
+        meta = load_meta(name)
     if meta is None:
         return SessionSummary(name=name, state="saved")
     return SessionSummary(
@@ -570,7 +658,11 @@ def delete_session(name: str) -> bool:
     p = session_path(name)
     if not p.exists():
         return False
-    p.unlink()
+    with _INDEX_LOCK:
+        sessions = _read_index_unlocked()
+        sessions.pop(name, None)
+        _write_index_unlocked(sessions)
+    p.unlink(missing_ok=True)
     meta_path(name).unlink(missing_ok=True)
     directory = session_dir(name)
     if directory.is_dir():

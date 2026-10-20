@@ -20,31 +20,41 @@ snapshotted — the machinery behind /undo and /retry.
 from __future__ import annotations
 
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any
 
-from .client import ChatClient
+from .client import ChatClient, StreamClient
+from .compaction import compact as run_compaction
+from .compaction import summarize as run_summarize
 from .config import ProviderProfile
 from .conversation import (
-    SUMMARY_PREFIX, Conversation, Message, Timing, ToolCall, build_parts,
-    image_refs, is_summary,
+    Conversation,
+    Message,
+    RollbackPlan,
+    Timing,
+    ToolCall,
+    build_parts,
 )
-from .events import (
+from .gitwork import (
+    GitInfo,
+    GitWorktreeError,
+    RevertConflict,
+    TurnCheckpoint,
+    revert_turns,
+)
+from .gitwork import snapshot_state as git_snapshot_state
+from .images import ImageAttachment
+from .protocol import (
     ContentDelta,
     ReasoningDelta,
-    StreamError,
     StreamEvent,
     ToolCallArgumentsDone,
     TurnComplete,
     Usage,
 )
-from .gitwork import GitInfo, GitWorktreeError, RevertConflict, TurnCheckpoint
-from .images import ImageAttachment, ImageRef
-from .util import utcnow_iso as _utcnow_iso
-from .gitwork import snapshot_state as git_snapshot_state
-from .gitwork import revert_turns
 from .tools import ToolRegistry, ToolResult
+from .util import utcnow_iso as _utcnow_iso
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
 # usage data. Deliberately conservative; results are labeled approximate.
@@ -56,37 +66,6 @@ _CHARS_PER_TOKEN = 4
 class PartialRound:
     reasoning_parts: list[str]
     content_parts: list[str]
-
-
-
-
-class StreamClient(Protocol):
-    """Anything that can stream a round; ChatClient is the real implementation."""
-
-    def stream(
-        self,
-        wire_messages: Sequence[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[StreamEvent]: ...
-
-
-@dataclass(slots=True)
-class RollbackPlan:
-    """What /undo or /retry needs to do, computed by :meth:`rollback_plan`.
-
-    Usage totals are monotonic (they count everything ever spent, including
-    undone turns), so a plan carries no usage bookkeeping."""
-
-    user_text: str  # the turn's user message (input box / resend)
-    revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
-    keep: list[Message]  # what the conversation becomes
-    images: list[ImageRef] | None = None
-    # Epoch to restore (undoing a compaction flips it back instead of
-    # restoring a second copy of the history).
-    epoch: int = 0
-    # True for a compaction-only undo: no messages are dropped, the turn
-    # stays intact, no files are reverted, and the input box is not touched.
-    compaction_only: bool = False
 
 
 class ChatController:
@@ -175,7 +154,6 @@ class ChatController:
                 content=result.output if result.ok else (result.error or "error"),
                 ok=result.ok,
                 parse_error=result.parse_error,
-                header=result.header or None,
                 timing=Timing(start=start_time, end=end_time),
             )
         )
@@ -260,78 +238,20 @@ class ChatController:
     # /undo + /retry
 
     def rollback_plan(self) -> RollbackPlan | None:
-        """Plan the rollback of the last user turn, or None if there is
-        nothing to undo (no user message, or no response to it yet).
-
-        If the most recent thing that happened is a compaction (a summary in
-        the visible history, no real user turn after it), /undo //retry undo
-        the compaction itself first by flipping the epoch back; the turn that
-        triggered it stays intact and no files are touched."""
-        conversation = self.conversation
-        visible = conversation.visible_messages()
-        if conversation.epoch > 0 and visible and is_summary(visible[-1]):
-            return RollbackPlan(
-                user_text="", revert_turns=[], keep=list(conversation.messages),
-                epoch=conversation.epoch - 1, compaction_only=True,
-            )
-        turn = conversation.turns[-1] if conversation.turns else None
-        message = self._message_by_id(turn.user_message_id) if turn else None
-        if message is None:
-            # Legacy session without a tracked turn: fall back to the last
-            # real user message that has a response after it.
-            message = next(
-                (m for m in reversed(visible)
-                 if m.role == "user" and not is_summary(m) and m is not visible[-1]),
-                None,
-            )
-        if message is None or (visible and message is visible[-1]):
-            return None  # the turn produced no response yet
-        return self.rollback_plan_to(message)
-
-    def _message_by_id(self, message_id: str) -> Message | None:
-        return next((m for m in self.conversation.messages if m.id == message_id), None)
+        """Plan the rollback of the last user turn (see
+        :meth:`Conversation.rollback_plan`)."""
+        return self.conversation.rollback_plan()
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
-        """Plan a rollback to an arbitrary earlier user message (click-to-undo):
-        drop that message and everything after it, restoring the workspace to
-        the checkpoint taken when it was sent.
-
-        Searches the full append-only history, so messages the last compaction
-        summarized away are found too (the epoch simply drops back to theirs).
-        Returns None when the message is not a user turn in this conversation.
-        """
-        if message.role != "user" or is_summary(message):
-            return None
-        conversation = self.conversation
-        index = next((i for i, m in enumerate(conversation.messages) if m is message), None)
-        if index is None:
-            return None
-        dropped_ids = {m.id for m in conversation.messages[index:]}
-        # Revert only closed, unlocked turns that are being dropped; their
-        # file edits can still be undone.
-        revert = [
-            TurnCheckpoint(t.before_tree, t.after_tree)
-            for t in reversed(conversation.turns)
-            if t.user_message_id in dropped_ids and not t.locked
-            and t.before_tree and t.after_tree
-        ]
-        return RollbackPlan(
-            user_text=message.content, revert_turns=revert[::-1],
-            keep=list(conversation.messages[:index]), epoch=message.epoch,
-            images=image_refs(message) or None,
-        )
+        """Plan a rollback to an arbitrary earlier user message (see
+        :meth:`Conversation.rollback_plan_to`)."""
+        return self.conversation.rollback_plan_to(message)
 
     def apply_rollback(self, plan: RollbackPlan) -> None:
         """Truncate the conversation to the plan. File edits are reversed
         separately (see :meth:`revert_changes`) so a conflict can abort before
         the conversation changes. Usage totals are monotonic and untouched."""
-        conversation = self.conversation
-        conversation.messages = list(plan.keep)
-        conversation.epoch = plan.epoch
-        kept = {m.id for m in conversation.messages}
-        conversation.turns = [
-            t for t in conversation.turns if t.user_message_id in kept
-        ]
+        self.conversation.apply_rollback(plan)
         self.last_compaction = None
 
     @property
@@ -391,84 +311,20 @@ class ChatController:
         stay in the append-only list and come back if the compaction is
         undone. Returns the summary text; before/after token counts are left
         in :attr:`last_compaction` for the compaction notice."""
-        conversation = self.conversation
-        compactable = conversation.visible_messages()
-        if not compactable:
+        result = await run_compaction(
+            self.conversation, self._client, summarizer=self._summarize,
+        )
+        if result is None:
             self.last_compaction = None
             return "nothing to compact yet"
-
-        before_tokens = sum(self._message_tokens(m) for m in compactable)
-        transcript = "\n\n".join(self._render_for_summary(m) for m in compactable)
-        summary, usage = await self._summarize(transcript)
-        summary_message = Message(
-            role="user", content=f"{SUMMARY_PREFIX}\n\n{summary}",
-            kind="summary", usage=usage,
-        )
-        if usage is not None:
-            self._fold_usage(usage)
-        conversation.epoch += 1
-        conversation.add(summary_message)
-        self.last_compaction = (before_tokens, self._message_tokens(summary_message))
-        return summary
-
-    @staticmethod
-    def _message_tokens(message: Message) -> int:
-        """Rough context contribution of one message, in tokens.
-
-        Assistant messages carry their round's real usage; its output tokens
-        are what the message added to the context (input tokens would count
-        the whole prompt again). Everything else falls back to the
-        chars-per-token heuristic.
-        """
-        if message.usage is not None:
-            return message.usage.output_tokens
-        return len(message.content or "") // _CHARS_PER_TOKEN
-
-    @staticmethod
-    def _render_for_summary(message: Message) -> str:
-        """One message as plain text for the summarizer prompt."""
-        role = message.role
-        parts = [f"{role}: {message.content}"] if message.content else [f"{role}:"]
-        for call in message.tool_calls or []:
-            parts.append(f"  {role} called {call.name}({call.arguments_json})")
-        if role == "tool" and message.tool_call_id:
-            parts.append(f"  (result for call {message.tool_call_id})")
-        return "\n".join(parts)
+        if result.usage is not None:
+            self._fold_usage(result.usage)
+        self.last_compaction = (result.before_tokens, result.after_tokens)
+        return result.summary
 
     async def _summarize(self, transcript: str) -> tuple[str, Usage | None]:
-        """One-off handoff round through the same client, no tools.
-
-        Returns the handoff text and the round's usage, so its cost can be
-        folded into the session totals instead of being silently dropped."""
-        prompt = (
-            "You are handing this conversation off to a fresh context. Write "
-            "the handoff the next assistant instance needs to continue the "
-            "work seamlessly. Cover, in this order:\n"
-            "1. The task: what the user is trying to accomplish, in their "
-            "terms.\n"
-            "2. What's known so far: key decisions, file paths, relevant "
-            "commands and their results, constraints discovered.\n"
-            "3. What's next: the current state of any work in progress and "
-            "the immediate next steps.\n"
-            "Be concise — a few short paragraphs at most. Reply with the "
-            "handoff only.\n\n"
-            "--- conversation ---\n"
-            f"{transcript}"
-        )
-        parts: list[str] = []
-        usage: Usage | None = None
-        async for event in self._client.stream([{"role": "user", "content": prompt}]):
-            if isinstance(event, ContentDelta):
-                parts.append(event.text)
-            elif isinstance(event, StreamError):
-                raise RuntimeError(event.message)
-            elif isinstance(event, TurnComplete):
-                usage = event.usage
-                break
-        summary = "".join(parts).strip()
-        if not summary:
-            raise RuntimeError("summarization returned no content")
-        return summary, usage
+        """One-off handoff round through the same client, no tools."""
+        return await run_summarize(self._client, transcript)
 
     # ------------------------------------------------------------------
     # streaming

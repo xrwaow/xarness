@@ -344,7 +344,7 @@ src/xarness/
   cli.py          argument parsing, boots the TUI, change-tracking setup
   config.py       pydantic config models, YAML loading, profile selection
   client.py       async httpx SSE client, reasoning-effort mapping
-  events.py       typed stream events (the client/UI contract)
+  compaction.py   context handoff: token estimates + summarizer round
   controller.py   conversation state + event enrichment (no UI imports)
   host.py         session host: FastAPI over a unix socket, lifecycle, config resolution
   api.py          HTTP/SSE endpoints used by the TUI and other clients

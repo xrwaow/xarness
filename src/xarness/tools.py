@@ -29,10 +29,6 @@ class ToolResult:
     output: str = ""
     error: str = ""
     parse_error: bool = False
-    # One-line summary for the TUI's settled tool-call header (the dimmed
-    # detail after "Ran <tool>"). Computed by the tool itself so it can be
-    # persisted with the conversation and replayed on /resume.
-    header: str = ""
 
 
 @dataclass(slots=True)
@@ -275,7 +271,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
 
         if not ranged:
             if total_lines <= OUTLINE_THRESHOLD:
-                return ToolResult(ok=True, output=contents, header=path)
+                return ToolResult(ok=True, output=contents)
             return await _outline_result(path, total_lines, contents)
         end = total_lines if end is None else min(end, total_lines)
         if end < start:
@@ -296,7 +292,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             # point hinting it should pass them again — keep just the
             # position/truncation note.
             output += f"\n[showing lines {start}-{end} of {total_lines}]"
-        return ToolResult(ok=True, output=output, header=f"{path} [{start}, {end}]")
+        return ToolResult(ok=True, output=output)
 
     async def _outline_result(path: str, total_lines: int, contents: str) -> ToolResult:
         outline = _python_outline(contents)
@@ -329,7 +325,6 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             "with the same path plus start_line and end_line from the outline above.\n"
             "For example, to read a function shown as [L100-150], use start_line: 100 "
             "and end_line: 150."),
-            header=path,
         )
 
     return read_file
@@ -371,8 +366,6 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
         return ToolResult(
             ok=True,
             output=f"{verb} {path} ({len(content)} bytes)",
-            # Mirrors edit_file's '+N -M path': counts first, path last.
-            header=f"+{loc} {path}",
         )
 
     return write_file
@@ -539,7 +532,6 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         return ToolResult(
             ok=True,
             output=f"applied {plural} to {path}\n{diff}",
-            header=f"+{adds} -{dels} {path}",
         )
 
     return edit_file
@@ -601,18 +593,17 @@ def _make_run_bash_tool(
         if git_guard is not None:
             block_reason = git_guard(command)
             if block_reason:
-                return ToolResult(ok=False, error=block_reason, header=command)
+                return ToolResult(ok=False, error=block_reason)
         result = await session.run(command, on_output=_output_sink.get(), timeout=timeout)
         if result.timed_out:
             label = f" after {int(timeout)}s" if timeout is not None else ""
             return ToolResult(
-                ok=False, error=f"command timed out{label} (shell restarted)", header=command
+                ok=False, error=f"command timed out{label} (shell restarted)"
             )
         return ToolResult(
             ok=result.exit_code == 0,
             output=result.stdout,
             error="" if result.exit_code == 0 else f"exit code {result.exit_code}",
-            header=command,
         )
 
     return run_bash

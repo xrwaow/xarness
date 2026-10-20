@@ -6,33 +6,25 @@ the OpenAPI schema from these directly, so the docs can never drift from
 the code.
 
 Usage, ImageAttachment, ToolCall and Message are the very models defined in
-:mod:`xarness.events` / :mod:`xarness.conversation` / :mod:`xarness.images` — a
-message is persisted, converted to a provider request and shown to a client
-as one object, with no mirrored copy to keep in sync. The transient stream
-deltas are likewise the models defined in :mod:`xarness.events`.
+:mod:`xarness.conversation` / :mod:`xarness.images` — a message is persisted,
+converted to a provider request and shown to a client as one object, with no
+mirrored copy to keep in sync. Every event (including the transient stream
+deltas) is defined here.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from .conversation import (  # noqa: F401 - re-exported for clients
-    SUMMARY_PREFIX, Message, image_refs, is_summary,
-)
-from .events import (
-    ContentDelta,
-    EventBase,
-    Mode,
-    State,
-    ProcessingStarted,
-    ReasoningDelta,
-    StreamError,
-    ToolCallArgumentsDelta,
-    ToolCallArgumentsDone,
-    ToolCallStarted,
-    TurnComplete,
+    SUMMARY_PREFIX,
+    Message,
+    Usage,
+    image_refs,
+    is_summary,
 )
 from .images import ImageAttachment, ImageRef
 
@@ -42,6 +34,109 @@ PROTOCOL_VERSION = 9
 # missing session/path); a ``command`` always returns 200 with
 # ``CommandResult.ok=False`` and ``error`` text, because a rejected command is
 # a valid, attributable outcome the UI renders inline.
+
+# ---------------------------------------------------------------------------
+# stream events
+#
+# The provider-stream subset (ProcessingStarted … StreamError) is emitted by
+# the API client while a round streams. Every other event below is host
+# lifecycle/UI traffic. All of them are defined here, next to the commands and
+# envelopes they cross the wire with, so there is one event vocabulary.
+
+State = Literal["idle", "running", "compacting"]
+Mode = Literal["plan", "write"]
+
+
+class EventBase(BaseModel):
+    """Base for wire events.
+
+    Unknown fields are ignored, not rejected: the host and client can be
+    different builds across a restart, and a newer host may add event
+    fields a client doesn't know yet."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Server-side emission time. Clients use differences between these
+    # stamps to derive live durations (reasoning time, turn time).
+    t: float = Field(default_factory=time.monotonic)
+
+
+class ProcessingStarted(EventBase):
+    """Emitted once per round, right after the request is sent (state 1)."""
+
+    type: Literal["processing_started"] = "processing_started"
+
+
+class ReasoningDelta(EventBase):
+    """A chunk of reasoning/thinking-channel text (state 2: thinking)."""
+
+    type: Literal["reasoning_delta"] = "reasoning_delta"
+    text: str
+
+
+class ContentDelta(EventBase):
+    """A chunk of the final answer (state 3: answer streaming)."""
+
+    type: Literal["content_delta"] = "content_delta"
+    text: str
+
+
+class ToolCallStarted(EventBase):
+    """First sight of a tool call: id + name known, arguments may still stream."""
+
+    type: Literal["tool_call_started"] = "tool_call_started"
+    call_id: str
+    name: str
+
+
+class ToolCallArgumentsDelta(EventBase):
+    """A raw JSON argument fragment for a call already announced via ToolCallStarted."""
+
+    type: Literal["tool_call_arguments_delta"] = "tool_call_arguments_delta"
+    call_id: str
+    text: str
+
+
+class ToolCallArgumentsDone(EventBase):
+    """Arguments fully received for one call — safe to parse and execute."""
+
+    type: Literal["tool_call_arguments_done"] = "tool_call_arguments_done"
+    call_id: str
+    name: str
+    arguments_json: str
+
+
+class TurnComplete(EventBase):
+    """End of one model round, with usage if the provider reported it.
+
+    A "round" is one full model response (reasoning + content + possibly tool
+    calls). ``has_tool_calls`` tells the consumer whether another round
+    follows — tool results must be appended and the model called again — or
+    whether this round is the final answer.
+    """
+
+    type: Literal["turn_complete"] = "turn_complete"
+    usage: Usage | None = None
+    has_tool_calls: bool = False
+
+
+class StreamError(EventBase):
+    """A request-level failure (connection error, non-200, in-stream error)."""
+
+    type: Literal["stream_error"] = "stream_error"
+    message: str
+
+
+StreamEvent = (
+    ProcessingStarted
+    | ReasoningDelta
+    | ContentDelta
+    | ToolCallStarted
+    | ToolCallArgumentsDelta
+    | ToolCallArgumentsDone
+    | TurnComplete
+    | StreamError
+)
 
 # ---------------------------------------------------------------------------
 # primitives
@@ -86,6 +181,14 @@ class RefInfo(BaseModel):
     mount: str
 
 
+class WorkspaceRefUpdate(BaseModel):
+    """POST /v1/workspaces/refs: add/remove one workspace reference."""
+
+    workspace: str
+    path: str
+    add: bool
+
+
 class StatusPayload(BaseModel):
     """Everything a client needs for its status bar / steer bar / prompts."""
 
@@ -128,7 +231,6 @@ class PartialToolCall(BaseModel):
     name: str
     arguments: str = ""
     output: str = ""
-    header: str = ""
     ok: bool | None = None
     parse_error: bool = False
 
@@ -245,7 +347,7 @@ class DiffInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# events (EventBase and the transient stream deltas come from xarness.events)
+# events
 
 class ToolExecStarted(EventBase):
     type: Literal["tool_exec_started"] = "tool_exec_started"
@@ -265,7 +367,6 @@ class ToolFinished(EventBase):
     parse_error: bool = False
     output: str = ""
     error: str = ""
-    header: str = ""
 
 
 
@@ -541,13 +642,102 @@ Command = Annotated[
     Field(discriminator="type"),
 ]
 
+class SendMessageResult(BaseModel):
+    type: Literal["send_message_result"] = "send_message_result"
+    started: bool = False
+    queued: bool = False
+
+
+class CancelResult(BaseModel):
+    type: Literal["cancel_result"] = "cancel_result"
+    cancelled: bool
+
+
+class StartedResult(BaseModel):
+    type: Literal["started_result"] = "started_result"
+    started: bool = True
+
+
+class DiscardedResult(BaseModel):
+    type: Literal["discarded_result"] = "discarded_result"
+    discarded: int
+    text: str | None = None
+
+
+class FlushedResult(BaseModel):
+    type: Literal["flushed_result"] = "flushed_result"
+    flushed: bool
+
+
+class RollbackResult(BaseModel):
+    type: Literal["rollback_result"] = "rollback_result"
+    user_text: str | None = None
+    images: list[ImageAttachment] | None = None
+
+
+class ModeResult(BaseModel):
+    type: Literal["mode_result"] = "mode_result"
+    mode: Mode
+
+
+class ModelResult(BaseModel):
+    type: Literal["model_result"] = "model_result"
+    model: str
+
+
+class SandboxResult(BaseModel):
+    type: Literal["sandbox_result"] = "sandbox_result"
+    sandbox: str | None
+
+
+class FilterResult(BaseModel):
+    type: Literal["filter_result"] = "filter_result"
+    filter_list: list[str]
+
+
+class RefsResult(BaseModel):
+    type: Literal["refs_result"] = "refs_result"
+    refs: list[RefInfo]
+
+
+class DoneResult(BaseModel):
+    type: Literal["done"] = "done"
+
+
+class CloseResult(BaseModel):
+    closed: bool
+
+
+class DeleteResult(BaseModel):
+    deleted: bool
+
+
+CommandPayload = Annotated[
+    Union[
+        SendMessageResult,
+        CancelResult,
+        StartedResult,
+        DiscardedResult,
+        FlushedResult,
+        RollbackResult,
+        ModeResult,
+        ModelResult,
+        SandboxResult,
+        FilterResult,
+        RefsResult,
+        DoneResult,
+    ],
+    Field(discriminator="type"),
+]
+
+
 class CommandResult(BaseModel):
     """Reply to one command, delivered only to its issuer."""
 
     cmd_id: str = ""
     ok: bool
     error: str | None = None
-    payload: dict[str, Any] | None = None
+    payload: CommandPayload | None = None
 
 
 class CommandEnvelope(BaseModel):

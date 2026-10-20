@@ -11,12 +11,17 @@ from textual.pilot import Pilot
 from xarness import protocol
 from xarness.clientlib import ClientError
 from xarness.conversation import Timing
-from xarness.tui import flow as tflow
-from xarness.tui.transcript import ToolStatus
 from xarness.protocol import (
-    CommandResult, ConfigInfo, DiffInfo, Event, SessionSummary, Snapshot,
+    CommandResult,
+    ConfigInfo,
+    DiffInfo,
+    Event,
+    SessionSummary,
+    Snapshot,
     StatusPayload,
 )
+from xarness.tui import flow as tflow
+from xarness.tui.transcript import ToolStatus
 
 
 class FakeClient:
@@ -29,6 +34,8 @@ class FakeClient:
         self.commands: list[tuple[str, Event]] = []
         self.command_results: dict[str, CommandResult] = {}
         self.closed: list[str] = []
+        self.refs: list[protocol.RefInfo] = []
+        self.ref_updates: list[tuple[str, str, bool]] = []
 
     async def snapshot(self, name: str) -> Snapshot:
         return self.snapshot_data
@@ -48,7 +55,7 @@ class FakeClient:
     async def command(self, name: str, command) -> CommandResult:
         self.commands.append((name, command))
         return self.command_results.get(
-            command.type, CommandResult(cmd_id="t", ok=True, payload={"user_text": "put back"}),
+            command.type, CommandResult(cmd_id="t", ok=True, payload=protocol.RollbackResult(user_text="put back")),
         )
 
     async def sessions(self, **kwargs):
@@ -68,6 +75,19 @@ class FakeClient:
 
     async def search_files(self, workspace: str, q: str) -> list[str]:
         return []
+
+    async def workspace_refs(self, workspace: str) -> list[protocol.RefInfo]:
+        return list(self.refs)
+
+    async def update_workspace_refs(
+        self, workspace: str, path: str, add: bool,
+    ) -> list[protocol.RefInfo]:
+        self.ref_updates.append((workspace, path, add))
+        if add:
+            self.refs.append(protocol.RefInfo(path=path, mount=f".refs/{path}"))
+        else:
+            self.refs = [ref for ref in self.refs if ref.path != path]
+        return list(self.refs)
 
     async def create_session(self, request) -> SessionSummary:
         return getattr(self, "create_result", None) or SessionSummary(
@@ -249,8 +269,8 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
     async def test_connection_loss_respawns_and_reattaches(self) -> None:
         from unittest import mock
 
-        from xarness.tui.app import AgentApp
         import xarness.tui.app as app_mod
+        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
         client.fail_attach_first = True
@@ -382,7 +402,7 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
     dispatches add/remove without ever touching the worktree."""
 
     async def test_lists_mounts_and_dispatches_remove(self) -> None:
-        from xarness.protocol import RefAdd, RefInfo, RefRemove
+        from xarness.protocol import RefInfo
         from xarness.tui.app import AgentApp
         from xarness.tui.refs_screen import RefsScreen
 
@@ -391,6 +411,7 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             refs = [RefInfo(path="/tmp/notes.md", mount=".refs/notes.md")]
+            client.refs = list(refs)
             app.push_screen(RefsScreen(refs))
             await pilot.pause()
             screen = app.screen
@@ -400,15 +421,13 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._refs, refs)
             await pilot.click("#refs-remove-0")
             await pilot.pause()
-            self.assertIsInstance(client.commands[-1][1], RefRemove)
-            self.assertEqual(client.commands[-1][1].path, "/tmp/notes.md")
+            self.assertEqual(client.ref_updates[-1][1:], ("/tmp/notes.md", False))
             # Typing a path in the input dispatches an add.
             for key in "/tmp/other.md":
                 await pilot.press(key)
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIsInstance(client.commands[-1][1], RefAdd)
-            self.assertEqual(client.commands[-1][1].path, "/tmp/other.md")
+            self.assertEqual(client.ref_updates[-1][1:], ("/tmp/other.md", True))
 
     async def test_slash_command_opens_the_manager(self) -> None:
         from xarness.tui.app import AgentApp
@@ -478,7 +497,8 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             thinking = items(tflow.ThinkingItem)
             self.assertEqual(len(thinking), 1)
             self.assertTrue(thinking[0].item.done)
-            # Round 2 begins: fresh CoT and answer entries.
+            # Round 2 begins: the provider opens it with ProcessingStarted.
+            q.put_nowait(protocol.ProcessingStarted())
             q.put_nowait(protocol.ReasoningDelta(text="think two"))
             q.put_nowait(protocol.ContentDelta(text="answer two"))
             await pilot.pause(); await pilot.pause()
@@ -521,6 +541,35 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
     """While a tool is still MAKING_CALL its streamed arguments must already
     show the useful detail: write_file's +LOC, edit_file's +adds -dels and
     run_bash's command — not just the bare tool name."""
+
+    def test_settled_summary_derives_detail_from_args(self) -> None:
+        """The header is not stored separately: once settled, the summary is
+        rebuilt from the call's arguments."""
+        from xarness.tui.tool_view import ToolCallView, summary_text
+        from xarness.tui.transcript import ToolStatus
+
+        def summary(name: str, args: str) -> str:
+            return summary_text(ToolCallView(
+                name=name, args=args, status=ToolStatus.CALL_SUCCEEDED,
+            )).plain
+
+        self.assertEqual(
+            summary("write_file", '{"path": "a.py", "content": "a\\nb\\n"}'),
+            "write_file +2 a.py",
+        )
+        self.assertEqual(
+            summary("edit_file", '{"path": "b.py", "edits": [{"old_string": '
+                    '"x", "new_string": "y"}]}'),
+            "edit_file +1 -1 b.py",
+        )
+        self.assertEqual(
+            summary("run_bash", '{"command": "ls -la"}'),
+            "run_bash ls -la",
+        )
+        self.assertEqual(
+            summary("read_file", '{"path": "c.py", "start_line": 2}'),
+            "read_file c.py [start_line=2]",
+        )
 
     def test_partial_edit_arguments_already_count_lines(self) -> None:
         """A half-streamed edits array is not valid JSON yet; the live label
@@ -573,9 +622,9 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
         """edit_file's returned unified diff must render as +/- rows — the
         tool output generator used to collapse its headers/hunks onto one
         line, leaving the expanded block empty."""
-        from xarness.tui.transcript import ToolStatus
         from xarness.tools import _format_edit_diff
         from xarness.tui.tool_view import ToolCallView, _edit_body
+        from xarness.tui.transcript import ToolStatus
 
         output = "applied 1 edit to a.py\n" + _format_edit_diff(
             "a.py", "old\nkeep\n", "new\nkeep\n",
@@ -654,7 +703,7 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
                 arguments_json='{"path": "a.py", "edits": []}',
             ))
             client.queue.put_nowait(protocol.ToolFinished(
-                call_id="e1", ok=True, output=output, header="+1 -1 a.py",
+                call_id="e1", ok=True, output=output,
             ))
             await pilot.pause()
             await pilot.pause()
@@ -670,8 +719,8 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
     def test_legacy_collapsed_edit_diff_still_renders(self) -> None:
         """Sessions recorded by the buggy generator stored the whole hunk
         on one line; replaying them must not lose the diff."""
-        from xarness.tui.transcript import ToolStatus
         from xarness.tui.tool_view import ToolCallView, _edit_body
+        from xarness.tui.transcript import ToolStatus
 
         output = (
             "applied 1 edit to a.py\ndiff --git a/a.py b/a.py\n"
@@ -706,8 +755,8 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         ]
 
     def test_state_word_color_per_state(self) -> None:
-        from xarness.tui.list_picker import STATE_WORDS as _STATE_WORDS
         from xarness import theme
+        from xarness.tui.list_picker import STATE_WORDS as _STATE_WORDS
         expected = {
             "waiting": "accent", "running": "success",
             "compacting": "success", "idle": "muted",
@@ -721,6 +770,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
         from textual.widgets import Label, OptionList
+
         from xarness.tui.list_picker import ListPicker, session_options
 
         class Host(App):
@@ -764,6 +814,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         deleting the query must bring every row back."""
         from textual.app import App, ComposeResult
         from textual.widgets import Input, OptionList
+
         from xarness.tui.list_picker import ListPicker, session_options
 
         entries = [
@@ -827,8 +878,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, client, app)
 
     async def test_finished_suffix_clears_when_the_next_turn_starts(self) -> None:
-        from xarness.events import ProcessingStarted
-        from xarness.protocol import TurnFinished
+        from xarness.protocol import ProcessingStarted, TurnFinished
         from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
@@ -981,9 +1031,9 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_multiple_rows_visible(self) -> None:
         from textual.widgets import OptionList
-        from xarness.tui.list_picker import ListPicker, session_options
 
         from xarness.tui.app import AgentApp
+        from xarness.tui.list_picker import ListPicker, session_options
         summaries = [
             SessionSummary(name=f"s{i}", state="saved", active=False)
             for i in range(5)

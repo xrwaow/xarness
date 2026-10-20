@@ -105,7 +105,13 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Snapshot of a session (messages, status, live round)",
     )
     async def get_session(name: str) -> Snapshot:
-        return (await _session_or_load(host, name)).snapshot()
+        session = host.sessions.get(name)
+        if session is not None:
+            return session.snapshot()
+        try:
+            return host.saved_snapshot(name)
+        except SessionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.get(
         "/sessions/{name}/events",
@@ -157,24 +163,30 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Pending changes: summary and per-file diffs",
     )
     async def diff(name: str, path: str | None = None) -> protocol.DiffInfo:
-        session = await _session_or_load(host, name)
-        return await session.diff_info(path)
+        session = host.sessions.get(name)
+        if session is not None:
+            return await session.diff_info(path)
+        if not session_store.session_path(name).exists():
+            raise HTTPException(
+                status_code=404, detail=f"no saved session named {name!r}",
+            )
+        return await host.saved_diff_info(name, path)
 
     @router.post(
         "/sessions/{name}/close",
-        response_model=CommandResult,
+        response_model=protocol.CloseResult,
         summary="Stop hosting a session (cancel + unload; the saved file is kept)",
     )
-    async def close_session(name: str) -> CommandResult:
+    async def close_session(name: str) -> protocol.CloseResult:
         closed = await host.unload_session(name)
-        return CommandResult(cmd_id="", ok=True, payload={"closed": closed})
+        return protocol.CloseResult(closed=closed)
 
     @router.delete(
         "/sessions/{name}",
-        response_model=CommandResult,
+        response_model=protocol.DeleteResult,
         summary="Delete a saved session (idle only; the workspace is untouched)",
     )
-    async def delete_session(name: str) -> CommandResult:
+    async def delete_session(name: str) -> protocol.DeleteResult:
         return await host.delete_session(name)
 
     return router
@@ -182,6 +194,24 @@ def sessions_router(host: Host) -> APIRouter:
 
 def meta_router(host: Host) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["server"])
+
+    @router.get(
+        "/workspaces/refs",
+        response_model=list[protocol.RefInfo],
+        summary="Workspace external references (no session needed)",
+    )
+    async def workspace_refs(workspace: str) -> list[protocol.RefInfo]:
+        return host.workspace_refs(workspace)
+
+    @router.post(
+        "/workspaces/refs",
+        response_model=list[protocol.RefInfo],
+        summary="Add/remove one workspace external reference",
+    )
+    async def update_workspace_refs(
+        body: protocol.WorkspaceRefUpdate,
+    ) -> list[protocol.RefInfo]:
+        return await host.update_workspace_refs(body)
 
     @router.get("/health", response_model=ServerInfo, summary="Host health and protocol version")
     async def health() -> ServerInfo:

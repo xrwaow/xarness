@@ -10,7 +10,13 @@ import pytest
 
 from xarness.client import ChatClient
 from xarness.config import CotStrength, ProviderProfile
-from xarness.events import ContentDelta, ProcessingStarted, StreamError, TurnComplete, Usage
+from xarness.protocol import (
+    ContentDelta,
+    ProcessingStarted,
+    StreamError,
+    TurnComplete,
+    Usage,
+)
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1",
@@ -140,6 +146,7 @@ def test_connect_error_respawns_host_and_retries() -> None:
     (a client idle on the draft screen outlives the host's grace exit) —
     no raw httpx.ConnectError reaches the caller."""
     import httpx
+
     from xarness import clientlib
 
     attempts: list[int] = []

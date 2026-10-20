@@ -940,3 +940,43 @@ def make_sandbox(
     (callers fall back to filesystem/bash tools being disabled)."""
     config = SandboxConfig.from_settings(workspace, settings, git_info)
     return config, SandboxSession(config)
+
+
+@dataclass
+class SandboxRuntime:
+    """A session's resolved sandbox: profile identity, config and shell.
+
+    The four values travel together everywhere (construction, mode switches,
+    status, persistence, shutdown), so keeping them in one object removes the
+    repeated ``if sandbox is not None`` and keeps the mode/read-only mapping in
+    one place."""
+
+    config: SandboxConfig | None = None
+    shell: SandboxSession | None = None
+    name: str | None = None
+    settings: "SandboxSettings | None" = None
+
+    @classmethod
+    def make(
+        cls, workspace: Path, settings: "SandboxSettings",
+        git_info: "GitInfo | None", *, name: str | None = None,
+    ) -> "SandboxRuntime":
+        config, shell = make_sandbox(workspace, settings, git_info)
+        return cls(config=config, shell=shell, name=name, settings=settings)
+
+    @property
+    def use_container(self) -> bool:
+        return self.config.use_container if self.config is not None else True
+
+    @property
+    def allow_git_write(self) -> bool:
+        return self.settings.allow_git_write if self.settings is not None else False
+
+    def set_mode(self, mode: str) -> None:
+        if self.config is not None:
+            self.config.read_only = mode != "write"
+
+    async def close(self) -> None:
+        if self.shell is not None:
+            await self.shell.close()
+            self.shell = None

@@ -5,11 +5,20 @@ from __future__ import annotations
 import unittest
 
 from xarness.conversation import SUMMARY_PREFIX, Message, Timing, ToolCall
-from xarness.events import (
-    ContentDelta, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
-    ToolCallArgumentsDone, ToolCallStarted, TurnComplete,
+from xarness.protocol import (
+    ContentDelta,
+    ProcessingStarted,
+    ReasoningDelta,
+    Snapshot,
+    StatusPayload,
+    StreamError,
+    ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
+    ToolFinished,
+    TurnComplete,
+    UserMessageAdded,
 )
-from xarness.protocol import Snapshot, StatusPayload, ToolFinished, UserMessageAdded
 from xarness.tui import transcript as tr
 
 
@@ -34,7 +43,7 @@ class TranscriptTest(unittest.TestCase):
             ),
         )
         result = Message(role="tool", content="body", tool_call_id="c1",
-                         ok=False, header="h")
+                         ok=False)
         t = tr.Transcript()
         items = t.load(_snap([user, assistant, result]))
         self.assertIsInstance(items[0], tr.UserItem)
@@ -147,12 +156,55 @@ class TranscriptTest(unittest.TestCase):
                                       arguments_json='{"command": "ls"}'))
         tool = t.tool_blocks["c"]
         self.assertEqual(tool.args, '{"command": "ls"}')
-        t.apply(ToolFinished(call_id="c", ok=True, output="ok", header="+1"))
+        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
         self.assertEqual(tool.status, tr.ToolStatus.CALL_SUCCEEDED)
         t.apply(StreamError(message="boom"))
         self.assertEqual(t.cancel(), [])
         # Events after cancel are ignored.
         self.assertEqual(t.apply(ContentDelta(text="late")), [])
+
+    def test_processing_started_opens_a_fresh_round(self):
+        """Every round (post-tool included) is opened by ProcessingStarted:
+        the previous round's settled entries are never appended to."""
+        t = tr.Transcript()
+        t.apply(ProcessingStarted(t=0.0))
+        t.apply(ReasoningDelta(text="one", t=0.0))
+        t.apply(ContentDelta(text="answer one", t=0.5))
+        first_thinking, first_answer = t.thinking, t.assistant
+        t.apply(TurnComplete(has_tool_calls=True, t=1.0))
+        self.assertTrue(first_thinking.done)
+        self.assertTrue(first_answer.finalized)
+
+        t.apply(ProcessingStarted(t=2.0))
+        self.assertIsNone(t.thinking)
+        self.assertIsNone(t.assistant)
+        t.apply(ReasoningDelta(text="two", t=2.0))
+        t.apply(ContentDelta(text="answer two", t=2.5))
+        self.assertIsNot(t.thinking, first_thinking)
+        self.assertIsNot(t.assistant, first_answer)
+        self.assertEqual(first_answer.chunks, ["answer one"])
+        self.assertEqual(t.thinking.reasoning, "two")
+
+    def test_settle_is_idempotent_and_survives_late_tool_results(self):
+        t = tr.Transcript()
+        t.apply(ProcessingStarted())
+        t.apply(ToolCallStarted(call_id="c", name="read_file"))
+        t.apply(TurnComplete(has_tool_calls=True))
+        self.assertEqual(t.settle(None), [])  # nothing live to settle twice
+        # The tool result lands after the round closed and still resolves.
+        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
+        self.assertEqual(t.tool_blocks["c"].status, tr.ToolStatus.CALL_SUCCEEDED)
+
+    def test_processing_started_reopens_after_cancel(self):
+        t = tr.Transcript()
+        t.apply(ProcessingStarted())
+        t.apply(ContentDelta(text="partial"))
+        t.cancel()
+        self.assertEqual(t.apply(ContentDelta(text="late")), [])
+        t.apply(ProcessingStarted())
+        self.assertFalse(t.cancelled)
+        t.apply(ContentDelta(text="next"))
+        self.assertEqual(t.assistant.live, "next")
 
     def test_finish_keeps_first_duration(self):
         item = tr.ThinkingItem(parts=["x"])

@@ -31,29 +31,56 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from . import protocol
+from . import protocol, session_store
 from .config import (
-    ConfigError, ProviderProfile, SandboxSettings, load_sectioned,
-    resolve_api_key, save_preferences, validate_filter_path,
+    ConfigError,
+    ProviderProfile,
+    load_sectioned,
+    resolve_api_key,
+    save_preferences,
+    validate_filter_path,
 )
-from .conversation import Conversation, Message, ToolCall, image_refs
-from .conversation import is_summary
-from .controller import ChatController, RollbackPlan
-from .events import Mode, State, Usage
+from .controller import ChatController
+from .conversation import (
+    Conversation,
+    Message,
+    RollbackPlan,
+    ToolCall,
+    image_refs,
+    is_summary,
+)
 from .gitwork import (
-    DiffStat, GitInfo, GitWorktreeError, RevertConflict, accept_changes,
-    attributed_diff_stat, check_blocked_git, diff_stat, git_diff, revert_to_tree,
-    snapshot_state, tree_diff_stat,
+    DiffStat,
+    GitInfo,
+    GitWorktreeError,
+    RevertConflict,
+    accept_changes,
+    attributed_diff_stat,
+    check_blocked_git,
+    diff_stat,
+    git_diff,
+    revert_to_tree,
+    snapshot_state,
+    tree_diff_stat,
 )
 from .images import ImageAttachment, ImageRef
 from .prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
 from .protocol import (
-    Command, CommandResult, Event, SessionSummary, Snapshot, StatusPayload,
+    Command,
+    CommandResult,
+    Event,
+    Mode,
+    SessionSummary,
+    Snapshot,
+    State,
+    StatusPayload,
+    Usage,
 )
 from .sandbox import (
-    SandboxConfig, SandboxSession, SandboxUnavailable, make_sandbox,
+    SandboxConfig,
+    SandboxRuntime,
+    SandboxUnavailable,
 )
-from . import session_store
 from .session_store import SessionState, load_state
 from .tools import build_registry
 from .util import utcnow_iso as _utcnow
@@ -80,7 +107,7 @@ class SessionError(Exception):
     """A command was rejected (busy, unknown target, git failure, …)."""
 
 
-def _ok(payload: dict[str, Any] | None = None) -> CommandResult:
+def _ok(payload: Any = None) -> CommandResult:
     """A successful command result. ``cmd_id`` is stamped by the inbox."""
     return CommandResult(cmd_id="", ok=True, payload=payload)
 
@@ -112,13 +139,10 @@ class SessionParts:
     profile_name: str
     api_key: str | None
     config_path: Path | None
-    sandbox: SandboxConfig | None
-    sandbox_session: SandboxSession | None
+    sandbox: SandboxRuntime
     git_info: GitInfo | None
     auto_compact: bool
     tool_output_limit: int | None
-    sandbox_name: str
-    sandbox_settings: SandboxSettings
 
     def session_kwargs(self, name: str) -> dict[str, Any]:
         """Keyword arguments for ``Session(name=..., **kwargs)`` (shallow:
@@ -138,15 +162,12 @@ class Session:
         profile_name: str | None,
         api_key: str | None,
         conversation: Conversation | None = None,
-        sandbox: SandboxConfig | None = None,
-        sandbox_session: SandboxSession | None = None,
+        sandbox: SandboxRuntime | None = None,
         git_info: GitInfo | None = None,
         mode: Mode = "write",
         auto_compact: bool = False,
         tool_output_limit: int | None = None,
         client: Any = None,
-        sandbox_name: str | None = None,
-        sandbox_settings: "SandboxSettings | None" = None,
         config_path: Path | None = None,
         no_save: bool = False,
         idle_callback: "Callable[[Session], None] | None" = None,
@@ -157,26 +178,17 @@ class Session:
         self.profile_name = profile_name
         self.api_key = api_key
         self.config_path = config_path
-        self.sandbox = sandbox
-        self.sandbox_session = sandbox_session
+        self.sandbox = sandbox or SandboxRuntime()
+        self.sandbox.set_mode(mode)
         self.git_info = git_info
         self.mode: Mode = mode
-        if sandbox is not None:
-            sandbox.read_only = mode != "write"
         self.auto_compact = auto_compact
         # Id of the message whose usage the last auto-compaction fired on:
         # never compact twice on the same round (loop guard). Comparing the
         # id survives a reload, unlike object identity.
         self._compacted_on_message_id: str | None = None
-        # Per-session sandbox settings (resolved at creation from the
-        # config's sandbox profiles; fixed except via /sandbox or /filter).
-        self.sandbox_name = sandbox_name
-        self.sandbox_settings = sandbox_settings
-        self.allow_git_write = (
-            sandbox_settings.allow_git_write if sandbox_settings else False
-        )
         self.tool_registry = build_registry(
-            sandbox, sandbox_session, mode=self.mode,
+            self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
@@ -290,9 +302,7 @@ class Session:
         await self._flush_persist()
         # Close the sandbox shell here (not only on host eviction) so every
         # path — explicit unload, delete, eviction, shutdown — releases it.
-        if self.sandbox_session is not None:
-            await self.sandbox_session.close()
-            self.sandbox_session = None
+        await self.sandbox.close()
         # Release the provider connection pool.
         client = getattr(self.controller, "_client", None)
         if client is not None and hasattr(client, "aclose"):
@@ -353,7 +363,7 @@ class Session:
             name=self.name, workspace=str(self.workspace),
             state=state if active else "saved",
             active=active, clients_attached=self.clients_attached,
-            model=self.profile_name, sandbox=self.sandbox_name,
+            model=self.profile_name, sandbox=self.sandbox.name,
             last_user_message_at=self.last_user_message_at(),
             message_count=len(self.conversation.visible_messages()),
             tracking=self.git_info is not None,
@@ -414,7 +424,6 @@ class Session:
                 call.ok = event.ok
                 call.parse_error = event.parse_error
                 call.output = event.output or event.error
-                call.header = event.header
         elif isinstance(event, protocol.StreamError):
             self._reset_partial()
 
@@ -479,13 +488,13 @@ class Session:
             model_id=self.profile.model_id,
             cot_strength=self.profile.cot_strength.value,
             max_context=self.profile.max_context,
-            sandbox_name=self.sandbox_name,
+            sandbox_name=self.sandbox.name,
             filter_list=(
-                list(self.sandbox_settings.filter_list)
-                if self.sandbox_settings is not None else []
+                list(self.sandbox.settings.filter_list)
+                if self.sandbox.settings is not None else []
             ),
             refs=self._ref_infos(),
-            use_container=self.sandbox.use_container if self.sandbox else True,
+            use_container=self.sandbox.use_container,
             enable_tracking=self.git_info is not None,
             total_in=self.controller.usage_total.input_tokens,
             total_out=self.controller.usage_total.output_tokens,
@@ -657,9 +666,9 @@ class Session:
             # Steering: queued until the next round boundary (or turn end).
             self._queued.append((command.text, images, _utcnow()))
             self._emit_status()
-            return _ok(payload={"queued": True})
+            return _ok(protocol.SendMessageResult(queued=True))
         await self._start_turn(command.text, images)
-        return _ok(payload={"started": True})
+        return _ok(protocol.SendMessageResult(started=True))
 
     async def _start_turn(self, text: str, images: list[ImageAttachment] | None) -> None:
         # Set synchronously, BEFORE create_task: the lock can dispatch the
@@ -677,12 +686,12 @@ class Session:
 
     def _cmd_cancel(self) -> CommandResult:
         if self._state == "idle":
-            return _ok(payload={"cancelled": False})
+            return _ok(protocol.CancelResult(cancelled=False))
         if self._turn_task is not None:
             self._turn_task.cancel()
         if self._compact_task is not None:
             self._compact_task.cancel()
-        return _ok(payload={"cancelled": True})
+        return _ok(protocol.CancelResult(cancelled=True))
 
     def _cmd_answer_ask(self, command: protocol.AnswerAsk) -> CommandResult:
         pending = self._pending_ask
@@ -697,7 +706,7 @@ class Session:
             ask_id=command.ask_id, answers=command.answers,
         ))
         self._notify_idle()
-        return _ok()
+        return _ok(protocol.DoneResult())
 
     async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
         if self._pending_drift is None:
@@ -725,25 +734,25 @@ class Session:
                 "shows up in /diff"
             )
         self._notify_idle()
-        return _ok()
+        return _ok(protocol.DoneResult())
 
     def _cmd_discard_queued(self) -> CommandResult:
         if not self._queued:
-            return _ok(payload={"discarded": 0})
+            return _ok(protocol.DiscardedResult(discarded=0))
         text, _, _ = self._queued.pop(0)
         self._emit_status()
-        return _ok(payload={"discarded": 1, "text": text})
+        return _ok(protocol.DiscardedResult(discarded=1, text=text))
 
     def _cmd_flush_queued(self) -> CommandResult:
         """Send the oldest queued message now: cancel the running turn or
         compaction; the cleanup starts the queued message immediately."""
         if self._state == "idle" or not self._queued:
-            return _ok(payload={"flushed": False})
+            return _ok(protocol.FlushedResult(flushed=False))
         if self._turn_task is not None:
             self._turn_task.cancel()
         if self._compact_task is not None:
             self._compact_task.cancel()
-        return _ok(payload={"flushed": True})
+        return _ok(protocol.FlushedResult(flushed=True))
 
     async def _cmd_undo(self, resend: bool) -> CommandResult:
         """Shared body of /undo (drop the last turn, put its user message
@@ -752,9 +761,9 @@ class Session:
         plan = self.controller.rollback_plan()
         if plan is None:
             self._emit_notice(f"nothing to {label}")
-            return _ok(payload={"user_text": None})
+            return _ok(protocol.RollbackResult())
         result = await self._apply_rollback(plan, resend=resend)
-        return _ok(payload=result)
+        return _ok(result)
 
     async def _cmd_undo_to(self, command: protocol.UndoTo) -> CommandResult:
         message = self._message_by_id(command.message_id)
@@ -763,9 +772,9 @@ class Session:
         plan = self.controller.rollback_plan_to(message)
         if plan is None:
             self._emit_notice("nothing to undo there")
-            return _ok(payload={"user_text": None})
+            return _ok(protocol.RollbackResult())
         result = await self._apply_rollback(plan, resend=False, scope="messages from here on")
-        return _ok(payload=result)
+        return _ok(result)
 
     def _message_by_id(self, message_id: str) -> Message | None:
         return next(
@@ -774,7 +783,7 @@ class Session:
 
     async def _apply_rollback(
         self, plan: RollbackPlan, resend: bool, scope: str = "last turn",
-    ) -> dict[str, Any]:
+    ) -> protocol.RollbackResult:
         """Carry out a rollback plan: rewrite the history, revert the files,
         broadcast HistoryReplaced, and report what happened."""
         if plan.compaction_only:
@@ -785,7 +794,7 @@ class Session:
                 scope=scope, resend=resend, compaction_undone=True,
                 note="reverted",
             ))
-            return {"user_text": None}
+            return protocol.RollbackResult()
         label = "retry" if resend else "undo"
         try:
             await self.controller.revert_changes(plan.revert_turns)
@@ -809,14 +818,11 @@ class Session:
         ))
         if resend:
             await self._start_turn(plan.user_text, self._attachments(plan.images))
-            return {"user_text": None}
-        return {
-            "user_text": plan.user_text,
-            "images": [
-                attachment.model_dump()
-                for attachment in self._attachments(plan.images) or ()
-            ],
-        }
+            return protocol.RollbackResult()
+        return protocol.RollbackResult(
+            user_text=plan.user_text,
+            images=self._attachments(plan.images),
+        )
 
     def _attachments(self, refs: list[ImageRef] | None) -> list[ImageAttachment] | None:
         """Resolve image refs back into uploadable attachments (retry/undo)."""
@@ -834,7 +840,7 @@ class Session:
         self._compact_task = asyncio.get_running_loop().create_task(
             self._run_compact()
         )
-        return _ok(payload={"started": True})
+        return _ok(protocol.StartedResult())
 
     async def _run_compact(self) -> None:
         try:
@@ -902,7 +908,7 @@ class Session:
                 f"accepted: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
                 "locked in; /diff is reset and /undo can no longer revert them"
             )
-        return _ok()
+        return _ok(protocol.DoneResult())
 
     async def _cmd_reject(self) -> CommandResult:
         """Discard every change made since the last /accept (allowed mid-turn)."""
@@ -933,13 +939,13 @@ class Session:
                 f"rejected: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
                 "since the last accept were reverted"
             )
-        return _ok()
+        return _ok(protocol.DoneResult())
 
     def _cmd_set_mode(self, command: protocol.SetMode) -> CommandResult:
         self.mode = command.mode
         self._rebuild_tools()
         self._emit_status()
-        return _ok(payload={"mode": self.mode})
+        return _ok(protocol.ModeResult(mode=self.mode))
 
     async def _cmd_switch_model(self, command: protocol.SwitchModel) -> CommandResult:
         if self.config_path is None:
@@ -960,7 +966,7 @@ class Session:
         if command.persist_default:
             save_preferences(self.config_path, default_profile=command.name)
         self._emit_status()
-        return _ok(payload={"model": command.name})
+        return _ok(protocol.ModelResult(model=command.name))
 
     async def _cmd_set_sandbox(self, command: protocol.SetSandbox) -> CommandResult:
         """Switch this session's sandbox profile (idle only): the shell
@@ -971,7 +977,7 @@ class Session:
         self._emit_notice(
             f"sandbox switched to {name!r} — the persistent shell restarted"
         )
-        return _ok(payload={"sandbox": name})
+        return _ok(protocol.SandboxResult(sandbox=name))
 
     async def _cmd_filter(self, path: str, add: bool) -> CommandResult:
         """Add/remove a mount exclusion (idle only). Saved in the session
@@ -989,7 +995,7 @@ class Session:
             # Nothing to exclude: filtering a nonexistent path would either
             # fail at argv-build time or plant a stray path in the worktree.
             raise SessionError(f"no such path in the workspace: {rel!r}")
-        settings = self.sandbox_settings
+        settings = self.sandbox.settings
         if settings is None:
             raise SessionError("this session has no sandbox settings to filter")
         filters = list(settings.filter_list)
@@ -999,13 +1005,13 @@ class Session:
         elif rel in filters:
             filters.remove(rel)
         settings = settings.model_copy(update={"filter_list": filters})
-        await self._apply_sandbox_settings(self.sandbox_name, settings)
+        await self._apply_sandbox_settings(self.sandbox.name, settings)
         verb = "added to" if add else "removed from"
         self._emit_notice(
             f"{rel} {verb} the sandbox mount exclusions — the persistent "
             "shell restarted"
         )
-        return _ok(payload={"filter_list": filters})
+        return _ok(protocol.FilterResult(filter_list=filters))
 
     # ------------------------------------------------------------------
     # External references
@@ -1017,13 +1023,14 @@ class Session:
         return (path if path.is_absolute() else self.workspace / path).resolve()
 
     def _ref_specs(self) -> list:
-        settings = self.sandbox_settings
+        settings = self.sandbox.settings
         return list(settings.auto_include_refs) if settings is not None else []
 
     def _ref_infos(self) -> list[protocol.RefInfo]:
         """The refs currently bound, for the client's status payload."""
         external = (
-            self.sandbox.external_refs if self.sandbox is not None
+            self.sandbox.config.external_refs
+            if self.sandbox.config is not None
             else SandboxConfig.resolve_auto_refs(self.workspace, self._ref_specs())
         )
         return [
@@ -1038,7 +1045,7 @@ class Session:
         per workspace. Nothing is ever created in the worktree (or at
         ``.refs``) — the mount exists only inside the container namespace."""
         raw = path.strip()
-        settings = self.sandbox_settings
+        settings = self.sandbox.settings
         if not raw or settings is None:
             raise SessionError("references need a path and a sandbox")
         host = self._ref_path(raw)
@@ -1057,8 +1064,7 @@ class Session:
                 raise SessionError(f"no such reference: {raw}")
             specs = kept
 
-        settings = settings.model_copy(update={"auto_include_refs": specs})
-        await self._apply_sandbox_settings(self.sandbox_name, settings)
+        await self.apply_ref_specs(specs)
 
         try:
             saved = session_store.load_workspace_refs(str(self.workspace))
@@ -1075,11 +1081,17 @@ class Session:
         self._emit_notice(
             f"{host} {verb} the workspace references"
             + (" — the persistent shell restarted"
-               if self.sandbox_session is not None else "")
+               if self.sandbox.shell is not None else "")
         )
-        return _ok(payload={
-            "refs": [info.model_dump() for info in self._ref_infos()],
-        })
+        return _ok(protocol.RefsResult(refs=self._ref_infos()))
+
+    async def apply_ref_specs(self, specs: list) -> None:
+        """Apply a workspace's canonical ref list to this live session."""
+        settings = self.sandbox.settings
+        if settings is None or list(settings.auto_include_refs) == list(specs):
+            return
+        settings = settings.model_copy(update={"auto_include_refs": list(specs)})
+        await self._apply_sandbox_settings(self.sandbox.name, settings)
 
     def _resolve_sandbox_profile(self, name: str | None):
         """Resolve a sandbox profile from the config (with inheritance)."""
@@ -1093,19 +1105,17 @@ class Session:
 
     async def _apply_sandbox_settings(self, name: str | None, settings) -> None:
         """Rebuild the sandbox + registry from new settings (idle only)."""
-        self.sandbox_name = name
-        self.sandbox_settings = settings
-        self.allow_git_write = settings.allow_git_write
-        old_session = self.sandbox_session
+        old = self.sandbox
         try:
-            sandbox, session_obj = make_sandbox(self.workspace, settings, self.git_info)
+            runtime = SandboxRuntime.make(
+                self.workspace, settings, self.git_info, name=name,
+            )
         except SandboxUnavailable as exc:
-            sandbox = session_obj = None
+            runtime = SandboxRuntime(name=name, settings=settings)
             self._emit_notice(f"warning: filesystem/bash tools disabled: {exc}", "warn")
-        if old_session is not None:
-            await old_session.close()
-        self.sandbox = sandbox
-        self.sandbox_session = session_obj
+        runtime.set_mode(self.mode)
+        await old.close()
+        self.sandbox = runtime
         self._rebuild_tools(output_limit=settings.tool_output_limit)
         self._persist()
         self._emit_status()
@@ -1138,13 +1148,7 @@ class Session:
         try:
             stream = self.controller.send(text, images)
             while True:
-                done_calls: list[ToolCall] = []
                 async for event in stream:
-                    if isinstance(event, protocol.ToolCallArgumentsDone):
-                        done_calls.append(ToolCall(
-                            call_id=event.call_id, name=event.name,
-                            arguments_json=event.arguments_json,
-                        ))
                     self._emit(event)
                 # A round that ended without finishing — a provider or
                 # transport error, say — still streamed something. Keep the
@@ -1156,6 +1160,14 @@ class Session:
                 # turn keeps streaming (the state is unchanged, so
                 # _set_state would not emit).
                 self._emit_status()
+                # The controller stamped this round's tool calls onto the
+                # assistant message at TurnComplete; read them from there
+                # instead of accumulating a second list.
+                last = self.conversation.messages[-1] if self.conversation.messages else None
+                done_calls = (
+                    list(last.tool_calls or [])
+                    if last is not None and last.role == "assistant" else []
+                )
                 if not done_calls:
                     # Threshold crossed on the model's final round: compact
                     # and keep the turn going — the model picks the work back
@@ -1253,7 +1265,7 @@ class Session:
         end = _utcnow()
         self._emit(protocol.ToolFinished(
             call_id=call_id, ok=result.ok, parse_error=result.parse_error,
-            output=result.output, error=result.error, header=result.header,
+            output=result.output, error=result.error,
         ))
         if call.name in MUTATING_TOOLS:
             await self._emit_diff_changed()
@@ -1305,7 +1317,7 @@ class Session:
     # git tracking
 
     def _make_git_guard(self) -> Callable[[str], str | None]:
-        if self.allow_git_write:
+        if self.sandbox.allow_git_write:
             # The git guard is off entirely: the agent manages git itself;
             # tracking guarantees no longer hold.
             return lambda command: None
@@ -1425,17 +1437,16 @@ class Session:
         """Derive the mode-aware system prompt for the next request. It is
         never persisted in the conversation."""
         self.controller.system_prompt = system_prompt_for(
-            GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox,
+            GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox.config,
             tracking=self.git_info is not None,
         )
 
     def _rebuild_tools(self, output_limit: int | None = None) -> None:
         """Rebuild tools for the current mode/sandbox, preserving the output cap."""
-        if self.sandbox is not None:
-            self.sandbox.read_only = self.mode != "write"
+        self.sandbox.set_mode(self.mode)
         limit = output_limit if output_limit is not None else self.tool_registry.max_output_chars
         self.tool_registry = build_registry(
-            self.sandbox, self.sandbox_session, mode=self.mode,
+            self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_user,
             git_guard=self._make_git_guard(),
         )
@@ -1473,10 +1484,10 @@ class Session:
             profile=self.profile_name,
             workspace=str(self.workspace),
             git=self.git_info.to_block() if self.git_info else None,
-            sandbox_name=self.sandbox_name,
+            sandbox_name=self.sandbox.name,
             sandbox_settings=(
-                self.sandbox_settings.model_dump()
-                if self.sandbox_settings is not None else None
+                self.sandbox.settings.model_dump()
+                if self.sandbox.settings is not None else None
             ),
             total_in=self.controller.usage_total.input_tokens,
             total_out=self.controller.usage_total.output_tokens,
