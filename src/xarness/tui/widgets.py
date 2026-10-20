@@ -8,8 +8,6 @@ events and hold no conversation state of their own (the reasoning text inside
 
 from __future__ import annotations
 
-import difflib
-import json
 import random
 import re
 
@@ -23,28 +21,8 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from .. import theme
+from ..themes import blend_hex
 
-
-_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-
-
-def _split_settled(text: str) -> tuple[str, str]:
-    """Split text at the end of the last complete fenced code block.
-
-    Returns (settled, remainder). `settled` is everything up through the
-    last fully-closed ``` ... ``` pair (including any plain text before it);
-    `remainder` is whatever comes after — plain text and/or a fence that's
-    still open. Multiple complete fences in one chunk are all included in
-    `settled` in one pass via finditer's non-overlapping matches.
-
-    Known limitation: naive backtick pairing, not a real markdown parser —
-    fine for normal LLM output, could mis-pair on unusual nested backtick
-    usage inside a fence body.
-    """
-    last_end = 0
-    for match in _FENCE_RE.finditer(text):
-        last_end = match.end()
-    return text[:last_end], text[last_end:]
 
 def _fmt_tokens(count: int) -> str:
     if count < 1_000:
@@ -52,34 +30,6 @@ def _fmt_tokens(count: int) -> str:
     if count < 1_000_000:
         return f"{count / 1_000:.1f}k"
     return f"{count / 1_000_000:.2f}M"
-
-
-def _lerp_hex(c1: str, c2: str, t: float) -> str:
-    c1, c2 = c1.lstrip("#"), c2.lstrip("#")
-    r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
-    r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
-    r = round(r1 + (r2 - r1) * t)
-    g = round(g1 + (g2 - g1) * t)
-    b = round(b1 + (b2 - b1) * t)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def _fence_highlight(
-    code: str, language: str, ansi: bool = False, dark: bool = False,
-    path: str | None = None,
-) -> Content:
-    """Highlight a code block with the xarness palette.
-
-    Textual's fence uses its own dark-only code theme, which renders
-    unreadable colors on light backgrounds. In ANSI mode the terminal's own
-    palette is still used; otherwise the palette-driven CodeHighlightTheme
-    applies (and follows live /theme switches)."""
-    from textual.highlight import ANSIDarkHighlightTheme, ANSILightHighlightTheme
-
-    if ansi:
-        ansi_theme = ANSIDarkHighlightTheme if dark else ANSILightHighlightTheme
-        return highlight(code, language=language or None, path=path, theme=ansi_theme)
-    return highlight(code, language=language or None, path=path, theme=theme.CodeHighlightTheme)
 
 
 def _content_to_rich_text(content: Content) -> Text:
@@ -93,22 +43,12 @@ def _content_to_rich_text(content: Content) -> Text:
     blend toward the background, ansi_* names to rich color names."""
     p = theme.PALETTE
 
-    def blend(color: str, pct: float) -> str:
-        factor = pct / 100.0
-        bg = p["bg"].lstrip("#")
-        fg = color.lstrip("#")
-        mixed = "".join(
-            f"{round(int(fg[i:i + 2], 16) * factor + int(bg[i:i + 2], 16) * (1 - factor)):02x}"
-            for i in (0, 2, 4)
-        )
-        return f"#{mixed}"
-
     def resolve(style: str) -> str:
         out: list[str] = []
         last_color: str | None = None
         for token in style.split():
             if token.endswith("%") and last_color is not None:
-                out[-1] = blend(last_color, float(token[:-1]))
+                out[-1] = blend_hex(last_color, p["bg"], float(token[:-1]) / 100)
                 continue
             if token.startswith("$c-"):
                 last_color = p.get(token[3:], p["text"])
@@ -144,14 +84,18 @@ def highlight_code(code: str, path: str | None = None, language: str = "") -> Te
     variable styles never resolve.
     """
     from textual.app import active_app
+    from textual.highlight import ANSIDarkHighlightTheme, ANSILightHighlightTheme
 
     app = active_app.get()
-    content = _fence_highlight(
-        code,
-        language=language or None,
-        ansi=app.native_ansi_color,
-        dark=app.current_theme.dark,
-        path=path,
+    if app.native_ansi_color:
+        code_theme = (
+            ANSIDarkHighlightTheme if app.current_theme.dark
+            else ANSILightHighlightTheme
+        )
+    else:
+        code_theme = theme.CodeHighlightTheme
+    content = highlight(
+        code, language=language or None, path=path, theme=code_theme,
     )
     return _content_to_rich_text(content)
 
@@ -208,224 +152,6 @@ class SteerQueueBar(Vertical):
             self.remove_class("visible")
 
 
-def _shorten(text: str, limit: int = 60) -> str:
-    """Collapse whitespace and truncate long text for a one-line header."""
-    text = " ".join(text.split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def _json_tool_args(args_text: str) -> dict:
-    """Best-effort parse of a tool call's streamed arguments JSON."""
-    try:
-        parsed = json.loads(args_text)
-    except (ValueError, TypeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _partial_string(args_text: str, key: str, unescape: bool = False) -> str | None:
-    """Best-effort extraction of a string argument from tool-call JSON that
-    may still be streaming: the text after ``"key": "`` up to the (not yet
-    arrived, possibly) closing quote. Returns None when the key hasn't
-    appeared at all."""
-    match = re.search(rf'"{re.escape(key)}"\s*:\s*"', args_text)
-    if match is None:
-        return None
-    rest = args_text[match.end():]
-    # Stop at the unescaped closing quote; also tolerate a dangling backslash
-    # from a fragment boundary landing mid-escape.
-    i = 0
-    while i < len(rest):
-        if rest[i] == "\\":
-            i += 2
-            continue
-        if rest[i] == '"':
-            rest = rest[:i]
-            break
-        i += 1
-    rest = rest.rstrip("\\")
-    if unescape:
-        rest = rest.replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
-    return rest
-
-
-def _write_file_loc(args_text: str) -> int | None:
-    """Best-effort line count of write_file's ``content`` argument while its
-    JSON is still streaming. Complete JSON counts exactly; a partial one
-    counts the escaped ``\\n`` sequences after the "content" key. A
-    trailing newline doesn't start a new line."""
-    content = _json_tool_args(args_text).get("content")
-    if isinstance(content, str):
-        return _line_count(content)
-    raw = _partial_string(args_text, "content")
-    if raw is None:
-        return None
-    return _line_count(raw.replace("\\\\", "").replace("\\n", "\n"))
-
-
-def _line_count(text: str) -> int:
-    """Number of lines in ``text``; a trailing newline ends a line, not
-    starts one (so "a\\nb\\n" is 2 lines, "a\\nb\\nc" is 3)."""
-    if not text:
-        return 0
-    return text.count("\n") + (0 if text.endswith("\n") else 1)
-
-
-def _live_edit_counts(args_text: str) -> str | None:
-    """'+N -M' running diffstat of edit_file's arguments while they stream
-    (complete JSON only — partially streamed edits aren't counted)."""
-    args = _json_tool_args(args_text)
-    edits = args.get("edits")
-    if not isinstance(edits, list):
-        old, new = args.get("old_string"), args.get("new_string")
-        if isinstance(old, str) and old:
-            edits = [{"old_string": old, "new_string": new if isinstance(new, str) else ""}]
-        else:
-            return None
-    adds = dels = 0
-    for edit in edits:
-        if not isinstance(edit, dict):
-            continue
-        old, new = edit.get("old_string", ""), edit.get("new_string", "")
-        if not isinstance(old, str) or not old:
-            continue
-        diff = list(difflib.unified_diff(
-            old.splitlines(), new.splitlines() if isinstance(new, str) else [], n=0, lineterm=""
-        ))
-        adds += sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
-        dels += sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
-    if not adds and not dels:
-        return None
-    return f"+{adds} -{dels}"
-
-
-def _stream_label(tool_name: str, args_text: str) -> str:
-    """Live one-line label for a call whose arguments are streaming or that
-    is executing: '<tool> <detail>', e.g. 'write_file +4 g.py',
-    'run_bash git status', 'edit_file +2 -1 app.py'. Falls back to the bare
-    tool name until enough of the arguments has arrived."""
-    args = _json_tool_args(args_text)
-    path = args.get("path")
-    if not isinstance(path, str):
-        path = _partial_string(args_text, "path")
-
-    if tool_name == "write_file":
-        loc = _write_file_loc(args_text)
-        detail = " ".join(
-            part for part in (f"+{loc}" if loc is not None else None, path) if part
-        )
-        return f"write_file {detail}".rstrip()
-    if tool_name == "edit_file":
-        if not path:
-            return "edit_file"
-        counts = _live_edit_counts(args_text)
-        return f"edit_file {counts} {path}" if counts else "edit_file"
-    if tool_name == "read_file" and path:
-        return f"read_file {path}"
-    if tool_name == "run_bash":
-        command = args.get("command")
-        if not isinstance(command, str):
-            command = _partial_string(args_text, "command", unescape=True)
-        if command:
-            # One line only — later lines (a compound command, say) don't fit.
-            return tool_name + " " + _shorten(command.splitlines()[0])
-    return tool_name
-
-
-def _stream_parts(tool_name: str, args_text: str) -> tuple[str, str]:
-    """Split the live stream label into the shimmering part (the tool name)
-    and the static detail (the arguments-derived part, '' when none yet)."""
-    label = _stream_label(tool_name, args_text)
-    detail = label[len(tool_name):].strip()
-    return tool_name, detail
-
-
-_HEADER_PATTERNS = {
-    # Tool header → regex over it: the last group is the dimmed path, the
-    # earlier ones get the diff's add/del colors. Older sessions stored just
-    # the path — the regex then doesn't match and the header is shown plain
-    # dimmed.
-    "edit_file": re.compile(r"^(\+\d+) (-\d+) (.+)$"),
-    "write_file": re.compile(r"^(\+\d+) (.+)$"),
-}
-_HEADER_COUNT_STYLES = ("diff_add", "diff_del")
-
-
-def _header_detail_text(tool_name: str, header: str) -> Text | None:
-    """The stored header summary, laid out after the verb + tool name.
-
-    Every tool's detail appends dimmed after a space, all on one line
-    (``edit_file +3 -1 src/app.py``). For edit_file/write_file the leading
-    +N/-M counts get the diff's colors so they read at a glance and the
-    path stays dimmed. run_bash's command is truncated for the header —
-    the full command shows in the expanded body.
-    """
-    if not header:
-        return None
-    muted = theme.PALETTE["muted"]
-    detail = Text(" ", style=muted)
-    pattern = _HEADER_PATTERNS.get(tool_name)
-    if pattern is not None:
-        match = pattern.match(header)
-        if match:
-            *counts, path = match.groups()
-            for value, key in zip(counts, _HEADER_COUNT_STYLES):
-                detail.append(value, style=theme.PALETTE[key])
-                detail.append(" ", style=muted)
-            detail.append(path, style=muted)
-            return detail
-        detail.append(header, style=muted)
-        return detail
-    if tool_name == "run_bash":
-        detail.append(_shorten(header, 80), style=muted)
-        return detail
-    detail.append(header, style=muted)
-    return detail
-
-
-def _tool_header_detail(tool_name: str, args_text: str) -> Text | None:
-    """The dimmed detail that follows the verb in the settled header, e.g.
-    ``read_file [dimmed]src/app.py``. Returns None (plain verb + name)
-    for tools without a useful summary or unparseable arguments.
-
-    Kept best-effort and defensive: model-supplied arguments are not trusted
-    and a malformed call must never break rendering.
-    """
-    muted = theme.PALETTE["muted"]
-    args = _json_tool_args(args_text)
-
-    def as_str(value: object) -> str:
-        return value if isinstance(value, str) else ""
-
-    if tool_name in ("read_file", "write_file", "edit_file"):
-        path = as_str(args.get("path"))
-        if not path:
-            return None
-        detail = Text(" ")
-        detail.append(_shorten(path), style=muted)
-        if tool_name == "read_file":
-            # Surface the requested range: read_file index.html [start_line=270, end_line=30]
-            ranges = []
-            if args.get("start_line") is not None:
-                ranges.append(f"start_line={args['start_line']}")
-            if args.get("end_line") is not None:
-                ranges.append(f"end_line={args['end_line']}")
-            if ranges:
-                detail.append(f" [{', '.join(ranges)}]", style=muted)
-        return detail
-    if tool_name == "run_bash":
-        command = as_str(args.get("command"))
-        if not command:
-            return None
-        first = command.splitlines()[0]
-        detail = Text(" ")
-        detail.append(_shorten(first, 80), style=muted)
-        return detail
-    return None
-
-
-_EXPAND_PLAIN_TOOLS = frozenset({"run_bash"})
-
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT_RE = re.compile(r"^diff --git ", re.MULTILINE)
@@ -461,6 +187,27 @@ def _split_tool_diff(text: str) -> tuple[str, str] | None:
     return text[: match.start()], text[match.start() :]
 
 
+_LEGACY_DIFF_BREAK_RE = re.compile(
+    r"(?<!\n)(?=(?:--- [ab]/|\+\+\+ [ab]/|@@ -\d))"
+)
+_LEGACY_HUNK_END_RE = re.compile(
+    r"(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)(?=[^\n])"
+)
+
+
+def _normalize_legacy_diff(text: str) -> str:
+    """Re-break the malformed one-line diffs older edit_file calls stored.
+
+    A previous generator joined ``difflib`` output with ``""`` after passing
+    keepends lines, collapsing the ``---``/``+++``/``@@`` headers and the
+    first changed line together. Replaying such a session must still render
+    the hunk, so split those headers back onto their own lines. Valid diffs
+    are untouched (their headers already follow a newline).
+    """
+    text = _LEGACY_DIFF_BREAK_RE.sub("\n", text)
+    return _LEGACY_HUNK_END_RE.sub(r"\1\n", text)
+
+
 def _render_diff(text: str, show_headers: bool = True) -> Text:
     """Unified diff as GitHub-style rich text.
 
@@ -471,6 +218,7 @@ def _render_diff(text: str, show_headers: bool = True) -> Text:
     muted gutter. ``show_headers=False`` drops the per-file header line —
     used for edit_file, whose path is already in the summary row. Plain
     stateful parse — no external diff library."""
+    text = _normalize_legacy_diff(text)
     p = theme.PALETTE
     out = Text()
     header_path: str | None = None
@@ -577,7 +325,7 @@ class GeneratingBar(Static):
     def _level_color(self, level: int) -> str:
         """Foreground color for a brightness level (0 = dim, max = accent)."""
         t = level / (self.LEVELS - 1) if self.LEVELS > 1 else 1.0
-        return _lerp_hex(theme.PALETTE["bg"], theme.PALETTE["accent"], t)
+        return blend_hex(theme.PALETTE["bg"], theme.PALETTE["accent"], t)
 
     def on_mount(self) -> None:
         self._cols = [random.randrange(self.LEVELS) for _ in range(self.WIDTH)]
@@ -661,12 +409,7 @@ class StatusBar(Static):
         if workspace:
             line.append("  │  ", style=palette["border"])
             line.append(crop_path(workspace), style=palette["muted"])
-        self._text = str(line)
         self.update(line)
-
-    @property
-    def text(self) -> str:
-        return self._text
 
 
 # ChatInput (and its image-token machinery) live in chat_input.py;

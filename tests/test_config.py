@@ -145,15 +145,6 @@ def test_save_preferences_prefers_matching_preset(tmp_path: Path) -> None:
     assert load_sectioned(path).default_preset_model() == "b"
 
 
-def test_save_preferences_auto_compact(tmp_path: Path) -> None:
-    path = write(tmp_path, {"models": {
-        "a": {"base_url": "https://x.test/v1", "model_id": "m"},
-    }})
-    save_preferences(path, auto_compact=True)
-    data = json.loads(path.read_text())
-    assert data["models"]["a"]["auto_compact"] is True
-
-
 def test_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="config file not found"):
         load_sectioned(tmp_path / "nope.json")
@@ -222,8 +213,8 @@ def test_bad_auto_compact_threshold_rejected(tmp_path: Path, threshold: float) -
 
 def test_sandbox_settings_defaults() -> None:
     settings = SandboxSettings()
-    assert settings.allow_network is True
-    assert settings.gpu_access is True
+    assert settings.allow_network is False
+    assert settings.gpu_access is False
     assert settings.allow_git_write is False  # secure by default
     assert settings.use_container is True
     assert settings.enable_tracking is True

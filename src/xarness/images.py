@@ -12,6 +12,7 @@ re-processes pixels.
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from io import BytesIO
 from pathlib import Path
@@ -29,8 +30,13 @@ _JPEG_QUALITY = 85
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 # The placeholder an attached image leaves in the input text (and the
-# transcript). One token per image, deleted atomically in the editor.
-_TOKEN_TEXT = "[🖼 {name} {width}×{height}]"
+# transcript). One token per image, deleted atomically in the editor. The
+# ``#id`` suffix (content-hash prefix) keeps two differently-named/sized
+# images from colliding: same name and dimensions no longer means the same
+# token. Older sessions carry the suffix-less legacy form, still matched by
+# ``IMAGE_TOKEN_RE``.
+_TOKEN_TEXT = "[🖼 {name} {width}×{height} #{id}]"
+_LEGACY_TOKEN_TEXT = "[🖼 {name} {width}×{height}]"
 # Single source of truth for the token shape (see conversation.to_wire).
 IMAGE_TOKEN_RE = re.compile(r"\[🖼 [^\]\n]+\]")
 
@@ -39,15 +45,28 @@ class ImageError(Exception):
     """The file could not be read as an image."""
 
 
+class ImageRef(BaseModel):
+    """An image attached to a message, by content hash.
+
+    This is the persisted/wire shape: the bytes live once in the session's
+    ``blobs/<id>`` directory and are served by
+    ``GET /v1/sessions/{name}/images/{id}``. Persisted JSON and snapshots
+    therefore never carry base64 payloads."""
+
+    id: str
+    name: str
+    mime: str
+    width: int
+    height: int
+
+
 class ImageAttachment(BaseModel):
-    """One image attached to a user message.
+    """One image travelling from a client to the host.
 
     ``data_b64`` is the encoded image bytes; ``width``/``height`` describe
     the encoded image (post-downsample) so the TUI can show real dims
-    without decoding. Persisted verbatim in session files and sent over the
-    wire in snapshots — a pydantic model so the same object does both.
-    Unknown fields are ignored, not rejected: the host and client can be
-    different builds across a restart."""
+    without decoding. ``SendMessage`` carries these; the host stores the
+    bytes in its blob store and keeps only an :class:`ImageRef`."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -57,24 +76,61 @@ class ImageAttachment(BaseModel):
     width: int
     height: int
 
-    _data_url_cache: str | None = PrivateAttr(default=None)
+    # Content-hash id, computed lazily (hashing a multi-MB payload on every
+    # keystroke would be wasteful).
+    _ref_id: str | None = PrivateAttr(default=None)
 
-    def data_url(self) -> str:
-        if self._data_url_cache is None:
-            self._data_url_cache = f"data:{self.mime};base64,{self.data_b64}"
-        return self._data_url_cache
+    @property
+    def ref_id(self) -> str:
+        if self._ref_id is None:
+            self._ref_id = self.to_ref().id
+        return self._ref_id
+
+    def data(self) -> bytes:
+        return base64.b64decode(self.data_b64)
+
+    def to_ref(self) -> ImageRef:
+        """The content-addressed reference for these bytes."""
+        return ImageRef(
+            id=hashlib.sha256(self.data()).hexdigest(),
+            name=self.name, mime=self.mime,
+            width=self.width, height=self.height,
+        )
 
 
-def token_text(image: ImageAttachment) -> str:
+def sniff_mime(data: bytes) -> str:
+    """Best-effort MIME type from a blob's magic bytes."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return "application/octet-stream"
+
+
+def _token_id(image: ImageRef | ImageAttachment) -> str:
+    """The short content id a token carries (distinguishes same-named images)."""
+    return (image.id if isinstance(image, ImageRef) else image.ref_id)[:4]
+
+
+def token_text(image: ImageRef | ImageAttachment) -> str:
     """The placeholder token an attached image appears as in the text."""
     return _TOKEN_TEXT.format(
-        name=image.name, width=image.width, height=image.height
+        name=image.name, width=image.width, height=image.height,
+        id=_token_id(image),
     )
 
 
-def find_image_tokens(text: str) -> list[str]:
-    """Image placeholder tokens appearing in ``text``, in order."""
-    return IMAGE_TOKEN_RE.findall(text)
+def legacy_token_text(image: ImageRef | ImageAttachment) -> str:
+    """The pre-T1.11 token form (no ``#id``), for reading old sessions."""
+    return _LEGACY_TOKEN_TEXT.format(
+        name=image.name, width=image.width, height=image.height,
+    )
 
 
 def is_image_path(path: Path | str) -> bool:

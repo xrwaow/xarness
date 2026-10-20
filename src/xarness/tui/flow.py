@@ -26,8 +26,8 @@ import io
 import re
 import time
 import traceback
+from functools import singledispatch
 from pathlib import Path
-from dataclasses import dataclass, field
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -38,26 +38,22 @@ from textual.strip import Strip
 from textual_flowview import Presentation
 
 from .. import images, theme
-from ..conversation import Message as ConversationMessage
-from ..events import ToolCallStatus
-from ..images import token_text
-from .widgets import (
-    _json_tool_args,
-    _lerp_hex,
-    _render_diff,
-    _render_read_file,
-    _split_settled,
-    _split_tool_diff,
-    _stream_parts,
-    _tool_header_detail,
-    _header_detail_text,
-    highlight_code,
+from ..images import legacy_token_text, token_text
+from .tool_view import (
+    ToolCallView, body_renderable, live_parts as _stream_parts,
+    summary_text as _tool_summary_text,
 )
+from .transcript import (
+    AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
+    ToolStatus, UserItem,
+)
+from ..themes import blend_hex as _lerp_hex
+from .widgets import highlight_code
 
 __all__ = [
     "AssistantItem", "DividerItem", "LineItem", "PendingItem", "Presenter",
     "shimmer_now",
-    "ThinkingItem", "ToolItem", "ToolCallStatus", "UserItem",
+    "ThinkingItem", "ToolItem", "ToolStatus", "UserItem",
     "render_strips",
 ]
 
@@ -66,12 +62,20 @@ __all__ = [
 # strip rendering
 
 _console = Console(file=io.StringIO(), legacy_windows=False, color_system="truecolor")
-_console.push_theme(theme.rich_markdown_theme())
+_theme_pushed = False
 
 
 def push_rich_theme() -> None:
-    """Re-point rich.markdown's style names at the current palette."""
+    """Re-point rich.markdown's style names at the current palette (pop the
+    previous theme so repeated /theme switches don't grow the stack)."""
+    global _theme_pushed
+    if _theme_pushed:
+        _console.pop_theme()
     _console.push_theme(theme.rich_markdown_theme())
+    _theme_pushed = True
+
+
+push_rich_theme()
 
 
 def render_strips(renderable, width: int) -> list[Strip]:
@@ -117,235 +121,14 @@ def shimmer_text(
     for i, ch in enumerate(label):
         dist = abs(i - peak)
         intensity = max(0.0, 1.0 - dist / half_band)
-        color = _lerp_hex(base_color, peak_color, intensity)
+        # ``blend_hex(fg, bg, alpha)`` weights its first argument, so pass
+        # the peak first to get the base at intensity 0 and peak at 1.
+        color = _lerp_hex(peak_color, base_color, intensity)
         text.append(ch, style=Style(color=color, bold=intensity > 0.6))
     if suffix:
-        suffix_color = _lerp_hex(base_color, peak_color, 0.35)
+        suffix_color = _lerp_hex(peak_color, base_color, 0.35)
         text.append(" " + suffix, style=Style(color=suffix_color))
     return text
-
-
-# ---------------------------------------------------------------------------
-# items
-
-
-@dataclass
-class UserItem:
-    """A submitted user message (no local echo: created on UserMessageAdded)."""
-
-    text: str
-    images: list = field(default_factory=list)
-    suffix: str = ""  # "· queued" until the message is actually sent
-    undo_armed: bool = False
-    message: ConversationMessage | None = None
-    _cache: tuple = field(default=(), repr=False)
-
-    @classmethod
-    def from_message(cls, message: ConversationMessage) -> "UserItem":
-        """Build the transcript item for a persisted (or just-landed) user
-        message, carrying the message itself for click-to-undo."""
-        return cls(
-            text=message.content,
-            images=message.images or [],
-            message=ConversationMessage(
-                role="user", content=message.content, id=message.id or "",
-            ),
-        )
-
-    def undo_row(self, height: int) -> int | None:
-        """Row index of the "↩ undo to here" affordance, when armed.
-        (The presenter wraps the box in blank/pad/…/pad/blank, so the last
-        real row sits 2 above the bottom.)"""
-        if self.undo_armed and self.message is not None:
-            return height - 3
-        return None
-
-
-@dataclass
-class AssistantItem:
-    """One model answer: settled chunks (closed fences settled once) + live tail."""
-
-    chunks: list[str] = field(default_factory=list)
-    live: str = ""
-    finalized: bool = False
-    # (chunk index, epoch, width) -> strips. Markdown rendering dominates the
-    # cost of a streaming flush; chunks never change once settled.
-    chunk_cache: dict = field(default_factory=dict, repr=False)
-
-    def append_delta(self, text: str) -> None:
-        """Fold a delta into the live tail, settling any closed fence."""
-        self.live += text
-        settled, remainder = _split_settled(self.live)
-        if settled:
-            self.chunks.append(settled)
-            self.live = remainder
-
-    def finalize(self) -> None:
-        """Settle the tail; idempotent (also called after errors/interrupts)."""
-        if self.finalized:
-            return
-        self.finalized = True
-        tail = self.live
-        if tail.strip():
-            self.chunks.append(tail)
-            self.live = ""
-        elif not self.chunks:
-            self.chunks.append("(no output)")
-
-
-@dataclass
-class ThinkingItem:
-    """Reasoning channel. Click toggles the text; the pill shows the time.
-
-    Expanded while streaming (the live CoT is the interesting part), auto-
-    collapsed by :meth:`finish` when the round moves on; a click toggles at
-    any time — including mid-stream — so the user can tuck it away and
-    reopen it. Replays construct settled items with ``expanded=False``."""
-
-    parts: list[str] = field(default_factory=list)
-    done: bool = False
-    duration: float | None = None
-    expanded: bool = True
-    # True while the duration is provisional (unknown): a later finish with
-    # the session-recorded seconds overrides it.
-    _estimated: bool = False
-    _cache: tuple = field(default=(), repr=False)
-
-    @property
-    def reasoning(self) -> str:
-        return "".join(self.parts)
-
-    def finish(self, duration: float | None) -> None:
-        """Collapse to a summary. First backend duration wins; a later one
-        overrides only an unknown ("…") duration — the live path settles
-        without a local estimate, then TurnComplete fills the number in."""
-        if self.done:
-            if duration is not None and self._estimated:
-                self.duration = duration
-                self._estimated = False
-            return
-        self.done = True
-        self.duration = duration
-        self._estimated = duration is None
-        self.expanded = False  # auto-collapse once the round moves on
-
-    def summary_text(self) -> str:
-        if not self.done:
-            return "Thinking"
-        if self.duration is not None:
-            from ..util import format_duration
-            return f"Thought for {format_duration(self.duration)}"
-        return "Thought for …"
-
-
-@dataclass
-class ToolItem:
-    """One tool call: status dot + summary; click expands args/output."""
-
-    call_id: str
-    name: str
-    args: str = ""
-    output: str = ""
-    header: str = ""
-    status: ToolCallStatus = ToolCallStatus.MAKING_CALL
-    expanded: bool = False
-    _cache: tuple = field(default=(), repr=False)
-
-    STATUS_COLOR_KEY = {
-        ToolCallStatus.MAKING_CALL: "warning",
-        ToolCallStatus.PARSING_ERROR: "error",
-        ToolCallStatus.CALL_SUCCEEDED: "success",
-        ToolCallStatus.CALL_FAILED: "error",
-    }
-    STATUS_VERB = {
-        ToolCallStatus.MAKING_CALL: "Running",
-        ToolCallStatus.PARSING_ERROR: "Failed",
-        ToolCallStatus.CALL_SUCCEEDED: "",
-        ToolCallStatus.CALL_FAILED: "Failed",
-    }
-
-    def bash_command(self) -> str:
-        command = _json_tool_args(self.args).get("command")
-        if isinstance(command, str) and command:
-            return command
-        return self.header
-
-    def body_renderable(self):
-        """Port of ToolCallBlock._refresh_body — the expanded body."""
-        if self.name == "edit_file":
-            split = _split_tool_diff(self.output)
-            if split is not None:
-                return _render_diff(split[1], show_headers=False)
-            return Text(self.output)
-        args = _json_tool_args(self.args)
-        path = args.get("path")
-        if (
-            self.name == "read_file" and isinstance(path, str) and path
-            and self.status is ToolCallStatus.CALL_SUCCEEDED
-        ):
-            return _render_read_file(path, self.output)
-        if self.name == "write_file":
-            content = args.get("content")
-            if isinstance(path, str) and path and isinstance(content, str):
-                body = highlight_code(content, path=path)
-                if self.output:
-                    body.append("\n" + self.output)
-                return body
-        body = self.args
-        if self.name == "run_bash":
-            command = self.bash_command()
-            if command:
-                body = command
-        if self.output:
-            body = f"{body}\n{self.output}" if body else self.output
-        split = _split_tool_diff(body)
-        if split is None:
-            return Text(body)
-        prose, diff = split
-        rendered = Text(prose.rstrip("\n"))
-        if rendered:
-            rendered.append("\n")
-        rendered.append_text(_render_diff(diff))
-        return rendered
-
-    def summary_text(self) -> Text:
-        verb = self.STATUS_VERB[self.status]
-        summary = Text(f"{verb} {self.name}" if verb else self.name)
-        if self.status is ToolCallStatus.CALL_SUCCEEDED and not (
-            self.expanded and self.name in ("run_bash",)
-        ):
-            detail = _header_detail_text(self.name, self.header)
-            if detail is None:
-                detail = _tool_header_detail(self.name, self.args)
-            if detail is not None:
-                summary.append_text(detail)
-        return summary
-
-
-@dataclass
-class PendingItem:
-    """The ephemeral "Processing · esc to interrupt" strip, shown while a
-    round waits on the provider. Owned by the app's phase machine — never
-    persisted or replayed; the shimmer comes from the shared clock."""
-
-    label: str = "Processing"
-    hint: str = "esc to interrupt"
-    _cache: tuple = field(default=(), repr=False)
-
-
-@dataclass
-class LineItem:
-    """A one-line status message (notice / warn / error / success / hint)."""
-
-    text: str
-    kind: str = "notice"
-
-
-@dataclass
-class DividerItem:
-    """A divider line (the compaction handoff marker)."""
-
-    text: str
 
 
 _GLYPHS = {"error": "✗ ", "warn": "! ", "success": "✓ "}
@@ -362,15 +145,33 @@ class Presenter:
 
     def __init__(self) -> None:
         self.epoch = 0  # bumped on /theme; part of every cache key
+        # Per-entry strip caches live here, not on the (pure-data) items:
+        # id(entry) -> (key, strips), and a per-entry chunk cache for the
+        # settled assistant blocks.
+        self._cache: dict[int, tuple] = {}
+        self._chunks: dict[int, dict] = {}
+        # (len(args), live label parts) — streaming args are re-parsed only
+        # when the text grows, not on every shimmer frame.
+        self._args_cache: dict[int, tuple] = {}
 
     def invalidate(self) -> None:
         self.epoch += 1
+        self._cache.clear()
+        self._chunks.clear()
+        self._args_cache.clear()
         push_rich_theme()
+
+    def reset(self) -> None:
+        """Forget all cached strips (the transcript was rebuilt)."""
+        self._cache.clear()
+        self._chunks.clear()
+        self._args_cache.clear()
+        self._index_cache = None
 
     async def present(self, entry, width: int) -> Presentation:
         item = entry.item
         try:
-            strips = self._present_item(item, width)
+            strips = render_item(item, self, entry, width)
         except Exception as exc:
             # FlowView only surfaces `{type}: {exc}` — without the traceback
             # a render bug is undebuggable. Log the full trace (re-raise so
@@ -386,19 +187,19 @@ class Presenter:
         # on most terminals) — indistinguishable from the dark palettes by
         # luck, glaringly wrong on light ones.
         base_style = Style(color=theme.PALETTE["text"], bgcolor=theme.PALETTE["bg"])
-        if not isinstance(item, UserItem):
+        if not item.full_width:
             inset = Strip.blank(1, base_style)
             strips = [
                 Strip.join([inset, s]).adjust_cell_length(width) for s in strips
             ]
         # Vertical rhythm (the old widget CSS is ignored here — the presenter
         # paints raw strips, so it owns the spacing):
-        if isinstance(item, UserItem):
+        if item.full_width:
             # Old UserMessage CSS: `padding: 1 0` (surface-coloured blank row
             # inside the box, above and below the text).
             pad = Strip.blank(width, Style(bgcolor=theme.PALETTE["surface"]))
             strips = [pad, *strips, pad]
-        leading = self._leading_blanks(entry, item)
+        leading = item.leading_blanks(self._previous_item(entry))
         if leading:
             # Styled: unstyled filler cells make the selection highlighter
             # crash (None + Style) when a drag spans the blank row.
@@ -411,31 +212,6 @@ class Presenter:
         # re-applies the selection span with cell styles overridden.
         strips = [s.apply_style(base_style) for s in strips]
         return Presentation(height=len(strips), strips=strips)
-
-    def _leading_blanks(self, entry, item) -> int:
-        """Blank lines painted above an entry — the old widget CSS margins,
-        now owned by the presenter.
-
-        user   → 1, except flush under a status line (e.g. "Worked for …")
-                 and at the very top of the transcript (nothing above)
-        cot    → 1
-        answer → 1, except flush under its own cot
-        tools/shimmers → 1 after a user message (a turn can open with a
-                 tool call, and it needs the same gap as a reply), else 0
-                 (they pack tight under the reply above them)
-        status lines → 1 (they belong to the reply above them)"""
-        if isinstance(item, UserItem):
-            prev = self._previous_item(entry)
-            return 0 if prev is None or isinstance(prev, LineItem) else 1
-        if isinstance(item, (ToolItem, PendingItem)):
-            return isinstance(self._previous_item(entry), UserItem)
-        if isinstance(item, LineItem):
-            return 1
-        if isinstance(item, (ThinkingItem, AssistantItem)):
-            prev = self._previous_item(entry)
-            flush = isinstance(item, AssistantItem) and isinstance(prev, ThinkingItem)
-            return 0 if flush else 1
-        return 0
 
     def _previous_item(self, entry) -> object | None:
         """The item immediately above ``entry`` (O(1) per entry via index cache)."""
@@ -450,29 +226,11 @@ class Presenter:
         i = cache[1].get(id(entry), 0)
         return flat[i - 1].item if i else None
 
-    def _present_item(self, item, width: int) -> list[Strip]:
-        if isinstance(item, UserItem):
-            return self._user(item, width)
-        if isinstance(item, AssistantItem):
-            return self._assistant(item, width)
-        if isinstance(item, ThinkingItem):
-            return self._thinking(item, width)
-        if isinstance(item, ToolItem):
-            return self._tool(item, width)
-        if isinstance(item, PendingItem):
-            return self._shimmering(item, width)
-        if isinstance(item, LineItem):
-            return self._line(item, width)
-        if isinstance(item, DividerItem):
-            return render_strips(Text(item.text, style=theme.PALETTE["accent"]), width)
-        # pragma: no cover — every item type is handled above
-        return render_strips(Text(repr(item)), width)
-
     # -- user ---------------------------------------------------------------
 
-    def _user(self, item: UserItem, width: int) -> list[Strip]:
-        key = (self.epoch, width, item.text, item.suffix, item.undo_armed,
-               len(item.images))
+    def _user(self, entry, width: int) -> list[Strip]:
+        item: UserItem = entry.item
+        key = (self.epoch, width, item.text, item.undo_armed, len(item.images))
 
         def build():
             p = theme.PALETTE
@@ -480,14 +238,15 @@ class Presenter:
             token_style = Style(bgcolor=p["border"], color=p["muted"])
             for match in images.IMAGE_TOKEN_RE.finditer(item.text):
                 body.stylize(token_style, match.start(), match.end())
-            if item.suffix:
-                body.append(" " + item.suffix, style=p["muted"])
             rows: list = [body]
             for image in item.images:
-                if token_text(image) in item.text:
+                if (
+                    token_text(image) in item.text
+                    or legacy_token_text(image) in item.text
+                ):
                     continue  # the token itself already shows the attachment
                 rows.append(Text(token_text(image), style=p["muted"]))
-            if item.undo_armed and item.message is not None:
+            if item.undo_armed and item.message_id:
                 rows.append(Text("↩ undo to here", style=f"italic {p['accent']}"))
             # First row carries the "›" marker; wrapped lines hang-indent under
             # it. Every row gets the surface background (the old UserMessage
@@ -504,22 +263,24 @@ class Presenter:
                 strips.extend(s.apply_style(bg) for s in block)
             return strips
 
-        return _cached(item, key, build)
+        return _cached(self, entry, key, build)
 
     # -- assistant ------------------------------------------------------------
 
-    def _assistant(self, item: AssistantItem, width: int) -> list[Strip]:
+    def _assistant(self, entry, width: int) -> list[Strip]:
+        item: AssistantItem = entry.item
         p = theme.PALETTE
         body_w = width - 2
         body: list[Strip] = []
-        if len(item.chunk_cache) > 2_000:
-            item.chunk_cache.clear()
+        chunks = self._chunks.setdefault(id(entry), {})
+        if len(chunks) > 2_000:
+            chunks.clear()
         for i, chunk in enumerate(item.chunks):
             key = (i, self.epoch, width)
-            cached = item.chunk_cache.get(key)
+            cached = chunks.get(key)
             if cached is None:
                 cached = _settled_strips(chunk, body_w)
-                item.chunk_cache[key] = cached
+                chunks[key] = cached
             body.extend(cached)
         tail = item.live.rstrip()
         if tail:
@@ -537,7 +298,8 @@ class Presenter:
 
     # -- thinking ---------------------------------------------------------
 
-    def _thinking(self, item: ThinkingItem, width: int) -> list[Strip]:
+    def _thinking(self, entry, width: int) -> list[Strip]:
+        item: ThinkingItem = entry.item
         p = theme.PALETTE
         # Shimmer phase derives at render time; settled items keep a stable
         # cache key (phase None).
@@ -568,23 +330,34 @@ class Presenter:
                 ))
             return strips
 
-        return _cached(item, key, build)
+        return _cached(self, entry, key, build)
 
     # -- tool call ----------------------------------------------------------
 
-    def _tool(self, item: ToolItem, width: int) -> list[Strip]:
+    def _tool(self, entry, width: int) -> list[Strip]:
+        item: ToolItem = entry.item
         p = theme.PALETTE
         label = f"Running {item.name}"
         phase = (
             shimmer_now(len(label) + 2 * theme.SHIMMER_BAND_WIDTH)
-            if item.status is ToolCallStatus.MAKING_CALL else None
+            if item.status is ToolStatus.MAKING_CALL else None
         )
         key = (self.epoch, width, item.expanded, item.status, len(item.args),
                len(item.output), item.header, phase)
+        view = ToolCallView(
+            name=item.name, args=item.args, output=item.output,
+            header=item.header, status=item.status, expanded=item.expanded,
+        )
+        if item.status is ToolStatus.MAKING_CALL:
+            cached = self._args_cache.get(id(entry))
+            if cached is None or cached[0] != len(item.args):
+                cached = (len(item.args), _stream_parts(item.name, item.args))
+                self._args_cache[id(entry)] = cached
+            live_name, live_detail = cached[1]
 
         def build():
-            if item.status is ToolCallStatus.MAKING_CALL:
-                name, detail = _stream_parts(item.name, item.args)
+            if item.status is ToolStatus.MAKING_CALL:
+                name, detail = live_name, live_detail
                 dot = Text("•", style=p["warning"])
                 head = shimmer_text(
                     f"Running {name}", *theme.SHIMMER_THINKING,
@@ -592,17 +365,17 @@ class Presenter:
                 )
             else:
                 dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
-                head = item.summary_text()
+                head = _tool_head(item, view)
             dot_strips = render_strips(Text.assemble(dot, " ", head), width)
             strips = list(dot_strips)
             if item.expanded:
                 strips.extend(_prefix_strips(
-                    render_strips(item.body_renderable(), width - 2), width,
+                    render_strips(body_renderable(view), width - 2), width,
                     _seg("│ ", p["border"]),
                 ))
             return strips
 
-        return _cached(item, key, build)
+        return _cached(self, entry, key, build)
 
     # -- the pending strip ---------------------------------------------------
 
@@ -622,6 +395,7 @@ class Presenter:
         p = theme.PALETTE
         color_key = {
             "error": "error", "warn": "warning", "success": "success",
+            "info": "muted", "hint": "muted",
         }.get(item.kind, "muted")
         glyph = _GLYPHS.get(item.kind, "")
         text = Text(f"{glyph}{item.text}", style=p[color_key])
@@ -667,14 +441,68 @@ def _settled_strips(text: str, width: int) -> list[Strip]:
     return strips
 
 
-def _cached(item, key, build):
-    """Per-item strip cache: return the strips cached under ``key``, or build
-    them (and cache) via ``build()``. Items carry a single ``_cache`` slot —
-    a fresh key (width/epoch/content change) misses and rebuilds."""
-    if item._cache and item._cache[0] == key:
-        return item._cache[1]
+def _tool_head(item: ToolItem, view: ToolCallView) -> Text:
+    """The settled tool line: verb + name, plus a one-line detail when the
+    summary adds more than the bare tool name."""
+    verb = item.STATUS_VERB[item.status]
+    summary = Text(f"{verb} {item.name}" if verb else item.name)
+    if item.status is ToolStatus.CALL_SUCCEEDED and not (
+        item.expanded and item.name == "run_bash"
+    ):
+        detail = _tool_summary_text(view)
+        if detail.plain != item.name:
+            summary.append_text(detail[len(item.name):])
+    return summary
+
+
+@singledispatch
+def render_item(item, presenter, entry, width: int) -> list[Strip]:
+    return render_strips(Text(repr(item)), width)
+
+
+@render_item.register
+def _(item: UserItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._user(entry, width)
+
+
+@render_item.register
+def _(item: AssistantItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._assistant(entry, width)
+
+
+@render_item.register
+def _(item: ThinkingItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._thinking(entry, width)
+
+
+@render_item.register
+def _(item: ToolItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._tool(entry, width)
+
+
+@render_item.register
+def _(item: PendingItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._shimmering(item, width)
+
+
+@render_item.register
+def _(item: LineItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._line(item, width)
+
+
+@render_item.register
+def _(item: DividerItem, presenter, entry, width: int) -> list[Strip]:
+    return render_strips(Text(item.text, style=theme.PALETTE["accent"]), width)
+
+
+def _cached(presenter, entry, key, build):
+    """Per-entry strip cache: return the strips cached under ``key``, or
+    build (and cache) them. A change of width/epoch/content misses."""
+    cached = presenter._cache.get(id(entry))
+    if cached is not None and cached[0] == key:
+        return cached[1]
     value = build()
-    item._cache = (key, value)
+    presenter._cache[id(entry)] = (key, value)
     return value
 
 

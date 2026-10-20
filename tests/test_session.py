@@ -7,7 +7,8 @@ import pytest
 
 from xarness import gitwork, protocol, session_store
 from xarness.config import ProviderProfile
-from xarness.conversation import Message, turn_time_summary
+from xarness.conversation import SUMMARY_PREFIX, Message, Timing, Turn
+from xarness.tui.transcript import turn_time_summary
 from xarness.events import (
     ContentDelta, ProcessingStarted, ReasoningDelta, StreamError,
     ToolCallArgumentsDone, ToolCallStarted, TurnComplete, Usage,
@@ -16,6 +17,8 @@ from xarness.protocol import (
     Accept, AnswerAsk, Cancel, Compact, FilterAdd, Reject, Retry, SendMessage,
     SetMode, Undo, UndoTo,
 )
+import base64
+
 from xarness.images import ImageAttachment
 from xarness.session import Session
 from xarness.tools import ToolRegistry, ToolResult, tool
@@ -64,7 +67,8 @@ async def wait_idle(session: Session, timeout: float = 10.0) -> None:
 
 def _image() -> ImageAttachment:
     return ImageAttachment(
-        name="cat.png", mime="image/png", data_b64="636174", width=1, height=1,
+        name="cat.png", mime="image/png",
+        data_b64=base64.b64encode(b"cat").decode(), width=1, height=1,
     )
 
 
@@ -129,11 +133,8 @@ def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:
     assert types[0] == "StatusChanged"
     assert types[1] == "UserMessageAdded"
     assert "TurnFinished" in types
-    # Snapshot + subscribe has no gap and no duplicate: every live event's
-    # seq is strictly greater than the snapshot's, all unique and ordered.
-    seqs = [e.seq for e in events]
-    assert all(s > snapshot.seq for s in seqs)
-    assert seqs == sorted(set(seqs))
+    # Snapshot + subscribe has no gap and no duplicate.
+    assert snapshot.messages == []
 
 
 def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
@@ -168,21 +169,18 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
     assert statuses[-1].context_used > 0
 
 
-def test_history_replaced_never_sits_in_turn_events(tmp_path) -> None:
-    """A rewrite invalidates every buffered turn event, and the event itself
-    is never buffered: an attaching client gets the fresh history in its
-    snapshot, never a replayed HistoryReplaced on top of stale deltas."""
+def test_history_replaced_keeps_live_partial_round(tmp_path) -> None:
+    """A rewrite mid-turn must not lose the partial answer: the snapshot
+    carries it alongside the fresh history, so attach renders once."""
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
-        # Notices only buffer mid-turn (an attaching client mid-turn needs
-        # the deltas; an idle one gets the history in its snapshot).
         session._set_state("running")
-        session._emit_notice("before")
-        assert session._turn_events
+        session._emit(protocol.ContentDelta(text="before"))
+        assert session.snapshot().partial_round.content == "before"
         session._emit_history()
-        assert session._turn_events == []
+        assert session.snapshot().partial_round.content == "before"
 
     asyncio.run(go())
 
@@ -334,7 +332,8 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
     # The interrupted call got a synthetic error result, so the next API
     # request is valid (every tool call is answered).
     tool_messages = [m for m in session.conversation.messages if m.role == "tool"]
-    assert [m.content for m in tool_messages] == ["error: interrupted"]
+    assert [m.content for m in tool_messages] == ["interrupted"]
+    assert all(not m.ok for m in tool_messages)
     wire = session.conversation.to_wire()
     answered = {m["tool_call_id"] for m in wire if m["role"] == "tool"}
     for m in wire:
@@ -377,8 +376,8 @@ def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
     assert state.profile == "test"  # the profile key, not model_id
     user = state.conversation.messages[0]
     assistant = state.conversation.messages[1]
-    assert user.send_time is not None
-    assert assistant.start_time is not None and assistant.end_time is not None
+    assert user.timing.send is not None
+    assert assistant.timing.start is not None and assistant.timing.end is not None
     # Timestamps are never sent to the provider.
     wire = session.controller._client.received_wire[-1]
     for message in wire:
@@ -518,18 +517,110 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
     assert "after compact" in user_texts
 
 
+def test_compaction_emits_typed_outcome_event(tmp_path) -> None:
+    """Compaction reports its outcome as CompactionDone, not prose Notice."""
+    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+
+    async def fake_compact() -> str:
+        session.controller.last_compaction = (100, 30)
+        return "handoff summary"
+
+    session.controller.compact = fake_compact
+
+    async def go():
+        queue = session.subscribe()[1]
+        assert (await session.execute("c1", Compact())).ok
+        await wait_idle(session)
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        done = [e for e in events if isinstance(e, protocol.CompactionDone)]
+        assert len(done) == 1, done
+        assert (done[0].before, done[0].after) == (100, 30)
+        assert done[0].summary == "handoff summary"
+        assert done[0].automatic is False
+
+    asyncio.run(go())
+
+
+def test_undo_emits_typed_rollback_event(tmp_path) -> None:
+    """Undo reports its outcome as RollbackApplied, not prose."""
+    session = make_session(
+        [[ContentDelta(text="answer"), TurnComplete()]], tmp_path,
+    )
+
+    async def go():
+        await session.execute("c1", SendMessage(text="question"))
+        await wait_idle(session)
+        queue = session.subscribe()[1]
+        assert (await session.execute("u1", Undo())).ok
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        applied = [e for e in events if isinstance(e, protocol.RollbackApplied)]
+        assert len(applied) == 1, applied
+        assert applied[0].resend is False
+        assert applied[0].scope == "last turn"
+        assert applied[0].note == "no_tracking"
+
+    asyncio.run(go())
+
+
 def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> None:
     from xarness.config import SandboxSettings
 
     session = make_session([], tmp_path)
     session.sandbox_name = "netless"
     session.sandbox_settings = SandboxSettings(filter_list=["secrets"])
-    session._pending_drift = ("aaa", "bbb")
+    session._pending_drift = ("aaa", "bbb", ["a.txt"])
     status = session.status()
     assert status.sandbox_name == "netless"
     assert status.filter_list == ["secrets"]
     assert status.pending_drift is not None
-    assert status.pending_drift.detail
+    assert status.pending_drift.files == ["a.txt"]
+    assert status.pending_drift.last_known == "aaa"
+
+
+def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
+    """Compaction hides old messages from the model, but the snapshot still
+    carries them so a resumed/attached client can show the full transcript."""
+    session = make_session([], tmp_path)
+    old = session.conversation.add(Message(role="user", content="before"))
+    session.conversation.epoch += 1
+    summary = session.conversation.add(Message(
+        role="user", kind="summary",
+        content=f"{SUMMARY_PREFIX}\n\nthe handoff",
+    ))
+
+    snap = session.snapshot()
+    assert [m.id for m in snap.history] == [old.id]
+    assert [m.id for m in snap.messages] == [summary.id]
+
+
+def test_resume_drift_uses_accepted_turns_too(tmp_path, monkeypatch) -> None:
+    """A locked (/accepted) turn is not undoable, but it is still the last
+    known workspace state. Comparing against the older baseline made a clean
+    accept look like external drift on the next resume."""
+    from xarness.gitwork import GitInfo
+    import xarness.session as session_mod
+
+    session = make_session([], tmp_path)
+    session.git_info = GitInfo(
+        session_id="s", workspace=tmp_path, git_dir=tmp_path,
+        baseline_tree="a" * 40,
+    )
+    user = session.conversation.add(Message(role="user", content="hi"))
+    session.conversation.turns.append(Turn(
+        user_message_id=user.id,
+        before_tree="b" * 40, after_tree="c" * 40, locked=True,
+    ))
+
+    async def fake_snapshot(_info):
+        return "c" * 40
+
+    monkeypatch.setattr(session_mod, "snapshot_state", fake_snapshot)
+
+    assert asyncio.run(session.detect_resume_drift()) is None
 
 
 def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
@@ -549,7 +640,7 @@ def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
 
     async def go():
         queue = session.subscribe()[1]
-        session._pending_drift = ("aaa", "bbb")
+        session._pending_drift = ("aaa", "bbb", [])
         result = await session.execute("d1", protocol.ResolveDrift(accept=False))
         assert result.ok
         events = []
@@ -564,7 +655,7 @@ def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
     # is emitted.
     async def go2():
         queue = session.subscribe()[1]
-        session._pending_drift = ("aaa", "bbb")
+        session._pending_drift = ("aaa", "bbb", [])
         result = await session.execute("d2", protocol.ResolveDrift(accept=True))
         assert result.ok
         events = []
@@ -642,42 +733,72 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_history_replaced_never_buffered_and_resets_turn_events(tmp_path) -> None:
-    """HistoryReplaced must never sit in snapshot.turn_events: while idle
-    the buffer is empty, and a rewrite while running resets the buffer."""
+def test_partial_round_is_none_when_idle(tmp_path) -> None:
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
         await session.execute("c1", SendMessage(text="hi"))
         await wait_idle(session)
-        assert session.snapshot().turn_events == []
-        # A rewrite while "running": buffered deltas are dropped, the event
-        # itself is not stored.
-        session._set_state("running")
-        session._emit(protocol.ContentDelta(text="stale"))
-        assert session.snapshot().turn_events, "buffer holds the live round"
-        session._emit_history()
-        assert session.snapshot().turn_events == []
+        assert session.snapshot().partial_round is None
 
     asyncio.run(go())
 
 
-def test_events_carry_monotonic_seqs_across_a_rewrite(tmp_path) -> None:
-    """Sequences keep increasing across a history rewrite; HistoryReplaced
-    itself is never buffered for attach (a fresh snapshot carries it)."""
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+def test_only_round_content_updates_partial_round(tmp_path) -> None:
+    """Status/notice events are snapshot state, not replay log."""
+    session = make_session([], tmp_path)
 
     async def go():
-        session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
-        await wait_idle(session)
-        seq = session._seq
-        session._emit_notice("after")
-        assert session._seq > seq
-        session._emit_history()  # a rewrite
-        assert session._seq > seq + 1
-        assert session._turn_events == []
+        session._set_state("running")
+        session._emit(protocol.Notice(text="stale notice"))
+        session._emit(protocol.StatusChanged(status=session.status()))
+        assert session.snapshot().partial_round is None
+        session._emit(protocol.ContentDelta(text="live"))
+        partial = session.snapshot().partial_round
+        assert partial is not None and partial.content == "live"
+
+    asyncio.run(go())
+
+
+def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
+    session = make_session([], tmp_path)
+
+    async def go():
+        session._set_state("running")
+        session._emit(protocol.ContentDelta(text="answer"))
+        session._emit(protocol.ToolCallStarted(call_id="c1", name="read_file"))
+        session._emit(protocol.ToolCallArgumentsDone(
+            call_id="c1", name="read_file", arguments_json='{"path": "a"}',
+        ))
+        session._emit(protocol.ToolOutputDelta(call_id="c1", text="body"))
+        session._emit(protocol.TurnComplete())
+        partial = session.snapshot().partial_round
+        assert partial is not None
+        assert partial.content == ""  # persisted in the assistant message
+        assert len(partial.tool_calls) == 1
+        call = partial.tool_calls[0]
+        assert call.arguments == '{"path": "a"}'
+        assert call.output == "body"
+        assert call.ok is None  # still running
+        session._emit(protocol.ToolFinished(
+            call_id="c1", ok=True, output="full body", header="+1",
+        ))
+        call = session.snapshot().partial_round.tool_calls[0]
+        assert call.ok is True and call.header == "+1"
+
+    asyncio.run(go())
+
+
+def test_partial_round_never_truncates_a_long_answer(tmp_path) -> None:
+    session = make_session([], tmp_path)
+
+    async def go():
+        session._set_state("running")
+        for _ in range(600):
+            session._emit(protocol.ContentDelta(text="x"))
+        partial = session.snapshot().partial_round
+        assert partial is not None and len(partial.content) == 600
 
     asyncio.run(go())
 
@@ -738,9 +859,8 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
 
 
 def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
-    """After an /undo (a rewrite) an attaching client's snapshot has empty
-    turn_events: the history is rendered exactly once — the HistoryReplaced
-    event itself is never stored or replayed."""
+    """After an /undo (a rewrite) an attaching client's snapshot has no
+    live round: the history is rendered exactly once."""
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
 
     async def go():
@@ -749,11 +869,10 @@ def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
         await wait_idle(session)
         result = await session.execute("c2", Undo())
         assert result.ok
-        assert session.snapshot().turn_events == []
-        # A client attaching now sees the rewritten history exactly once:
-        # nothing in turn_events replays on top of snapshot.messages.
+        assert session.snapshot().partial_round is None
+        # A client attaching now sees the rewritten history exactly once.
         snapshot, _queue = session.subscribe()
-        assert snapshot.turn_events == []
+        assert snapshot.partial_round is None
         # The undo dropped the turn: the rewritten history (which the client
         # renders exactly once) holds no leftover messages.
         assert snapshot.messages == []
@@ -889,22 +1008,28 @@ def test_turn_time_summary_format(tmp_path) -> None:
     iso = base.isoformat
 
     session.conversation.add(Message(
-        role="user", content="hi", send_time=iso(),
+        role="user", content="hi", timing=Timing(send=iso()),
     ))
     session.conversation.add(Message(
         role="assistant", content="thinking about it",
-        start_time=iso(), end_time=(base + timedelta(seconds=2)).isoformat(),
-        reasoning_start=(base + timedelta(milliseconds=300)).isoformat(),
+        timing=Timing(
+            start=iso(), end=(base + timedelta(seconds=2)).isoformat(),
+            reasoning_seconds=1.7,
+        ),
     ))
     session.conversation.add(Message(
         role="tool", tool_call_id="c1",
-        start_time=(base + timedelta(seconds=2)).isoformat(),
-        end_time=(base + timedelta(seconds=5)).isoformat(),
+        timing=Timing(
+            start=(base + timedelta(seconds=2)).isoformat(),
+            end=(base + timedelta(seconds=5)).isoformat(),
+        ),
     ))
     session.conversation.add(Message(
         role="assistant", content="done",
-        start_time=(base + timedelta(seconds=5)).isoformat(),
-        end_time=(base + timedelta(seconds=8)).isoformat(),
+        timing=Timing(
+            start=(base + timedelta(seconds=5)).isoformat(),
+            end=(base + timedelta(seconds=8)).isoformat(),
+        ),
     ))
     summary = turn_time_summary(session.conversation.messages)
     assert summary is not None
@@ -918,9 +1043,9 @@ def test_turn_time_summary_format(tmp_path) -> None:
     assert idle == "0.3s"
 
 
-def test_turn_finish_stamps_time_summary_and_persists(tmp_path) -> None:
-    """A completed turn gets its timing summary on the last assistant message
-    (persisted, so reloads render it) and in TurnFinished.summary."""
+def test_turn_finished_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
+    """TurnFinished carries elapsed only; the timing line is derived from
+    the persisted stamps on load (no second, preformatted copy)."""
     session = make_session(
         [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
@@ -940,13 +1065,13 @@ def test_turn_finish_stamps_time_summary_and_persists(tmp_path) -> None:
     finished = asyncio.run(go())
     last_assistant = session.conversation.messages[-1]
     assert last_assistant.role == "assistant"
-    assert last_assistant.time_summary
-    assert finished is not None and finished.summary == last_assistant.time_summary
-    assert "|" in finished.summary
+    assert finished is not None and finished.elapsed >= 0
+    assert not hasattr(last_assistant.timing, "summary")
 
-    # Persisted: a reload sees the same line.
+    # Persisted stamps are enough for the client to derive the same line.
     state = session_store.load_state("test")
-    assert state.conversation.messages[-1].time_summary == last_assistant.time_summary
+    summary = turn_time_summary(state.conversation.messages)
+    assert summary is not None and "|" in summary
 
 
 def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
@@ -1008,6 +1133,69 @@ def _tool_round(call_id="c1"):
         ToolCallArgumentsDone(call_id=call_id, name="edit", arguments_json="{}"),
         TurnComplete(has_tool_calls=True),
     ]
+
+
+def test_mutating_tool_and_turn_end_emit_diff_changed(tmp_path, monkeypatch) -> None:
+    """The host pushes the pending-changes summary after a mutating tool and
+    at turn end, so clients stop polling /diff on every tool result."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        @tool("edit_file", "edit a file")
+        async def edit(args) -> ToolResult:
+            (tmp_path / "ws" / "a.txt").write_text("agent\n")
+            return ToolResult(ok=True, output="ok")
+
+        registry = ToolRegistry()
+        registry.register(edit)
+        session, _info = await _tracked_session(tmp_path, [
+            [
+                ToolCallStarted(call_id="c1", name="edit_file"),
+                ToolCallArgumentsDone(
+                    call_id="c1", name="edit_file", arguments_json="{}",
+                ),
+                TurnComplete(has_tool_calls=True),
+            ],
+            [ContentDelta(text="done"), TurnComplete()],
+        ], registry)
+        queue = session.subscribe()[1]
+        await session.execute("s1", SendMessage(text="hi"))
+        await wait_idle(session)
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        changed = [e for e in events if isinstance(e, protocol.DiffChanged)]
+        assert changed, "expected at least one DiffChanged"
+        paths = {f.path for event in changed for f in event.summary.files}
+        assert paths == {"a.txt"}, paths
+
+    asyncio.run(go())
+
+
+def test_diff_info_path_snapshots_workspace_once(tmp_path, monkeypatch) -> None:
+    """`/diff <path>` needs the stat rows and the text; both must share a
+    single workspace snapshot instead of running two full snapshots."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    import xarness.session as session_mod
+
+    async def go():
+        session, _info = await _tracked_session(tmp_path, [])
+        (tmp_path / "ws" / "a.txt").write_text("changed\n")
+        calls = 0
+        real = session_mod.snapshot_state
+
+        async def counting(info):
+            nonlocal calls
+            calls += 1
+            return await real(info)
+
+        monkeypatch.setattr(session_mod, "snapshot_state", counting)
+        payload = await session.diff_info("a.txt")
+        assert [f.path for f in payload.files] == ["a.txt"]
+        assert payload.text
+        assert calls == 1, calls
+
+    asyncio.run(go())
 
 
 def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch) -> None:
@@ -1142,8 +1330,7 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
 
         await session.execute("s1", SendMessage(text="first"))
         await wait_idle(session)
-        first_turn = session.conversation.messages[1]
-        assert first_turn.role == "user" and first_turn.content == "first"
+        first_turn = session.conversation.turns[0]
         first_after = first_turn.after_tree
         assert first_after
 
@@ -1162,11 +1349,8 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
         await wait_idle(session)
 
         assert first_turn.after_tree == first_after
-        second_turn = next(
-            m for m in session.conversation.messages
-            if m.role == "user" and m.content == "second"
-        )
-        assert second_turn.checkpoint_sha is None
+        second_turn = session.conversation.turns[1]
+        assert second_turn.before_tree is None
         assert second_turn.after_tree is None
         assert len(session.turn_checkpoints()) == 1
 

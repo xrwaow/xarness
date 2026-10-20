@@ -27,15 +27,10 @@ from .chat_input import ChatInput
 from .widgets import _render_diff
 
 
-# Sentinel: no diff section currently shown (None is a valid *key* — the full diff).
-_NO_DIFF: object = object()
-
-
 class DiffText(VerticalScroll):
     """Capped, focusable diff pane with its own scrollbar. Up/down page by
     the pane's full visible height and stop at the pane's top/bottom — they
-    never switch files. Left/right step to the previous/next file's diff;
-    with the full diff open, right opens the first file's diff.
+    never switch files. Left/right step to the previous/next file's diff.
     At the first/last file the arrows do nothing."""
 
     can_focus = True
@@ -51,14 +46,7 @@ class DiffText(VerticalScroll):
         if summary is None:
             return False
         key = summary._active_key
-        if not isinstance(key, str):
-            # Full multi-file diff open: right steps into the first file.
-            if (
-                key is None and delta == 1 and summary._stat is not None
-                and summary._stat.files
-            ):
-                summary.post_message(summary.DiffRequested(summary._stat.files[0].path))
-                return True
+        if key is None:
             return False
         return summary._request_neighbour(key, delta)
 
@@ -81,14 +69,14 @@ class DiffSummary(Vertical):
     can_focus = True  # arrow-key navigation over the file list once minimized
 
     class DiffRequested(Message):
-        def __init__(self, key: str | None) -> None:
-            self.key = key  # None = the full multi-file diff
+        def __init__(self, key: str) -> None:
+            self.key = key
             super().__init__()
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._stat: DiffStat | None = None
-        self._active_key: str | None | object = _NO_DIFF
+        self._active_key: str | None = None
         self._active_text = ""
 
     def _request_neighbour(self, key: str, delta: int) -> bool:
@@ -120,12 +108,12 @@ class DiffSummary(Vertical):
                 yield Static("", id="diff-text", markup=False)
 
     @property
-    def active_diff_key(self) -> str | None | object:
+    def active_diff_key(self) -> str | None:
         return self._active_key
 
     @property
     def diff_shown(self) -> bool:
-        return self._active_key is not _NO_DIFF
+        return self._active_key is not None
 
     def toggle(self) -> None:
         if self.has_class("expanded"):
@@ -136,7 +124,7 @@ class DiffSummary(Vertical):
     def _reset_diff(self) -> None:
         """Drop the open diff pane: forget the active key/text, clear the
         Static and hide the scroll container."""
-        self._active_key = _NO_DIFF
+        self._active_key = None
         self._active_text = ""
         if self.is_mounted:
             self.query_one("#diff-text", Static).update("")
@@ -161,10 +149,10 @@ class DiffSummary(Vertical):
         # up, same as esc), not collapse the whole panel.
         node = event.widget
         while node is not None and node is not self:
-            diff_key = getattr(node, "diff_key", _NO_DIFF)
-            if diff_key is not _NO_DIFF:
+            diff_key = getattr(node, "diff_key", None)
+            if diff_key is not None:
                 event.stop()
-                self.post_message(self.DiffRequested(cast("str | None", diff_key)))
+                self.post_message(self.DiffRequested(cast("str", diff_key)))
                 return
             if node.id == "diff-content":
                 event.stop()
@@ -202,7 +190,7 @@ class DiffSummary(Vertical):
             return
         current = self._active_row_index()
         index = 0 if current is None else max(0, min(len(rows) - 1, current + delta))
-        self._mark_active_row(cast("str | None", getattr(rows[index], "diff_key", None)))
+        self._mark_active_row(getattr(rows[index], "diff_key", None))
 
     def _open_highlighted(self) -> None:
         rows = list(self.query(".diff-file-row"))
@@ -211,7 +199,7 @@ class DiffSummary(Vertical):
             return
         key = getattr(rows[index], "diff_key", None)
         if key is not None:
-            self.post_message(self.DiffRequested(cast("str | None", key)))
+            self.post_message(self.DiffRequested(cast("str", key)))
 
     async def set_summary(self, stat: DiffStat) -> None:
         """Update the summary + per-file rows in place; becomes visible.
@@ -338,8 +326,8 @@ class DiffSummary(Vertical):
         if self.is_mounted:
             await self.query_one("#diff-files", Vertical).remove_children()
 
-    def show_diff(self, key: str | None, text: str) -> None:
-        """Display one file's (or the full) unified diff inline."""
+    def show_diff(self, key: str, text: str) -> None:
+        """Display one file's unified diff inline."""
         self._active_key = key
         self._active_text = text
         self.add_class("visible")
@@ -362,7 +350,7 @@ class DiffSummary(Vertical):
     def _mark_active_row(self, key: str | None) -> None:
         """Highlight the row whose diff is currently displayed."""
         for row in self.query(".diff-file-row"):
-            if getattr(row, "diff_key", _NO_DIFF) == key:
+            if getattr(row, "diff_key", None) == key:
                 row.add_class("active")
             else:
                 row.remove_class("active")
@@ -375,5 +363,5 @@ class DiffSummary(Vertical):
         rich styles and needs a re-render."""
         if not self.is_mounted:
             return
-        if self._active_key is not _NO_DIFF:
+        if self._active_key is not None:
             self.query_one("#diff-text", Static).update(_render_diff(self._active_text))

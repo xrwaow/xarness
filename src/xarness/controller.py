@@ -26,7 +26,10 @@ from typing import Any, Callable, Protocol
 
 from .client import ChatClient
 from .config import ProviderProfile
-from .conversation import SUMMARY_PREFIX, Conversation, Message, ToolCall, is_summary
+from .conversation import (
+    SUMMARY_PREFIX, Conversation, Message, Timing, ToolCall, build_parts,
+    image_refs, is_summary,
+)
 from .events import (
     ContentDelta,
     ReasoningDelta,
@@ -37,8 +40,8 @@ from .events import (
     Usage,
 )
 from .gitwork import GitInfo, GitWorktreeError, RevertConflict, TurnCheckpoint
-from .images import ImageAttachment
-from .util import mono_to_iso as _mono_to_iso, utcnow_iso as _utcnow_iso
+from .images import ImageAttachment, ImageRef
+from .util import utcnow_iso as _utcnow_iso
 from .gitwork import snapshot_state as git_snapshot_state
 from .gitwork import revert_turns
 from .tools import ToolRegistry, ToolResult
@@ -55,38 +58,6 @@ class PartialRound:
     content_parts: list[str]
 
 
-def _last_user_turn_index(messages: list[Message]) -> int | None:
-    """Index of the last real user turn (summary placeholders don't count)
-    that has a response after it, or None."""
-    index = max(
-        (i for i, m in enumerate(messages) if m.role == "user" and not is_summary(m)
-         and i < len(messages) - 1),
-        default=None,
-    )
-    return index
-
-
-def _summary_index(messages: list[Message]) -> int | None:
-    """Index of the first compaction summary in the list, or None."""
-    return next((i for i, m in enumerate(messages) if is_summary(m)), None)
-
-
-def _turns_in(messages: list[Message]) -> list[TurnCheckpoint]:
-    """The turns in ``messages`` that can be reversed, oldest first.
-
-    A turn is a user message carrying both a before tree (``checkpoint_sha``)
-    and an after tree. Turns from sessions saved before after-trees existed
-    are skipped: their files cannot be reversed without risking the loss of
-    edits made since, so /undo falls back to conversation-only rollback.
-
-    ``revert_turns`` walks the list newest-first, so this returns
-    chronological order.
-    """
-    return [
-        TurnCheckpoint(m.checkpoint_sha, m.after_tree)
-        for m in messages
-        if m.role == "user" and m.checkpoint_sha and m.after_tree
-    ]
 
 
 class StreamClient(Protocol):
@@ -109,14 +80,12 @@ class RollbackPlan:
     user_text: str  # the turn's user message (input box / resend)
     revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
     keep: list[Message]  # what the conversation becomes
-    images: list[ImageAttachment] | None = None
-    # True when the restore point is before the most recent compaction, so
-    # apply_rollback must drop the compact snapshot (the summary it covers
-    # is no longer part of the history).
-    clears_compaction: bool = False
-    # True for a compaction-only undo: the pre-compaction history is
-    # restored verbatim, the turn stays intact, no files are reverted, and
-    # the input box is not touched.
+    images: list[ImageRef] | None = None
+    # Epoch to restore (undoing a compaction flips it back instead of
+    # restoring a second copy of the history).
+    epoch: int = 0
+    # True for a compaction-only undo: no messages are dropped, the turn
+    # stays intact, no files are reverted, and the input box is not touched.
     compaction_only: bool = False
 
 
@@ -151,38 +120,41 @@ class ChatController:
         # Live view of the round currently streaming. Cleared when the round
         # completes; read by save_interrupted_round() when a turn is cancelled.
         self._partial_round: PartialRound | None = None
-        # The user message that opened the turn currently being generated, or
-        # None between turns. Explicit state (not inferred from after_tree)
-        # because a mid-turn /accept //reject rewrites every checkpoint, and a
-        # mid-turn compaction moves this message into compact_snapshot — both
-        # would hide the still-open turn from a message-list scan.
-        self._open_turn: Message | None = None
+        # The system prompt is derived at request time (never persisted).
+        self.system_prompt: str | None = None
         # Optional hook, called with each user message as it lands in the
         # history (send and inject_user_message). The session uses it to emit
         # UserMessageAdded — there is no local echo in the client.
         self.on_user_message: Callable[[Message], None] | None = None
+        # Image blob storage, supplied by the session (content-addressed).
+        # Without one, parts carry the bytes transiently (tests, headless
+        # throwaway conversations).
+        self.image_store: Any = None
+
+    def _user_message(
+        self, text: str, images: list[ImageAttachment] | None = None, **kwargs: Any,
+    ) -> Message:
+        """A user message with its text/image parts in order."""
+        parts = build_parts(text, images, self.image_store) if images else None
+        return Message(role="user", content=text, parts=parts, **kwargs)
+
+    def _image_loader(self, image_id: str) -> bytes | None:
+        if self.image_store is None:
+            return None
+        return self.image_store.load(image_id)
 
     async def send(self, user_text: str, images: list[ImageAttachment] | None = None) -> AsyncIterator[StreamEvent]:
         """Send a user message, streaming the first round.
 
-        ``images`` are base64 attachments carried on the user message and
-        resent with the history on every round."""
-        message = Message(
-            role="user",
-            content=user_text,
-            images=images or None,
-            checkpoint_sha=await self._take_checkpoint(),
-        )
+        ``images`` are attachments from the client; the bytes are stored
+        once and the history keeps content-addressed references."""
+        message = self._user_message(user_text, images)
+        before_tree = await self._take_checkpoint()
         self.conversation.add(message)
         # The turn is open from here until finish_turn records its after tree.
-        self._open_turn = message
-        # Snapshot marker for /undo //retry: the index of this turn's user
-        # message. The turn snapshot is the messages[:turn_start + 1] prefix,
-        # so restoring it rolls back the whole turn — even one that compacted
-        # the history mid-flight.
-        self.conversation.turn_start = len(self.conversation.messages) - 1
+        self.conversation.begin_turn(message, before_tree)
         if self.on_user_message is not None:
-            self.on_user_message(self.conversation.messages[-1])
+            self.on_user_message(message)
         async for event in self._stream_round():
             yield event
 
@@ -196,15 +168,15 @@ class ChatController:
         start_time: str | None = None, end_time: str | None = None,
     ) -> None:
         """Append a ``tool`` role message with the outcome of one call."""
-        content = result.output if result.ok else f"error: {result.error}"
         self.conversation.add(
             Message(
                 role="tool",
                 tool_call_id=call_id,
-                content=content,
+                content=result.output if result.ok else (result.error or "error"),
+                ok=result.ok,
+                parse_error=result.parse_error,
                 header=result.header or None,
-                start_time=start_time,
-                end_time=end_time,
+                timing=Timing(start=start_time, end=end_time),
             )
         )
 
@@ -235,6 +207,7 @@ class ChatController:
                 role="assistant",
                 content=content,
                 reasoning=reasoning,
+                kind="interrupted",
             )
         )
         return True
@@ -252,9 +225,7 @@ class ChatController:
         their original stamp). No checkpoint of its own: it belongs to the
         turn that is already running, whose snapshot /undo restores anyway.
         """
-        message = Message(
-            role="user", content=text, images=images or None, send_time=send_time,
-        )
+        message = self._user_message(text, images, timing=Timing(send=send_time))
         self.conversation.add(message)
         if self.on_user_message is not None:
             self.on_user_message(message)
@@ -293,121 +264,89 @@ class ChatController:
         nothing to undo (no user message, or no response to it yet).
 
         If the most recent thing that happened is a compaction (a summary in
-        the history, no real user turn after it), /undo //retry undo the
-        compaction itself first: the full pre-compaction history is
-        restored, the turn that triggered it stays intact, and no files are
-        touched. The next /undo then removes that turn normally.
-
-        Otherwise, with a turn snapshot (the normal case) the conversation
-        is restored to exactly what it was when the turn began. Without one
-        (resumed session) it falls back to truncating at the last user
-        message. Either way the turn's user message is dropped: /undo stops
-        there, /retry re-sends its text (which takes a fresh checkpoint).
-        """
-        messages = self.conversation.messages
-        compact_snapshot = self.conversation.compact_snapshot
-        summary_idx = _summary_index(messages)
-        last_real = _last_user_turn_index(messages)
-        if (
-            compact_snapshot is not None and summary_idx is not None
-            and (last_real is None or last_real < summary_idx)
-        ):
-            # Undo the compaction: restore the pre-compaction history
-            # verbatim. The summary and everything after it leave the
-            # history (their spend stays counted — totals are monotonic);
-            # the compaction turn's own messages come back.
-            keep = list(compact_snapshot)
+        the visible history, no real user turn after it), /undo //retry undo
+        the compaction itself first by flipping the epoch back; the turn that
+        triggered it stays intact and no files are touched."""
+        conversation = self.conversation
+        visible = conversation.visible_messages()
+        if conversation.epoch > 0 and visible and is_summary(visible[-1]):
             return RollbackPlan(
-                user_text="", revert_turns=[], keep=keep,
-                clears_compaction=True, compaction_only=True,
+                user_text="", revert_turns=[], keep=list(conversation.messages),
+                epoch=conversation.epoch - 1, compaction_only=True,
             )
-        turn_start = self.conversation.turn_start
-        if turn_start is not None and 0 <= turn_start < len(messages) and messages[turn_start].role == "user":
-            if turn_start == len(messages) - 1:
-                return None  # the turn produced no response yet
-            return self.rollback_plan_to(messages[turn_start])
-        if last_real is None:
-            return None
-        return self.rollback_plan_to(messages[last_real])
+        turn = conversation.turns[-1] if conversation.turns else None
+        message = self._message_by_id(turn.user_message_id) if turn else None
+        if message is None:
+            # Legacy session without a tracked turn: fall back to the last
+            # real user message that has a response after it.
+            message = next(
+                (m for m in reversed(visible)
+                 if m.role == "user" and not is_summary(m) and m is not visible[-1]),
+                None,
+            )
+        if message is None or (visible and message is visible[-1]):
+            return None  # the turn produced no response yet
+        return self.rollback_plan_to(message)
+
+    def _message_by_id(self, message_id: str) -> Message | None:
+        return next((m for m in self.conversation.messages if m.id == message_id), None)
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
         """Plan a rollback to an arbitrary earlier user message (click-to-undo):
         drop that message and everything after it, restoring the workspace to
         the checkpoint taken when it was sent.
 
-        Handles messages the last compaction summarized away too — the
-        pre-compaction snapshot is restored first, then truncated at the
-        clicked turn. Returns None when the message is not a user turn in this
-        conversation. Even with nothing to drop (no later messages, no file
-        edits) the plan is still produced so the message's text is put back
-        in the input.
+        Searches the full append-only history, so messages the last compaction
+        summarized away are found too (the epoch simply drops back to theirs).
+        Returns None when the message is not a user turn in this conversation.
         """
-        if message.role != "user":
+        if message.role != "user" or is_summary(message):
             return None
-        messages = self.conversation.messages
-        index = next((i for i, m in enumerate(messages) if m is message), None)
-        if index is not None:
-            # Even when the message is the latest one (nothing after it to
-            # drop) we still produce a plan: the text goes back into the
-            # input.
-            keep = list(messages[:index])
-            clears = not any(is_summary(m) for m in keep)
-            return RollbackPlan(
-                user_text=message.content, revert_turns=_turns_in(messages[index:]),
-                keep=keep, clears_compaction=clears, images=message.images,
-            )
-        snapshot = self.conversation.compact_snapshot
-        if snapshot is None:
+        conversation = self.conversation
+        index = next((i for i, m in enumerate(conversation.messages) if m is message), None)
+        if index is None:
             return None
-        idx = next((i for i, m in enumerate(snapshot) if m is message), None)
-        if idx is None:
-            return None
-        keep = list(snapshot[:idx])
-        # Revert every dropped turn — the ones the snapshot summarized away
-        # (from the clicked turn onward) plus those that ran after compaction.
-        revert = _turns_in([*snapshot[idx:], *messages])
+        dropped_ids = {m.id for m in conversation.messages[index:]}
+        # Revert only closed, unlocked turns that are being dropped; their
+        # file edits can still be undone.
+        revert = [
+            TurnCheckpoint(t.before_tree, t.after_tree)
+            for t in reversed(conversation.turns)
+            if t.user_message_id in dropped_ids and not t.locked
+            and t.before_tree and t.after_tree
+        ]
         return RollbackPlan(
-            user_text=message.content, revert_turns=revert,
-            keep=keep, clears_compaction=True, images=message.images,
+            user_text=message.content, revert_turns=revert[::-1],
+            keep=list(conversation.messages[:index]), epoch=message.epoch,
+            images=image_refs(message) or None,
         )
 
     def apply_rollback(self, plan: RollbackPlan) -> None:
-        """Truncate the conversation and clear the snapshot. The file edits
-        are reversed separately (see :meth:`revert_changes`) so a conflict
-        can abort before the conversation changes. Usage totals are
-        monotonic and untouched."""
-        self.conversation.messages = list(plan.keep)
-        self.conversation.turn_start = None
+        """Truncate the conversation to the plan. File edits are reversed
+        separately (see :meth:`revert_changes`) so a conflict can abort before
+        the conversation changes. Usage totals are monotonic and untouched."""
+        conversation = self.conversation
+        conversation.messages = list(plan.keep)
+        conversation.epoch = plan.epoch
+        kept = {m.id for m in conversation.messages}
+        conversation.turns = [
+            t for t in conversation.turns if t.user_message_id in kept
+        ]
         self.last_compaction = None
-        if plan.clears_compaction:
-            # The restore point is before the compaction: its summary is no
-            # longer in the history, so the pre-compaction snapshot (which
-            # would only offer a stale second undo of the same turn) is
-            # dropped too.
-            self.conversation.compact_snapshot = None
 
     @property
-    def open_turn(self) -> Message | None:
-        """The user message of the turn being generated, or None.
-
-        /accept and /reject rewrite every checkpoint mid-turn; the open turn
-        is identified by identity, not by scanning the message list."""
-        return self._open_turn
+    def open_turn(self):
+        """The still-open :class:`Turn` being generated, or None."""
+        return self.conversation.open_turn
 
     async def finish_turn(self) -> None:
-        """Record the workspace state after the turn's edits as ``after_tree``
-        on the turn's user message, so /undo can reverse exactly this turn's
-        diff later. Called by the app once a turn's rounds and tools have
-        finished (including on interruption). No-op without git tracking, when
-        no turn is open, or when the snapshot fails.
-
-        Uses the explicitly-open turn, not ``last_turn_message``: a turn whose
-        checkpoint failed must not restamp the previous (closed) turn with the
-        new after tree."""
-        turn = self._open_turn
-        self._open_turn = None
+        """Record the workspace state after the turn's edits as the open
+        turn's after tree, so /undo can reverse exactly this turn's diff
+        later. No-op without git tracking, when no turn is open, or when the
+        snapshot fails."""
+        turn = self.conversation.open_turn
         info = self.git_info
-        if info is None or turn is None or not turn.checkpoint_sha:
+        if info is None or turn is None or not turn.before_tree:
             return
         try:
             turn.after_tree = await git_snapshot_state(info)
@@ -415,26 +354,18 @@ class ChatController:
             return
 
     def open_turn_before(self) -> str | None:
-        """The still-open turn's before tree, or None.
-
-        /diff attribution folds this into the agent-touched set so the
-        in-flight turn's edits are not shown as drift while streaming — even
-        after a mid-turn /accept //reject rewrote the checkpoint, or a
-        mid-turn compaction moved the message into ``compact_snapshot``.
-        """
-        turn = self._open_turn
-        if turn is None or not turn.checkpoint_sha:
-            return None
-        return turn.checkpoint_sha
+        """The still-open turn's before tree, or None."""
+        turn = self.conversation.open_turn
+        return turn.before_tree if turn is not None else None
 
     def turn_checkpoints(self) -> list[TurnCheckpoint]:
-        """The reversible turns since the baseline, oldest first.
-
-        Includes turns the last compaction summarized away (kept in
-        ``compact_snapshot``), so /diff attribution and the resume drift check
-        still see their edits."""
-        pre = self.conversation.compact_snapshot or []
-        return _turns_in([*pre, *self.conversation.messages])
+        """The reversible turns since the baseline, oldest first. Locked
+        (accepted) turns are excluded: their edits must not be reverted."""
+        return [
+            TurnCheckpoint(t.before_tree, t.after_tree)
+            for t in self.conversation.turns
+            if not t.locked and t.before_tree and t.after_tree
+        ]
 
     async def revert_changes(self, turns: list[TurnCheckpoint]) -> None:
         """Reverse the given turns' file edits (newest first) onto the live
@@ -455,18 +386,13 @@ class ChatController:
     # compaction
 
     async def compact(self) -> str:
-        """Summarize the conversation and replace older messages with it.
-
-        Auto-compact runs at a round boundary (every tool result recorded,
-        every assistant message stamped), so there are no pending tool calls
-        to break pairing. Keeps the system prompt;
-        everything after it becomes a single handoff summary user message
-        (task, what's known so far, what to do next). Returns the summary
-        text; the before/after token counts are left in
-        :attr:`last_compaction` for the compaction notice.
-        """
-        messages = self.conversation.messages
-        compactable = messages[1:]
+        """Summarize the conversation and replace the visible history with a
+        single handoff summary by advancing the compaction epoch. Old messages
+        stay in the append-only list and come back if the compaction is
+        undone. Returns the summary text; before/after token counts are left
+        in :attr:`last_compaction` for the compaction notice."""
+        conversation = self.conversation
+        compactable = conversation.visible_messages()
         if not compactable:
             self.last_compaction = None
             return "nothing to compact yet"
@@ -475,21 +401,13 @@ class ChatController:
         transcript = "\n\n".join(self._render_for_summary(m) for m in compactable)
         summary, usage = await self._summarize(transcript)
         summary_message = Message(
-            role="user",
-            content=f"{SUMMARY_PREFIX}\n\n{summary}",
-            usage=usage,
+            role="user", content=f"{SUMMARY_PREFIX}\n\n{summary}",
+            kind="summary", usage=usage,
         )
-        # The summarization round's own spend is part of the session total.
         if usage is not None:
             self._fold_usage(usage)
-        # Snapshot for /undo: the full pre-compaction history. Taken here (not
-        # on entry) so an empty compaction never clobbers an older snapshot.
-        self.conversation.compact_snapshot = list(messages)
-        self.conversation.messages = [messages[0], summary_message]
-        # The turn snapshot prefix must stay valid mid-turn: anchor it on the
-        # summary message, so /undo //retry never slice past the compacted
-        # history with the pre-compaction index.
-        self.conversation.turn_start = len(self.conversation.messages) - 1
+        conversation.epoch += 1
+        conversation.add(summary_message)
         self.last_compaction = (before_tokens, self._message_tokens(summary_message))
         return summary
 
@@ -567,7 +485,12 @@ class ChatController:
 
         tools_schema = self.tools.schema() if self.tools is not None else None
         async for event in self._client.stream(
-            self.conversation.to_wire(keep_reasoning=self.profile.keep_reasoning), tools=tools_schema
+            self.conversation.to_wire(
+                keep_reasoning=self.profile.keep_reasoning,
+                system=self.system_prompt,
+                image_loader=self._image_loader,
+            ),
+            tools=tools_schema,
         ):
             if isinstance(event, ReasoningDelta):
                 if first_reasoning_at is None:
@@ -593,7 +516,6 @@ class ChatController:
                     reasoning_seconds = end - first_reasoning_at
                 usage = event.usage or self._estimate_usage(partial.content_parts)
                 self._fold_usage(usage)
-                reasoning_end = _mono_to_iso(first_content_at) or _utcnow_iso()
                 self.conversation.add(
                     Message(
                         role="assistant",
@@ -603,15 +525,14 @@ class ChatController:
                         usage=usage,
                         # Wall-clock stamps taken at the moment the round
                         # actually streamed (never reconstructed later).
-                        start_time=started_at,
-                        end_time=_utcnow_iso(),
-                        reasoning_start=_mono_to_iso(first_reasoning_at),
-                        reasoning_end=reasoning_end,
+                        timing=Timing(
+                            start=started_at, end=_utcnow_iso(),
+                            reasoning_seconds=reasoning_seconds,
+                        ),
                     )
                 )
                 event = TurnComplete(
                     usage=usage,
-                    reasoning_seconds=reasoning_seconds,
                     has_tool_calls=bool(done_calls),
                 )
             yield event
@@ -623,7 +544,10 @@ class ChatController:
         self.last_usage = usage
 
     def _estimate_usage(self, content_parts: list[str]) -> Usage:
-        prompt_chars = sum(len(message.content or "") for message in self.conversation.messages)
+        prompt_chars = sum(
+            len(message.content or "")
+            for message in self.conversation.visible_messages()
+        )
         return Usage(
             input_tokens=prompt_chars // _CHARS_PER_TOKEN,
             output_tokens=sum(len(part) for part in content_parts) // _CHARS_PER_TOKEN,

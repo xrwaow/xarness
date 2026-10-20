@@ -14,17 +14,18 @@ second mirrored model to keep in sync.
 
 from __future__ import annotations
 
-import re
+import base64
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from .events import Usage
-from .util import format_duration
-from .images import IMAGE_TOKEN_RE, ImageAttachment, token_text
+from .images import (
+    IMAGE_TOKEN_RE, ImageAttachment, ImageRef, legacy_token_text, token_text,
+)
 
 
 # Prefix of the summary user message compaction leaves behind. Identifying
@@ -33,129 +34,84 @@ SUMMARY_PREFIX = "[earlier conversation, summarized]"
 
 def is_summary(message: "Message") -> bool:
     """True for the summary user message a compaction leaves behind."""
-    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
+    return message.kind == "summary"
 
 
-def turn_time_summary(messages: list["Message"]) -> str | None:
-    """The turn's timing line: total | running | idle.
+class TextPart(BaseModel):
+    """One text segment of a message."""
 
-    Computed from the persisted wall-clock stamps, so the same string can be
-    stamped on the turn's last assistant message (reloads show it) and sent
-    in TurnFinished (the live clients show it). None when the stamps are
-    missing (old sessions, or nothing streamed).
+    type: Literal["text"] = "text"
+    text: str
 
-    - total: turn user message send_time → last assistant end_time
-    - running: streaming (per round, end_time − reasoning_start; start_time
-      when the round had no chain of thought) + tool execution durations
-    - idle: what's left (per-round latency and round boundaries)
+
+class ImagePart(BaseModel):
+    """One image segment, ordered where it appeared in the text.
+
+    ``ref`` is the persisted/wire shape (content hash + display metadata).
+    ``data`` is a transient fallback for callers without an image store; it
+    is excluded from every serialization, so it never reaches a session
+    file or a snapshot."""
+
+    type: Literal["image"] = "image"
+    ref: ImageRef
+    data: bytes | None = Field(default=None, exclude=True)
+
+
+MessagePart = TextPart | ImagePart
+
+
+def build_parts(
+    text: str, images: list[ImageAttachment] | None,
+    store: Any = None,
+) -> list[MessagePart]:
+    """Build ordered text/image parts from a user message.
+
+    The text carries one ``[🖼 name W×H]`` token per attachment; parts are
+    emitted in token order so ``compare [img1] with [img2]`` keeps its
+    meaning. A token without a matching attachment stays text, and an
+    attachment without a token is appended at the end. ``store`` (an object
+    with ``save(ImageAttachment) -> ImageRef``) writes the bytes to the blob
+    store; without one the parts carry transient ``data`` instead.
     """
-    turn_user_index = next(
-        (i for i, m in reversed(list(enumerate(messages)))
-         if m.role == "user" and m.send_time and not is_summary(m)),
-        None,
-    )
-    turn = messages[turn_user_index + 1:] if turn_user_index is not None else messages
-    assistants = [
-        m for m in turn if m.role == "assistant" and m.start_time and m.end_time
-    ]
-    if not assistants:
-        return None
-    total_end = _parse_iso(assistants[-1].end_time)
-    total_start = (
-        _parse_iso(messages[turn_user_index].send_time)
-        if turn_user_index is not None
-        else _parse_iso(assistants[0].start_time)
-    )
-    if total_end is None or total_start is None:
-        return None
-    total = max(0.0, (total_end - total_start).total_seconds())
-    streaming = 0.0
-    for message in assistants:
-        end = _parse_iso(message.end_time)
-        first = _parse_iso(message.reasoning_start) or _parse_iso(message.start_time)
-        if end is not None and first is not None:
-            streaming += max(0.0, (end - first).total_seconds())
-    tools = 0.0
-    for message in turn:
-        if message.role != "tool":
-            continue
-        start = _parse_iso(message.start_time)
-        end = _parse_iso(message.end_time)
-        if start is not None and end is not None:
-            tools += max(0.0, (end - start).total_seconds())
-    other = max(0.0, total - streaming - tools)
-    fmt = format_duration
-    return f"{fmt(total)} | {fmt(streaming + tools)} {fmt(other)}"
+    if not images:
+        return [TextPart(text=text)] if text else []
+    by_token = {token_text(image): image for image in images}
+    legacy = {legacy_token_text(image): image for image in images}
+    used: set[int] = set()
+    parts: list[MessagePart] = []
 
+    def add_image(image: ImageAttachment) -> None:
+        ref = store.save(image) if store is not None else image.to_ref()
+        parts.append(ImagePart(
+            ref=ref, data=None if store is not None else image.data(),
+        ))
 
-def normalize_time_summary(summary: str) -> str:
-    """Re-render a persisted timing line in the current shape:
-    'total | running idle' with compact durations ('1m02s').
-
-    Older versions persisted 'total | streaming tools other' (three
-    numbers) and spaced durations ('1m 02s'); both are re-rendered — the
-    three numbers merge into running = streaming + tools. Anything that
-    doesn't parse as a timing line passes through unchanged, and a line
-    already in the current shape is returned as-is.
-    """
-    unit_seconds = {"s": 1, "m": 60, "h": 3600}
-
-    parts = [part.strip() for part in summary.split("|")]
-    if len(parts) != 2:
-        return summary
-    # Split the tail into durations via its number+unit pairs ('1m02s' and
-    # the legacy '1m 02s' both give (1,m),(02,s)). Units descend h→m→s
-    # within one duration, so a pair continues the previous duration when
-    # it steps down the chain (h→m, m→s) and starts a new one otherwise.
-    # Whitespace is irrelevant.
-    durations: list[float] = []
-    previous_unit = ""
-    current_has_hours = False
-    for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", parts[1]):
-        value = float(number) * unit_seconds[unit]
-        # 'h' durations end at 'm' (format_duration never emits h+m+s), so
-        # an 'm' pair that completes an 'h' does not absorb a following 's'.
-        continues = (
-            (previous_unit, unit) == ("h", "m")
-            or ((previous_unit, unit) == ("m", "s") and not current_has_hours)
-        )
-        if continues and durations:
-            durations[-1] += value
+    last = 0
+    for match in IMAGE_TOKEN_RE.finditer(text):
+        chunk = text[last:match.start()]
+        if chunk:
+            parts.append(TextPart(text=chunk))
+        image = by_token.get(match.group(0)) or legacy.get(match.group(0))
+        if image is not None and id(image) not in used:
+            used.add(id(image))
+            add_image(image)
         else:
-            durations.append(value)
-            current_has_hours = unit == "h"
-        previous_unit = unit
-    if len(durations) == 3:
-        # Legacy three-number line: streaming + tools merge into running.
-        running, idle = durations[0] + durations[1], durations[2]
-    elif len(durations) == 2:
-        running, idle = durations
-    else:
-        return summary
-    total = 0.0
-    for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", parts[0]):
-        total += float(number) * unit_seconds[unit]
-    if total <= 0:
-        return summary
-    rendered = (
-        f"{format_duration(total)} | {format_duration(running)} {format_duration(idle)}"
-    )
-    return rendered if rendered != summary else summary
+            parts.append(TextPart(text=match.group(0)))
+        last = match.end()
+    chunk = text[last:]
+    if chunk:
+        parts.append(TextPart(text=chunk))
+    for image in images:
+        if id(image) not in used:
+            add_image(image)
+    return parts
 
 
-def _parse_iso(stamp: str | None) -> datetime | None:
-    """Parse one of the ISO stamps carried on messages (None on failure)."""
-    if not stamp:
-        return None
-    try:
-        return datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-
-
-# The placeholder tokens attached images leave in user text (see
-# images.token_text); matches are replaced by image content parts on the wire.
-_TOKEN_RE = IMAGE_TOKEN_RE
+def image_refs(message: "Message") -> list[ImageRef]:
+    """The image references carried by a message, in text order."""
+    return [
+        part.ref for part in message.parts or () if isinstance(part, ImagePart)
+    ]
 
 
 class ToolCall(BaseModel):
@@ -182,39 +138,46 @@ class ToolCall(BaseModel):
         )
 
 
+class Timing(BaseModel):
+    """When a message happened and (for a turn's last answer) how long it took.
+
+    One sub-model instead of six fields scattered on ``Message``. Stamps are
+    wall-clock UTC ISO 8601; ``summary`` is the derived turn timing line
+    ("total | running idle") stamped only on the turn's last assistant
+    message so every client and every reload shows the same one."""
+
+    send: str | None = None
+    start: str | None = None
+    end: str | None = None
+    reasoning_seconds: float | None = None
+
+
 class Message(BaseModel):
     """One conversation message, mirroring the API's message object."""
 
-    role: str  # "user" | "assistant" | "system" | "tool"
+    role: Literal["user", "assistant", "system", "tool"]
     content: str = ""
+    # "summary" marks the handoff message compaction appends; "interrupted"
+    # marks a partial assistant message saved when a turn was cancelled.
+    kind: Literal["normal", "summary", "interrupted"] = "normal"
+    # Compaction epoch: the conversation shows only messages whose epoch
+    # equals the current one (plus later appends). Undo-compaction flips the
+    # epoch back instead of restoring a second copy of the history.
+    epoch: int = 0
     # Stable id (uuid4), persisted. Click-to-undo addresses messages by
     # id, not object identity.
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    # Wall-clock UTC ISO 8601 stamps (None for old sessions). User messages
-    # carry send_time (steering: when the client sent it, not when it was
-    # injected); assistant messages start_time/end_time around the request,
-    # reasoning_start/reasoning_end for the chain of thought; tool result
-    # messages start_time/end_time for the call's execution. Never sent to
-    # the provider (to_wire does not include them).
-    send_time: str | None = None
-    start_time: str | None = None
-    end_time: str | None = None
-    reasoning_start: str | None = None
-    reasoning_end: str | None = None
+    # Timestamps and the derived timing line. Never sent to the provider.
+    timing: Timing = Field(default_factory=Timing)
     # Local-only: reasoning-channel text for assistant messages.
     reasoning: str | None = None
     # Local-only: token usage reported for the round that produced this
     # message (assistant messages only; never sent over the wire).
     usage: Usage | None = None
-    # Local-only: git checkpoint tree sha taken when this user message was
-    # sent — the workspace state *before* the turn's edits. /undo //retry
-    # reverse the turn's diff (checkpoint_sha → after_tree).
-    checkpoint_sha: str | None = None
-    # Local-only: workspace tree sha after the turn's edits finished — the
-    # state the turn produced. Recorded once the turn completes; together
-    # with checkpoint_sha it lets /undo reverse exactly this turn's changes
-    # without disturbing edits made since.
-    after_tree: str | None = None
+    # Tool result outcome, persisted explicitly instead of encoded in the
+    # content prefix, so the TUI can rebuild the call's status faithfully.
+    ok: bool = True
+    parse_error: bool = False
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] | None = None
@@ -222,90 +185,45 @@ class Message(BaseModel):
     # only) — computed by the tool, persisted so /resume renders the same
     # headers. Never sent over the wire.
     header: str | None = None
-    # Local-only: "Worked for X | Y Z W" timing of the turn that produced
-    # this assistant message (last one of the turn only) — total, streaming,
-    # idle-waiting-for-tools, and the leftover latency. Computed by the
-    # session at turn end from the persisted stamps, so every client and
-    # every reload shows the same line.
-    time_summary: str | None = None
-    # Images attached to a user message (persisted; sent over the wire as
-    # base64 ``image_url`` content parts on every round). None = text only.
-    images: list[ImageAttachment] | None = None
+    # Ordered text/image segments of a user message. Images are stored by
+    # content hash (see ImageRef); the provider wire format is assembled in
+    # to_wire, so persistence and snapshots carry no base64 payloads.
+    parts: list[TextPart | ImagePart] | None = None
 
-    @field_validator("tool_calls", mode="before")
-    @classmethod
-    def _coerce_tool_calls(cls, value: object) -> object:
-        """Accept tool calls in either shape: the wire shape persisted in
-        session files and sent to providers (``{id, type, function}``), and
-        the internal shape a ``model_dump()`` round-trip produces
-        (``{call_id, name, arguments_json}`` — snapshots serialize Message
-        as-is, so this is what crosses the host→client JSON boundary)."""
-        if isinstance(value, list):
-            out = []
-            for c in value:
-                if isinstance(c, ToolCall):
-                    out.append(c)
-                elif isinstance(c, dict) and (
-                    "call_id" in c or "arguments_json" in c
-                ):
-                    out.append(ToolCall.model_validate(c))
-                else:
-                    out.append(ToolCall.from_wire(c))
-            return out
-        return value
-
-    @property
-    def reasoning_duration(self) -> float | None:
-        """Seconds spent in the reasoning channel, derived from the
-        reasoning_start/reasoning_end stamps (None when unknown)."""
-        if not self.reasoning_start or not self.reasoning_end:
-            return None
-        start = _parse_iso(self.reasoning_start)
-        end = _parse_iso(self.reasoning_end)
-        if start is None or end is None:
-            return None
-        return max(0.0, (end - start).total_seconds())
-
-    def to_wire(self, include_reasoning: bool = False) -> dict[str, Any]:
+    def to_wire(
+        self, include_reasoning: bool = False,
+        image_loader: Callable[[str], bytes | None] | None = None,
+    ) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role}
         # Per spec, an assistant message that only calls tools should omit
         # content entirely — some providers reject an empty string there.
         if self.content or self.role != "assistant" or not self.tool_calls:
             message["content"] = self.content
-        if self.role == "user" and self.images:
-            # Multipart content. The text may carry image placeholder tokens
-            # ("[🖼 name W×H]") marking where each image belongs; content
-            # parts are emitted in that order so "compare [img1] with
-            # [img2]" stays meaningful to the model. Tokens without a
-            # matching attachment (or images without a token) still come
-            # through: text parts first, unmatched images appended at the end.
-            parts: list[dict[str, Any]] = []
-            last = 0
-            # Match tokens by placeholder text, not ordinal: an unknown or
-            # duplicate token must not shift later images.
-            by_token = {token_text(image): image for image in self.images}
-            used: set[int] = set()
-            for match in _TOKEN_RE.finditer(self.content):
-                chunk = self.content[last:match.start()]
-                if chunk:
-                    parts.append({"type": "text", "text": chunk})
-                image = by_token.get(match.group(0))
-                if image is not None and id(image) not in used:
-                    used.add(id(image))
-                    parts.append(
-                        {"type": "image_url", "image_url": {"url": image.data_url()}}
-                    )
-                else:
-                    parts.append({"type": "text", "text": match.group(0)})
-                last = match.end()
-            chunk = self.content[last:]
-            if chunk:
-                parts.append({"type": "text", "text": chunk})
-            parts.extend(
-                {"type": "image_url", "image_url": {"url": image.data_url()}}
-                for image in self.images if id(image) not in used
-            )
-            message["content"] = parts
+        image_parts = [p for p in self.parts or () if isinstance(p, ImagePart)]
+        if self.role == "user" and image_parts:
+            # Multipart content, in the order the text/image parts were
+            # recorded. The bytes are resolved from the session blob store
+            # (or carried transiently when there is no store).
+            content: list[dict[str, Any]] = []
+            for part in self.parts or ():
+                if isinstance(part, TextPart):
+                    if part.text:
+                        content.append({"type": "text", "text": part.text})
+                    continue
+                data = part.data
+                if data is None and image_loader is not None:
+                    data = image_loader(part.ref.id)
+                if data is None:
+                    # The blob is gone: keep the message valid rather than
+                    # silently dropping the attachment entirely.
+                    content.append({"type": "text", "text": token_text(part.ref)})
+                    continue
+                encoded = base64.b64encode(data).decode("ascii")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{part.ref.mime};base64,{encoded}"},
+                })
+            message["content"] = content
         if include_reasoning and self.role == "assistant" and self.reasoning is not None:
             # DeepSeek-style field name; providers that don't know it ignore it.
             message["reasoning_content"] = self.reasoning
@@ -318,65 +236,100 @@ class Message(BaseModel):
         return message
 
 
+class Turn(BaseModel):
+    """One tracked user turn: the user message that opened it and the git
+    trees on either side of its edits. ``after_tree is None`` means open."""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    user_message_id: str
+    before_tree: str | None = None
+    after_tree: str | None = None
+    # /accept locks a turn: its files can no longer be reverted by /undo.
+    locked: bool = False
+
+
 @dataclass(slots=True)
 class Conversation:
-    """Ordered message history; the single source of truth for the chat."""
+    """Ordered message history; the single source of truth for the chat.
+
+    ``messages`` is append-only across compaction: old epochs stay in the
+    list and are simply hidden by ``visible_messages`` until an undo flips
+    ``epoch`` back. ``turns`` owns the per-turn git checkpoints, so a user
+    message carries no turn state of its own."""
 
     messages: list[Message] = field(default_factory=list)
-    # Local-only: index of the current turn's user message (set by the
-    # controller when the turn begins; /undo //retry roll back to it —
-    # including across a mid-turn compaction). The turn snapshot is always
-    # the messages[:turn_start + 1] prefix of the list, so an index stands
-    # in for a full copy and survives save/load unchanged.
-    turn_start: int | None = None
-    # Local-only: the full message list as it stood just before the most
-    # recent compaction, so /undo can restore pre-compaction history. Only
-    # the most recent compaction is recoverable.
-    compact_snapshot: list[Message] | None = None
+    turns: list[Turn] = field(default_factory=list)
+    epoch: int = 0
 
     def add(self, message: Message) -> Message:
+        message.epoch = self.epoch
         self.messages.append(message)
         return message
 
-    def last_turn_message(self) -> Message | None:
-        """The most recent user message that opened a tracked turn (carries
-        a checkpoint sha), or None."""
-        return next(
-            (m for m in reversed(self.messages)
-             if m.role == "user" and m.checkpoint_sha is not None),
-            None,
-        )
+    def visible_messages(self) -> list[Message]:
+        return [m for m in self.messages if m.epoch == self.epoch]
+
+    @property
+    def open_turn(self) -> Turn | None:
+        """The still-open turn (its after_tree not yet recorded), or None."""
+        return next((t for t in reversed(self.turns) if t.after_tree is None), None)
+
+    def begin_turn(self, user_message: Message, before_tree: str | None) -> Turn:
+        turn = Turn(user_message_id=user_message.id, before_tree=before_tree)
+        self.turns.append(turn)
+        return turn
+
+    def lock_turns(self, tree: str) -> None:
+        """Point every turn's checkpoints at ``tree`` (an accepted/rejected
+        baseline) and mark the closed ones locked. The open turn keeps
+        ``after_tree = None`` so finish_turn still records its end."""
+        open_turn = self.open_turn
+        for turn in self.turns:
+            turn.before_tree = tree
+            if turn is not open_turn:
+                turn.after_tree = tree
+                turn.locked = True
 
     def repair_orphaned_tool_calls(self, now: str | None = None) -> bool:
         """Give any assistant tool_call without a matching tool message a
-        synthetic ``error: interrupted`` result, so the next API request is
-        valid. Runs after a cancel and on a session load. Returns True when
-        anything was added."""
+        synthetic interrupted result (``kind="interrupted"``, ``ok=False``),
+        so the next API request is valid. Runs after a cancel and on a
+        session load. Returns True when anything was added."""
+        visible = self.visible_messages()
         answered = {
-            m.tool_call_id for m in self.messages
+            m.tool_call_id for m in visible
             if m.role == "tool" and m.tool_call_id
         }
         changed = False
-        for message in self.messages:
+        for message in visible:
             if message.role != "assistant" or not message.tool_calls:
                 continue
             for call in message.tool_calls:
                 if call.call_id not in answered:
                     self.add(Message(
                         role="tool", tool_call_id=call.call_id,
-                        content="error: interrupted",
+                        content="interrupted", kind="interrupted", ok=False,
                         end_time=now,
                     ))
                     answered.add(call.call_id)
                     changed = True
         return changed
 
-    def to_wire(self, keep_reasoning: bool = False) -> list[dict[str, Any]]:
+    def to_wire(
+        self, keep_reasoning: bool = False, system: str | None = None,
+        image_loader: Callable[[str], bytes | None] | None = None,
+    ) -> list[dict[str, Any]]:
         # Orphaned tool calls (turn interrupted mid-execution, session saved
         # mid-turn) are answered synthetically by Session._repair_tool_calls,
         # which runs on cancel and on session load, so every message can go
-        # out as-is.
-        return [
-            message.to_wire(include_reasoning=keep_reasoning)
-            for message in self.messages
-        ]
+        # out as-is. The system prompt is derived per request, never stored.
+        messages = []
+        if system is not None:
+            messages.append({"role": "system", "content": system})
+        messages.extend(
+            message.to_wire(
+                include_reasoning=keep_reasoning, image_loader=image_loader,
+            )
+            for message in self.visible_messages()
+        )
+        return messages

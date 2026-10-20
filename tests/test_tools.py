@@ -322,6 +322,12 @@ def test_edit_file_applies_multiple_edits_in_one_call(tmp_path) -> None:
     assert "diff --git a/f.txt b/f.txt" in result.output
     for line in ("-alpha", "+ALPHA", "-gamma", "+GAMMA"):
         assert line in result.output
+    # The diff must be line-structured: the TUI parser keys off "---",
+    # "+++" and "@@" starting their own lines.
+    lines = result.output.splitlines()
+    assert "--- a/f.txt" in lines
+    assert "+++ b/f.txt" in lines
+    assert any(line.startswith("@@") for line in lines)
 
 
 def test_edit_file_edits_apply_in_order(tmp_path) -> None:

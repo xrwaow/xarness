@@ -819,8 +819,13 @@ class SandboxSession:
             await self.close()
         self._mount_key = self._config.mount_key
         argv = self._config.build_argv(["/bin/sh"])
+        # Python block-buffers stdout when it is a pipe, so a long `pytest` /
+        # script run would show nothing until it exits. The persistent shell's
+        # children inherit this, letting run_bash stream their output live.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
+            env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,

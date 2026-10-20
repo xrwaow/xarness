@@ -459,7 +459,12 @@ def _format_edit_diff(path: str, before: str, after: str) -> str:
         lines = lines[:_MAX_EDIT_DIFF_LINES] + [
             f"\n[... diff truncated at {_MAX_EDIT_DIFF_LINES} lines]"
         ]
-    return f"diff --git a/{path} b/{path}\n" + "".join(lines)
+    # ``lineterm=""`` keeps content line endings intact, but leaves the
+    # ``---``/``+++``/``@@`` headers without one. Normalise every element to
+    # its own line, or the parser cannot see the hunk at all (and renders
+    # an empty body for edit_file).
+    diff = "\n".join(line.rstrip("\n") for line in lines)
+    return f"diff --git a/{path} b/{path}\n" + diff.rstrip("\n") + "\n"
 
 
 def _make_edit_tool(sandbox: SandboxConfig) -> Tool:

@@ -40,11 +40,8 @@ import shlex
 import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
-from .protocol import DiffFileInfo, DiffInfo
-
 
 _GIT_TIMEOUT = 30.0
 
@@ -674,16 +671,17 @@ async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra
     return out
 
 
-async def _diff_trees(info: GitInfo, *extra: str) -> str:
+async def _diff_trees(info: GitInfo, *extra: str, current: str | None = None) -> str:
     """Diff the workspace's current state (tracked, uncommitted, and
     untracked-not-ignored files) against the session's baseline tree."""
-    current = await snapshot_state(info)
+    if current is None:
+        current = await snapshot_state(info)
     return await _diff_tree_pair(info, info.baseline_tree, current, *extra)
 
 
-def _parse_numstat(out: str) -> list[DiffFileInfo]:
-    """Parse ``git diff --numstat`` output into DiffFileInfo rows."""
-    files: list[DiffFileInfo] = []
+def _parse_numstat(out: str) -> list[DiffFile]:
+    """Parse ``git diff --numstat`` output into :class:`DiffFile` rows."""
+    files: list[DiffFile] = []
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -691,7 +689,7 @@ def _parse_numstat(out: str) -> list[DiffFileInfo]:
         if len(parts) < 3:
             continue
         adds, dels, raw = parts
-        files.append(DiffFileInfo(
+        files.append(DiffFile(
             path=_clean_numstat_path(raw),
             additions=0 if adds == "-" else int(adds or 0),
             deletions=0 if dels == "-" else int(dels or 0),
@@ -746,7 +744,7 @@ def _created_paths(out: str, subtree: str = "") -> frozenset[str]:
     return frozenset(created)
 
 
-async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffInfo:
+async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffStat:
     """Per-file +/- counts between two snapshot trees, with ``is_new`` set
     relative to ``base_tree``."""
     out = await _numstat_between(info, base_tree, other_tree)
@@ -757,7 +755,7 @@ async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> Diff
     return _diff_info(files)
 
 
-async def diff_stat(info: GitInfo) -> DiffInfo:
+async def diff_stat(info: GitInfo) -> DiffStat:
     """Per-file +/- line counts of everything that changed since the
     session's baseline. With a scoped subtree, limited to it, paths
     relative to it."""
@@ -766,8 +764,8 @@ async def diff_stat(info: GitInfo) -> DiffInfo:
 
 async def attributed_diff_stat(
     info: GitInfo, turns: list[TurnCheckpoint],
-    open_before: str | None = None,
-) -> DiffInfo:
+    open_before: str | None = None, current: str | None = None,
+) -> DiffStat:
     """Pending changes since ``baseline_tree``, tagged by source.
 
     ``baseline_tree`` only ever moves via :func:`accept_changes`, so this is
@@ -780,7 +778,7 @@ async def attributed_diff_stat(
     ``open_before`` is the still-open turn's before tree: without it the
     in-flight turn's edits would show as drift until end of streaming.
     """
-    current = await snapshot_state(info)
+    current = current or await snapshot_state(info)
     total = await tree_diff_stat(info, info.baseline_tree, current)
 
     agent_touched: set[str] = set()
@@ -796,23 +794,42 @@ async def attributed_diff_stat(
     return total
 
 
-async def git_diff(info: GitInfo, path: str | None = None) -> str:
+async def git_diff(
+    info: GitInfo, path: str | None = None, current: str | None = None,
+) -> str:
     """Unified diff of the workspace's current state vs the session's
     baseline tree, optionally limited to one path (subtree-relative when
-    the session is scoped)."""
+    the session is scoped). Pass ``current`` (a snapshot sha) when the caller
+    already has one, so /diff <path> snapshots the workspace only once."""
     extra: tuple[str, ...] = ("--", path) if path else ()
-    return await _diff_trees(info, *extra)
+    return await _diff_trees(info, *extra, current=current)
 
 
 # ----------------------------------------------------------------------
-# diff summary data — the protocol's DiffInfo/DiffFileInfo models, so
-# session.diff_info can hand gitwork's result straight to clients with no
-# field-by-field copy.
+# diff summary data — plain dataclasses, deliberately independent of the
+# wire protocol. The API edge maps these to protocol.DiffInfo.
 
 
-def _diff_info(files: list[DiffFileInfo]) -> DiffInfo:
-    """A DiffInfo with the totals computed from ``files``."""
-    return DiffInfo(
+@dataclass(slots=True)
+class DiffFile:
+    path: str
+    additions: int
+    deletions: int
+    is_new: bool = False
+    source: str = ""
+
+
+@dataclass(slots=True)
+class DiffStat:
+    files: list[DiffFile] = field(default_factory=list)
+    additions: int = 0
+    deletions: int = 0
+    tracking: bool = False
+
+
+def _diff_info(files: list[DiffFile]) -> DiffStat:
+    """A DiffStat with the totals computed from ``files``."""
+    return DiffStat(
         files=files,
         additions=sum(f.additions for f in files),
         deletions=sum(f.deletions for f in files),

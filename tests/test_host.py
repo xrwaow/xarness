@@ -79,7 +79,7 @@ def _unix_http(socket_path: Path) -> httpx.AsyncClient:
 
 async def _make_session(host: Host, tmp_path, script) -> str:
     (tmp_path / "ws").mkdir(exist_ok=True)
-    summary = await host.create_session(workspace=str(tmp_path / "ws"))
+    summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
     session = host.sessions[summary.name]
     session.controller._client = FakeClient(script)
     return session.name
@@ -94,14 +94,14 @@ def test_create_session_creates_missing_workspace(tmp_path) -> None:
         task = await _serve(host)
         try:
             missing = tmp_path / "data" / "new_ws"
-            summary = await host.create_session(workspace=str(missing))
+            summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(missing)))
             assert missing.is_dir()
             assert host.sessions[summary.name].workspace == missing.resolve()
             # An uncreatable path still fails with a readable error.
             blocked = tmp_path / "file.txt" / "under"
             (tmp_path / "file.txt").write_text("x")
             with pytest.raises(SessionError, match="could not be created"):
-                await host.create_session(workspace=str(blocked))
+                await host.create_session(protocol.CreateSessionRequest(workspace=str(blocked)))
         finally:
             task.cancel()
 
@@ -122,13 +122,13 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
             # No real git repo here: stub the two git-backed methods.
             from xarness.protocol import DiffFileInfo
 
-            async def fake_summary():
+            async def fake_summary(current=None):
                 return protocol.DiffInfo(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
                     source="agent",
                 )], additions=1, deletions=0)
 
-            async def fake_text(path):
+            async def fake_text(path, current=None):
                 return f"diff for {path}"
 
             session.diff_summary = fake_summary
@@ -280,16 +280,15 @@ def test_load_session_restores_saved_baseline(tmp_path) -> None:
     async def go():
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
-        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
         # Simulate a finished turn that changed the workspace (never accepted).
         session.git_info.baseline_tree = "b" * 40
-        session.conversation.add(Message(
-            role="user", content="do things",
-            checkpoint_sha="b" * 40, after_tree="c" * 40,
-        ))
+        user = session.conversation.add(Message(role="user", content="do things"))
+        session.conversation.begin_turn(user, "b" * 40)
+        session.conversation.turns[-1].after_tree = "c" * 40
         session._persist()
         await host.unload_session(name)
 
@@ -318,16 +317,15 @@ def test_no_false_drift_after_clean_exit(tmp_path) -> None:
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
         (tmp_path / "ws" / "file.txt").write_text("hello")
-        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
         from xarness.gitwork import snapshot_state
         current = await snapshot_state(session.git_info)
-        session.conversation.add(Message(
-            role="user", content="edit",
-            checkpoint_sha=current, after_tree=current,
-        ))
+        user = session.conversation.add(Message(role="user", content="edit"))
+        session.conversation.begin_turn(user, current)
+        session.conversation.turns[-1].after_tree = current
         session._persist()
         await host.unload_session(name)
 
@@ -346,17 +344,15 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
         (tmp_path / "ws" / "file.txt").write_text("hello")
-        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
         from xarness.gitwork import snapshot_state
         current = await snapshot_state(session.git_info)
         # A turn with a checkpoint but no after-tree: finish_turn never ran.
-        session.conversation.add(Message(
-            role="user", content="still working",
-            checkpoint_sha=current, after_tree=None,
-        ))
+        user = session.conversation.add(Message(role="user", content="still working"))
+        session.conversation.begin_turn(user, current)
         session._persist()
         await host.unload_session(name)
 
@@ -375,7 +371,7 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
     async def go():
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
-        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
@@ -398,9 +394,9 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
 
 def test_protocol_models_tolerate_unknown_fields() -> None:
     """Host and client can be different builds across a restart: a snapshot
-    carrying fields the validating model doesn't know must parse, not
-    crash with extra_forbidden (e.g. a message-level time_summary added by
-    a newer host while the TUI still runs an older clientlib)."""
+    carrying fields the validating model doesn't know must parse, not crash
+    with extra_forbidden (e.g. a message-level timing field added by a
+    newer host while the TUI still runs an older clientlib)."""
     raw = {
         "seq": 7,
         "status": {"state": "idle"},
@@ -414,7 +410,8 @@ def test_protocol_models_tolerate_unknown_fields() -> None:
         ],
     }
     snap = protocol.Snapshot.model_validate(raw)
-    assert snap.messages[0].time_summary == "22m 45s | 8m 57s 11m 48s"
+    assert snap.messages[0].content == "hi"
+    assert not hasattr(snap.messages[0].timing, "summary")
     # Events are equally tolerant.
     event = protocol.Notice.model_validate({"seq": 1, "text": "x", "new": 1})
     assert event.text == "x"
@@ -492,8 +489,8 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
             # the session (before the first message is sent).
             orig_create = client.create_session
 
-            async def create_session(**kwargs):
-                summary = await orig_create(**kwargs)
+            async def create_session(request):
+                summary = await orig_create(request)
                 host.sessions[summary.name].controller._client = FakeClient(
                     [[ContentDelta(text="Hello!"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]]
                 )
@@ -579,9 +576,9 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
         (tmp_path / "elsewhere").mkdir()
-        summary = await host.create_session(
+        summary = await host.create_session(protocol.CreateSessionRequest(
             workspace=str(tmp_path / "ws"), no_init_repo=False,
-        )
+        ))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
@@ -684,7 +681,7 @@ def test_session_listing_uses_meta_not_conversations(tmp_path, monkeypatch) -> N
     async def go():
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
-        await host.create_session(workspace=str(tmp_path / "ws"))
+        await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = next(iter(host.sessions))
         host.sessions[name]._persist()
         await host.unload_session(name)
@@ -727,6 +724,28 @@ def test_create_session_endpoint_uses_request_model(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_config_defaults_endpoint_is_host_owned(tmp_path) -> None:
+    """The client asks the host to persist defaults; it never writes the
+    config file itself."""
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            async with _unix_http(host.unix_socket) as http:
+                response = await http.put(
+                    "/v1/config/defaults", json={"default_profile": "test"},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["default_model"] == "test"
+            saved = json.loads(host.config_path.read_text())
+            assert saved["presets"]["default"]["model"] == "test"
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_idle_session_is_released_and_listed_as_saved(tmp_path) -> None:
     """Send a message, let the turn finish, close the stream: the session
     leaves host.sessions (its sandbox shell released), is not listed as
@@ -742,7 +761,7 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path) -> None:
             snapshot, queue = session.subscribe()  # a client attaches
             await session.execute("x1", SendMessage(text="hi"))
             await asyncio.wait_for(session._turn_task, timeout=5)
-            assert host.summary_for(session).active
+            assert session.summary().active
             # The client closes the stream.
             session.unsubscribe(queue)
             await asyncio.sleep(0.1)  # let the release task run
@@ -777,7 +796,7 @@ def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
     async def go():
         host = make_host(tmp_path)
         (tmp_path / "ws").mkdir()
-        summary = await host.create_session(workspace=str(tmp_path / "ws"))
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
         assert session.git_info is not None
@@ -789,7 +808,7 @@ def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
         loaded = await host.load_session(name)
         assert loaded._pending_drift is None, "drift must not be computed at load"
         assert not loaded.is_active, "host must be able to exit"
-        row = host.summary_for(loaded)
+        row = loaded.summary()
         assert row.state != "waiting" and row.active is False
 
         # A client attaches: NOW the drift is detected and prompted.
@@ -798,3 +817,76 @@ def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
         assert loaded.status().pending_drift is not None
 
     asyncio.run(go())
+
+
+def test_concurrent_load_yields_one_session(tmp_path) -> None:
+    """Two simultaneous loads of the same saved session must share one
+    Session object (no duplicate sandbox / tracking)."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
+        name = summary.name
+        await host.unload_session(name)
+
+        first, second = await asyncio.gather(
+            host.load_session(name), host.load_session(name),
+        )
+        assert first is second
+        assert host.sessions[name] is first
+    asyncio.run(go())
+
+
+def test_unload_closes_sandbox_session(tmp_path) -> None:
+    """Unloading/evicting a session must close its sandbox shell."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
+        session = host.sessions[summary.name]
+
+        class FakeShell:
+            closed = False
+            async def close(self) -> None:
+                self.closed = True
+
+        shell = FakeShell()
+        session.sandbox_session = shell
+        await host.unload_session(summary.name)
+        assert shell.closed
+    asyncio.run(go())
+
+
+def test_loading_a_session_reuses_saved_tracking_without_rescanning(tmp_path) -> None:
+    """Resume must not run setup_tracking (a full workspace snapshot/ignore
+    scan) only to replace the result with the persisted git block."""
+    from unittest import mock
+
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        (tmp_path / "ws" / "file.txt").write_text("hello\n")
+        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
+        name = summary.name
+        await host.unload_session(name)
+
+        with mock.patch.object(
+            host_mod.gitwork, "setup_tracking",
+            side_effect=AssertionError("resume re-ran tracking setup"),
+        ):
+            loaded = await host.load_session(name)
+        assert loaded.git_info is not None
+        assert loaded.git_info.baseline_tree
+    asyncio.run(go())
+
+
+def test_daemon_import_does_not_pull_in_textual() -> None:
+    """Importing the host (the daemon) must not import the TUI stack."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, xarness.host, xarness.themes; "
+        "assert 'textual' not in sys.modules, sorted(sys.modules)"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

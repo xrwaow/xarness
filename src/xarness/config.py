@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import (
-    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator,
     model_validator,
 )
 
@@ -79,7 +79,11 @@ class ProviderProfile(BaseModel):
     model_id: str
     # The key in the config's "models" section; set when parsing.
     name: str | None = None
-    shown_name: str | None = None
+    # User-facing label; accepts the legacy config key ``shown_name``.
+    display_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("display_name", "shown_name"),
+    )
     max_context: int = Field(default=128_000, gt=0)
     cot_strength: CotStrength = CotStrength.MEDIUM
     # Send assistant reasoning back to the model on later rounds.
@@ -109,11 +113,6 @@ class ProviderProfile(BaseModel):
         """Treat null/blank as "no key needed" (local models), not an error."""
         return value if value is None or value.strip() else None
 
-    @property
-    def display_name(self) -> str:
-        """Name shown in the UI, independent of the wire ``model_id``."""
-        return self.shown_name or self.model_id
-
 
 class RefSpec(BaseModel):
     """One ``auto_include_refs`` entry with an explicit mount point.
@@ -126,9 +125,9 @@ class RefSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
-    # Container path of the mount ("" = the container-only refs tmpfs,
+    # Container path of the mount (None = the container-only refs tmpfs,
     # addressed as ``.refs/<alias>`` with the alias derived from the path's
-    # basename).
+    # basename); an empty string is normalized to None.
     mount: str | None = None
     read_only: bool = True
 
@@ -165,8 +164,8 @@ class SandboxSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    allow_network: bool = True
-    gpu_access: bool = True
+    allow_network: bool = False
+    gpu_access: bool = False
     # Off by default; on disables the git guard entirely (the agent manages
     # git itself) — tracking guarantees no longer hold.
     allow_git_write: bool = False
@@ -370,16 +369,13 @@ def save_preferences(
     *,
     default_theme: str | None = None,
     default_profile: str | None = None,
-    auto_compact: bool | None = None,
-    profile: str | None = None,
 ) -> None:
     """Persist UI preferences (chosen theme / profile) into the config file so
     they carry over to the next session.
 
     ``default_profile`` lands where the loader reads it back: as
     ``defaults.preset`` (when a preset already carries that model) or as the
-    default preset's model. ``auto_compact`` is written onto the named model
-    (``profile``, defaulting to the file's default)."""
+    default preset's model."""
     data = _read(path)
     if default_theme is not None:
         data.setdefault("ui", {})["theme"] = default_theme
@@ -395,15 +391,6 @@ def save_preferences(
             defaults["preset"] = matching[0]
         else:
             presets.setdefault(current, {})["model"] = default_profile
-    if auto_compact is not None:
-        target = profile or default_profile
-        if target is None:
-            # Fall back to the default preset's model.
-            sectioned = load_sectioned(path)
-            target = sectioned.default_preset_model()
-        if target is None:
-            raise ConfigError("no model named to write auto_compact onto")
-        data.setdefault("models", {}).setdefault(target, {})["auto_compact"] = auto_compact
     tmp = path.with_suffix(f".json.tmp-{os.getpid()}")
     try:
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -417,10 +404,10 @@ def resolve_api_key(
 ) -> str | None:
     """Read the API key from the env var named by ``api_key_env``.
 
-    ``env`` defaults to this process's environment; a host process resolves
-    keys against the *client's* environment instead (its own is stale — the
-    host is long-lived). The mapping is used only for the lookup and is
-    never persisted or logged."""
+    ``env`` defaults to this process's environment. The daemon resolves keys
+    against its own environment, which it inherits from whichever client
+    spawned it; rotating a key therefore requires a host restart. The
+    mapping is used only for the lookup and is never persisted or logged."""
     if profile.api_key_env is None:
         return None
     source = os.environ if env is None else env

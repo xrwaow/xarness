@@ -31,6 +31,12 @@ MODE_CLAUSE = {
 }
 
 
+TRACKING_CLAUSE = """
+
+Change tracking:
+When the workspace is tracked, text-file edits are captured so /diff and /undo work. NOT tracked: gitignored files, binary/media file types (images, video, audio, archives, fonts, databases, compiled artifacts), and files over 1 MB. Edits to untracked files cannot be shown in /diff or reversed by /undo — treat destructive changes there as irreversible and say so."""
+
+
 def system_prompt_for(
     base: str,
     mode: str,
@@ -52,9 +58,3 @@ def system_prompt_for(
         if tracking:
             prompt += TRACKING_CLAUSE
     return prompt
-
-
-TRACKING_CLAUSE = """
-
-Change tracking:
-When the workspace is tracked, text-file edits are captured so /diff and /undo work. NOT tracked: gitignored files, binary/media file types (images, video, audio, archives, fonts, databases, compiled artifacts), and files over 1 MB. Edits to untracked files cannot be shown in /diff or reversed by /undo — treat destructive changes there as irreversible and say so."""

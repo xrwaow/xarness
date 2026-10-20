@@ -258,17 +258,44 @@ DiffSummary.expanded #diff-body {
     width: 1fr;
 }
 
-#confirm-modal {
-    width: 64;
+/* Shared chrome for every popup: titled surface panel and search field. */
+.modal-panel {
     height: auto;
     background: $c-surface;
     padding: 1 2;
 }
 
-#confirm-title {
-    color: $c-text;
+.modal-title {
+    color: $c-muted;
     text-style: bold;
     margin-bottom: 1;
+}
+
+.modal-input {
+    height: 1;
+    border: none;
+    background: $c-surface;
+    color: $c-text;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+.modal-input > .input--placeholder {
+    color: $c-muted;
+}
+
+/* Textual's Input tints the background 5% $foreground while focused, which
+   renders as a darker box inside the surface modal; kill it. */
+.modal-input:focus {
+    background-tint: transparent;
+}
+
+#confirm-modal {
+    width: 64;
+}
+
+#confirm-title {
+    color: $c-text;
 }
 
 /* The drift summary: a distinct inset block so the "what changed" detail
@@ -322,43 +349,21 @@ DiffSummary.expanded #diff-body {
     color: $c-bg;
 }
 
-ResumeScreen, PickerScreen, ConfirmScreen, RefsScreen {
+ConfirmScreen, RefsScreen, ListPicker {
     align: center middle;
 }
 
 #refs-modal {
     width: 72;
-    height: auto;
     max-height: 24;
-    background: $c-surface;
-    padding: 1 2;
-}
-
-#refs-title {
-    color: $c-muted;
-    text-style: bold;
-    margin-bottom: 1;
 }
 
 #refs-add-label {
     color: $c-muted;
 }
 
-#refs-input {
-    height: 1;
-    border: none;
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-    margin-bottom: 1;
-}
-
-#refs-input > .input--placeholder, #refs-empty, .refs-mount {
+#refs-empty, .refs-mount {
     color: $c-muted;
-}
-
-#refs-input:focus {
-    background-tint: transparent;
 }
 
 #refs-list {
@@ -396,41 +401,12 @@ ResumeScreen, PickerScreen, ConfirmScreen, RefsScreen {
     color: $c-text;
 }
 
-#resume-modal, #picker-modal {
+#picker-modal {
     width: 52;
-    height: auto;
     max-height: 20;
-    background: $c-surface;
-    padding: 1 2;
 }
 
-#resume-title, #picker-title {
-    color: $c-muted;
-    text-style: bold;
-    margin-bottom: 1;
-}
-
-#resume-search {
-    height: 1;
-    border: none;
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-    margin-bottom: 1;
-}
-
-#resume-search > .input--placeholder {
-    color: $c-muted;
-}
-
-/* Textual's Input tints the background 5% $foreground while focused, which
-   renders as a darker box inside the surface modal; kill it (the resume
-   search is focused essentially all the time). */
-#resume-search:focus {
-    background-tint: transparent;
-}
-
-#resume-list, #picker-list {
+#picker-list {
     /* The default height: 1fr collapses to a single visible row inside the
        auto-height modal — one entry at a time, the rest only reachable by
        scrolling. Also: the widgets default to Textual's own dark $surface,
@@ -440,38 +416,20 @@ ResumeScreen, PickerScreen, ConfirmScreen, RefsScreen {
     background: $c-surface;
     border: none;
     padding: 0;
-}
-
-#resume-list, #picker-list {
-    /* Options are NOT DOM widgets (virtual rows) — an "#resume-list > Option"
-       selector never matches and unstyled option text falls back to
-       Textual's own theme color. Style the rows via the list's component
-       classes instead. */
     color: $c-text;
 }
 
-#resume-list > .option-list--option {
+#picker-list > .option-list--option {
     background: $c-surface;
     color: $c-text;
     padding: 0 1;
 }
 
-/* Highlighted rows get a distinct background. (ListView's ListItem -highlight
-   class is a real widget class and still works via the ListItem rules.) */
-#resume-list > .option-list--option-hover,
-#resume-list > .option-list--option-highlighted,
-#picker-list > ListItem.-highlight,
-#picker-list > ListItem.-hovered {
+#picker-list > .option-list--option-hover,
+#picker-list > .option-list--option-highlighted {
     background: $c-border;
     color: $c-text;
     text-style: bold;
-}
-
-#picker-list > ListItem {
-    background: $c-surface;
-    color: $c-text;
-    padding: 0 1;
-    height: auto;
 }
 
 #steer-queue-bar {

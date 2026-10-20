@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -31,45 +33,46 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
 
 from .. import theme
-from ..clientlib import ClientError, XarnessClient
+from ..clientlib import ClientError, XarnessClient, ensure_host
 from ..config import DEFAULT_CONFIG_PATH, save_preferences
-from ..conversation import SUMMARY_PREFIX, Message, normalize_time_summary
-from ..events import ToolCallStatus
 from ..images import ImageAttachment
 from ..protocol import (
     AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
-    DiscardQueued, DriftResolved, Event, FilterAdd, FilterRemove,
+    CreateSessionRequest, DiffChanged, DiscardQueued, DriftDetected,
+    DriftResolved, Event, CompactionDone, RollbackApplied,
+    FilterAdd, FilterRemove,
     FlushQueued, HistoryReplaced,
     Notice, ProcessingStarted, ReasoningDelta, Reject, ResolveDrift,
     Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
     StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
     RefAdd, RefRemove,
-    ToolCallArgumentsDelta, ToolCallArgumentsDone, ToolCallStarted,
-    ToolExecStarted, ToolFinished, ToolOutputDelta, TurnComplete,
-    TurnFinished, Undo, UndoTo, UserMessageAdded,
+    ToolCallStarted, TurnComplete,
+    TurnEnded, TurnFinished, Undo, UndoTo, UserMessageAdded,
 )
 from textual_flowview import Anchor, FlowModel, FlowView
 
 from ..util import format_duration as _format_duration
 from . import flow as tflow
-from .flow import (
-    AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
-    UserItem,
-)
+from .flow import LineItem, PendingItem
+from .transcript import Transcript
 from .confirm_screen import ConfirmScreen
-from .picker_screen import PickerScreen
+from .list_picker import ListPicker, name_options, session_options
 from .refs_screen import RefsScreen
-from .resume_screen import ResumeScreen
 from .diff_summary import DiffSummary
 from .widgets import (
     AskBar, ChatInput, GeneratingBar, StatusBar,
     SteerQueueBar, SuggestionPopup,
 )
 
+# Reconnect backoff for the one recovery loop (seconds).
+RECONNECT_MIN = 0.25
+RECONNECT_MAX = 4.0
+
 INPUT_PLACEHOLDER = (
-    "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode · Ctrl+T: thoughts)"
+    "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode)"
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
+
 
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
@@ -77,241 +80,63 @@ INTERRUPT_ARM_SECONDS = 2.5
 # How long to wait for a cancel command to unwind before exiting anyway.
 CANCEL_TIMEOUT = 2.0
 
-MAX_LIVE_TOOL_OUTPUT = 65_536
-
-# Divider mounted in the chat log at every compaction point (live and on
-# /resume): everything above is history the model no longer sees verbatim.
-COMPACTED_DIVIDER = (
-    "— compacted: the model sees only the summary below; "
-    "messages above are kept here for you —"
-)
+COMMANDS: dict[str, "SlashCommand"] = {}
 
 
-def _item_streaming(item) -> bool:
-    """True while the item is still actively streaming (drives its shimmer
-    repaints). The pending strip lives only while it is relevant — the phase
-    machine removes it the moment content arrives — so it is always
-    "streaming" here."""
-    if isinstance(item, tflow.ThinkingItem):
-        return not item.done
-    if isinstance(item, tflow.ToolItem):
-        return item.status is ToolCallStatus.MAKING_CALL
-    return True
+@dataclass(frozen=True)
+class SlashCommand:
+    """One slash command: the popup, dispatcher and usage errors share it."""
+
+    name: str
+    description: str
+    handler: Callable[["AgentApp", str], None]
+    # Takes an argument: the popup completes the word and lets the user type
+    # it instead of executing immediately (Enter on "filter" used to run the
+    # command with an empty arg).
+    takes_arg: bool = False
 
 
-class _RoundView:
-    """Flow-entry state for one streaming round: thinking block, assistant
-    answer, tool-call blocks. The pending strip is not here — the app's
-    phase machine owns it, so dropping a round view can't orphan it."""
-
-    def __init__(self, app: "AgentApp") -> None:
-        self.app = app
-        self.thinking = None             # Entry[ThinkingItem] | None
-        self.assistant = None            # Entry[AssistantItem] | None
-        self.tool_blocks: dict[str, object] = {}
-        # Set by cancel(): entries created afterwards (a cancelled event still
-        # landing) remove themselves — checked via self.cancelled on creation.
-        self.cancelled = False
-
-    # -- helpers ---------------------------------------------------------
-
-    def _append(self, item):
-        entry = self.app._append_item(item)
-        if self.cancelled:
-            self.app._remove_entry(entry)
-        return entry
-
-    def _reset_round(self) -> None:
-        """A new round of the same turn (the previous one ended with tool
-        calls): the finished thinking block and settled answer belong to the
-        transcript — start fresh entries, or round 2+ CoT and answers stream
-        into finished (collapsed, dropped-text) entries and stay invisible
-        until reload."""
-        self.thinking = None
-        self.assistant = None
-
-    async def handle(self, event: Event) -> None:
-        if isinstance(event, ReasoningDelta):
-            if self.thinking is not None and self.thinking.item.done:
-                self._reset_round()
-            if self.thinking is None:
-                self.app._phase_streaming()
-                self.thinking = self._append(ThinkingItem())
-            item: ThinkingItem = self.thinking.item
-            item.parts.append(event.text)
-            self.thinking.update()
-        elif isinstance(event, ContentDelta):
-            if self.assistant is not None and self.assistant.item.finalized:
-                self._reset_round()
-            if self.assistant is None:
-                self.app._phase_streaming()
-                if self.thinking is not None:
-                    self._finish_thinking(duration=None)
-                self.assistant = self._append(AssistantItem())
-            item: AssistantItem = self.assistant.item
-            item.append_delta(event.text)
-            self.assistant.update()
-        elif isinstance(event, ToolCallStarted):
-            self.app._phase_streaming()
-            if self.thinking is not None:
-                self._finish_thinking(duration=None)
-            # One ToolItem per call, created at once: MAKING_CALL renders the
-            # "Running <tool>" shimmer; streamed args accumulate in it.
-            block = self._append(ToolItem(call_id=event.call_id, name=event.name))
-            self.tool_blocks[event.call_id] = block
-        elif isinstance(event, ToolCallArgumentsDelta):
-            block = self.tool_blocks.get(event.call_id)
-            if block is not None:
-                item: ToolItem = block.item
-                item.args += event.text
-                block.update()
-        elif isinstance(event, ToolCallArgumentsDone):
-            block = self.tool_blocks.get(event.call_id)
-            if block is not None:
-                block.item.args = event.arguments_json
-                block.update()
-        elif isinstance(event, ToolExecStarted):
-            pass  # the block's amber "Running" dot is already showing
-        elif isinstance(event, ToolOutputDelta):
-            entry = self.tool_blocks.get(event.call_id)
-            if entry is not None:
-                item: ToolItem = entry.item
-                if len(item.output) < MAX_LIVE_TOOL_OUTPUT:
-                    room = MAX_LIVE_TOOL_OUTPUT - len(item.output)
-                    item.output += event.text[:room]
-                entry.update()
-        elif isinstance(event, ToolFinished):
-            # The ToolCallStatus mapping lives here (client-side): the
-            # session reports the outcome, the client picks the dot color.
-            if event.parse_error:
-                status = ToolCallStatus.PARSING_ERROR
-            elif event.ok:
-                status = ToolCallStatus.CALL_SUCCEEDED
-            else:
-                status = ToolCallStatus.CALL_FAILED
-            entry = self.tool_blocks.get(event.call_id)
-            if entry is not None:
-                item: ToolItem = entry.item
-                item.status = status
-                item.output = event.output or event.error
-                item.header = event.header
-                entry.update()
-        elif isinstance(event, TurnComplete):
-            await self.app._complete_round(event, self)
-        elif isinstance(event, StreamError):
-            self.app._phase_idle()
-            if self.thinking is not None:
-                # No TurnComplete follows an error: settle the cot here, or
-                # it keeps shimmering next to the error line.
-                self._finish_thinking(duration=None)
-            if self.assistant is not None:
-                # No TurnComplete follows an error: settle the streamed text
-                # here, or it stays in the unselectable live tail.
-                self.assistant.item.finalize()
-                self.assistant.update()
-            self.app._error(event.message)
-            self.app._clear_hint_lines()
-
-    def _finish_thinking(self, duration: float | None) -> None:
-        if self.thinking is None:
-            return
-        item: ThinkingItem = self.thinking.item
-        item.finish(duration)
-        self.thinking.update()
-        self.app._stop_anim(self.thinking)
+def _command(name: str, description: str, handler, takes_arg: bool = False):
+    COMMANDS[name] = SlashCommand(name, description, handler, takes_arg)
 
 
-    async def cancel(self) -> None:
-        """Settle the round's entries for an interrupted turn."""
-        # Flip first: any entry created afterwards (an event whose landing
-        # was cancelled mid-flight) removes itself via _append.
-        self.cancelled = True
-        self.app._phase_idle()
-        if self.thinking is not None and not self.thinking.item.done:
-            self._finish_thinking(duration=None)
-        if self.assistant is not None:
-            # Interrupted rounds never reach TurnComplete/finalize: settle the
-            # partial answer so it's selectable (and matches the /resume replay).
-            self.assistant.item.finalize()
-            self.assistant.update()
-        self.app._clear_hint_lines()
-        for entry in self.tool_blocks.values():
-            if entry.item.status is ToolCallStatus.MAKING_CALL:
-                item: ToolItem = entry.item
-                item.status = ToolCallStatus.CALL_FAILED
-                item.output = item.output or "interrupted"
-                item.header = item.header or ""
-                entry.update()
-
-
-
-COMMANDS = {
-    # name -> (description, handler(app, arg)); `arg` is the text after the
-    # command word ("" when absent). The popup, the dispatcher and the
-    # unknown-command error all read from this one table.
-    "tools": (
-        "list available tools",
-        lambda s, a: s._notice(
-            "tools: " + (", ".join(s.status.tools) if s.status and s.status.tools else "none")
-        ),
-    ),
-    "model": (
-        "choose what model and reasoning effort to use",
-        lambda s, a: s._pick_model(),
-    ),
-    "sessions": (
-        "resume a previous session",
-        lambda s, a: s.call_later(s._open_sessions_async),
-    ),
-    "mode": (
-        "switch between plan (read-only) and write mode",
-        lambda s, a: s._switch_mode(),
-    ),
-    "sandbox": (
-        "choose this session's sandbox profile (idle only)",
-        lambda s, a: s._pick_sandbox(),
-    ),
-    "filter": (
-        "add/remove/list paths excluded from the sandbox mounts",
-        lambda s, a: s._handle_filter_command(a),
-    ),
-    "refs": (
-        "add/remove this workspace's external reference paths",
-        lambda s, a: s._handle_refs_command(a),
-    ),
-    "theme": (
-        "choose a color theme",
-        lambda s, a: s._handle_theme_command(a) if a else s._pick_theme(),
-    ),
-    "new": (
-        "leave this session and start a fresh chat",
-        lambda s, a: s._start_new_session(),
-    ),
-    "delete": (
-        "delete the current session and start a new one (your files are left exactly as they are)",
-        lambda s, a: s.call_later(s._delete_async),
-    ),
-    "diff": (
-        "show pending changes (optionally: /diff <path>)",
-        lambda s, a: s._show_diff_command(a),
-    ),
-    "accept": (
-        "lock in the changes made so far (they stop showing in /diff and can no longer be undone)",
-        lambda s, a: s._post_command(Accept()),
-    ),
-    "reject": (
-        "discard all changes made since the last /accept",
-        lambda s, a: s._post_command(Reject()),
-    ),
-    "undo": (
-        "drop the last turn and revert its file edits",
-        lambda s, a: s.call_later(s._run_undo),
-    ),
-    "retry": (
-        "revert the last turn's file edits and resend your message",
-        lambda s, a: s._post_command(Retry()),
-    ),
-}
+_command("tools", "list available tools",
+         lambda s, a: s._notice(
+             "tools: " + (
+                 ", ".join(s.view_status.tools) if s.view_status.tools else "none"
+             )
+         ))
+_command("model", "choose what model and reasoning effort to use",
+         lambda s, a: s._pick_model())
+_command("sessions", "resume a previous session",
+         lambda s, a: s.call_later(s._open_sessions_async))
+_command("mode", "switch between plan (read-only) and write mode",
+         lambda s, a: s._switch_mode())
+_command("sandbox", "choose this session's sandbox profile (idle only)",
+         lambda s, a: s._pick_sandbox())
+_command("filter", "add/remove/list paths excluded from the sandbox mounts",
+         lambda s, a: s._handle_filter_command(a), takes_arg=True)
+_command("refs", "add/remove this workspace's external reference paths",
+         lambda s, a: s._handle_refs_command(a), takes_arg=True)
+_command("theme", "choose a color theme",
+         lambda s, a: s._handle_theme_command(a) if a else s._pick_theme(),
+         takes_arg=True)
+_command("new", "leave this session and start a fresh chat",
+         lambda s, a: s._start_new_session())
+_command("delete",
+         "delete the current session and start a new one (your files are left exactly as they are)",
+         lambda s, a: s.call_later(s._delete_async))
+_command("diff", "show pending changes (optionally: /diff <path>)",
+         lambda s, a: s._show_diff_command(a), takes_arg=True)
+_command("accept",
+         "lock in the changes made so far (they stop showing in /diff and can no longer be undone)",
+         lambda s, a: s._post_command(Accept()))
+_command("reject", "discard all changes made since the last /accept",
+         lambda s, a: s._post_command(Reject()))
+_command("undo", "drop the last turn and revert its file edits",
+         lambda s, a: s.call_later(s._run_undo))
+_command("retry", "revert the last turn's file edits and resend your message",
+         lambda s, a: s._post_command(Retry()))
 
 
 # Transcript virtualization: the chat log is a textual_flowview.FlowView —
@@ -450,19 +275,14 @@ class AgentApp(App[None]):
         self.startup_notices = startup_notices or []
         # Latest status from the session (drives the bars); a draft has none.
         self.status: StatusPayload | None = None
-        self._view: _RoundView | None = None
-        # Message ids currently rendered in the chat log (see
-        # _mount_user_message / _on_history_replaced: the trim path).
-        self._rendered_ids: set[str] = set()
-        # Seq of the snapshot the chat log was last built from: the attach
-        # flow renders the GET snapshot, and the event stream immediately
-        # delivers the same snapshot again — skip that duplicate.
-        self._rendered_snapshot_seq: int | None = None
-        # The virtualized transcript: every entry (whole history included —
-        # FlowView paints only the visible rows) lives in this model.
+        # The pure reducer owns the transcript data; the FlowModel holds one
+        # widget entry per item. _entries maps id(item) -> entry so live
+        # mutations repaint the right row without a second copy of state.
+        self._transcript = Transcript()
         self._flow_model: "FlowModel" = FlowModel()
+        self._entries: dict[int, object] = {}
+        self._anim: dict[int, object] = {}
         self._presenter = tflow.Presenter()
-        self._last_snapshot: Snapshot | None = None
         # Transient hint lines ("press esc again …"), removed when the
         # assistant's message settles.
         self._hint_entries: list = []
@@ -476,12 +296,15 @@ class AgentApp(App[None]):
         self._interrupt_armed = False
         self._interrupt_timer = None
         self._at_search_timer = None
-        self._diff_timer = None
+        # Commands go through one ordered queue worker: the server lock is
+        # FIFO by arrival, so concurrent HTTP sends could reorder commands.
+        self._command_queue: asyncio.Queue[Command] = asyncio.Queue()
+        self._command_worker: Worker | None = None
         self._config_cache = None
         # Live phase — the single owner of the ephemeral pending strip.
         # pending = a round is waiting on the provider (turn start and every
         # post-tools round); the transitions below are the strip's only
-        # append/remove sites, so a dropped _RoundView can never orphan it.
+        # append/remove sites, so a dropped round can never orphan it.
         self._phase = "idle"
         self._pending_entry = None
         # Draft-chat state (before any session exists): the mode Tab toggles
@@ -565,6 +388,9 @@ class AgentApp(App[None]):
             await self._attach(self.session_name)
 
     async def on_unmount(self) -> None:
+        if self._command_worker is not None:
+            self._command_worker.cancel()
+            self._command_worker = None
         if self.client is not None:
             await self.client.aclose()
 
@@ -572,25 +398,12 @@ class AgentApp(App[None]):
     # Attach + event pump
 
     async def _attach(self, name: str) -> None:
-        """Attach to a hosted session: snapshot first, then live events."""
+        """Attach to a hosted session; the stream's first frame is its
+        snapshot, so there is no separate GET to race with it."""
         if self._pump_worker is not None:
             self._pump_worker.cancel()
             self._pump_worker = None
         self.session_name = name
-        try:
-            snap = await self.client.snapshot(name)
-        except ClientError as exc:
-            self._error(f"could not attach to {name}: {exc}")
-            return
-        self.status = snap.status
-        self._set_vision(snap.status.supports_vision)
-        self._refresh_title()
-        await self._render_history(snap)
-        self._refresh_bars()
-        if snap.status.finished_while_away:
-            self._notice("finished while you were away")
-            self._set_title_state("finished")
-        await self.refresh_diff_summary()
         self._pump_worker = self._pump_events(name)
 
     @work(group="stream", exit_on_error=False)
@@ -604,66 +417,52 @@ class AgentApp(App[None]):
                 if isinstance(item, Snapshot):
                     self.status = item.status
                     self._set_vision(item.status.supports_vision)
-                    # The attach flow already rendered this exact snapshot
-                    # (GET /snapshot); only rebuild when the stream's
-                    # snapshot is newer (reconnect after missed events).
-                    if item.seq != self._rendered_snapshot_seq:
-                        await self._render_history(item)
-                    self._view = None
+                    self._refresh_title()
+                    await self._render_history(item)
+                    self._refresh_bars()
+                    if item.status.finished_while_away:
+                        self._notice("finished while you were away")
+                        self._set_title_state("finished")
+                    await self.refresh_diff_summary()
+                    self._sync_ask()
+                    self._maybe_prompt_drift()
                 else:
                     await self._handle_event(item)
         except asyncio.CancelledError:
             raise
         except (ClientError, httpx.HTTPError) as exc:
-            self._view = None
             self.call_later(self._recover, name, exc)
         except Exception as exc:  # noqa: BLE001 - never crash on connection loss
-            self._view = None
             self.call_later(self._recover, name, exc)
 
     async def _recover(self, name: str, exc: Exception) -> None:
-        """Connection loss: respawn the host if it died, reload the session
-        on the (fresh) host, and reattach. One attempt: a failure is
-        reported and the user reattaches via /sessions."""
+        """Connection loss: the one recovery path. Respawn the host if it
+        died, then reattach; retry with backoff until it succeeds or the user
+        switches/detaches away from this session. The stream endpoint hosts a
+        saved session on demand, so there is no separate ``load_session``
+        round-trip."""
         self._error(f"connection lost: {exc} — reconnecting")
-        try:
-            from ..clientlib import ensure_host
-            await ensure_host()
+        backoff = RECONNECT_MIN
+        while self.session_name == name:
             try:
-                await self.client.load_session(name)
-            except ClientError:
-                pass  # the fresh host may already host it (load is idempotent)
-            await self._attach(name)
-        except ClientError as recover_exc:
-            self._error(
-                f"could not reconnect: {recover_exc} — /sessions to reattach"
-            )
+                await ensure_host()
+                await self._attach(name)
+                return
+            except (ClientError, httpx.HTTPError):
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_MAX)
 
     async def _handle_event(self, event: Event) -> None:
         """Route one live event to the widgets."""
         if isinstance(event, StatusChanged):
-            was_streaming = self.status is not None and self.status.state in (
-                "running", "compacting",
-            )
             self.status = event.status
             self._set_vision(event.status.supports_vision)
             self._refresh_bars()
             self._sync_refs_screen()
+            self._sync_ask()
             # Spawned, not awaited: it is a worker (push_screen_wait needs
             # one) and must not block the event pump on its modal.
             self._maybe_prompt_drift()
-            if was_streaming and self.status.state not in ("running", "compacting"):
-                # The turn ended without a TurnComplete for this client —
-                # an interrupt (esc / stop-and-quit) or a forced steer
-                # cancelling it. Settle the live round, or the Thinking
-                # shimmer (and a half-streamed tool's Running shimmer)
-                # keeps animating next to the "interrupted" error line.
-                if self._view is not None:
-                    await self._view.cancel()
-                    self._view = None
-                self._phase_idle()
-                # Interrupted, not completed: back to the plain workspace title.
-                self._set_default_title()
             return
         if isinstance(event, Notice):
             if event.level == "error":
@@ -674,7 +473,7 @@ class AgentApp(App[None]):
                 self._notice(event.text)
             return
         if isinstance(event, UserMessageAdded):
-            await self._mount_user_message(event)
+            self._sync_entries(self._transcript.apply(event))
             return
         if isinstance(event, HistoryReplaced):
             await self._on_history_replaced(event)
@@ -685,22 +484,41 @@ class AgentApp(App[None]):
         if isinstance(event, AskResolved):
             self._on_ask_resolved(event)
             return
+        if isinstance(event, DiffChanged):
+            await self._show_diff_summary(event.summary)
+            return
+        if isinstance(event, CompactionDone):
+            self._notice(self._compaction_text(event))
+            return
+        if isinstance(event, RollbackApplied):
+            self._notice(self._rollback_text(event))
+            return
+        if isinstance(event, DriftDetected):
+            # The prompt is session state (see _maybe_prompt_drift); the
+            # status carries it. No separate UI action needed.
+            return
         if isinstance(event, DriftResolved):
             self._drift_modal_open = False
+            # The prompt is resolved: drop the pending flag locally too, or
+            # the next StatusChanged would reopen the modal for a drift that
+            # no longer exists.
+            if self.status is not None:
+                self.status.pending_drift = None
+            return
+        if isinstance(event, TurnEnded):
+            # The turn is fully unwound: settle anything still live and stop
+            # the shimmer/status without inferring it from a status change.
+            self._sync_entries(self._transcript.cancel())
+            self._phase_idle()
+            self._clear_hint_lines()
+            if event.outcome == "finished":
+                self._set_title_state("finished")
+            else:
+                self._set_default_title()
             return
         if isinstance(event, TurnFinished):
-            # The per-turn timing line (total | streaming | tools | other);
-            # the session also persists it on the turn's last assistant
-            # message, so a reload renders the identical line there.
-            self._notice(
-                # normalize_time_summary re-renders a stale host's spaced /
-                # legacy-shaped summary in the current compact form.
-                f"Worked for {normalize_time_summary(event.summary)}"
-                if event.summary
-                else f"Worked for {_format_duration(event.elapsed)}"
-            )
+            self._notice(f"Worked for {_format_duration(event.elapsed)}")
             self._set_title_state("finished")
-            self._refresh_diff_summary_soon()
             return
         if isinstance(event, SessionDeleted):
             # The session went away (deleted, or closed by this or another
@@ -710,16 +528,55 @@ class AgentApp(App[None]):
         if isinstance(event, ProcessingStarted):
             # A round opened and is waiting on the provider: the strip goes
             # up (this is the start of a turn AND every post-tools round).
+            self._transcript.start_round()
             self._phase_pending()
             # Clear a stale "finished" suffix as soon as the next turn starts.
             self._set_default_title()
             return
-        # Everything else is a streaming-round event.
-        if self._view is None:
-            self._view = _RoundView(self)
-        await self._view.handle(event)
-        if isinstance(event, ToolFinished):
-            self._refresh_diff_summary_soon()
+        # Everything else is a streaming-round event: the reducer folds it and
+        # reports the items it created or mutated.
+        if isinstance(event, (ReasoningDelta, ContentDelta, ToolCallStarted)):
+            self._phase_streaming()
+        self._sync_entries(self._transcript.apply(event))
+        if isinstance(event, TurnComplete):
+            self._complete_round(event)
+        elif isinstance(event, StreamError):
+            self._phase_idle()
+            self._error(event.message)
+            self._clear_hint_lines()
+
+    @staticmethod
+    def _compaction_text(event: CompactionDone) -> str:
+        """Render a compaction outcome (counts + model summary) as one line."""
+        if not event.before:
+            if event.automatic:
+                return "auto-compacted: nothing to compact yet"
+            return event.summary or "nothing to compact yet"
+        counts = (
+            f"{event.before:,} → {event.after:,} tokens "
+            f"(freed {max(0, event.before - event.after):,})"
+        )
+        prefix = "auto-compacted" if event.automatic else "compacted"
+        return f"{prefix}: {counts}\n{event.summary}"
+
+    @staticmethod
+    def _rollback_text(event: RollbackApplied) -> str:
+        """Render an undo/retry outcome from the typed fields."""
+        if event.compaction_undone:
+            text = "compaction undone: pre-compaction history restored"
+            if event.resend:
+                text += " — nothing to retry (the turn is still in the conversation)"
+            return text
+        note = {
+            "reverted": "file edits reverted",
+            "no_edits": "no file edits to revert",
+            "no_tracking": (
+                "no git tracking for this session — file edits could not be reverted"
+            ),
+        }[event.note]
+        if event.resend:
+            return f"retrying: {event.scope} rolled back ({note})"
+        return f"undone: {event.scope} removed ({note})"
 
     # ------------------------------------------------------------------
     # Commands
@@ -748,13 +605,22 @@ class AgentApp(App[None]):
         return result.payload
 
     def _post_command(self, command: Command) -> None:
-        """Fire-and-forget command send: results are ignored (the effects
-        arrive as events / StatusChanged anyway). Every caller that does not
-        await _send_command must go through this — calling the coroutine
-        bare silently does nothing."""
-        self.run_worker(
-            self._send_command(command), group="post-command", exit_on_error=False,
-        )
+        """Queue a fire-and-forget command: results are ignored (the effects
+        arrive as events / StatusChanged anyway). One worker drains the queue
+        in order, so commands cannot overtake each other at the server."""
+        self._command_queue.put_nowait(command)
+        if self._command_worker is None or self._command_worker.is_finished:
+            self._command_worker = self.run_worker(
+                self._drain_commands(), group="command-queue", exclusive=True,
+            )
+
+    async def _drain_commands(self) -> None:
+        while True:
+            command = await self._command_queue.get()
+            try:
+                await self._send_command(command)
+            finally:
+                self._command_queue.task_done()
 
     # ------------------------------------------------------------------
     # Terminal title
@@ -778,9 +644,7 @@ class AgentApp(App[None]):
 
     def _base_title(self) -> str:
         """`xarness <workdir>` for the attached session, or the local draft."""
-        workspace = self.status.workspace if (
-            self.session_name is not None and self.status is not None
-        ) else None
+        workspace = self.view_status.workspace if self.session_name is not None else None
         path = workspace or str(self.workspace or Path.cwd())
         return f"xarness {self._title_for(path)}"
 
@@ -810,36 +674,7 @@ class AgentApp(App[None]):
         self._refresh_generating()
 
     def _refresh_status(self) -> None:
-        status = self.status
-        if status is None:
-            # Draft chat: the backend tells us what a fresh session starts
-            # with (/config defaults), so show that instead of a dash. A
-            # /model picked before the first message lives in ``self.model``
-            # — reflect it here immediately instead of waiting for the
-            # session that the first message creates.
-            config = self._config_cache
-            target = self.model or (config.default_model if config else None)
-            entry = next(
-                (m for m in (config.models if config else []) if m.get("name") == target),
-                None,
-            )
-            if entry is not None:
-                shown_name = entry.get("display_name") or entry.get("name") or "—"
-                effort = entry.get("cot_strength") or "medium"
-                max_context = entry.get("max_context") or 128_000
-            else:
-                shown_name = (
-                    config.default_model_display_name if config else None
-                ) or "—"
-                effort = "medium"
-                max_context = 128_000
-            self.query_one("#status-bar", StatusBar).update_status(
-                shown_name=shown_name,
-                effort=effort, mode=self._draft_mode,
-                total_in=0, total_out=0, context_used=0, max_context=max_context,
-                workspace=str(self.workspace) if self.workspace else None,
-            )
-            return
+        status = self.view_status
         self.query_one("#status-bar", StatusBar).update_status(
             shown_name=status.model_display_name,
             effort=status.cot_strength,
@@ -849,6 +684,40 @@ class AgentApp(App[None]):
             context_used=status.context_used,
             max_context=status.max_context,
             workspace=status.workspace,
+        )
+
+    @property
+    def view_status(self) -> StatusPayload:
+        """The status the UI shows: the real session status, or — for a draft
+        chat — one synthesized from ``/config`` defaults plus the pre-session
+        model/mode choices. Never ``None``, so view code has no fake-status
+        branch and ``session_name``/``supports_vision`` need not be mirrored."""
+        if self.status is not None:
+            return self.status
+        config = self._config_cache
+        target = self.model or (config.default_model if config else None)
+        entry = next(
+            (m for m in (config.models if config else []) if m.get("name") == target),
+            None,
+        )
+        if entry is not None:
+            shown_name = entry.get("display_name") or entry.get("name") or "—"
+            effort = entry.get("cot_strength") or "medium"
+            max_context = entry.get("max_context") or 128_000
+        else:
+            shown_name = (
+                config.default_model_display_name if config else None
+            ) or "—"
+            effort = "medium"
+            max_context = 128_000
+        return StatusPayload(
+            state="idle",
+            mode=self._draft_mode,
+            model_name=target or "",
+            model_display_name=shown_name,
+            cot_strength=effort,
+            max_context=max_context,
+            workspace=str(self.workspace) if self.workspace else None,
         )
 
     @work(group="draft-status", exit_on_error=False)
@@ -895,7 +764,7 @@ class AgentApp(App[None]):
             bar = self.query_one("#generating-bar", GeneratingBar)
         except NoMatches:
             return
-        state = self.status.state if self.status else "idle"
+        state = self.view_status.state
         if state in ("running", "compacting"):
             bar.add_class("active")
         else:
@@ -909,32 +778,29 @@ class AgentApp(App[None]):
             bar = self.query_one("#steer-queue-bar", SteerQueueBar)
         except NoMatches:
             return  # app shutting down
-        queued = self.status.queued if self.status else []
+        queued = self.view_status.queued
         bar.update_items([q.text for q in queued])
 
-    def _refresh_diff_summary_soon(self) -> None:
-        """Recompute the pending-changes bar, coalescing bursts of events."""
-        if self._diff_timer is not None:
-            self._diff_timer.stop()
-        self._diff_timer = self.set_timer(
-            0.05, lambda: self.call_later(self.refresh_diff_summary)
-        )
-
     async def refresh_diff_summary(self) -> None:
-        """Recompute the pending-changes bar (hidden when empty or gitless)."""
-        try:
-            widget = self.query_one("#diff-summary", DiffSummary)
-        except NoMatches:
-            return  # app shutting down; DOM already pruned
+        """Recompute the pending-changes bar (hidden when empty or gitless).
+        Live updates normally arrive as ``DiffChanged``; this is the attach/
+        history-replaced path."""
         if self.session_name is None:
-            await widget.clear()
+            await self._show_diff_summary(None)
             return
         try:
             info = await self.client.diff(self.session_name)
         except ClientError:
-            await widget.clear()  # tracking broken (e.g. repo gone): stay quiet
-            return
-        if not info.files:
+            info = None  # tracking broken (e.g. repo gone): stay quiet
+        await self._show_diff_summary(info)
+
+    async def _show_diff_summary(self, info) -> None:
+        """Render one DiffInfo (or clear when empty/None)."""
+        try:
+            widget = self.query_one("#diff-summary", DiffSummary)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
+        if info is None or not info.files:
             await widget.clear()
         else:
             await widget.set_summary(info)
@@ -976,7 +842,7 @@ class AgentApp(App[None]):
         if self.session_name is not None:
             return True
         try:
-            summary = await self.client.create_session(
+            summary = await self.client.create_session(CreateSessionRequest(
                 workspace=str(self.workspace) if self.workspace else None,
                 model=self.model,
                 sandbox=self.sandbox_name,
@@ -985,7 +851,7 @@ class AgentApp(App[None]):
                 gpu=self.gpu,
                 no_init_repo=self.no_init_repo,
                 no_session=self.no_session,
-            )
+            ))
         except ClientError as exc:
             self._error(f"could not start a session: {exc}")
             return False
@@ -1007,22 +873,22 @@ class AgentApp(App[None]):
         # the first message.
         if self.session_name is None and not await self._ensure_session():
             return
-        # Pasted/dragged images ride along as base64 attachments; @path
-        # tokens in the text are resolved server-side. SendMessage and
-        # UserMessageAdded carry the same ImageAttachment shape the input
+        # Pasted/dragged images ride along as base64 attachments; SendMessage
+        # and UserMessageAdded carry the same ImageAttachment shape the input
         # produced, so they pass through unchanged.
         await self._send_command(SendMessage(text=text, images=images or None))
 
     # ------------------------------------------------------------------
     # Ask tool (event-driven)
 
-    @work(group="ask")
+    @work(group="ask", exclusive=True)
     async def _ask_flow(self, ask_id: str, questions: list[str]) -> None:
         """Show the questions one at a time in the AskBar; the user answers
         through the normal chat input (Enter submits, Esc skips all). The
         collected answers go back as one ``answer_ask`` command — any client
         may answer; first answer wins."""
         self._set_title_state("ask")
+        self._ask_id = ask_id
         ask_bar = self.query_one("#ask-bar", AskBar)
         chat_input = self.query_one("#chat-input", ChatInput)
         answers: list[str] = []
@@ -1035,7 +901,6 @@ class AgentApp(App[None]):
                     asyncio.get_running_loop().create_future()
                 )
                 self._ask_future = future
-                self._ask_id = ask_id
                 answer = await future
                 if answer is None:  # esc: skip the remaining questions
                     await self._send_command(AnswerAsk(ask_id=ask_id, answers=None))
@@ -1054,10 +919,27 @@ class AgentApp(App[None]):
         Cancelling the worker unwinds the awaited future into its finally
         block, which hides the ask bar and restores the input."""
         if self._ask_id is not None and self._ask_id == event.ask_id:
-            self._ask_id = None
-            if self._ask_worker is not None:
-                self._ask_worker.cancel()
-                self._ask_worker = None
+            self._close_ask()
+
+    def _close_ask(self) -> None:
+        self._ask_id = None
+        if self._ask_worker is not None:
+            self._ask_worker.cancel()
+            self._ask_worker = None
+
+    def _sync_ask(self) -> None:
+        """Reconcile the local ask prompt with the session's ``pending_ask``
+        state: open it on attach (or when a status update reveals it) and
+        close it when the session no longer has one. This keeps
+        ``AskResolved`` from being the only way a stale prompt closes."""
+        pending = self.view_status.pending_ask
+        if pending is None:
+            if self._ask_id is not None:
+                self._close_ask()
+            return
+        if self._ask_id == pending.ask_id:
+            return
+        self._ask_worker = self._ask_flow(pending.ask_id, pending.questions)
 
     # ------------------------------------------------------------------
     # Drift prompt (session state; any client may resolve)
@@ -1080,7 +962,7 @@ class AgentApp(App[None]):
         ):
             return
         self._drift_modal_open = True
-        detail = self.status.pending_drift.detail
+        detail = self._drift_detail(self.status.pending_drift)
         choice = await self.push_screen_wait(ConfirmScreen(
             "Workspace changed outside this session since it was last open:",
             detail=detail,
@@ -1094,6 +976,24 @@ class AgentApp(App[None]):
             return  # dismissed: leave the prompt pending
         await self._send_command(ResolveDrift(accept=bool(choice)))
 
+    @staticmethod
+    def _drift_detail(pending) -> str:
+        """Render the structured drift state for the confirmation modal."""
+        files = pending.files or []
+        if files:
+            shown = ", ".join(files[:8])
+            if len(files) > 8:
+                shown += f" (+{len(files) - 8} more)"
+        else:
+            shown = "(paths unavailable)"
+        return (
+            "the workspace changed while this session was closed "
+            f"(last known tree {pending.last_known[:7]}, now "
+            f"{pending.current[:7]})\n\n{shown}\n\n"
+            "accept to make the workspace the new baseline, or keep "
+            "tracking against the last known state"
+        )
+
     # ------------------------------------------------------------------
     # Slash commands
 
@@ -1105,7 +1005,7 @@ class AgentApp(App[None]):
         if entry is None:
             self._error(f"unknown command: /{cmd}")
             return
-        entry[1](self, arg)
+        entry.handler(self, arg)
 
     def _switch_mode(self) -> None:
         """Toggle plan/write mode; shared by /mode and the Tab shortcut.
@@ -1115,7 +1015,7 @@ class AgentApp(App[None]):
             self._draft_mode = "plan" if self._draft_mode == "write" else "write"
             self._refresh_status()
             return
-        current = self.status.mode if self.status else "write"
+        current = self.view_status.mode
         new_mode = "plan" if current == "write" else "write"
         self._post_command(SetMode(mode=new_mode))
 
@@ -1144,23 +1044,8 @@ class AgentApp(App[None]):
         """In-transcript clicks: expand/collapse tool calls and thinking
         blocks, arm/trigger the user message's undo affordance."""
         entry, item = event.entry, event.entry.item
-        if isinstance(item, ToolItem):
-            item.expanded = not item.expanded
+        if item.handle_click(self):
             entry.update()
-        elif isinstance(item, ThinkingItem):
-            # Toggleable at any time — mid-stream too (the user can collapse
-            # the live CoT and reopen it; finish() re-collapses at round end).
-            item.expanded = not item.expanded
-            entry.update()
-        elif isinstance(item, UserItem) and item.message is not None:
-            if item.undo_armed:
-                # The click landed anywhere on the armed message: undo to it.
-                item.undo_armed = False
-                entry.update()
-                self.call_later(self._run_undo_to, item.message.id)
-            else:
-                item.undo_armed = True
-                entry.update()
 
     def _start_new_session(self) -> None:
         """Slash /new: leave the current session (it keeps running in the
@@ -1178,8 +1063,6 @@ class AgentApp(App[None]):
             self._pump_worker = None
         self.session_name = None
         self.status = None
-        self._view = None
-        self._last_snapshot = None
         self._refresh_title()
         self._flow_model.clear()
         self._hint_entries = []
@@ -1206,9 +1089,12 @@ class AgentApp(App[None]):
         if not entries:
             return
         self.push_screen(
-            ResumeScreen(
-                entries,
-                workspace=str(self.workspace) if self.workspace else None,
+            ListPicker(
+                session_options(
+                    entries,
+                    str(self.workspace) if self.workspace else None,
+                ),
+                title="Open session", filterable=True,
             ),
             self._on_session_selected,
         )
@@ -1218,11 +1104,9 @@ class AgentApp(App[None]):
             return
         if name == self.session_name:
             return
+        # No explicit load: the stream endpoint hosts a saved session on
+        # demand, and the first frame is its snapshot.
         with self._reporting(f"could not open {name}: "):
-            active = {s.name: s for s in await self.client.sessions()}
-            summary = active.get(name)
-            if summary is None or not summary.active:
-                await self.client.load_session(name)
             await self._attach(name)
 
     async def _pick(
@@ -1233,7 +1117,7 @@ class AgentApp(App[None]):
         Awaited only from within a worker: push_screen_wait requires an
         active worker context."""
         return await self.push_screen_wait(
-            PickerScreen(names, current=current, title=title)
+            ListPicker(name_options(names, current), title=title)
         )
 
     @work(group="picker", exclusive=True)
@@ -1244,12 +1128,7 @@ class AgentApp(App[None]):
             return
         name = await self._pick(
             [m["name"] for m in self._config_cache.models],
-            current=(
-                self.status.model_name if self.status
-                else self.model or (
-                    self._config_cache.default_model if self._config_cache else None
-                )
-            ),
+            current=self.view_status.model_name or None,
             title="Switch model",
         )
         if not name:
@@ -1262,9 +1141,13 @@ class AgentApp(App[None]):
             self.model = name
             self._sync_vision_from_config(name)
             self._refresh_status()
+            # No session yet: the host still owns the config file.
+            try:
+                await self.client.set_default_profile(name)
+            except ClientError as exc:
+                self._error(f"could not save default model: {exc}")
         else:
-            self._post_command(SwitchModel(name=name))
-        self._save_preference(default_profile=name)
+            self._post_command(SwitchModel(name=name, persist_default=True))
         # The choice is now the config's default for the next session, so
         # keep the cached config in step: a later /new (which drops back to
         # a draft) read its status from here.
@@ -1287,7 +1170,7 @@ class AgentApp(App[None]):
             return
         name = await self._pick(
             [s["name"] for s in self._config_cache.sandboxes],
-            current=self.status.sandbox_name if self.status else None,
+            current=self.view_status.sandbox_name,
             title="Sandbox profile (applies when the session is idle)",
         )
         if name:
@@ -1302,7 +1185,7 @@ class AgentApp(App[None]):
         elif action == "remove" and path:
             self._post_command(FilterRemove(path=path))
         elif action == "list":
-            filters = self.status.filter_list if self.status else []
+            filters = self.view_status.filter_list
             if filters:
                 self._notice(
                     "filtered out of the sandbox mounts: " + ", ".join(filters)
@@ -1326,16 +1209,20 @@ class AgentApp(App[None]):
         """Open the manager; a draft gets its session started first."""
         if not await self._ensure_session():
             return
-        self.push_screen(RefsScreen(
-            list(self.status.refs) if self.status else [],
-            lambda path: self._ref_update(True, path),
-            lambda path: self._ref_update(False, path),
-        ))
+        self.push_screen(RefsScreen(list(self.view_status.refs)))
+
+    def on_refs_screen_add_ref(self, event: RefsScreen.AddRef) -> None:
+        self._ref_update(True, event.path)
+
+    def on_refs_screen_remove_ref(self, event: RefsScreen.RemoveRef) -> None:
+        self._ref_update(False, event.path)
 
     def _sync_refs_screen(self) -> None:
         """Keep an open RefsScreen in step with the session's status."""
         if isinstance(self.screen, RefsScreen):
-            self.screen.set_refs(self.status.refs if self.status else [])
+            self.screen.post_message(
+                RefsScreen.RefsChanged(list(self.view_status.refs))
+            )
 
     @work(group="refs", exit_on_error=False)
     async def _ref_update(self, add: bool, path: str) -> None:
@@ -1343,12 +1230,9 @@ class AgentApp(App[None]):
             return
         command = RefAdd(path=path) if add else RefRemove(path=path)
         try:
-            result = await self.client.command(self.session_name, command)
+            await self.client.command(self.session_name, command)
         except ClientError as exc:
             self._error(str(exc))
-            return
-        if not result.ok:
-            self._error(result.error or "could not update references")
 
     # ------------------------------------------------------------------
     # Theme (client-side preference)
@@ -1369,26 +1253,14 @@ class AgentApp(App[None]):
         self._apply_theme(arg)
         self._save_preference(default_theme=arg)
 
-    def _save_preference(
-        self,
-        *,
-        default_theme: str | None = None,
-        default_profile: str | None = None,
-        auto_compact: bool | None = None,
-        profile: str | None = None,
-    ) -> None:
-        """Write a chosen theme/model/auto-compact setting back to the config
-        file so it becomes the default for the next session. Failures are
-        reported, never fatal."""
+    def _save_preference(self, *, default_theme: str) -> None:
+        """Write the client-side theme choice to the config file.
+        Failures are reported, never fatal."""
         if self.config_path is None:
             return
         try:
             save_preferences(
-                self.config_path,
-                default_theme=default_theme,
-                default_profile=default_profile,
-                auto_compact=auto_compact,
-                profile=profile,
+                self.config_path, default_theme=default_theme,
             )
         except Exception as exc:  # noqa: BLE001 - preference save is best-effort
             self._notice(f"note: could not save preference: {exc}")
@@ -1440,11 +1312,41 @@ class AgentApp(App[None]):
         """Append one transcript item to the FlowModel, registering shimmer
         repaints for the items that have one."""
         entry = self._flow_model.append(item)
-        if isinstance(item, PendingItem) or (
-            isinstance(item, (ThinkingItem, ToolItem)) and _item_streaming(item)
-        ):
+        if item.streaming():
             self._start_anim(entry, item)
         return entry
+
+    def _register_item(self, item):
+        entry = self._append_item(item)
+        self._entries[id(item)] = entry
+        return entry
+
+    def _register_items(self, items) -> None:
+        """Register a whole rendered history in one FlowModel operation.
+
+        Appending one item at a time makes FlowView rebuild its entry index
+        on every insert — O(n²) on a long session. ``extend`` sends a single
+        insert-many notification, so loading a large transcript stays O(n)."""
+        items = list(items)
+        if not items:
+            return
+        entries = self._flow_model.extend(items)
+        for item, entry in zip(items, entries):
+            self._entries[id(item)] = entry
+            if item.streaming():
+                self._start_anim(entry, item)
+
+    def _sync_entries(self, items) -> None:
+        """Create entries for new items; repaint the rest (and stop their
+        shimmer once they settle)."""
+        for item in items:
+            entry = self._entries.get(id(item))
+            if entry is None:
+                self._register_item(item)
+            else:
+                if not item.streaming():
+                    self._stop_anim(entry)
+                entry.update()
 
     def _remove_entry(self, entry) -> None:
         self._stop_anim(entry)
@@ -1461,7 +1363,7 @@ class AgentApp(App[None]):
             return  # app shutting down / not mounted yet
 
         def tick(e) -> None:
-            if not _item_streaming(item):
+            if not item.streaming():
                 # Completed (or settled by some path that missed its stop):
                 # kill the animation here, like the interrupt path does — a
                 # leaked tick must never keep a finished cot/tool shimmering.
@@ -1470,15 +1372,14 @@ class AgentApp(App[None]):
                 return
             e.update()
 
-        item._anim = view.animate_entry(entry, 0.08, tick)  # type: ignore[attr-defined]
+        self._anim[id(entry)] = view.animate_entry(entry, 0.08, tick)
 
     def _stop_anim(self, entry) -> None:
-        handle = getattr(entry.item, "_anim", None)
+        handle = self._anim.pop(id(entry), None)
         if handle is not None:
             handle.stop()
-            entry.item._anim = None  # type: ignore[attr-defined]
 
-    def _line(self, text: str, kind: str = "notice", hint: bool = False) -> None:
+    def _line(self, text: str, kind: str = "info", hint: bool = False) -> None:
         """Append a one-line status message (notice/warn/error/hint) to the
         transcript. Whether it is in view is FlowView's business: it follows
         the tail only if the user is already at the bottom."""
@@ -1501,15 +1402,12 @@ class AgentApp(App[None]):
             self._remove_entry(entry)
         self._hint_entries = []
 
-    async def _complete_round(self, event: TurnComplete, view: "_RoundView") -> None:
+    def _complete_round(self, event: TurnComplete) -> None:
         self._clear_hint_lines()
-        if view.assistant is not None:
-            view.assistant.item.finalize()
-            view.assistant.update()
-        elif view.thinking is None and not event.has_tool_calls:
+        if (self._transcript.assistant is None
+                and self._transcript.thinking is None
+                and not event.has_tool_calls):
             self._error("empty response from model")
-        if view.thinking is not None:
-            view._finish_thinking(event.reasoning_seconds)
         if event.has_tool_calls:
             # The turn continues with another round: back to waiting on the
             # provider — the strip reappears below the settled tool blocks.
@@ -1522,136 +1420,34 @@ class AgentApp(App[None]):
         """The conversation was rewritten (undo, retry, accept, compaction,
         drift accept): re-render from the new snapshot. A data-only rebuild
         is cheap under FlowView, so there is no incremental trim path."""
-        self._view = None
-        new_ids = {m.id for m in event.snapshot.messages if m.id}
-        if self._rendered_ids == new_ids:
-            # Nothing added or removed (e.g. /accept, which only moves the
-            # baseline): the rendered transcript is already correct — don't
-            # rebuild, just the parts that depend on git state.
-            self._refresh_status()
-            self.call_later(self.refresh_diff_summary)
-            return
-        self._rendered_ids = new_ids
+        # The snapshot also carries the fresh status (a drift resolve clears
+        # pending_drift there); adopt it so local prompts/bars don't keep
+        # showing state the host already moved past.
+        self.status = event.snapshot.status
+        self._refresh_bars()
         await self._render_history(event.snapshot)
         self._refresh_status()
         self.call_later(self.refresh_diff_summary)
 
     async def _render_history(self, snap: Snapshot) -> None:
-        """Rebuild the transcript from a snapshot.
+        """Rebuild the transcript from a snapshot via the pure reducer.
 
-        Best-effort reconstruction: tool-call status is inferred from whether
-        the recorded tool-role content starts with "error: ", since the
-        original ToolCallStatus enum value isn't itself persisted.
-
-        If the conversation was compacted, the pre-compaction messages come
-        first (they are history, kept for the human), then a divider, then
-        the summary and everything after it — mirroring what the model
-        actually sees. The current turn's buffered events are fed through a
-        fresh _RoundView, so a mid-turn attach rebuilds the thinking block,
-        partial answer and running tool entries.
-
-        The FULL history goes into the model: FlowView paints only the
-        visible rows, so a 1k+-message session costs the same as a fresh one."""
-        self._view = None
-        self._last_snapshot = snap
-        self._rendered_snapshot_seq = snap.seq
-        self._rendered_ids = {m.id for m in snap.messages if m.id}
+        Tool-call status is rebuilt from the persisted ``ok`` flag on each
+        tool result, so a reload shows the same success/failure state. A
+        compacted conversation keeps the pre-compaction messages, then a
+        divider, then the summary — mirroring what the model sees. The
+        snapshot's ``partial_round`` renders the in-flight round, so a
+        mid-turn attach needs no event replay."""
         self._flow_model.clear()
         self._hint_entries = []
-        messages = snap.messages
-        pre_compact = snap.compact_snapshot
-        all_messages = [*pre_compact, *messages]
-        tool_results = {
-            m.tool_call_id: m for m in all_messages
-            if m.role == "tool" and m.tool_call_id
-        }
-        for message in pre_compact:
-            self._append_message_items(message, tool_results)
-        if pre_compact:
-            self._flow_model.append(DividerItem(COMPACTED_DIVIDER))
-        for message in messages:
-            self._append_message_items(message, tool_results)
-        # Mid-turn attach: rebuild the live round from the buffered events.
-        for tevent in snap.turn_events:
-            await self._handle_event(tevent)
+        self._entries = {}
+        self._anim = {}
+        self._presenter.reset()
+        self._register_items(self._transcript.load(snap))
         try:
             self._flow_view().scroll_to_bottom(animate=False)
         except NoMatches:
             pass
-
-    def _append_message_items(
-        self, message: Message, tool_results: dict[str, Message],
-    ) -> None:
-        """Append the transcript items for one persisted message."""
-        if message.role == "user":
-            if message.content.startswith(SUMMARY_PREFIX):
-                # The handoff an auto-compaction left behind: a distinct
-                # divider, not a plain user message.
-                self._flow_model.append(DividerItem(
-                    message.content.removeprefix(SUMMARY_PREFIX).strip(),
-                ))
-            else:
-                self._flow_model.append(UserItem.from_message(message))
-        elif message.role == "assistant":
-            if message.reasoning:
-                # Settled: a replayed block is never running.
-                thinking = ThinkingItem(
-                    parts=[message.reasoning], done=True,
-                    duration=message.reasoning_duration,
-                    expanded=False,
-                )
-                self._flow_model.append(thinking)
-            # Tool-call-only rounds render no answer body; an empty assistant
-            # message with no tool calls replays as "(no output)" — except a
-            # reasoning-only partial (saved on cancel): its thinking block is
-            # the whole message.
-            if message.content or (not message.tool_calls and not message.reasoning):
-                item = AssistantItem(finalized=True)
-                item.chunks = [message.content] if message.content else ["(no output)"]
-                self._flow_model.append(item)
-            for call in message.tool_calls or []:
-                item = ToolItem(
-                    call_id=call.call_id, name=call.name,
-                    args=call.arguments_json,
-                )
-                result = tool_results.get(call.call_id)
-                if result is not None:
-                    is_error = result.content.startswith("error: ")
-                    item.status = (
-                        ToolCallStatus.CALL_FAILED if is_error
-                        else ToolCallStatus.CALL_SUCCEEDED
-                    )
-                    item.output = result.content[len("error: "):] if is_error else result.content
-                    item.header = result.header or ""
-                else:
-                    # The call never produced a result: the turn was
-                    # interrupted mid-execution and the session was saved.
-                    # It can never complete now — render it as failed instead
-                    # of an eternally shimmering "Running …".
-                    item.status = ToolCallStatus.CALL_FAILED
-                    item.output = "interrupted"
-                self._flow_model.append(item)
-            if message.time_summary:
-                # normalize_time_summary upgrades the legacy three-number
-                # 'total | streaming tools other' line saved by older
-                # versions to the current 'total | running idle' shape.
-                self._flow_model.append(LineItem(
-                    text=f"Worked for {normalize_time_summary(message.time_summary)}",
-                    kind="notice",
-                ))
-
-    async def _mount_user_message(self, event: UserMessageAdded) -> None:
-        """Land a user message in the transcript (sent or steered)."""
-        message = Message(
-            role="user", content=event.text, id=event.message_id or "",
-            images=event.images or [],
-        )
-        self._flow_model.append(UserItem.from_message(message))
-        # Track the rendered id: HistoryReplaced compares these against the
-        # new history to decide between rebuild and no-op.
-        if event.message_id:
-            self._rendered_ids.add(event.message_id)
-
 
     # ------------------------------------------------------------------
     # Popups (@ search runs server-side against the session's workspace)
@@ -1667,7 +1463,7 @@ class AgentApp(App[None]):
         matches = [
             (
                 name,
-                f"/{name:<{width}}  [dim]{COMMANDS[name][0]}[/]",
+                f"/{name:<{width}}  [dim]{COMMANDS[name].description}[/]",
             )
             for name in COMMANDS
             if name.startswith(q)
@@ -1729,6 +1525,12 @@ class AgentApp(App[None]):
         if value is None:
             return
         if was_slash:
+            command = COMMANDS.get(value)
+            if command is not None and command.takes_arg:
+                # Complete the word and let the user type the argument
+                # instead of running with an empty one.
+                chat_input.load_text(f"/{value} ")
+                return
             chat_input.load_text("")
             self._handle_slash_command(f"/{value}")
         else:
@@ -1750,7 +1552,7 @@ class AgentApp(App[None]):
 
     def action_steer_discard(self) -> None:
         """ctrl+shift+backspace: discard the oldest queued steer message."""
-        if self.status is None or not self.status.queued:
+        if not self.view_status.queued:
             return
         self._post_command(DiscardQueued())
 
@@ -1759,7 +1561,8 @@ class AgentApp(App[None]):
 
         Cancels the running turn; the session starts the queued message
         immediately instead of waiting for the next round boundary."""
-        if self.status and self.status.queued and self.status.state == "running":
+        status = self.view_status
+        if status.queued and status.state == "running":
             self._post_command(FlushQueued())
 
     # ------------------------------------------------------------------
@@ -1788,8 +1591,8 @@ class AgentApp(App[None]):
         if self._copy_selection():
             return
         self._disarm_interrupt()
-        state = self.status.state if self.status else "idle"
-        has_pending_ask = bool(self.status and self.status.pending_ask)
+        state = self.view_status.state
+        has_pending_ask = bool(self.view_status.pending_ask)
         busy = self.session_name is not None and (
             state in ("running", "compacting") or has_pending_ask
         )
@@ -1907,7 +1710,7 @@ class AgentApp(App[None]):
                     return
                 widget.add_class("expanded")
                 return
-            text = await self._diff_text(arg)
+            text = (await self.client.diff(self.session_name, path=arg)).text or ""
             if not text.strip():
                 self._notice(f"no pending changes for {arg}")
                 return
@@ -1918,13 +1721,6 @@ class AgentApp(App[None]):
         except ClientError as exc:
             widget.hide_diff()
             self._error(f"/diff failed: {exc}")
-
-    async def _diff_text(self, path: str) -> str:
-        """One file's unified diff (the summary endpoint gives per-file
-        stats; the text comes from the same API's diff endpoint, which
-        populates ``text`` for path-specific requests)."""
-        info = await self.client.diff(self.session_name, path=path)
-        return info.text or ""
 
     async def on_diff_summary_diff_requested(self, event: DiffSummary.DiffRequested) -> None:
         if self.session_name is None:
@@ -1937,7 +1733,8 @@ class AgentApp(App[None]):
             widget.minimize_diff()
             return
         try:
-            text = await self._diff_text(event.key or "")
+            text = (await self.client.diff(
+                self.session_name, path=event.key)).text or ""
         except ClientError as exc:
             widget.hide_diff()
             self._error(f"diff failed: {exc}")

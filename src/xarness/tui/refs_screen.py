@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
@@ -17,21 +18,42 @@ from ..protocol import RefInfo
 
 
 class RefsScreen(ModalScreen[None]):
-    """Add/remove reference paths for the current workspace."""
+    """Add/remove reference paths for the current workspace.
+
+    The screen is passive: it posts :class:`AddRef` / :class:`RemoveRef` and
+    the app owns the command round-trip. Fresh rows arrive as a
+    :class:`RefsChanged` message (the app never reaches into the widget).
+    """
 
     BINDINGS = [("escape", "dismiss_none", "Done")]
 
-    def __init__(self, refs: list[RefInfo], add_ref, remove_ref) -> None:
+    class AddRef(Message):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    class RemoveRef(Message):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    class RefsChanged(Message):
+        def __init__(self, refs: list[RefInfo]) -> None:
+            self.refs = refs
+            super().__init__()
+
+    def __init__(self, refs: list[RefInfo]) -> None:
         super().__init__()
         self._refs = list(refs)
-        self._add_ref = add_ref
-        self._remove_ref = remove_ref
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="refs-modal"):
-            yield Label("references", id="refs-title")
+        with Vertical(id="refs-modal", classes="modal-panel"):
+            yield Label("references", id="refs-title", classes="modal-title")
             yield Label("add path:", id="refs-add-label")
-            yield Input(placeholder="file or directory", id="refs-input")
+            yield Input(
+                placeholder="file or directory", id="refs-input",
+                classes="modal-input",
+            )
             yield Vertical(id="refs-list")
 
     async def on_mount(self) -> None:
@@ -57,15 +79,15 @@ class RefsScreen(ModalScreen[None]):
             for i, ref in enumerate(self._refs)
         )
 
-    def set_refs(self, refs: list[RefInfo]) -> None:
-        self._refs = list(refs)
+    def on_refs_screen_refs_changed(self, event: RefsChanged) -> None:
+        self._refs = list(event.refs)
         if self.is_mounted:
             self.run_worker(self._render_refs(), group="refs-render", exclusive=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if path := event.value.strip():
             event.input.value = ""
-            self._add_ref(path)
+            self.post_message(self.AddRef(path))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -77,7 +99,7 @@ class RefsScreen(ModalScreen[None]):
         except ValueError:
             return
         if 0 <= index < len(self._refs):
-            self._remove_ref(self._refs[index].path)
+            self.post_message(self.RemoveRef(self._refs[index].path))
             self.query_one("#refs-input", Input).focus()
 
     def action_dismiss_none(self) -> None:

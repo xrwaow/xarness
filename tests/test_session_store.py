@@ -3,7 +3,7 @@
 import asyncio
 
 from xarness import session_store
-from xarness.conversation import Conversation, Message, ToolCall
+from xarness.conversation import Conversation, Message, Timing, ToolCall
 from xarness.events import ContentDelta, TurnComplete, Usage
 from xarness.controller import ChatController
 from xarness.config import CotStrength, ProviderProfile
@@ -17,33 +17,33 @@ PROFILE = ProviderProfile(
 
 
 def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:
-    """usage / checkpoint_sha / after_tree / undo_snapshot survive save +
-    load, and stay out of the wire format."""
+    """usage / turn checkpoints survive save + load, and stay out of the
+    wire format."""
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
 
     conversation = Conversation()
-    user = Message(role="user", content="hi", checkpoint_sha="abc123", after_tree="def456")
+    user = Message(role="user", content="hi")
     assistant = Message(
         role="assistant", content="hello", reasoning="thoughts", usage=Usage(input_tokens=12, output_tokens=3)
     )
     conversation.add(user)
     conversation.add(assistant)
-    conversation.turn_start = 0
+    conversation.begin_turn(user, "abc123")
+    conversation.turns[-1].after_tree = "def456"
     session_store.save_state("s", session_store.SessionState(conversation, "m"))
 
     loaded = session_store.load_state("s").conversation
     assert [m.role for m in loaded.messages] == ["user", "assistant"]
-    assert loaded.messages[0].checkpoint_sha == "abc123"
-    assert loaded.messages[0].after_tree == "def456"
     assert loaded.messages[1].usage == Usage(input_tokens=12, output_tokens=3)
     assert loaded.messages[1].reasoning == "thoughts"
-    assert loaded.turn_start == 0
-    assert loaded.messages[loaded.turn_start].checkpoint_sha == "abc123"
-    assert loaded.messages[loaded.turn_start].after_tree == "def456"
+    turn = loaded.turns[0]
+    assert turn.user_message_id == loaded.messages[0].id
+    assert turn.before_tree == "abc123"
+    assert turn.after_tree == "def456"
 
     # Local-only fields never reach the wire.
     assert all(
-        "usage" not in m and "checkpoint_sha" not in m and "after_tree" not in m
+        "usage" not in m and "checkpoint" not in m
         for m in loaded.to_wire()
     )
 
@@ -103,7 +103,7 @@ def test_to_wire_drops_unpaired_tool_calls() -> None:
     assert [m["role"] for m in wire] == ["user", "assistant", "tool", "tool"]
     assert [c["id"] for c in wire[1]["tool_calls"]] == ["call_1", "call_2"]
     assert wire[3]["tool_call_id"] == "call_2"
-    assert wire[3]["content"] == "error: interrupted"
+    assert wire[3]["content"] == "interrupted"
 
     # Text plus both calls survive; the synthetic result keeps the round valid.
     wire = make_conversation(
@@ -168,7 +168,7 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
 
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path / "sessions")
     conversation = Conversation()
-    conversation.add(Message(role="user", content="q", send_time="2026-01-01T00:00:00+00:00"))
+    conversation.add(Message(role="user", content="q", timing=Timing(send="2026-01-01T00:00:00+00:00")))
     conversation.add(Message(role="assistant", content="a"))
     store.save_state("s", store.SessionState(
         conversation, profile="p", workspace="/w", git={"session_id": "s"},
@@ -197,6 +197,123 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
 
 
 
+def _write_fixture(tmp_path, name: str, payload: dict) -> None:
+    import json
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_saved_files_carry_a_schema_version(tmp_path, monkeypatch) -> None:
+    import json
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    conversation = Conversation()
+    conversation.add(Message(role="user", content="hi"))
+    session_store.save_state("s", session_store.SessionState(conversation))
+    data = json.loads((tmp_path / "s.json").read_text())
+    assert data["schema"] == session_store.SCHEMA_VERSION
+
+
+def test_legacy_checkpoint_fields_migrate_to_turns(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _write_fixture(tmp_path, "old", {
+        "workspace": "/w",
+        "messages": [
+            {"role": "system", "content": "old prompt"},
+            {"role": "user", "content": "hi", "id": "u1",
+             "checkpoint_sha": "before", "after_tree": "after"},
+            {"role": "assistant", "content": "hello"},
+        ],
+    })
+    loaded = session_store.load_state("old")
+    assert [m.role for m in loaded.conversation.messages] == ["user", "assistant"]
+    assert loaded.conversation.turns[0].user_message_id == "u1"
+    assert loaded.conversation.turns[0].before_tree == "before"
+    assert loaded.conversation.turns[0].after_tree == "after"
+
+
+def test_legacy_compact_snapshot_migrates_to_epochs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _write_fixture(tmp_path, "old", {
+        "messages": [
+            {"role": "user", "content": "summary", "kind": "summary"},
+            {"role": "assistant", "content": "after"},
+        ],
+        "compact_snapshot": [
+            {"role": "user", "content": "pre", "id": "u0",
+             "checkpoint_sha": "tree0"},
+            {"role": "assistant", "content": "old answer"},
+        ],
+    })
+    loaded = session_store.load_state("old").conversation
+    assert loaded.epoch == 1
+    assert [m.content for m in loaded.messages] == [
+        "pre", "old answer", "summary", "after",
+    ]
+    assert [m.epoch for m in loaded.messages] == [0, 0, 1, 1]
+    assert loaded.turns[0].before_tree == "tree0"
+    assert [m.content for m in loaded.visible_messages()] == ["summary", "after"]
+
+
+def test_legacy_tool_error_prefix_migrates_to_ok(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _write_fixture(tmp_path, "old", {
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "tool", "tool_call_id": "c1",
+             "content": "error: boom"},
+        ],
+    })
+    tool = session_store.load_state("old").conversation.messages[1]
+    assert tool.content == "boom"
+    assert tool.ok is False
+
+
+def test_tool_calls_persist_in_internal_shape(tmp_path, monkeypatch) -> None:
+    import json
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    conversation = Conversation()
+    conversation.add(Message(
+        role="assistant", content="",
+        tool_calls=[ToolCall(call_id="c1", name="run_bash", arguments_json="{}")],
+    ))
+    session_store.save_state("s", session_store.SessionState(conversation))
+    raw = json.loads((tmp_path / "s.json").read_text())
+    assert raw["messages"][0]["tool_calls"] == [
+        {"call_id": "c1", "name": "run_bash", "arguments_json": "{}"},
+    ]
+
+
+def test_legacy_wire_tool_calls_migrate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _write_fixture(tmp_path, "old", {
+        "messages": [{
+            "role": "assistant", "content": "",
+            "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "run_bash", "arguments": "{}"},
+            }],
+        }],
+    })
+    call = session_store.load_state("old").conversation.messages[0].tool_calls[0]
+    assert call.call_id == "c1"
+    assert call.name == "run_bash"
+    assert call.arguments_json == "{}"
+
+
+def test_newer_schema_is_rejected(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _write_fixture(tmp_path, "future", {
+        "schema": session_store.SCHEMA_VERSION + 1,
+        "messages": [],
+    })
+    with pytest.raises(ValueError, match="newer than supported"):
+        session_store.load_state("future")
+
+
 def test_meta_sidecar_written_and_removed(tmp_path, monkeypatch) -> None:
     """save_state writes a meta sidecar so listing lookups never read the
     full session file; deleting the session removes both files."""
@@ -204,7 +321,7 @@ def test_meta_sidecar_written_and_removed(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
     conversation = Conversation()
-    conversation.add(Message(role="user", content="q", send_time="2026-01-01T00:00:00+00:00"))
+    conversation.add(Message(role="user", content="q", timing=Timing(send="2026-01-01T00:00:00+00:00")))
     session_store.save_state("s", session_store.SessionState(conversation, "m", workspace="/w"))
 
     sidecar = tmp_path / "s.meta.json"

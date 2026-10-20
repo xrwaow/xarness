@@ -1,6 +1,7 @@
 """Tests for the controller: event enrichment and conversation state."""
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -20,6 +21,7 @@ from xarness.events import (
     Usage,
 )
 from xarness.gitwork import TurnCheckpoint
+from xarness.conversation import build_parts
 from xarness.images import ImageAttachment
 from xarness.tools import ToolResult, build_registry
 
@@ -71,16 +73,15 @@ def test_turn_builds_conversation_and_wire_messages() -> None:
 
     events = asyncio.run(collect(controller, "Hi there"))
 
-    assert events[0] == ProcessingStarted()
+    assert isinstance(events[0], ProcessingStarted)
     assert isinstance(events[-1], TurnComplete)
     assert events[-1].usage == Usage(input_tokens=12, output_tokens=3)
-    assert events[-1].reasoning_seconds is not None  # reasoning was present
-
     # Conversation holds user + assistant, with reasoning stored locally.
     assert [m.role for m in controller.conversation.messages] == ["user", "assistant"]
     assistant = controller.conversation.messages[1]
     assert assistant.content == "Hello world"
     assert assistant.reasoning == "let me think"
+    assert assistant.timing.reasoning_seconds is not None
 
     # Wire messages sent to the client: user message only (first request).
     assert client.received_wire[0] == [{"role": "user", "content": "Hi there"}]
@@ -222,12 +223,14 @@ def test_compact_replaces_history_with_summary() -> None:
     summary = asyncio.run(controller.compact())
 
     assert summary == "summary text"
-    # Everything except the first message was folded into a summary user message.
-    assert [m.role for m in controller.conversation.messages] == ["user", "user"]
-    assert "summary text" in controller.conversation.messages[1].content
-    # The summarizer round saw the rendered transcript (the first message is
-    # kept verbatim, so only the rest is summarized), with no tools attached.
+    # The whole visible history folds into one summary message.
+    visible = controller.conversation.visible_messages()
+    assert [m.role for m in visible] == ["user"]
+    assert visible[0].kind == "summary"
+    assert "summary text" in visible[0].content
+    # The summarizer round saw the rendered transcript, with no tools attached.
     summarizer_prompt = client.received_wire[-1][0]["content"]
+    assert "first question" in summarizer_prompt
     assert "second question" in summarizer_prompt
     assert "assistant: one" in summarizer_prompt
     # The summarizer round ran without tools.
@@ -269,24 +272,22 @@ def test_send_snapshots_conversation_for_undo() -> None:
     controller = ChatController(PROFILE, "key", client=client)
     asyncio.run(collect(controller, "hello"))
 
-    # Snapshot taken when the turn began: just the user message.
-    assert controller.conversation.turn_start == 0
+    # A Turn owns the checkpoint taken when the turn began.
+    turn = controller.conversation.turns[0]
+    assert turn.user_message_id == controller.conversation.messages[0].id
+    assert turn.before_tree is None  # no git
+    assert turn.after_tree is None
     assert controller.conversation.messages[0].content == "hello"
-    assert controller.conversation.messages[0].checkpoint_sha is None  # no git
 
 
 def test_compact_with_no_history_is_a_no_op() -> None:
-    """Compacting a fresh conversation changes nothing — in particular it
-    must not touch the compact snapshot or suppress a tool result."""
+    """Compacting a fresh conversation changes nothing."""
     client = FakeClient([ContentDelta(text="summary text"), TurnComplete()])
     controller = ChatController(PROFILE, "key", client=client)
-    controller.conversation.add(Message(role="system", content="system prompt"))
 
     assert asyncio.run(controller.compact()) == "nothing to compact yet"
-    assert controller.conversation.compact_snapshot is None
-    assert [(m.role, m.content) for m in controller.conversation.messages] == [
-        ("system", "system prompt")
-    ]
+    assert controller.conversation.messages == []
+    assert controller.conversation.epoch == 0
     assert controller.last_compaction is None
 
 
@@ -300,11 +301,11 @@ def test_compact_reports_token_counts_and_folds_summarizer_usage() -> None:
 
     assert summary == "summary text"
     before, after = controller.last_compaction
-    assert before == 40 and after == 7
+    assert before == 43 and after == 7
     # The summarization round's own spend is part of the session total.
     assert controller.usage_total == Usage(input_tokens=105, output_tokens=47)
     # The summary message carries the summarizer's usage (for /undo).
-    assert controller.conversation.messages[1].usage == Usage(input_tokens=100, output_tokens=7)
+    assert controller.conversation.visible_messages()[0].usage == Usage(input_tokens=100, output_tokens=7)
 
 
 def test_undo_across_compaction_after_later_turn() -> None:
@@ -326,29 +327,26 @@ def test_undo_across_compaction_after_later_turn() -> None:
     asyncio.run(collect(controller, "third"))
     client.script = [ContentDelta(text="fourth answer"), TurnComplete(usage=Usage(input_tokens=7, output_tokens=2))]
     asyncio.run(collect(controller, "fourth"))
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "user", "assistant", "user", "assistant",
+    assert [m.role for m in controller.conversation.visible_messages()] == [
+        "user", "user", "assistant", "user", "assistant",
     ]
 
     # First /undo: removes turn 4, back to the end of turn 3 (post-compaction).
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "fourth"
-    assert not plan.clears_compaction
+    assert not plan.compaction_only
     controller.apply_rollback(plan)
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user", "user", "assistant",
+    assert [m.role for m in controller.conversation.visible_messages()] == [
+        "user", "user", "assistant",
     ]
-    assert controller.conversation.compact_snapshot is not None
+    assert controller.conversation.epoch == 1
 
     # Second /undo: removes turn 3 — the first turn after the compaction.
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "third"
     assert not plan.compaction_only
     controller.apply_rollback(plan)
-    assert [m.role for m in controller.conversation.messages] == [
-        "user", "user",
-    ]
-    assert controller.conversation.compact_snapshot is not None
+    assert [m.role for m in controller.conversation.visible_messages()] == ["user"]
 
     # Third /undo: undoes the compaction itself — the full pre-compaction
     # history comes back, turns 1 and 2 still intact.
@@ -357,22 +355,21 @@ def test_undo_across_compaction_after_later_turn() -> None:
     assert plan.user_text == ""
     assert plan.revert_turns == []  # compaction only: no files reverted
     controller.apply_rollback(plan)
-    assert [m.role for m in controller.conversation.messages] == [
+    assert [m.role for m in controller.conversation.visible_messages()] == [
         "user", "assistant", "user", "assistant",
     ]
     assert controller.conversation.messages[2].content == "second"
-    assert controller.conversation.compact_snapshot is None
+    assert controller.conversation.epoch == 0
     # Totals are monotonic: everything ever spent (turns 1-2, the
     # summarizer, turns 3-4) stays counted.
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
-    assert controller.conversation.turn_start is None
 
     # Fourth /undo: removes turn 2 normally.
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "second"
     assert not plan.compaction_only
     controller.apply_rollback(plan)
-    assert [m.content for m in controller.conversation.messages] == ["first", "one"]
+    assert [m.content for m in controller.conversation.visible_messages()] == ["first", "one"]
     assert controller.conversation.messages[1].role == "assistant"
     # Totals unchanged: nothing new was spent, and undo never subtracts.
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
@@ -381,7 +378,7 @@ def test_undo_across_compaction_after_later_turn() -> None:
     plan = controller.rollback_plan()
     assert plan is not None and plan.user_text == "first"
     controller.apply_rollback(plan)
-    assert controller.conversation.messages == []
+    assert controller.conversation.visible_messages() == []
     # Totals are monotonic: everything ever spent stays counted.
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
 
@@ -408,9 +405,10 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
 
     session_store.save_state("s", session_store.SessionState(controller.conversation, "test-model"))
     resumed_conversation = session_store.load_state("s").conversation
-    assert resumed_conversation.compact_snapshot is not None
+    assert resumed_conversation.epoch == 1
     assert any(
-        m.content.startswith(SUMMARY_PREFIX) for m in resumed_conversation.messages
+        m.content.startswith(SUMMARY_PREFIX)
+        for m in resumed_conversation.visible_messages()
     )
 
     controller2 = ChatController(PROFILE, "key", client=client)
@@ -423,18 +421,17 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     # history restored, turns 1 and 2 intact.
     plan = controller2.rollback_plan()
     assert plan is not None and plan.compaction_only
-    assert plan.clears_compaction
     controller2.apply_rollback(plan)
-    assert [m.role for m in controller2.conversation.messages] == [
+    assert [m.role for m in controller2.conversation.visible_messages()] == [
         "user", "assistant", "user", "assistant",
     ]
     assert controller2.conversation.messages[2].content == "second"
-    assert controller2.conversation.compact_snapshot is None
+    assert controller2.conversation.epoch == 0
     # Third /undo removes turn 2 normally.
     plan = controller2.rollback_plan()
     assert plan is not None and plan.user_text == "second"
     controller2.apply_rollback(plan)
-    assert [m.role for m in controller2.conversation.messages] == ["user", "assistant"]
+    assert [m.role for m in controller2.conversation.visible_messages()] == ["user", "assistant"]
     assert controller2.conversation.messages[1].content == "one"
 
 
@@ -466,9 +463,9 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     controller.conversation.add(Message(role="user", content="old"))
     controller.conversation.add(Message(role="assistant", content="a", usage=Usage(input_tokens=5, output_tokens=3)))
-    controller.conversation.add(
-        Message(role="user", content="last", checkpoint_sha="abc123", after_tree="def456")
-    )
+    last = controller.conversation.add(Message(role="user", content="last"))
+    controller.conversation.begin_turn(last, "abc123")
+    controller.conversation.turns[-1].after_tree = "def456"
     controller.conversation.add(Message(role="assistant", content="b", usage=Usage(input_tokens=9, output_tokens=4)))
     controller.usage_total = Usage(input_tokens=14, output_tokens=7)
 
@@ -477,7 +474,7 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     assert plan.user_text == "last"
     assert plan.revert_turns == [TurnCheckpoint("abc123", "def456")]
     controller.apply_rollback(plan)
-    assert [m.content for m in controller.conversation.messages] == ["old", "a"]
+    assert [m.content for m in controller.conversation.visible_messages()] == ["old", "a"]
     # Totals are monotonic: the undone turn's spend stays counted.
     assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
 
@@ -579,7 +576,8 @@ async def _drain(stream: AsyncIterator[Any]) -> list[Any]:
 
 def _image(name: str = "cat.png") -> ImageAttachment:
     return ImageAttachment(
-        name=name, mime="image/png", data_b64=name.encode().hex(),
+        name=name, mime="image/png",
+        data_b64=base64.b64encode(name.encode()).decode(),
         width=1, height=1,
     )
 
@@ -587,16 +585,20 @@ def _image(name: str = "cat.png") -> ImageAttachment:
 def test_rollback_plan_keeps_images() -> None:
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     image = _image()
-    controller.conversation.add(Message(role="user", content="look", images=[image]))
+    controller.conversation.add(Message(
+        role="user", content="look", parts=build_parts("look", [image]),
+    ))
     controller.conversation.add(Message(role="assistant", content="ok"))
     plan = controller.rollback_plan()
-    assert plan is not None and plan.images == [image]
+    assert plan is not None and plan.images == [image.to_ref()]
 
 
 def test_image_token_maps_by_text_not_ordinal() -> None:
     msg = Message(
         role="user", content="[🖼 stale 1×1] mid [🖼 cat.png 1×1] end",
-        images=[_image()],
+        parts=build_parts(
+            "[🖼 stale 1×1] mid [🖼 cat.png 1×1] end", [_image()],
+        ),
     )
     parts = msg.to_wire()["content"]
     image_at = next(i for i, p in enumerate(parts) if p["type"] == "image_url")

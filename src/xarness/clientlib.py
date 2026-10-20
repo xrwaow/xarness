@@ -8,7 +8,6 @@ later web client.
 Typical use::
 
     client = await XarnessClient.connect_unix()      # auto-starts the host
-    snapshot = await client.snapshot("my-session")
     async for item in client.attach("my-session"):   # Snapshot, then Events
         ...
 """
@@ -39,11 +38,6 @@ async def ensure_host(timeout: float = 5.0) -> None:
     nobody was attached."""
     from .host import connect_or_spawn
     await asyncio.to_thread(connect_or_spawn, timeout=timeout)
-
-
-# Reconnect backoff for the SSE reader (seconds).
-RECONNECT_MIN = 0.25
-RECONNECT_MAX = 4.0
 
 
 class ClientError(Exception):
@@ -141,6 +135,12 @@ class XarnessClient:
     async def config(self) -> protocol.ConfigInfo:
         return protocol.ConfigInfo.model_validate(await self._get("/v1/config"))
 
+    async def set_default_profile(self, name: str) -> protocol.ConfigInfo:
+        """Ask the host to persist the default model for future sessions."""
+        return protocol.ConfigInfo.model_validate(
+            await self._put("/v1/config/defaults", {"default_profile": name})
+        )
+
     async def search_files(self, workspace: str, q: str) -> list[str]:
         return list(await self._get(
             "/v1/workspaces/files", params={"workspace": workspace, "q": q},
@@ -163,32 +163,18 @@ class XarnessClient:
         ]
 
     async def create_session(
-        self,
-        *,
-        workspace: str | None = None,
-        model: str | None = None,
-        sandbox: str | None = None,
-        preset: str | None = None,
-        network: bool | None = None,
-        gpu: bool | None = None,
-        no_init_repo: bool = False,
-        no_session: bool = False,
-        first_message: str | None = None,
+        self, request: protocol.CreateSessionRequest,
     ) -> SessionSummary:
-        body = protocol.CreateSessionRequest(
-            workspace=workspace, model=model, sandbox=sandbox, preset=preset,
-            network=network, gpu=gpu, no_init_repo=no_init_repo,
-            no_session=no_session, first_message=first_message,
-        ).model_dump(exclude_none=True)
-        return SessionSummary.model_validate(await self._post("/v1/sessions", body))
+        return SessionSummary.model_validate(
+            await self._post(
+                "/v1/sessions", request.model_dump(exclude_none=True),
+            )
+        )
 
     async def load_session(self, name: str) -> SessionSummary:
         return SessionSummary.model_validate(
             await self._post(f"/v1/sessions/{name}/load", {})
         )
-
-    async def snapshot(self, name: str) -> Snapshot:
-        return Snapshot.model_validate(await self._get(f"/v1/sessions/{name}"))
 
     async def diff(self, name: str, path: str | None = None) -> protocol.DiffInfo:
         params = {"path": path} if path else None
@@ -227,22 +213,14 @@ class XarnessClient:
     # attach: SSE with reconnect
 
     async def attach(self, name: str) -> AsyncIterator[Snapshot | Event]:
-        """Yield a Snapshot, then live Events, reconnecting automatically.
+        """Yield a Snapshot, then live Events from one stream connection.
 
-        On a dropped connection the reader retries with backoff; every
-        reconnect starts from a fresh Snapshot. Transport errors retry
-        forever; API errors (unknown session) raise :class:`ClientError`."""
-        backoff = RECONNECT_MIN
-        while True:
-            try:
-                async for item in self._stream_once(name):
-                    backoff = RECONNECT_MIN
-                    yield item
-                # Server closed the stream cleanly (e.g. session deleted).
-                return
-            except httpx.HTTPError:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, RECONNECT_MAX)
+        Every attach starts from a fresh Snapshot. Transport and API errors
+        propagate to the caller, which owns reconnection (and can respawn the
+        host): keeping one recovery layer avoids two loops racing to
+        reattach."""
+        async for item in self._stream_once(name):
+            yield item
 
     async def _stream_once(self, name: str) -> AsyncIterator[Snapshot | Event]:
         headers = {"Accept": "text/event-stream"}
@@ -279,6 +257,9 @@ class XarnessClient:
 
     async def _post(self, path: str, body: dict[str, Any]) -> Any:
         return self._json(await _wrap_http(self._request("POST", path, json=body)))
+
+    async def _put(self, path: str, body: dict[str, Any]) -> Any:
+        return self._json(await _wrap_http(self._request("PUT", path, json=body)))
 
     @staticmethod
     def _json(response: httpx.Response) -> Any:

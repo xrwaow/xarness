@@ -846,15 +846,19 @@ class ContainerExecTest(unittest.TestCase):
 
     def test_ro_mounts_readable_and_git_reads_work(self):
         config = self.session_config(git_dir=self.workspace / ".git")
-        (r,) = self.run_session(
+        results = self.run_session(
             SandboxSession(config),
             "cat /etc/resolv.conf >/dev/null && ls /etc/ssl >/dev/null "
             "&& echo ETC_OK",
             "cat /workspace/.gitignore",
             "git status --porcelain; git log --oneline | head -1",
         )
-        self.assertEqual(r.exit_code, 0, r.stdout)
-        self.assertIn("ETC_OK", r.stdout)
+        for result in results:
+            self.assertEqual(result.exit_code, 0, result.stdout)
+        output = "".join(result.stdout for result in results)
+        self.assertIn("ETC_OK", output)
+        self.assertIn("*.log", output)
+        self.assertIn("init", output)
 
     def test_git_index_not_mutated(self):
         import subprocess
@@ -894,7 +898,7 @@ class ContainerExecTest(unittest.TestCase):
 
     def test_env_and_identity_inside_container(self):
         config = self.session_config()
-        (r,) = self.run_session(
+        results = self.run_session(
             SandboxSession(config),
             'test "$HOME" = /tmp && echo HOME_OK',
             '[ "$(hostname)" = sandbox ] && echo HOST_OK',
@@ -905,17 +909,19 @@ class ContainerExecTest(unittest.TestCase):
             "&& echo DNS_OK",
             "ls / | grep -q '^home$' && echo HAS_HOME || echo NO_HOME",
         )
-        self.assertEqual(r.exit_code, 0, r.stdout)
+        for result in results:
+            self.assertEqual(result.exit_code, 0, result.stdout)
+        output = "".join(result.stdout for result in results)
         for marker in ("HOME_OK", "HOST_OK", "USER_OK", "IDENT_OK",
                        "DNS_OK", "NO_HOME"):
-            self.assertIn(marker, r.stdout)
+            self.assertIn(marker, output)
 
     # 4. caches
 
     def test_cache_layout(self):
         config = self.session_config()
         expected = hashlib.sha1(str(self.workspace).encode()).hexdigest()[:12]
-        (r,) = self.run_session(
+        results = self.run_session(
             SandboxSession(config),
             'case "$UV_CACHE_DIR" in /cache/*) echo UV_OK;; esac',
             "echo x > /cache/uv/xarness-probe && rm /cache/uv/xarness-probe "
@@ -926,10 +932,12 @@ class ContainerExecTest(unittest.TestCase):
             f'case "$UV_PROJECT_ENVIRONMENT" in /cache/venvs/{expected}) '
             f'echo VENV_OK;; esac',
         )
-        self.assertEqual(r.exit_code, 0, r.stdout)
+        for result in results:
+            self.assertEqual(result.exit_code, 0, result.stdout)
+        output = "".join(result.stdout for result in results)
         for marker in ("UV_OK", "UVW_OK", "VENV_OK"):
-            self.assertIn(marker, r.stdout)
-        self.assertTrue(any(m in r.stdout for m in
+            self.assertIn(marker, output)
+        self.assertTrue(any(m in output for m in
                             ("PYRO_OK", "PYRO_ABSENT", "PYRW_BAD")))
 
     # 5. persistence + filter restart
@@ -948,17 +956,27 @@ class ContainerExecTest(unittest.TestCase):
     def test_filter_change_restarts_shell_and_hides_path(self):
         config = self.session_config()
         session = SandboxSession(config)
-        (first,) = self.run_session(session, "echo hello")
-        self.assertEqual(first.exit_code, 0)
-        pid_before = session._proc.pid
-        config.filter_list = ["filtered.txt"]
-        (second,) = self.run_session(
-            session,
-            "if [ -e /workspace/filtered.txt ]; then echo VISIBLE; "
-            "else echo HIDDEN; fi")
+
+        async def drive():
+            try:
+                first = await session.run("echo hello")
+                self.assertEqual(first.exit_code, 0)
+                pid_before = session._proc.pid
+                config.filter_list = ["filtered.txt"]
+                # A file filter shadows the path with an empty read-only
+                # placeholder (bwrap cannot remove an existing mountpoint),
+                # so the file exists but has no content.
+                second = await session.run(
+                    "if [ -s /workspace/filtered.txt ]; then echo VISIBLE; "
+                    "else echo HIDDEN; fi")
+                return pid_before, session._proc.pid, second
+            finally:
+                await session.close()
+
+        pid_before, pid_after, second = asyncio.run(drive())
         self.assertEqual(second.exit_code, 0)
         # The shell was restarted (new pid) and the path is hidden.
-        self.assertNotEqual(session._proc.pid, pid_before)
+        self.assertNotEqual(pid_after, pid_before)
         self.assertIn("HIDDEN", second.stdout)
         self.assertNotIn("VISIBLE", second.stdout)
 
@@ -967,22 +985,30 @@ class ContainerExecTest(unittest.TestCase):
     def test_plan_mode_flip_restarts_and_enforces(self):
         config = self.session_config()
         session = SandboxSession(config)
-        (write_ok,) = self.run_session(
-            session, "echo a > /workspace/plan.txt && echo WROTE_OK")
+
+        async def drive():
+            try:
+                write_ok = await session.run(
+                    "echo a > /workspace/plan.txt && echo WROTE_OK")
+                pid_before = session._proc.pid
+                config.read_only = True
+                ro = await session.run(
+                    "echo b > /workspace/plan2.txt 2>/dev/null && echo RW_BAD "
+                    "|| echo RO_OK; cat /workspace/plan.txt")
+                pid_after = session._proc.pid
+                config.read_only = False
+                rw = await session.run(
+                    "echo c > /workspace/plan3.txt && echo WROTE2_OK")
+                return write_ok, ro, pid_before, pid_after, rw
+            finally:
+                await session.close()
+
+        write_ok, ro, pid_before, pid_after, rw = asyncio.run(drive())
         self.assertIn("WROTE_OK", write_ok.stdout)
-        pid_before = session._proc.pid
-        config.read_only = True
-        (ro,) = self.run_session(
-            session,
-            "echo b > /workspace/plan2.txt 2>/dev/null && echo RW_BAD "
-            "|| echo RO_OK; cat /workspace/plan.txt")
-        self.assertNotEqual(session._proc.pid, pid_before)  # restart on flip
+        self.assertNotEqual(pid_after, pid_before)  # restart on flip
         self.assertIn("RO_OK", ro.stdout)
         self.assertNotIn("RW_BAD", ro.stdout)
         self.assertIn("a", ro.stdout)  # reads still work
-        config.read_only = False
-        (rw,) = self.run_session(
-            session, "echo c > /workspace/plan3.txt && echo WROTE2_OK")
         self.assertIn("WROTE2_OK", rw.stdout)
 
     # 7. default_timeout used when no per-command timeout is given

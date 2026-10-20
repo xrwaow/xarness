@@ -11,10 +11,12 @@ session opened in the same directory shares it.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,7 +25,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .conversation import Conversation, Message
+from .conversation import Conversation, Message, ToolCall, Turn, build_parts
+from .images import ImageAttachment, ImageRef
+from .protocol import SessionSummary
 from .util import utcnow_iso as _utcnow_iso
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
@@ -76,6 +80,73 @@ def session_path(name: str) -> Path:
     return SESSIONS_DIR / f"{_validate_session_name(name)}.json"
 
 
+def session_dir(name: str) -> Path:
+    """Per-session directory holding image blobs."""
+    return SESSIONS_DIR / _validate_session_name(name)
+
+
+def _blob_path(name: str, image_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", image_id or ""):
+        raise ValueError(f"invalid image id: {image_id!r}")
+    return session_dir(name) / "blobs" / image_id
+
+
+class SessionImageStore:
+    """Content-addressed image bytes for one session.
+
+    ``persist=False`` (a ``no_session`` conversation) keeps the blobs in
+    memory: images still work for the provider, nothing touches disk."""
+
+    def __init__(self, name: str, persist: bool = True) -> None:
+        self.name = name
+        self.persist = persist
+        self._memory: dict[str, bytes] = {}
+
+    def save(self, attachment: ImageAttachment) -> ImageRef:
+        ref = attachment.to_ref()
+        data = attachment.data()
+        if self.persist:
+            path = _blob_path(self.name, ref.id)
+            if not path.exists():
+                path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, path)
+        else:
+            self._memory[ref.id] = data
+        return ref
+
+    def load(self, image_id: str) -> bytes | None:
+        if not self.persist:
+            return self._memory.get(image_id)
+        try:
+            return _blob_path(self.name, image_id).read_bytes()
+        except (OSError, ValueError):
+            return None
+
+    def attachment(self, ref: ImageRef) -> ImageAttachment | None:
+        data = self.load(ref.id)
+        if data is None:
+            return None
+        return ImageAttachment(
+            name=ref.name, mime=ref.mime,
+            data_b64=base64.b64encode(data).decode("ascii"),
+            width=ref.width, height=ref.height,
+        )
+
+
+def load_blob(name: str, image_id: str) -> bytes | None:
+    """Read one stored image blob (saved sessions included)."""
+    try:
+        return _blob_path(name, image_id).read_bytes()
+    except (OSError, ValueError):
+        return None
+
+
 def meta_path(name: str) -> Path:
     """Sidecar holding the small meta block, so listing / last-used lookups
     never parse (or even read) the full session file with its base64
@@ -110,28 +181,220 @@ class SessionState:
     last_in: int = 0
     last_out: int = 0
     mode: str | None = None
+    # Message id the last auto-compaction fired on (loop guard).
+    compacted_on: str | None = None
 
 
-def _message_from(raw: dict) -> Message:
-    # model_validate handles nested Usage/ToolCall/ImageAttachment models
+# Persisted-payload schema. Bump when a migration is added to MIGRATIONS.
+SCHEMA_VERSION = 3
+
+_TIMING_FIELDS = (
+    ("send_time", "send"), ("start_time", "start"), ("end_time", "end"),
+)
+
+
+def _migrate_message(
+    raw: dict, store: SessionImageStore | None = None,
+) -> dict:
+    """Normalize one persisted message to the current shape.
+
+    Idempotent: current-shape messages pass through unchanged. Legacy inline
+    ``images`` become ordered parts (and blobs when a store is given); tool
+    errors stored as an ``"error: "`` content prefix gain the explicit
+    ``ok=False`` field and lose the prefix.
+    """
+    raw = dict(raw)
+    timing = dict(raw.get("timing") or {})
+    # The old preformatted timing line is derived client-side now.
+    timing.pop("summary", None)
+    raw.pop("time_summary", None)
+    for old, new in _TIMING_FIELDS:
+        if old in raw:
+            value = raw.pop(old)
+            if value is not None:
+                timing[new] = value
+    # v2 stored reasoning bounds as ISO stamps; v3 keeps the duration.
+    r_start, r_end = raw.pop("reasoning_start", None), raw.pop("reasoning_end", None)
+    if r_start and r_end:
+        try:
+            timing["reasoning_seconds"] = max(0.0, (
+                datetime.fromisoformat(r_end) - datetime.fromisoformat(r_start)
+            ).total_seconds())
+        except ValueError:
+            pass
+    if timing:
+        raw["timing"] = timing
+    if "images" in raw:
+        images = [
+            ImageAttachment.model_validate(item) for item in raw.pop("images") or ()
+        ]
+        if images and not raw.get("parts"):
+            raw["parts"] = [
+                part.model_dump()
+                for part in build_parts(raw.get("content") or "", images, store)
+            ]
+    if raw.get("role") == "tool" and isinstance(raw.get("content"), str):
+        if raw["content"].startswith("error: "):
+            raw["content"] = raw["content"][len("error: "):]
+            raw.setdefault("ok", False)
+    calls = raw.get("tool_calls")
+    if isinstance(calls, list):
+        raw["tool_calls"] = [
+            ToolCall.from_wire(call).model_dump()
+            if isinstance(call, dict) and "function" in call
+            else call
+            for call in calls
+        ]
+    return raw
+
+
+def _migrate_v0_to_v1(
+    data: dict[str, Any], store: SessionImageStore | None,
+) -> dict:
+    """Unversioned legacy files: inline images, tool error prefixes and the
+    persisted system prompt (now derived per request)."""
+    data = dict(data)
+    messages = []
+    for raw in data.get("messages", []):
+        raw = _migrate_message(raw, store)
+        if raw.get("role") == "system":
+            continue
+        messages.append(raw)
+    data["messages"] = messages
+    data["schema"] = 1
+    return data
+
+
+def _migrate_v1_to_v2(
+    data: dict[str, Any], store: SessionImageStore | None,
+) -> dict:
+    """Tool calls persist in the internal shape (``call_id``/``name``/
+    ``arguments_json``), not the provider wire shape."""
+    data = dict(data)
+    data["messages"] = [
+        _migrate_message(raw, store) for raw in data.get("messages", [])
+    ]
+    data["schema"] = 2
+    return data
+
+
+def _migrate_v2_to_v3(
+    data: dict[str, Any], store: SessionImageStore | None,
+) -> dict:
+    """Per-message ISO stamps collapse into one ``timing`` sub-model."""
+    data = dict(data)
+    data["messages"] = [
+        _migrate_message(raw, store) for raw in data.get("messages", [])
+    ]
+    data["schema"] = 3
+    return data
+
+
+# version -> migration to the next version (each one bumps "schema").
+MIGRATIONS: dict[int, Any] = {
+    0: _migrate_v0_to_v1, 1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3,
+}
+
+
+def _migrate(
+    data: dict[str, Any], store: SessionImageStore | None,
+) -> dict[str, Any]:
+    """Apply the migration chain; reject files from a newer build."""
+    try:
+        version = int(data.get("schema") or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid session schema: {data.get('schema')!r}") from None
+    if version > SCHEMA_VERSION:
+        raise ValueError(
+            f"session schema {version} is newer than supported {SCHEMA_VERSION}"
+        )
+    while version < SCHEMA_VERSION:
+        migration = MIGRATIONS.get(version)
+        if migration is None:
+            raise ValueError(f"no migration from session schema {version}")
+        data = migration(data, store)
+        version += 1
+    return data
+
+
+def _message_from(
+    raw: dict, store: SessionImageStore | None = None,
+) -> Message:
+    """Parse one persisted message (migrating it if necessary)."""
+    # model_validate handles nested Usage/ToolCall/ImageRef models
     # (Message's tool_calls validator accepts the persisted wire shape).
-    return Message.model_validate(raw)
+    return Message.model_validate(_migrate_message(raw, store))
 
 
 def _message_dump(message: Message) -> dict:
-    dump = message.model_dump(exclude_none=True)
-    if message.tool_calls is not None:
-        dump["tool_calls"] = [call.to_wire() for call in message.tool_calls]
-    return dump
+    return message.model_dump(exclude_none=True)
 
 
-def _conversation_from(data: dict[str, Any]) -> Conversation:
+def _migrate_legacy_turns(
+    raw_messages: list[dict[str, Any]], parsed: list[Message],
+) -> list[Turn]:
+    """Reconstruct turns from a pre-``Turn`` session's message fields."""
+    turns: list[Turn] = []
+    for raw, message in zip(raw_messages, parsed):
+        before = raw.get("checkpoint_sha")
+        if message.role == "user" and before is not None:
+            turns.append(Turn(
+                user_message_id=message.id, before_tree=before,
+                after_tree=raw.get("after_tree"),
+            ))
+    return turns
+
+
+def _migrate_legacy_compaction(
+    conversation: Conversation, data: dict[str, Any],
+    store: SessionImageStore | None,
+) -> None:
+    """Merge a legacy ``compact_snapshot`` into the append-only message list,
+    splitting it into epochs (the snapshot is the pre-compaction history)."""
+    snapshot = data.get("compact_snapshot")
+    if not isinstance(snapshot, list):
+        return
+    pre = [
+        _message_from(raw, store) for raw in snapshot
+        if raw.get("role") != "system"
+    ]
+    pre_raw = [raw for raw in snapshot if raw.get("role") != "system"]
+    parsed = conversation.messages
+    summary_index = next(
+        (i for i, m in enumerate(parsed) if m.kind == "summary"), 0,
+    )
+    post = parsed[summary_index:]
+    for message in pre:
+        message.epoch = 0
+    for message in post:
+        message.epoch = 1
+    conversation.messages = pre + post
+    conversation.epoch = 1
+    conversation.turns = _migrate_legacy_turns(pre_raw, pre) + conversation.turns
+
+
+def _conversation_from(
+    data: dict[str, Any], name: str | None = None,
+) -> Conversation:
+    """Parse a saved conversation, migrating legacy shapes (persisted system
+    prompts, message-level checkpoint fields, ``compact_snapshot``, inline
+    base64 images) into the append-only epochs + turns model."""
     conversation = Conversation()
-    for raw in data["messages"]:
-        conversation.add(_message_from(raw))
-    conversation.turn_start = data.get("turn_start")
-    if isinstance(data.get("compact_snapshot"), list):
-        conversation.compact_snapshot = [_message_from(raw) for raw in data["compact_snapshot"]]
+    store = SessionImageStore(name) if name is not None else None
+    data = _migrate(data, store)
+    raw_messages = data["messages"]
+    parsed = [_message_from(raw, store) for raw in raw_messages]
+
+    turns_raw = data.get("turns")
+    if isinstance(turns_raw, list):
+        conversation.turns = [Turn.model_validate(t) for t in turns_raw]
+        conversation.epoch = int(data.get("epoch") or 0)
+        conversation.messages = parsed
+        return conversation
+
+    conversation.turns = _migrate_legacy_turns(raw_messages, parsed)
+    conversation.messages = parsed
+    _migrate_legacy_compaction(conversation, data, store)
     return conversation
 
 
@@ -142,9 +405,10 @@ def _meta_block(
 ) -> dict[str, Any]:
     """The small summary block listing and last-used lookups read: no
     conversation parsing needed on those paths."""
+    visible = conversation.visible_messages()
     last_user = max(
-        (m.send_time for m in conversation.messages
-         if m.role == "user" and m.send_time),
+        (m.timing.send for m in visible
+         if m.role == "user" and m.timing.send),
         default=None,
     )
     return {
@@ -152,7 +416,7 @@ def _meta_block(
         "workspace": workspace,
         "updated_at": updated_at,
         "sandbox_name": sandbox_name,
-        "message_count": len(conversation.messages),
+        "message_count": len(visible),
         "last_user_message_at": last_user,
         "tracking": tracking,
     }
@@ -176,24 +440,22 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def save_state(name: str, state: SessionState) -> None:
-    """Persist a session state as one JSON file, atomically.
+def serialize_state(state: SessionState) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Snapshot the live state into JSON-ready dicts (call on the event loop).
 
-    Written to a temp file in the same directory, fsynced, then ``os.replace``d
-    over the target, so a crash mid-write never leaves a truncated session
-    file behind (a reader would see either the old or the new state)."""
-    SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    Runs without a deepcopy: pydantic dumps copy the data, so the writer
+    thread only ever touches plain dicts while the session keeps mutating."""
     conversation = state.conversation
     data: dict[str, Any] = {
+        "schema": SCHEMA_VERSION,
         "profile": state.profile,
         "workspace": state.workspace,
         "updated_at": state.updated_at or _utcnow_iso(),
         "messages": [_message_dump(m) for m in conversation.messages],
+        "turns": [turn.model_dump() for turn in conversation.turns],
     }
-    if conversation.turn_start is not None:
-        data["turn_start"] = conversation.turn_start
-    if conversation.compact_snapshot is not None:
-        data["compact_snapshot"] = [_message_dump(m) for m in conversation.compact_snapshot]
+    if conversation.epoch:
+        data["epoch"] = conversation.epoch
     if state.git is not None:
         data["git"] = state.git
     if state.sandbox_name is not None:
@@ -208,22 +470,36 @@ def save_state(name: str, state: SessionState) -> None:
         data["last_out"] = state.last_out
     if state.mode is not None:
         data["mode"] = state.mode
-    _atomic_write_json(session_path(name), data)
-    _atomic_write_json(meta_path(name), _meta_block(
+    if state.compacted_on is not None:
+        data["compacted_on"] = state.compacted_on
+    meta = _meta_block(
         conversation,
         profile=state.profile,
         workspace=state.workspace,
         updated_at=data["updated_at"],
         sandbox_name=state.sandbox_name,
         tracking=state.git is not None,
-    ))
+    )
+    return data, meta
+
+
+def write_state(name: str, data: dict[str, Any], meta: dict[str, Any]) -> None:
+    """Write pre-serialized dicts atomically (safe in a worker thread)."""
+    SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _atomic_write_json(session_path(name), data)
+    _atomic_write_json(meta_path(name), meta)
+
+
+def save_state(name: str, state: SessionState) -> None:
+    """Serialize and persist a session state atomically."""
+    write_state(name, *serialize_state(state))
 
 
 def load_state(name: str) -> SessionState:
     """Parse the session file once and return everything in it."""
     data = json.loads(session_path(name).read_text(encoding="utf-8"))
     return SessionState(
-        conversation=_conversation_from(data),
+        conversation=_conversation_from(data, name),
         profile=data.get("profile"),
         workspace=data.get("workspace"),
         git=data.get("git") if isinstance(data.get("git"), dict) else None,
@@ -236,6 +512,7 @@ def load_state(name: str) -> SessionState:
         last_in=data.get("last_in") or 0,
         last_out=data.get("last_out") or 0,
         mode=data.get("mode") if data.get("mode") in ("plan", "write") else None,
+        compacted_on=data.get("compacted_on"),
     )
 
 
@@ -274,10 +551,28 @@ def load_meta(name: str) -> dict[str, Any] | None:
     )
 
 
+def saved_summary(name: str) -> SessionSummary:
+    """The list row for a session that is only on disk."""
+    meta = load_meta(name)
+    if meta is None:
+        return SessionSummary(name=name, state="saved")
+    return SessionSummary(
+        name=name, workspace=meta.get("workspace"), state="saved",
+        active=False, model=meta.get("profile"),
+        sandbox=meta.get("sandbox_name"),
+        last_user_message_at=meta.get("last_user_message_at"),
+        message_count=meta.get("message_count", 0),
+        tracking=bool(meta.get("tracking")),
+    )
+
+
 def delete_session(name: str) -> bool:
     p = session_path(name)
     if not p.exists():
         return False
     p.unlink()
     meta_path(name).unlink(missing_ok=True)
+    directory = session_dir(name)
+    if directory.is_dir():
+        shutil.rmtree(directory)
     return True

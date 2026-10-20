@@ -26,23 +26,20 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, fields, replace as dataclasses_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from . import __version__, protocol, session_store
 from .config import (
-    DEFAULT_CONFIG_PATH, ConfigError, ProviderProfile, SandboxSettings,
+    DEFAULT_CONFIG_PATH, ConfigError, SandboxSettings,
     SectionedConfig, ensure_config, load_sectioned, resolve_api_key,
+    save_preferences,
 )
 from . import gitwork
 from .gitwork import GitInfo, GitWorktreeError
 from .protocol import CommandResult, SessionSummary, ServerInfo, ServerStats
-from .sandbox import (
-    SandboxConfig, SandboxSession, make_sandbox, SandboxUnavailable,
-)
-from .session import Session, SessionError
+from .sandbox import make_sandbox, SandboxUnavailable
+from .session import Session, SessionError, SessionParts
 from .util import utcnow_iso as _utcnow
 
 HOST_DIR = Path("~/.local/share/xarness").expanduser()
@@ -55,35 +52,6 @@ GRACE_SECONDS = 5.0
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
-
-
-@dataclass(slots=True)
-class SessionParts:
-    """Everything :class:`Session` needs, resolved by ``_build_parts``.
-
-    Typed instead of a ``**``-splatted dict, so a mismatch with the
-    ``Session`` constructor is a type error, not a runtime surprise. Field
-    names match Session's keyword parameters, so ``Session(name=...,
-    **parts.session_kwargs(name))`` constructs it."""
-
-    workspace: Path
-    profile: ProviderProfile
-    profile_name: str
-    api_key: str | None
-    config_path: Path | None
-    sandbox: SandboxConfig | None
-    sandbox_session: SandboxSession | None
-    git_info: GitInfo | None
-    auto_compact: bool
-    tool_output_limit: int | None
-    sandbox_name: str
-    sandbox_settings: "SandboxSettings"
-
-    def session_kwargs(self, name: str) -> dict[str, Any]:
-        """Keyword arguments for ``Session(name=..., **kwargs)`` (shallow:
-        nested dataclasses like the sandbox config must stay objects)."""
-        return {"name": name, **{f.name: getattr(self, f.name) for f in fields(self)}}
-
 
 
 class Host:
@@ -105,6 +73,9 @@ class Host:
             pass
         self.unix_socket = unix_socket
         self.sessions: dict[str, Session] = {}
+        # One lock per session name: concurrent loads of the same saved
+        # session (e.g. GET snapshot + GET events) must yield one Session.
+        self._load_locks: dict[str, asyncio.Lock] = {}
         self._started_at = time.monotonic()
         self._started_at_wall = _utcnow()
         self._shutdown_event = asyncio.Event()
@@ -139,17 +110,12 @@ class Host:
 
     async def _build_parts(
         self,
+        request: protocol.CreateSessionRequest,
         *,
-        workspace: str | None,
-        model: str | None,
-        sandbox: str | None,
-        preset: str | None,
-        no_init_repo: bool,
-        network: bool | None = None,
-        gpu: bool | None = None,
         session_name: str,
         saved_sandbox_name: str | None = None,
         saved_sandbox_settings: dict | None = None,
+        saved_git_info: GitInfo | None = None,
     ) -> SessionParts:
         """Everything Session needs, from the sectioned config.
 
@@ -159,7 +125,8 @@ class Host:
             sectioned = load_sectioned(self.config_path)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
-        ws = Path(workspace).expanduser().resolve() if workspace else Path.cwd()
+        ws = Path(request.workspace).expanduser().resolve() \
+            if request.workspace else Path.cwd()
         if not ws.exists():
             # A new workspace is a fine thing to start a session on: create
             # it (mkdir -p) instead of refusing — a failed mkdir surfaces as
@@ -172,13 +139,15 @@ class Host:
                     f"({exc}): {ws}"
                 ) from None
 
-        preset_name = preset or sectioned.default_preset
+        preset_name = request.preset or sectioned.default_preset
         preset_settings = sectioned.presets.get(preset_name)
         last_model, last_sandbox = self._workspace_last_used(ws)
-        model_name = model or (preset_settings.model if preset_settings else None) \
-            or last_model
-        sandbox_name = sandbox or (preset_settings.sandbox if preset_settings else None) \
-            or last_sandbox
+        model_name = request.model or (
+            preset_settings.model if preset_settings else None
+        ) or last_model
+        sandbox_name = request.sandbox or (
+            preset_settings.sandbox if preset_settings else None
+        ) or last_sandbox
         try:
             profile_name, profile = sectioned.resolve_model(model_name)
             sandbox_key, settings = sectioned.resolve_sandbox(sandbox_name)
@@ -201,17 +170,30 @@ class Host:
                 })
         # Tri-state CLI overrides (--network/--gpu): the flag wins over the
         # sandbox profile when given.
-        if network is not None or gpu is not None:
+        if request.network is not None or request.gpu is not None:
             settings = settings.model_copy(update={
-                **({"allow_network": network} if network is not None else {}),
-                **({"gpu_access": gpu} if gpu is not None else {}),
+                **({"allow_network": request.network}
+                   if request.network is not None else {}),
+                **({"gpu_access": request.gpu}
+                   if request.gpu is not None else {}),
             })
         try:
             api_key = resolve_api_key(profile)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
 
-        git_info, _notes = await self._setup_tracking(ws, session_name, allow_init=not no_init_repo)
+        # A loaded session already persisted its git block: reuse it instead
+        # of re-scanning/snapshotting the whole workspace just to throw the
+        # fresh result away below. That scan is the slow part of resume.
+        if saved_git_info is not None:
+            git_info = saved_git_info
+        else:
+            try:
+                git_info, _notes = await gitwork.setup_tracking(
+                    ws, session_name, allow_init=not request.no_init_repo,
+                )
+            except GitWorktreeError:
+                git_info = None
         if not settings.enable_tracking:
             git_info = None
 
@@ -236,40 +218,17 @@ class Host:
             sandbox_settings=settings,
         )
 
-    @staticmethod
-    async def _setup_tracking(
-        workspace: Path, session_name: str, allow_init: bool,
-    ) -> tuple[GitInfo | None, list[str]]:
-        try:
-            return await gitwork.setup_tracking(workspace, session_name, allow_init=allow_init)
-        except GitWorktreeError:
-            return None, []
-
     # ------------------------------------------------------------------
     # session management
 
     async def create_session(
-        self,
-        *,
-        workspace: str | None = None,
-        model: str | None = None,
-        sandbox: str | None = None,
-        preset: str | None = None,
-        no_init_repo: bool = False,
-        network: bool | None = None,
-        gpu: bool | None = None,
-        no_session: bool = False,
-        first_message: str | None = None,
+        self, request: protocol.CreateSessionRequest,
     ) -> Session:
         name = session_store.new_session_name()
-        parts = await self._build_parts(
-            workspace=workspace, model=model, sandbox=sandbox, preset=preset,
-            no_init_repo=no_init_repo, network=network, gpu=gpu,
-            session_name=name,
-        )
+        parts = await self._build_parts(request, session_name=name)
         session = Session(**parts.session_kwargs(name), idle_callback=self._on_session_idle)
         self.sessions[name] = session
-        if no_session:
+        if request.no_session:
             # The client asked for an unsaved conversation: nothing is ever
             # written to the session store (Session._persist no-ops).
             session.no_save = True
@@ -277,15 +236,27 @@ class Host:
             # Durable from creation: the session shows up as saved in /sessions
             # and survives a host crash before the first turn.
             session._persist()
-        if first_message:
-            await session.execute(f"boot-{name}", protocol.SendMessage(text=first_message))
+        if request.first_message:
+            await session.execute(
+                f"boot-{name}",
+                protocol.SendMessage(text=request.first_message),
+            )
         return session
 
     async def load_session(self, name: str) -> Session:
-        """Host a saved session (idempotent)."""
+        """Host a saved session (idempotent, safe under concurrent loads)."""
         existing = self.sessions.get(name)
         if existing is not None:
             return existing
+        async with self._load_locks.setdefault(name, asyncio.Lock()):
+            # Re-check: another coroutine may have finished loading while
+            # this one waited on the lock.
+            existing = self.sessions.get(name)
+            if existing is not None:
+                return existing
+            return await self._load_session_locked(name)
+
+    async def _load_session_locked(self, name: str) -> Session:
         if not session_store.session_path(name).exists():
             raise SessionError(f"no saved session named {name!r}")
         try:
@@ -297,26 +268,32 @@ class Host:
                 f"saved session {name!r} has no workspace recorded; cannot "
                 "rebuild its sandbox and tracking"
             )
-        parts = await self._build_parts(
-            workspace=state.workspace, model=state.profile, sandbox=None,
-            preset=None, no_init_repo=False, session_name=name,
-            saved_sandbox_name=state.sandbox_name,
-            saved_sandbox_settings=state.sandbox_settings,
-        )
         # Rebind tracking from the SAVED git block: the baseline must be the
         # one the session measured against when it was last open, not the
         # workspace's current state (otherwise every saved change would look
-        # like drift and /undo would lose its turn trees).
+        # like drift and /undo would lose its turn trees). Parse it BEFORE
+        # building the session, so _build_parts can skip a fresh (expensive)
+        # workspace snapshot.
         saved_block = state.git if isinstance(state.git, dict) else None
+        saved_git_info: GitInfo | None = None
         if saved_block:
             try:
-                parts = dataclasses_replace(
-                    parts, git_info=GitInfo.from_block(saved_block)
-                )
+                saved_git_info = GitInfo.from_block(saved_block)
             except (KeyError, TypeError, ValueError):
-                pass  # keep the freshly built tracking as the fallback
-        session = Session.load(**parts.session_kwargs(name), state=state,
-                               idle_callback=self._on_session_idle)
+                saved_git_info = None
+        parts = await self._build_parts(
+            protocol.CreateSessionRequest(
+                workspace=state.workspace, model=state.profile,
+            ),
+            session_name=name,
+            saved_sandbox_name=state.sandbox_name,
+            saved_sandbox_settings=state.sandbox_settings,
+            saved_git_info=saved_git_info,
+        )
+        session = Session.load(
+            name, parts=parts, state=state,
+            idle_callback=self._on_session_idle,
+        )
         self.sessions[name] = session
         # A turn left open by a host crash or a quit mid-turn never got its
         # after-tree (finish_turn never ran). Record the workspace's current
@@ -325,10 +302,10 @@ class Host:
         # surface the session's own unaccepted edits as "drift". The turn
         # must be the last one (nothing streamed after it).
         if session.git_info is not None:
-            last = session.conversation.last_turn_message()
-            if last is not None and not last.after_tree:
+            turns = session.conversation.turns
+            if turns and turns[-1].after_tree is None and turns[-1].before_tree:
                 try:
-                    last.after_tree = await gitwork.snapshot_state(session.git_info)
+                    turns[-1].after_tree = await gitwork.snapshot_state(session.git_info)
                     session._persist()
                 except GitWorktreeError:
                     pass
@@ -375,7 +352,7 @@ class Host:
         for session in self.sessions.values():
             if workspace is not None and str(session.workspace) != workspace:
                 continue
-            summaries.append(self.summary_for(session))
+            summaries.append(session.summary())
         if active is None or active is False:
             hosted_names = set(self.sessions)
             for name in session_store.list_sessions():
@@ -385,44 +362,11 @@ class Host:
                     meta = session_store.load_meta(name)
                     if not meta or meta.get("workspace") != workspace:
                         continue
-                summaries.append(self.saved_summary(name))
+                summaries.append(session_store.saved_summary(name))
         if active is True:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
         return summaries
-
-    def summary_for(self, session: Session) -> SessionSummary:
-        state = session.state
-        if session.pending_ask is not None or (
-            session.pending_drift is not None and session.clients_attached
-        ):
-            state = "waiting"
-        # Active derives from the same predicate the grace loop uses — a
-        # hosted but fully idle session (no stream, no ask, no running
-        # turn) is not active; it is released and listed as saved.
-        active = session.is_active
-        return SessionSummary(
-            name=session.name, workspace=str(session.workspace),
-            state=state if active else "saved",
-            active=active, clients_attached=session.clients_attached,
-            model=session.profile_name, sandbox=session.sandbox_name,
-            last_user_message_at=session.last_user_message_at(),
-            message_count=len(session.conversation.messages),
-            tracking=session.git_info is not None,
-        )
-
-    def saved_summary(self, name: str) -> SessionSummary:
-        meta = session_store.load_meta(name)
-        if meta is None:
-            return SessionSummary(name=name, state="saved")
-        return SessionSummary(
-            name=name, workspace=meta.get("workspace"), state="saved",
-            active=False, model=meta.get("profile"),
-            sandbox=meta.get("sandbox_name"),
-            last_user_message_at=meta.get("last_user_message_at"),
-            message_count=meta.get("message_count", 0),
-            tracking=bool(meta.get("tracking")),
-        )
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(
@@ -435,7 +379,7 @@ class Host:
         )
 
     def stats(self) -> ServerStats:
-        sessions = [self.summary_for(s) for s in self.sessions.values()]
+        sessions = [s.summary() for s in self.sessions.values()]
         by_state: dict[str, int] = {}
         for summary in sessions:
             by_state[summary.state] = by_state.get(summary.state, 0) + 1
@@ -453,6 +397,12 @@ class Host:
             sessions=sessions,
         )
 
+    def set_default_profile(self, name: str | None) -> None:
+        """Write the default model choice to the host-owned config file."""
+        if name is None:
+            return
+        save_preferences(self.config_path, default_profile=name)
+
     def config_info(self) -> protocol.ConfigInfo:
         """Names and non-secret fields for the client's pickers (never API
         keys). A broken config falls back to an empty (default) config."""
@@ -463,7 +413,7 @@ class Host:
         models = [
             {
                 "name": name,
-                "display_name": p.display_name,
+                "display_name": p.display_name or p.model_id,
                 "cot_strength": p.cot_strength.value,
                 "max_context": p.max_context,
                 "supports_vision": p.supports_vision,
@@ -473,14 +423,15 @@ class Host:
         ]
         sandboxes = [{"name": name} for name in sectioned.sandboxes]
         presets = list(sectioned.presets)
-        from . import theme
+        from .themes import THEMES
         default_model = sectioned.default_preset_model()
         return protocol.ConfigInfo(
             models=models, sandboxes=sandboxes, presets=presets,
-            themes=list(theme.THEMES),
+            themes=list(THEMES),
             default_model=default_model,
             default_model_display_name=(
                 sectioned.models[default_model].display_name
+                or sectioned.models[default_model].model_id
                 if default_model in sectioned.models else default_model
             ),
             default_sandbox=sectioned.default_preset_sandbox(),
@@ -492,7 +443,8 @@ class Host:
         for session in self.sessions.values():
             path = str(session.workspace)
             counts[path] = counts.get(path, 0) + 1
-            active[path] = active.get(path, 0) + 1
+            if session.is_active:
+                active[path] = active.get(path, 0) + 1
         hosted_names = set(self.sessions)
         for name in session_store.list_sessions():
             # Hosted sessions are persisted at creation; skip them so they
@@ -593,9 +545,6 @@ class Host:
         if session.is_active:
             return  # a client re-attached or a turn started in the meantime
         await self._evict(session)
-        if session.sandbox_session is not None:
-            await session.sandbox_session.close()
-            session.sandbox_session = None
 
     async def request_shutdown(self) -> None:
         self._shutdown_event.set()

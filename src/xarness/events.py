@@ -10,21 +10,27 @@ without changing existing consumers.
 
 from __future__ import annotations
 
-from enum import Enum
+import time
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+State = Literal["idle", "running", "compacting"]
+Mode = Literal["plan", "write"]
 
 
 class EventBase(BaseModel):
-    """Base for wire events: a session-assigned ``seq`` plus tolerance.
+    """Base for wire events.
 
     Unknown fields are ignored, not rejected: the host and client can be
     different builds across a restart, and a newer host may add event
     fields a client doesn't know yet."""
 
-    seq: int = 0
     model_config = ConfigDict(extra="ignore")
+
+    # Server-side emission time. Clients use differences between these
+    # stamps to derive live durations (reasoning time, turn time).
+    t: float = Field(default_factory=time.monotonic)
 
 
 class ProcessingStarted(EventBase):
@@ -72,15 +78,6 @@ class ToolCallArgumentsDone(EventBase):
     arguments_json: str
 
 
-class ToolCallStatus(Enum):
-    """Lifecycle of one tool call, driving the status-dot color in the UI."""
-
-    MAKING_CALL = "making_call"  # yellow — arguments streaming / call in flight
-    PARSING_ERROR = "parsing_error"  # red — model produced invalid arguments JSON
-    CALL_SUCCEEDED = "call_succeeded"  # green
-    CALL_FAILED = "call_failed"  # red — tool ran but errored
-
-
 class Usage(BaseModel):
     """Token usage for a turn. ``approximate`` marks locally estimated counts.
 
@@ -103,7 +100,6 @@ class TurnComplete(EventBase):
 
     type: Literal["turn_complete"] = "turn_complete"
     usage: Usage | None = None
-    reasoning_seconds: float | None = None
     has_tool_calls: bool = False
 
 

@@ -12,14 +12,17 @@ session mutates that state.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import __version__, protocol
+from . import __version__, protocol, session_store
+from .config import ConfigError
+from .images import sniff_mime
 from .host import Host
 from .protocol import (
     CommandEnvelope, CommandResult, Snapshot, SessionSummary,
@@ -84,18 +87,8 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Create a session",
     )
     async def create_session(body: protocol.CreateSessionRequest) -> SessionSummary:
-        session = await host.create_session(
-            workspace=body.workspace,
-            model=body.model,
-            sandbox=body.sandbox,
-            preset=body.preset,
-            no_init_repo=body.no_init_repo,
-            network=body.network,
-            gpu=body.gpu,
-            no_session=body.no_session,
-            first_message=body.first_message,
-        )
-        return host.summary_for(session)
+        session = await host.create_session(body)
+        return session.summary()
 
     @router.post(
         "/sessions/{name}/load",
@@ -104,12 +97,12 @@ def sessions_router(host: Host) -> APIRouter:
     )
     async def load_session(name: str) -> SessionSummary:
         session = await host.load_session(name)
-        return host.summary_for(session)
+        return session.summary()
 
     @router.get(
         "/sessions/{name}",
         response_model=Snapshot,
-        summary="Snapshot of a session (messages, status, buffered turn events)",
+        summary="Snapshot of a session (messages, status, live round)",
     )
     async def get_session(name: str) -> Snapshot:
         return (await _session_or_load(host, name)).snapshot()
@@ -123,14 +116,14 @@ def sessions_router(host: Host) -> APIRouter:
                 "description": (
                     "text/event-stream. The first frame is `snapshot` (a "
                     "Snapshot); then `event` frames carrying Event models "
-                    "(discriminated on `type`; every event model appears "
-                    "under components/schemas via Snapshot.turn_events). "
+                    "(discriminated on `type`). The snapshot's "
+                    "`partial_round` renders the in-flight round. "
                     "Reconnects always receive a fresh snapshot."
                 ),
             },
         },
     )
-    async def events(name: str, request: Request) -> StreamingResponse:
+    async def events(name: str) -> StreamingResponse:
         session = await _session_or_load(host, name)
         return StreamingResponse(
             _event_stream(session),
@@ -146,6 +139,17 @@ def sessions_router(host: Host) -> APIRouter:
     async def post_command(name: str, envelope: CommandEnvelope) -> CommandResult:
         session = await _session_or_load(host, name)
         return await session.execute(envelope.cmd_id, envelope.command)
+
+    @router.get(
+        "/sessions/{name}/images/{image_id}",
+        summary="Fetch one stored image blob by content hash",
+        response_class=Response,
+    )
+    async def image(name: str, image_id: str) -> Response:
+        data = session_store.load_blob(name, image_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="image not found")
+        return Response(content=data, media_type=sniff_mime(data))
 
     @router.get(
         "/sessions/{name}/diff",
@@ -191,6 +195,20 @@ def meta_router(host: Host) -> APIRouter:
     async def config_info() -> protocol.ConfigInfo:
         return host.config_info()
 
+    @router.put(
+        "/config/defaults",
+        response_model=protocol.ConfigInfo,
+        summary="Persist the default model for future sessions",
+    )
+    async def update_defaults(
+        body: protocol.ConfigDefaults,
+    ) -> protocol.ConfigInfo:
+        try:
+            host.set_default_profile(body.default_profile)
+        except (ConfigError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return host.config_info()
+
     @router.get("/workspaces", response_model=list[protocol.WorkspaceInfo], summary="Known workspace directories")
     async def workspaces() -> list[protocol.WorkspaceInfo]:
         return host.workspaces()
@@ -217,10 +235,13 @@ async def _event_stream(session: Session) -> AsyncIterator[str]:
     the transcript."""
     # (Re)attach time is when resume drift is detected (never at load time —
     # a drifted workspace with nobody attached must not report "waiting" nor
-    # keep the host alive). Idempotent: the check runs once per hosting.
-    await session.prompt_resume_drift()
+    # keep the host alive). Run it AFTER the snapshot: the check snapshots the
+    # workspace's git tree, which can take a while on a large repo; blocking
+    # the first frame on it made resume feel slow. It emits StatusChanged when
+    # it finds drift, so the client still gets the prompt.
     snapshot, queue = session.subscribe()
     yield _sse("snapshot", snapshot)
+    drift_task = asyncio.create_task(session.prompt_resume_drift())
     try:
         while True:
             event = await queue.get()
@@ -228,6 +249,7 @@ async def _event_stream(session: Session) -> AsyncIterator[str]:
             if isinstance(event, protocol.SessionDeleted):
                 break
     finally:
+        drift_task.cancel()
         session.unsubscribe(queue)
 
 

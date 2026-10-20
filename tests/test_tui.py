@@ -10,10 +10,12 @@ from textual.pilot import Pilot
 
 from xarness import protocol
 from xarness.clientlib import ClientError
+from xarness.conversation import Timing
 from xarness.tui import flow as tflow
-from xarness.events import ToolCallStatus
+from xarness.tui.transcript import ToolStatus
 from xarness.protocol import (
-    CommandResult, DiffInfo, Event, SessionSummary, Snapshot, StatusPayload,
+    CommandResult, ConfigInfo, DiffInfo, Event, SessionSummary, Snapshot,
+    StatusPayload,
 )
 
 
@@ -35,6 +37,8 @@ class FakeClient:
         if getattr(self, "fail_attach_first", False):
             self.fail_attach_first = False
             raise ClientError("connection lost")
+        # The real SSE stream's first frame is a fresh Snapshot.
+        yield self.snapshot_data
         while True:
             item = await self.queue.get()
             if item is None:
@@ -65,9 +69,12 @@ class FakeClient:
     async def search_files(self, workspace: str, q: str) -> list[str]:
         return []
 
-    async def create_session(self, **kwargs) -> SessionSummary:
+    async def create_session(self, request) -> SessionSummary:
         return getattr(self, "create_result", None) or SessionSummary(
             name="new-session", active=True)
+
+    async def set_default_profile(self, name: str) -> ConfigInfo:
+        return ConfigInfo(default_model=name)
 
     async def delete_session(self, name: str) -> CommandResult:
         return CommandResult(cmd_id="t", ok=True)
@@ -82,7 +89,6 @@ class FakeClient:
 
 def make_snapshot(state: str = "idle") -> Snapshot:
     return Snapshot(
-        seq=0,
         messages=[],
         status=StatusPayload(
             state=state,  # type: ignore[arg-type]
@@ -185,7 +191,7 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
             users = [e for e in app._flow_model.entries
                      if isinstance(e.item, tflow.UserItem)]
             self.assertEqual(len(users), 1)
-            self.assertEqual(users[0].item.message.id, "m1")
+            self.assertEqual(users[0].item.message_id, "m1")
             self.assertEqual(
                 [c for _, c in client.commands if c.type == "send_message"], [],
             )
@@ -237,37 +243,29 @@ class ImportBoundaryTest(unittest.TestCase):
 
 
 class ReconnectTest(unittest.IsolatedAsyncioTestCase):
-    """On connection loss the TUI respawns the host, reloads its session,
-    and reattaches."""
+    """On connection loss the TUI respawns the host and reattaches; the
+    stream endpoint loads the saved session, with no separate round-trip."""
 
-    async def test_connection_loss_respawns_reloads_reattaches(self) -> None:
+    async def test_connection_loss_respawns_and_reattaches(self) -> None:
         from unittest import mock
 
         from xarness.tui.app import AgentApp
-        import xarness.clientlib as clientlib
+        import xarness.tui.app as app_mod
 
         client = FakeClient(make_snapshot())
         client.fail_attach_first = True
-        client.loaded: list[str] = []
         client.spawned: list[bool] = []
-
-        async def load_session(name: str) -> SessionSummary:
-            client.loaded.append(name)
-            return SessionSummary(name=name, active=True)
-
-        client.load_session = load_session
 
         async def fake_ensure_host(timeout: float = 5.0) -> None:
             client.spawned.append(True)
 
-        with mock.patch.object(clientlib, "ensure_host", fake_ensure_host):
+        with mock.patch.object(app_mod, "ensure_host", fake_ensure_host):
             app = AgentApp(client, workspace=None, session_name="s1")
             async with app.run_test() as pilot:
                 await pilot.pause()
                 await pilot.pause()
                 await pilot.pause()
 
-        self.assertEqual(client.loaded, ["s1"])
         self.assertEqual(client.spawned, [True])
 
 
@@ -342,6 +340,22 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
                 types, ["cancel", "flush_queued", "discard_queued"], types,
             )
 
+    async def test_popup_confirm_on_arg_command_completes_instead_of_running(self) -> None:
+        """Enter on /filter (takes an argument) must leave the word in the
+        input for the user to finish, not execute it with an empty arg."""
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import ChatInput
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._accept_popup_value("filter", was_slash=True)
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            self.assertEqual(chat_input.text, "/filter ")
+            self.assertEqual(client.commands, [])
+
     async def test_ctrl_c_skips_headless_prompt_when_opened_elsewhere(self) -> None:
         from xarness.tui.app import AgentApp
 
@@ -368,7 +382,7 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
     dispatches add/remove without ever touching the worktree."""
 
     async def test_lists_mounts_and_dispatches_remove(self) -> None:
-        from xarness.protocol import RefInfo
+        from xarness.protocol import RefAdd, RefInfo, RefRemove
         from xarness.tui.app import AgentApp
         from xarness.tui.refs_screen import RefsScreen
 
@@ -376,10 +390,8 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            added: list[str] = []
-            removed: list[str] = []
             refs = [RefInfo(path="/tmp/notes.md", mount=".refs/notes.md")]
-            app.push_screen(RefsScreen(refs, added.append, removed.append))
+            app.push_screen(RefsScreen(refs))
             await pilot.pause()
             screen = app.screen
             self.assertIsInstance(screen, RefsScreen)
@@ -388,13 +400,15 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._refs, refs)
             await pilot.click("#refs-remove-0")
             await pilot.pause()
-            self.assertEqual(removed, ["/tmp/notes.md"])
+            self.assertIsInstance(client.commands[-1][1], RefRemove)
+            self.assertEqual(client.commands[-1][1].path, "/tmp/notes.md")
             # Typing a path in the input dispatches an add.
             for key in "/tmp/other.md":
                 await pilot.press(key)
             await pilot.press("enter")
             await pilot.pause()
-            self.assertEqual(added, ["/tmp/other.md"])
+            self.assertIsInstance(client.commands[-1][1], RefAdd)
+            self.assertEqual(client.commands[-1][1].path, "/tmp/other.md")
 
     async def test_slash_command_opens_the_manager(self) -> None:
         from xarness.tui.app import AgentApp
@@ -431,7 +445,6 @@ class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
 
         client.attach = attach
         client.snapshot_data = Snapshot(
-            seq=42,
             messages=[],
             status=client.snapshot_data.status,
         )
@@ -484,6 +497,194 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, app_client, app)
 
 
+class DriftPromptStateTest(unittest.IsolatedAsyncioTestCase):
+    async def test_resolved_drift_is_cleared_from_local_status(self) -> None:
+        """After DriftResolved, a later StatusChanged must not re-open the
+        prompt for a drift that the host already resolved."""
+        from xarness.tui.app import AgentApp
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None,
+                       session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.status = StatusPayload(
+                state="idle",
+                pending_drift=protocol.PendingDrift(
+                    workspace="/tmp/ws", last_known="aaa", current="bbb",
+                    files=["a.txt"]),
+            )
+            await app._handle_event(protocol.DriftResolved(accepted=False))
+            self.assertIsNone(app.status.pending_drift)
+
+
+class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
+    """While a tool is still MAKING_CALL its streamed arguments must already
+    show the useful detail: write_file's +LOC, edit_file's +adds -dels and
+    run_bash's command — not just the bare tool name."""
+
+    def test_partial_edit_arguments_already_count_lines(self) -> None:
+        """A half-streamed edits array is not valid JSON yet; the live label
+        must still grow the +adds -dels count instead of showing only a path."""
+        from xarness.tui.tool_view import _edit_live
+
+        _name, detail = _edit_live(
+            '{"path": "b.py", "edits": [{"old_string": "x", '
+            '"new_string": "y'
+        )
+        self.assertIn("+1 -1", detail)
+        self.assertIn("b.py", detail)
+
+    async def test_streamed_arguments_render_live_details(self) -> None:
+        from xarness.tui.app import AgentApp
+
+        calls = [
+            ("w1", "write_file",
+             '{"path": "a.py", "content": "a\\nb\\nc\\n"}', "+3 a.py"),
+            ("e1", "edit_file",
+             '{"path": "b.py", "edits": [{"old_string": "x", '
+             '"new_string": "y\\nz"}]}', "+2 -1 b.py"),
+            ("b1", "run_bash", '{"command": "grep -rn foo"}',
+             "grep -rn foo"),
+        ]
+        client = FakeClient(make_snapshot(state="running"))
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for call_id, name, args, _expected in calls:
+                client.queue.put_nowait(
+                    protocol.ToolCallStarted(call_id=call_id, name=name))
+                # Stream in two halves: the label must follow partial JSON.
+                client.queue.put_nowait(protocol.ToolCallArgumentsDelta(
+                    call_id=call_id, text=args[: len(args) // 2]))
+                client.queue.put_nowait(protocol.ToolCallArgumentsDelta(
+                    call_id=call_id, text=args[len(args) // 2:]))
+            await pilot.pause()
+            await pilot.pause()
+
+            entries = [e for e in app._flow_model.entries
+                       if isinstance(e.item, tflow.ToolItem)]
+            self.assertEqual(len(entries), len(calls))
+            for entry, (_, _, _, expected) in zip(entries, calls):
+                presentation = await app._presenter.present(entry, 80)
+                text = "\n".join(strip.text for strip in presentation.strips)
+                self.assertIn(expected, text)
+
+    def test_expanded_edit_file_body_shows_the_diff(self) -> None:
+        """edit_file's returned unified diff must render as +/- rows — the
+        tool output generator used to collapse its headers/hunks onto one
+        line, leaving the expanded block empty."""
+        from xarness.tui.transcript import ToolStatus
+        from xarness.tools import _format_edit_diff
+        from xarness.tui.tool_view import ToolCallView, _edit_body
+
+        output = "applied 1 edit to a.py\n" + _format_edit_diff(
+            "a.py", "old\nkeep\n", "new\nkeep\n",
+        )
+        body = _edit_body(ToolCallView(
+            name="edit_file", args='{"path": "a.py"}', output=output,
+            status=ToolStatus.CALL_SUCCEEDED, expanded=True,
+        ))
+        self.assertIn("- old", body.plain)
+        self.assertIn("+ new", body.plain)
+
+    async def test_running_run_bash_shows_streamed_output(self) -> None:
+        """While the call is still running, each ToolOutputDelta must repaint
+        the expanded body (not wait for ToolFinished)."""
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot(state="running"))
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            client.queue.put_nowait(
+                protocol.ToolCallStarted(call_id="b1", name="run_bash"))
+            client.queue.put_nowait(protocol.ToolCallArgumentsDone(
+                call_id="b1", name="run_bash",
+                arguments_json='{"command": "echo hi"}',
+            ))
+            client.queue.put_nowait(
+                protocol.ToolOutputDelta(call_id="b1", text="first\n"))
+            await pilot.pause()
+            await pilot.pause()
+            entry = [e for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.ToolItem)][0]
+            self.assertIs(entry.item.status, ToolStatus.MAKING_CALL)
+            # No auto-expand: a running call stays collapsed until clicked.
+            self.assertFalse(entry.item.expanded)
+            collapsed = "\n".join(
+                strip.text
+                for strip in (await app._presenter.present(entry, 80)).strips
+            )
+            self.assertNotIn("first", collapsed)
+            entry.item.expanded = True
+            text = "\n".join(
+                strip.text
+                for strip in (await app._presenter.present(entry, 80)).strips
+            )
+            self.assertIn("first", text)
+
+            client.queue.put_nowait(
+                protocol.ToolOutputDelta(call_id="b1", text="second\n"))
+            await pilot.pause()
+            await pilot.pause()
+            text = "\n".join(
+                strip.text
+                for strip in (await app._presenter.present(entry, 80)).strips
+            )
+            self.assertIn("first", text)
+            self.assertIn("second", text)
+
+    async def test_completed_edit_file_expands_to_diff(self) -> None:
+        """End-to-end live path: the finished call's output feeds the
+        expanded body, not just a bare "applied" line."""
+        from xarness.tools import _format_edit_diff
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot(state="running"))
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            output = "applied 1 edit to a.py\n" + _format_edit_diff(
+                "a.py", "old\nkeep\n", "new\nkeep\n",
+            )
+            client.queue.put_nowait(
+                protocol.ToolCallStarted(call_id="e1", name="edit_file"))
+            client.queue.put_nowait(protocol.ToolCallArgumentsDone(
+                call_id="e1", name="edit_file",
+                arguments_json='{"path": "a.py", "edits": []}',
+            ))
+            client.queue.put_nowait(protocol.ToolFinished(
+                call_id="e1", ok=True, output=output, header="+1 -1 a.py",
+            ))
+            await pilot.pause()
+            await pilot.pause()
+            entry = [e for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.ToolItem)][0]
+            self.assertIn("diff --git", entry.item.output)
+            entry.item.expanded = True
+            presentation = await app._presenter.present(entry, 80)
+            text = "\n".join(strip.text for strip in presentation.strips)
+            self.assertIn("- old", text)
+            self.assertIn("+ new", text)
+
+    def test_legacy_collapsed_edit_diff_still_renders(self) -> None:
+        """Sessions recorded by the buggy generator stored the whole hunk
+        on one line; replaying them must not lose the diff."""
+        from xarness.tui.transcript import ToolStatus
+        from xarness.tui.tool_view import ToolCallView, _edit_body
+
+        output = (
+            "applied 1 edit to a.py\ndiff --git a/a.py b/a.py\n"
+            "--- a/a.py+++ b/a.py@@ -1,2 +1,2 @@-old\n+new\n keep\n"
+        )
+        body = _edit_body(ToolCallView(
+            name="edit_file", args='{"path": "a.py"}', output=output,
+            status=ToolStatus.CALL_SUCCEEDED, expanded=True,
+        ))
+        self.assertIn("- old", body.plain)
+        self.assertIn("+ new", body.plain)
+
+
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
     """Session popup rows: {title} {age}, with a right-aligned state word
     (padded to the longest state word) for loaded sessions — waiting=accent,
@@ -505,7 +706,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         ]
 
     def test_state_word_color_per_state(self) -> None:
-        from xarness.tui.resume_screen import _STATE_WORDS
+        from xarness.tui.list_picker import STATE_WORDS as _STATE_WORDS
         from xarness import theme
         expected = {
             "waiting": "accent", "running": "success",
@@ -520,7 +721,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
         from textual.widgets import Label, OptionList
-        from xarness.tui.resume_screen import ResumeScreen
+        from xarness.tui.list_picker import ListPicker, session_options
 
         class Host(App):
             def compose(self) -> ComposeResult:
@@ -529,16 +730,16 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         app = Host()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.push_screen(ResumeScreen(self._summaries(), workspace=None))
+            app.push_screen(ListPicker(session_options(self._summaries(), None), title="Open session", filterable=True))
             await pilot.pause()
-            option_list = app.screen.query_one("#resume-list", OptionList)
+            option_list = app.screen.query_one("#picker-list", OptionList)
             prompts = [
                 str(option_list.get_option_at_index(i).prompt)
                 for i in range(option_list.option_count)
             ]
             self.assertEqual(len(prompts), 5)
             # Only loaded sessions get a state word; saved-one shows none.
-            from xarness.tui.resume_screen import _STATE_WIDTH
+            from xarness.tui.list_picker import STATE_WIDTH as _STATE_WIDTH
             for state, name in (("waiting", "waiting-one"),
                                 ("running", "running-one"),
                                 ("compacting", "compacting-one"),
@@ -563,7 +764,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         deleting the query must bring every row back."""
         from textual.app import App, ComposeResult
         from textual.widgets import Input, OptionList
-        from xarness.tui.resume_screen import ResumeScreen
+        from xarness.tui.list_picker import ListPicker, session_options
 
         entries = [
             SessionSummary(name=f"2026-10-0{i} sess", state="saved")
@@ -577,9 +778,9 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         app = Host()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.push_screen(ResumeScreen(entries, workspace=None))
+            app.push_screen(ListPicker(session_options(entries, None), title="Open session", filterable=True))
             await pilot.pause()
-            ol = app.screen.query_one("#resume-list", OptionList)
+            ol = app.screen.query_one("#picker-list", OptionList)
             self.assertEqual(ol.option_count, 3)
             await pilot.press("0", "0")
             await pilot.pause()
@@ -613,6 +814,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             )
             client.snapshot_data = snap
             await app._attach("other")
+            await pilot.pause()
             self.assertIn("xarness ws", written, f"title not updated on attach: {written}")
             written.clear()
             app._detach()
@@ -646,9 +848,10 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             )
             client.snapshot_data = snap
             await app._attach("other")
+            await pilot.pause()
             self.assertEqual(written[-1], "xarness xarness")
 
-            await app._handle_event(TurnFinished(elapsed=1.0, summary=""))
+            await app._handle_event(TurnFinished(elapsed=1.0))
             self.assertEqual(written[-1], "xarness xarness - finished")
 
             # A new round/turn clears the stale suffix.
@@ -690,15 +893,10 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                         if isinstance(e.item, tflow.ThinkingItem)]
             self.assertEqual(len(thinking), 1)
             self.assertFalse(thinking[0].item.done)
-            # The interrupt: the session reports idle (an error Notice
-            # accompanies it — the Notice itself settles nothing).
+            # The interrupt: an error Notice plus the explicit end event
+            # (the Notice itself settles nothing).
             q.put_nowait(protocol.Notice(text="interrupted", level="error"))
-            q.put_nowait(protocol.StatusChanged(
-                status=StatusPayload(
-                    state="idle", session_name="s1", workspace="/tmp/ws",
-                    mode="write", model_name="m", model_display_name="m", model_id="m",
-                )
-            ))
+            q.put_nowait(protocol.TurnEnded(outcome="cancelled"))
             await pilot.pause()
             self.assertTrue(
                 [e for e in app._flow_model.entries
@@ -711,8 +909,6 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, client, app)
 
     async def test_idle_status_settles_tool_writing_shimmer(self) -> None:
-        from xarness.tui.app import AgentApp
-
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
             # The call starts waiting: pending strip first, then the tool's
@@ -741,7 +937,7 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             ))
             await pilot.pause()
             # The half-streamed call settles as failed — no eternal shimmer.
-            self.assertEqual(blocks[0].item.status, ToolCallStatus.CALL_FAILED)
+            self.assertEqual(blocks[0].item.status, ToolStatus.CALL_FAILED)
             self.assertEqual(app._phase, "idle")
             self.assertFalse(
                 [e for e in app._flow_model.entries
@@ -785,7 +981,7 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_multiple_rows_visible(self) -> None:
         from textual.widgets import OptionList
-        from xarness.tui.resume_screen import ResumeScreen
+        from xarness.tui.list_picker import ListPicker, session_options
 
         from xarness.tui.app import AgentApp
         summaries = [
@@ -796,10 +992,10 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name=None)
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.pause()
-            app.push_screen(ResumeScreen(summaries, workspace=None))
+            app.push_screen(ListPicker(session_options(summaries, None), title="Open session", filterable=True))
             await pilot.pause()
             screen = app.screen
-            option_list = screen.query_one("#resume-list", OptionList)
+            option_list = screen.query_one("#picker-list", OptionList)
             self.assertGreaterEqual(
                 option_list.region.height, 5,
                 "list collapsed: not all 5 rows visible at once",
@@ -835,42 +1031,18 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
             client.queue.put_nowait(protocol.UserMessageAdded(
                 text="live", message_id="u3"))
             await pilot.pause()
-            self.assertEqual(
-                app._rendered_ids, {"u1", "a1", "u2", "a2", "u3"})
+            users = [e.item.message_id for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.UserItem)]
+            self.assertEqual(users, ["u1", "u2", "u3"])
 
             # Undo-from-here on "second" (u2): u2, a2 and u3 are gone.
             trimmed = make_snapshot()
             object.__setattr__(trimmed, "messages", messages[:2])
             client.queue.put_nowait(protocol.HistoryReplaced(snapshot=trimmed))
             await pilot.pause()
-            self.assertEqual(app._rendered_ids, {"u1", "a1"})
-            users = [e.item.message.id for e in app._flow_model.entries
+            users = [e.item.message_id for e in app._flow_model.entries
                      if isinstance(e.item, tflow.UserItem)]
             self.assertEqual(users, ["u1"])
-
-
-class AcceptNoFullReloadTest(unittest.IsolatedAsyncioTestCase):
-    """/accept rewrites no messages: HistoryReplaced with an unchanged id
-    set must not rebuild the transcript (the pre-fix behavior re-rendered
-    the whole chat on every /accept)."""
-
-    async def test_history_replaced_with_same_ids_skips_rerender(self) -> None:
-        from xarness.tui.app import AgentApp
-
-        messages = [_msg("user", "u1", "first"), _msg("assistant", "a1", "answer")]
-        snap = make_snapshot()
-        object.__setattr__(snap, "messages", messages)
-        client = FakeClient(snap)
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            before = list(app._flow_model.entries)
-            replaced = make_snapshot()
-            object.__setattr__(replaced, "messages", messages)
-            client.queue.put_nowait(protocol.HistoryReplaced(snapshot=replaced))
-            await pilot.pause()
-            # Entry identity preserved: no rebuild happened.
-            self.assertIs(list(app._flow_model.entries)[0], before[0])
 
 
 class DiffClickMinimizeTest(unittest.IsolatedAsyncioTestCase):
@@ -903,7 +1075,7 @@ class DiffClickMinimizeTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(summary.diff_shown)
             # The file list itself stays expanded and populated.
             self.assertTrue(summary.has_class("expanded"))
-            self.assertTrue(list(summary.query(".diff-file-row")))
+            self.assertEqual(len(summary.query(".diff-file-row")), 1)
 
 
 def make_diff_stat():
@@ -1018,26 +1190,57 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         snap = make_snapshot()
         snap.messages = [
             protocol.Message(
-                role="user", id="u1", content="do it", send_time="2025-01-01T00:00:00+00:00",
+                role="user", id="u1", content="do it",
+                timing=Timing(send="2025-01-01T00:00:00+00:00"),
             ),
             protocol.Message(
                 role="assistant", id="a2", content="",
-                reasoning="step one\nstep two", reasoning_start='2026-01-01T00:00:00+00:00', reasoning_end='2026-01-01T00:00:04+00:00',
-                tool_calls=[{"id": "c1", "type": "function",
-                             "function": {"name": "read_file", "arguments": "{}"}}],
+                reasoning="step one\nstep two",
+                timing=Timing(reasoning_seconds=4.0),
+                tool_calls=[{"call_id": "c1", "name": "read_file",
+                             "arguments_json": "{}"}],
             ),
             protocol.Message(
                 role="tool", id="t1", tool_call_id="c1", content="file body",
             ),
             protocol.Message(
                 role="assistant", id="a1", content="Done.",
-                start_time="2025-01-01T00:00:01+00:00",
-                end_time="2025-01-01T00:00:05+00:00",
-                time_summary="4.0s | 4.0s 0.0s 0.0s",
+                timing=Timing(
+                    start="2025-01-01T00:00:01+00:00",
+                    end="2025-01-01T00:00:05+00:00",
+                ),
             ),
         ]
-        snap.turn_events = []
         return snap
+
+    async def test_hidden_epochs_from_compaction_still_render(self) -> None:
+        """The snapshot's ``history`` (older compaction epochs) is folded
+        before the current messages, so resuming shows the whole session."""
+        from xarness.conversation import SUMMARY_PREFIX
+        from xarness.tui.app import AgentApp
+        from xarness.tui.transcript import DividerItem, UserItem
+
+        snap = make_snapshot()
+        snap.history = [
+            protocol.Message(role="user", id="u0", content="first question"),
+            protocol.Message(
+                role="user", id="s0", kind="summary",
+                content=f"{SUMMARY_PREFIX}\n\nthe handoff",
+            ),
+        ]
+        snap.messages = [
+            protocol.Message(role="assistant", id="a0", content="after"),
+        ]
+        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            items = [entry.item for entry in app._flow_model.entries]
+            self.assertIsInstance(items[0], UserItem)
+            self.assertEqual(items[0].text, "first question")
+            self.assertIsInstance(items[1], DividerItem)
+            self.assertIn("the handoff", items[1].text)
+            self.assertEqual(items[2].chunks, ["after"])
 
     async def test_replay_has_no_shimmer_and_shows_timing(self) -> None:
         from xarness.tui.app import AgentApp
@@ -1052,7 +1255,7 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             tools = [e.item for e in app._flow_model.entries
                      if isinstance(e.item, tflow.ToolItem)]
             self.assertEqual(len(tools), 1)
-            self.assertEqual(tools[0].status, ToolCallStatus.CALL_SUCCEEDED)
+            self.assertEqual(tools[0].status, ToolStatus.CALL_SUCCEEDED)
             # The settled summary shows the tool name, not "Running read_file".
             all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
             self.assertIn("read_file", all_text)
@@ -1063,7 +1266,7 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(thinking), 1)
             self.assertTrue(thinking[0].done)
             self.assertIn("Thought for", all_text)
-            self.assertIn("Worked for 4.0s", all_text)
+            self.assertIn("Worked for 5.0s | 4.0s 1.0s", all_text)
 
 
 class FlowViewTest(unittest.IsolatedAsyncioTestCase):
@@ -1168,11 +1371,14 @@ class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
 
 
 
-class DiffSummaryIncrementalTest(unittest.IsolatedAsyncioTestCase):
-    """Refreshing the pending-changes panel must reconcile rows, not tear the
-    whole list down and remount it on every tool finish."""
+class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
+    """The pending-changes panel is a row of per-file cells, matching the
+    pre-refactor layout (name flexes, counts sit in their own right-hand
+    columns, source/new are separate badges)."""
 
-    async def test_same_files_update_in_place_and_add_remove_reconcile(self) -> None:
+    async def test_set_summary_lists_files(self) -> None:
+        from textual.widgets import Static
+
         from xarness.protocol import DiffFileInfo, DiffInfo
         from xarness.tui.app import AgentApp
         from xarness.tui.widgets import DiffSummary
@@ -1183,39 +1389,58 @@ class DiffSummaryIncrementalTest(unittest.IsolatedAsyncioTestCase):
             summary = app.query_one("#diff-summary", DiffSummary)
 
             await summary.set_summary(DiffInfo(files=[
-                DiffFileInfo(path="a.py", additions=2, deletions=1, source="agent"),
-            ]))
-            first_row = next(iter(summary.query(".diff-file-row")))
-            first_row.add_class("active")
-
-            # Same file, new counts + source: the row object survives and its
-            # values are updated in place (the active highlight too).
-            await summary.set_summary(DiffInfo(files=[
                 DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
-            ]))
-            rows = list(summary.query(".diff-file-row"))
-            self.assertIs(rows[0], first_row)
-            self.assertTrue(first_row.has_class("active"))
-            self.assertIn("+9", first_row.query_one(".diff-file-add").render().plain)
-            self.assertIn("drift", first_row.query_one(".diff-file-source").render().plain)
-
-            # A new file mounts one extra row; the existing row is untouched.
-            await summary.set_summary(DiffInfo(files=[
-                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
-                DiffFileInfo(path="b.py", additions=1, deletions=0, is_new=True, source="agent"),
+                DiffFileInfo(path="b.py", additions=1, deletions=0, is_new=True),
             ]))
             rows = list(summary.query(".diff-file-row"))
             self.assertEqual(len(rows), 2)
-            self.assertIs(rows[0], first_row)
-            self.assertIn("new", rows[1].query_one(".diff-file-new").render().plain)
+            self.assertEqual(rows[0].diff_key, "a.py")
+            self.assertEqual(rows[0].query_one(".diff-file-name", Static).render().plain, "a.py")
+            self.assertEqual(
+                rows[0].query_one(".diff-file-source", Static).render().plain, "drift"
+            )
+            self.assertTrue(rows[1].query_one(".diff-file-new"))
+            # Counts are separate cells so CSS can right-align them.
+            self.assertEqual(
+                rows[0].query_one(".diff-file-add", Static).render().plain, "+9"
+            )
+            self.assertEqual(
+                rows[0].query_one(".diff-file-del", Static).render().plain, "-3"
+            )
 
-            # Dropping a file removes exactly its row.
-            await summary.set_summary(DiffInfo(files=[
-                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
-            ]))
-            rows = list(summary.query(".diff-file-row"))
-            self.assertEqual(len(rows), 1)
-            self.assertIs(rows[0], first_row)
+
+class ShimmerDirectionTest(unittest.TestCase):
+    """The sweep must start at the base color and peak at the highlight.
+
+    The lerp helper the refactor reused weights its *first* argument, so
+    passing (base, peak) here silently inverted every shimmer."""
+
+    def test_peak_band_is_the_highlight_not_the_base(self) -> None:
+        from xarness import theme
+        from xarness.tui import flow
+
+        label = "x" * 40
+        text = flow.shimmer_text(
+            label, "#101010", "#f0f0f0", phase=theme.SHIMMER_BAND_WIDTH,
+        )
+        colors = {
+            span.start: span.style.color.get_truecolor().hex  # type: ignore[union-attr]
+            for span in text.spans
+        }
+        self.assertEqual(colors[0], "#f0f0f0")  # band centre
+        self.assertEqual(colors[len(label) - 1], "#101010")  # resting text
+
+    def test_palette_pairs_put_the_highlight_second(self) -> None:
+        from xarness import theme
+
+        self.assertEqual(
+            theme.SHIMMER_PROCESSING,
+            (theme.PALETTE["muted"], theme.PALETTE["text"]),
+        )
+        self.assertEqual(
+            theme.SHIMMER_THINKING,
+            (theme.PALETTE["muted"], theme.PALETTE["surface"]),
+        )
 
 
 class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
@@ -1231,3 +1456,15 @@ class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one("#chat-input", ChatInput).text, "put back")
             self.assertIn("undo", [command.type for _, command in client.commands])
+
+
+class RelativeTimeFormatTest(unittest.TestCase):
+    def test_days_are_not_rendered_as_hours(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from xarness.tui.list_picker import relative_time
+
+        now = datetime.now(timezone.utc)
+        self.assertEqual(relative_time((now - timedelta(days=2)).isoformat()), "2d")
+        self.assertEqual(relative_time((now - timedelta(hours=3)).isoformat()), "3h00m")
+        self.assertEqual(relative_time(None), "?")

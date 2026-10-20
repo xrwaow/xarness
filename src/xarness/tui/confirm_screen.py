@@ -3,7 +3,7 @@
 Used by the resume flow to surface workspace drift: the harness shows what
 changed and lets the user choose, rather than silently reverting or accepting.
 
-Follows the same shape as the other modals (``PickerScreen``/``ResumeScreen``):
+Follows the same shape as the other modals (``ListPicker``):
 a titled surface panel centered on screen, dismissed with the app's modal
 cancel binding. The question is the title, an optional plain-text ``detail``
 block sits beneath it, and the choice is two buttons — cancel then the
@@ -46,8 +46,11 @@ class ConfirmScreen(ModalScreen[bool | None]):
         self._detail = detail
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-modal"):
-            yield Label(self._question, id="confirm-title", markup=False)
+        with Vertical(id="confirm-modal", classes="modal-panel"):
+            yield Label(
+                self._question, id="confirm-title", classes="modal-title",
+                markup=False,
+            )
             if self._detail:
                 yield Static(self._detail, id="confirm-detail", markup=False)
             with Horizontal(id="confirm-buttons"):

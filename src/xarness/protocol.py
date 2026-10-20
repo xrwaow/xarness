@@ -18,10 +18,14 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from .conversation import Message
+from .conversation import (  # noqa: F401 - re-exported for clients
+    SUMMARY_PREFIX, Message, image_refs, is_summary,
+)
 from .events import (
     ContentDelta,
     EventBase,
+    Mode,
+    State,
     ProcessingStarted,
     ReasoningDelta,
     StreamError,
@@ -30,20 +34,28 @@ from .events import (
     ToolCallStarted,
     TurnComplete,
 )
-from .images import ImageAttachment
+from .images import ImageAttachment, ImageRef
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 9
+
+# Error convention: REST routes fail with HTTP 4xx (400 bad request, 404
+# missing session/path); a ``command`` always returns 200 with
+# ``CommandResult.ok=False`` and ``error`` text, because a rejected command is
+# a valid, attributable outcome the UI renders inline.
 
 # ---------------------------------------------------------------------------
 # primitives
 
 
 
+Level = Literal["info", "warn", "error", "success", "hint"]
+
+
 class QueuedMessage(BaseModel):
     """A steering message waiting to be injected at a round boundary."""
 
     text: str
-    images: list[ImageAttachment] | None = None
+    images: list[ImageRef] | None = None
 
 
 class PendingAsk(BaseModel):
@@ -54,10 +66,15 @@ class PendingAsk(BaseModel):
 
 
 class PendingDrift(BaseModel):
-    """A live resume-drift prompt (session state, resolvable by any client)."""
+    """A live resume-drift prompt (session state, resolvable by any client).
+
+    Structured, not prose: clients render their own message from the trees
+    and changed paths."""
 
     workspace: str
-    detail: str = ""
+    last_known: str = ""
+    current: str = ""
+    files: list[str] = Field(default_factory=list)
 
 
 class RefInfo(BaseModel):
@@ -72,10 +89,10 @@ class RefInfo(BaseModel):
 class StatusPayload(BaseModel):
     """Everything a client needs for its status bar / steer bar / prompts."""
 
-    state: Literal["idle", "running", "compacting"]
+    state: State
     session_name: str | None = None
     workspace: str | None = None
-    mode: Literal["plan", "write"] = "write"
+    mode: Mode = "write"
     model_name: str = ""
     model_display_name: str = ""
     model_id: str = ""
@@ -104,16 +121,40 @@ class StatusPayload(BaseModel):
     finished_while_away: bool = False
 
 
+class PartialToolCall(BaseModel):
+    """One tool call in the round currently being generated/executed."""
+
+    call_id: str
+    name: str
+    arguments: str = ""
+    output: str = ""
+    header: str = ""
+    ok: bool | None = None
+    parse_error: bool = False
+
+
+class PartialRound(BaseModel):
+    """The live round an attaching client must render on top of the
+    snapshot messages: reasoning/content not yet persisted, plus any tool
+    calls whose results are not in the history yet."""
+
+    reasoning: str = ""
+    content: str = ""
+    tool_calls: list[PartialToolCall] = Field(default_factory=list)
+
+
 class Snapshot(BaseModel):
     """The full state a client receives when it attaches (SSE first event)."""
 
-    seq: int = 0
+    # The current compaction epoch's messages — what the model sees.
     messages: list[Message] = Field(default_factory=list)
-    compact_snapshot: list[Message] = Field(default_factory=list)
-    turn_start: int | None = None
+    # Earlier epochs hidden from the model by compaction. They are still sent
+    # so a human resuming the session sees the full transcript, with each
+    # summary message rendered as the handoff divider.
+    history: list[Message] = Field(default_factory=list)
     status: StatusPayload = Field(default_factory=StatusPayload)
-    # Events buffered during the current turn (empty when idle).
-    turn_events: list["Event"] = Field(default_factory=list)
+    # Live round state; None when no round is streaming.
+    partial_round: PartialRound | None = None
 
 
 class ServerInfo(BaseModel):
@@ -168,6 +209,12 @@ class ConfigInfo(BaseModel):
     default_sandbox: str | None = None
 
 
+class ConfigDefaults(BaseModel):
+    """PUT /config/defaults: the host owns the config file."""
+
+    default_profile: str | None = None
+
+
 class WorkspaceInfo(BaseModel):
     """One known workspace directory."""
 
@@ -189,6 +236,9 @@ class DiffInfo(BaseModel):
     files: list[DiffFileInfo] = Field(default_factory=list)
     additions: int = 0
     deletions: int = 0
+    # False distinguishes "this session has no git tracking" from "tracking
+    # is on but nothing changed" (both otherwise look like an empty diff).
+    tracking: bool = False
     # Unified diff text — only populated when a specific path is requested
     # (the summary poll passes no path and must stay cheap).
     text: str = ""
@@ -228,7 +278,7 @@ class UserMessageAdded(EventBase):
 
     type: Literal["user_message_added"] = "user_message_added"
     text: str
-    images: list[ImageAttachment] | None = None
+    images: list[ImageRef] | None = None
     message_id: str | None = None
     send_time: str | None = None
 
@@ -241,7 +291,7 @@ class StatusChanged(EventBase):
 class Notice(EventBase):
     type: Literal["notice"] = "notice"
     text: str
-    level: Literal["info", "warn", "error"] = "info"
+    level: Level = "info"
 
 
 class HistoryReplaced(EventBase):
@@ -268,12 +318,61 @@ class DriftResolved(EventBase):
     accepted: bool
 
 
+class DiffChanged(EventBase):
+    """The pending-changes summary changed (a mutating tool ran, or the turn
+    ended). Clients render this instead of polling ``GET /diff`` after every
+    tool result — including read-only ones."""
+
+    type: Literal["diff_changed"] = "diff_changed"
+    summary: DiffInfo = Field(default_factory=DiffInfo)
+
+
+class CompactionDone(EventBase):
+    """A compaction finished. The counts and the model's handoff summary are
+    structured so clients render the outcome without parsing prose."""
+
+    type: Literal["compaction_done"] = "compaction_done"
+    before: int = 0
+    after: int = 0
+    summary: str = ""
+    automatic: bool = False
+
+
+class RollbackApplied(EventBase):
+    """An undo/retry rollback finished (history + file state).
+
+    ``note`` is a machine-readable reason, not a sentence:
+    ``reverted`` | ``no_edits`` | ``no_tracking``."""
+
+    type: Literal["rollback_applied"] = "rollback_applied"
+    scope: str = "last turn"
+    reverted: int = 0
+    resend: bool = False
+    compaction_undone: bool = False
+    note: Literal["reverted", "no_edits", "no_tracking"] = "reverted"
+
+
+class DriftDetected(EventBase):
+    """The session found workspace drift on resume (also carried in status)."""
+
+    type: Literal["drift_detected"] = "drift_detected"
+    pending: PendingDrift
+
+
 class TurnFinished(EventBase):
     type: Literal["turn_finished"] = "turn_finished"
     elapsed: float = 0.0
-    # "Worked for X | Y Z" — total | running (streaming + tools) | idle; the same
-    # string the session persists on the turn's last assistant message.
-    summary: str = ""
+
+
+class TurnEnded(EventBase):
+    """The turn is fully unwound (history persisted, state back to idle).
+
+    Emitted on every path — finished, cancelled, failed — so clients never
+    have to infer "the turn is over" from a StatusChanged transition."""
+
+    type: Literal["turn_ended"] = "turn_ended"
+    outcome: Literal["finished", "cancelled", "failed"] = "finished"
+    elapsed: float = 0.0
 
 
 class SessionDeleted(EventBase):
@@ -301,7 +400,12 @@ Event = Annotated[
         AskRequested,
         AskResolved,
         DriftResolved,
+        DiffChanged,
+        CompactionDone,
+        RollbackApplied,
+        DriftDetected,
         TurnFinished,
+        TurnEnded,
         SessionDeleted,
     ],
     Field(discriminator="type"),
@@ -376,12 +480,15 @@ class Reject(CommandBase):
 
 class SetMode(CommandBase):
     type: Literal["set_mode"] = "set_mode"
-    mode: Literal["plan", "write"]
+    mode: Mode
 
 
 class SwitchModel(CommandBase):
     type: Literal["switch_model"] = "switch_model"
     name: str
+    # Also make this the config's default for future sessions. Only an
+    # explicit /model asks for this; a scripted switch leaves it alone.
+    persist_default: bool = False
 
 
 class SetSandbox(CommandBase):

@@ -16,13 +16,15 @@ import heapq
 import os
 import subprocess
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 _MAX_WALK = 20_000
 _MAX_RESULTS = 50
 _GIT_TIMEOUT = 5.0
 _CANDIDATE_TTL = 2.0
-_candidate_cache: dict[Path, tuple[float, list[str]]] = {}
+_CACHE_LIMIT = 32
+_candidate_cache: OrderedDict[Path, tuple[float, list[str]]] = OrderedDict()
 
 
 def _git_candidates(root: Path) -> list[str] | None:
@@ -61,6 +63,9 @@ def _candidates(root: Path) -> list[str]:
         tracked = _git_candidates(root)
         cached = (now, tracked if tracked is not None else _walk_bounded(root))
         _candidate_cache[root] = cached
+        _candidate_cache.move_to_end(root)
+        while len(_candidate_cache) > _CACHE_LIMIT:
+            _candidate_cache.popitem(last=False)
     return cached[1]
 
 

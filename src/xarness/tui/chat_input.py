@@ -243,7 +243,7 @@ class ChatInput(TextArea):
         for attachment in self.attachments:
             by_token.setdefault(token_text(attachment), attachment)
         return [
-            by_token[token] for token in images.find_image_tokens(self.text)
+            by_token[token] for token in images.IMAGE_TOKEN_RE.findall(self.text)
             if token in by_token
         ]
 
