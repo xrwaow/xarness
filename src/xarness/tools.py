@@ -216,7 +216,8 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         "read_file",
         "Read a file's contents. Paths are relative to the workspace root, "
         "or '.refs/<alias>' for externally referenced files (in shell "
-        "commands these live at /tmp/refs/<alias>). Files over "
+        "commands these live at /tmp/refs/<alias>). Absolute container "
+        "paths (e.g. /cache/...) are also accepted for reads. Files over "
         f"{OUTLINE_THRESHOLD} lines return a structural outline with line "
         "numbers instead of contents; read specific sections of those by "
         "passing start_line and end_line (1-based, inclusive).",
@@ -227,8 +228,15 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
     )
     async def read_file(args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "")
-        if err := _check_path(sandbox, path):
+        # Absolute paths are allowed for reads: the sandbox (bwrap mounts)
+        # already bounds what is visible, and reads never write. Writes and
+        # edits stay workspace-relative (see validate_relpath).
+        if Path(path).is_absolute():
+            target = path
+        elif err := _check_path(sandbox, path):
             return err
+        else:
+            target = sandbox.tool_path(path)
 
         try:
             start = int(args["start_line"]) if args.get("start_line") is not None else 1
@@ -240,7 +248,6 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         if start < 1:
             return ToolResult(ok=False, error="start_line is 1-based", parse_error=True)
 
-        target = sandbox.tool_path(path)
         ranged = args.get("start_line") is not None or args.get("end_line") is not None
         count = 'total=$(awk \'END{print NR}\' "$1"); printf "%d\\n" "$total"; '
         if ranged:
@@ -307,7 +314,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
                 "to read specific sections]\n"
                 f"{preview}"
             ))
-        abs_path = sandbox.workspace / path
+        abs_path = path if Path(path).is_absolute() else sandbox.workspace / path
         return ToolResult(ok=True, output=(
             "File outline retrieved. This file is too large to read all at once, so "
             "the outline below shows the file's structure with line numbers.\n"
@@ -406,25 +413,30 @@ def _collect_edits(
     return edits, None
 
 
-def _apply_edits(current: str, edits: list[tuple[str, str]]) -> tuple[str, str | None]:
-    """Apply every edit in order; return ``(new_text, error)``.
+def _apply_edits(
+    current: str, edits: list[tuple[str, str]],
+) -> tuple[str, list[str]]:
+    """Apply every edit in order; return ``(new_text, failures)``.
 
-    All-or-nothing: the first edit that does not match exactly once aborts
-    the whole call, so a partially edited file is never written.
-    """
+    Each edit is applied independently against the text the previous ones
+    produced; an edit that does not match exactly once is skipped and
+    reported, but the edits before it still count."""
     updated = current
+    failures: list[str] = []
     for index, (old, new) in enumerate(edits, 1):
         where = f"edit {index}" if len(edits) > 1 else "old_string"
         occurrences = updated.count(old)
         if occurrences == 0:
-            return updated, f"{where}: old_string not found in file"
+            failures.append(f"{where}: old_string not found in file")
+            continue
         if occurrences > 1:
-            return updated, (
+            failures.append(
                 f"{where}: old_string is not unique ({occurrences} matches); "
                 "include more surrounding context to disambiguate"
             )
+            continue
         updated = updated.replace(old, new, 1)
-    return updated, None
+    return updated, failures
 
 
 def _format_edit_diff(path: str, before: str, after: str) -> str:
@@ -468,8 +480,9 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         "file into one call rather than calling this tool repeatedly. Each "
         "old_string must match the file exactly and uniquely; include enough "
         "surrounding context (a few lines) to disambiguate if the snippet "
-        "could appear more than once. Edits are all-or-nothing: if any one "
-        "fails to match, nothing is written. The result includes a diff of "
+        "could appear more than once. Edits are applied independently: if "
+        "one fails to match it is skipped and reported, but the previous "
+        "ones are still written. The result includes a diff of "
         "what changed. Use write_file to create a file or replace its whole "
         "contents. Cannot write under '.refs/', which is read-only.",
         required=("path", "edits"),
@@ -507,9 +520,10 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             return _exec_error(read_result, "read failed")
 
         current = read_result.stdout
-        updated, failure = _apply_edits(current, edits)
-        if failure is not None:
-            return ToolResult(ok=False, error=failure)
+        updated, failures = _apply_edits(current, edits)
+        applied = len(edits) - len(failures)
+        if not applied:
+            return ToolResult(ok=False, error="; ".join(failures))
 
         write_result = await run_in_sandbox(
             sandbox,
@@ -518,12 +532,11 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         )
         if write_result.exit_code != 0:
             return _exec_error(write_result, "write failed")
-        plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
-        diff = _format_edit_diff(path, current, updated)
-        return ToolResult(
-            ok=True,
-            output=f"applied {plural} to {path}\n{diff}",
-        )
+        plural = "edit" if applied == 1 else f"{applied} edits"
+        output = f"applied {plural} to {path}\n{_format_edit_diff(path, current, updated)}"
+        if failures:
+            return ToolResult(ok=False, error="; ".join(failures), output=output)
+        return ToolResult(ok=True, output=output)
 
     return edit_file
 

@@ -17,7 +17,7 @@ from xarness.images import (
 )
 from xarness import session_store
 from xarness.session_store import (
-    SessionImageStore, _message_from, _message_dump, load_blob,
+    SessionImageStore, load_blob,
 )
 
 
@@ -139,7 +139,7 @@ class TestOrderedWireFormat(unittest.TestCase):
         a = ImageAttachment(name="a.png", mime="image/png", data_b64="QQ==", width=2, height=2)
         b = ImageAttachment(name="b.png", mime="image/png", data_b64="Qg==", width=3, height=3)
         message = _user_message(
-            "compare [🖼 a.png 2×2] with [🖼 b.png 3×3]", [a, b],
+            f"compare {token_text(a)} with {token_text(b)}", [a, b],
         )
         parts = message.to_wire()["content"]
         self.assertEqual(
@@ -161,7 +161,9 @@ class TestOrderedWireFormat(unittest.TestCase):
 
     def test_token_without_attachment_keeps_its_text(self) -> None:
         a = ImageAttachment(name="a.png", mime="image/png", data_b64="QQ==", width=2, height=2)
-        message = _user_message("[🖼 a.png 2×2] and [🖼 gone.png 1×1]", [a])
+        message = _user_message(
+            f"{token_text(a)} and [🖼 gone.png 1×1 #0000]", [a],
+        )
         parts = message.to_wire()["content"]
         self.assertEqual(parts[0]["type"], "image_url")
         texts = [p.get("text", "") for p in parts if p["type"] == "text"]
@@ -186,8 +188,8 @@ class TestPersistence(unittest.TestCase):
             data_b64=base64.b64encode(_png(4, 4)).decode(), width=4, height=4,
         )
         message = _user_message("see attached", [att])
-        raw = json.loads(json.dumps(_message_dump(message)))
-        loaded = _message_from(raw)
+        raw = json.loads(json.dumps(message.model_dump(exclude_none=True)))
+        loaded = Message.model_validate(raw)
         # The persisted shape carries only the content hash, never base64.
         self.assertNotIn("data_b64", json.dumps(raw))
         self.assertNotIn("data", json.dumps(raw))
@@ -209,20 +211,6 @@ class TestPersistence(unittest.TestCase):
         ).model_dump_json()
         self.assertNotIn(att.data_b64, payload)
         self.assertIn(att.to_ref().id, payload)
-
-    def test_legacy_inline_images_migrate_to_refs(self) -> None:
-        att = ImageAttachment(
-            name="shot.png", mime="image/png",
-            data_b64=base64.b64encode(_png(4, 4)).decode(), width=4, height=4,
-        )
-        raw = {
-            "role": "user", "content": "see attached",
-            "images": [att.model_dump()],
-        }
-        loaded = _message_from(raw)
-        self.assertFalse(hasattr(loaded, "images"))
-        self.assertEqual(loaded.parts[1].ref.id, att.to_ref().id)
-
 
 class TestBlobStore(unittest.TestCase):
     def setUp(self) -> None:

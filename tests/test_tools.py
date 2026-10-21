@@ -8,7 +8,11 @@ import pytest
 
 from xarness.sandbox import SandboxConfig
 from xarness.tools import (
-    Tool, ToolRegistry, ToolResult, _truncate_output, build_registry,
+    Tool,
+    ToolRegistry,
+    ToolResult,
+    _truncate_output,
+    build_registry,
 )
 
 
@@ -120,6 +124,26 @@ def test_read_small_file_returns_full_contents(tmp_path) -> None:
     )
     assert result.ok
     assert result.output == "one\ntwo\n"
+
+
+def test_read_accepts_absolute_container_path(tmp_path) -> None:
+    """read_file also takes absolute (container) paths, e.g. files in the
+    shared cache anchor; only reads — writes stay workspace-relative."""
+    (tmp_path / "a.txt").write_text("one\ntwo\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", '{"path": "/workspace/a.txt"}'
+    ))
+    assert result.ok
+    assert result.output == "one\ntwo\n"
+
+
+def test_read_absolute_path_outline_keeps_path_intact(tmp_path) -> None:
+    _big_python_file(tmp_path)
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", '{"path": "/workspace/big.py"}'
+    ))
+    assert result.ok
+    assert "# File outline for /workspace/big.py" in result.output
 
 
 def _big_python_file(tmp_path) -> None:
@@ -342,7 +366,7 @@ def test_edit_file_edits_apply_in_order(tmp_path) -> None:
     assert (tmp_path / "f.txt").read_text() == "UNO\ntwo\n"
 
 
-def test_edit_file_edits_are_all_or_nothing(tmp_path) -> None:
+def test_edit_file_applies_edits_before_a_failure(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\nbeta\n")
     result = asyncio.run(_registry_for(tmp_path).call(
         "edit_file",
@@ -354,7 +378,10 @@ def test_edit_file_edits_are_all_or_nothing(tmp_path) -> None:
     assert not result.ok
     assert "edit 2" in result.error
     assert "not found" in result.error
-    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\n"
+    # Edit 1 was applied even though edit 2 failed.
+    assert (tmp_path / "f.txt").read_text() == "ALPHA\nbeta\n"
+    assert "applied edit to f.txt" in result.output
+    assert "+ALPHA" in result.output
 
 
 def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
@@ -369,7 +396,9 @@ def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
     assert not result.ok
     assert "edit 2" in result.error
     assert "not unique" in result.error
-    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\nalpha\n"
+    # Edit 1 was applied even though edit 2 was ambiguous.
+    assert (tmp_path / "f.txt").read_text() == "alpha\nBETA\nalpha\n"
+    assert "applied edit to f.txt" in result.output
 
 
 def test_edit_file_rejects_empty_edits_list(tmp_path) -> None:

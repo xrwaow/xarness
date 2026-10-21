@@ -486,6 +486,10 @@ class Transcript:
             item = self.tool_blocks.get(event.call_id)
             if item is None:
                 return []
+            # Some providers only send the function name on a later fragment
+            # than the first; the authoritative name rides on Done.
+            if event.name:
+                item.name = event.name
             item.args = event.arguments_json
             return [item]
         if isinstance(event, ToolOutputDelta):

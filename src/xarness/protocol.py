@@ -283,6 +283,11 @@ class SessionSummary(BaseModel):
     last_user_message_at: str | None = None
     message_count: int = 0
     tracking: bool = False
+    # Unaccepted (pending) change totals vs the session's baseline —
+    # hosted (loaded) sessions only, and only when the listing asks for
+    # stats (cheap listing omits them).
+    additions: int = 0
+    deletions: int = 0
 
 
 class ServerStats(BaseModel):

@@ -38,6 +38,20 @@ STATE_WORDS = {
 # Right-aligned state column: padded to the longest state word.
 STATE_WIDTH = max(len(word) for word, _ in STATE_WORDS.values())
 
+# Usable row width inside the session picker, derived from the CSS:
+# #picker-modal is PICKER_MODAL_WIDTH wide, .modal-panel pads 2 per side
+# and each option pads 1 per side — width - 2*2 - 2*1 characters of
+# content. Keep in step with styles.tcss. The age and +/- columns are
+# fixed (age up to 6 chars like "23h58m", counts up to 4 digits); only
+# the name flexes.
+PICKER_MODAL_WIDTH = 62
+SESSION_ROW_WIDTH = PICKER_MODAL_WIDTH - 6
+AGE_WIDTH = 6
+# +/- fields: sign glued to a 3-digit number, each field right-aligned
+# ("  +2", "+410" / "  -1", "-431") and joined by one space.
+PLUS_FIELD = 4
+MINUS_FIELD = 4
+
 
 def relative_time(iso: str | None) -> str:
     """Format an ISO timestamp as age from now: 5m / 3h / 12d."""
@@ -95,19 +109,67 @@ def session_options(
          if not s.active and _same_path(s.workspace or "", resolved)),
         key=lambda s: s.last_user_message_at or "", reverse=True,
     )
-    rows = []
+    # Column widths are derived from the data so every row lines up as a
+    # table: age right-aligned, unaccepted +/- totals in fixed +/-
+    # sub-columns (blank for tracked-but-clean or untracked sessions),
+    # state word flush right. The name takes whatever width is left.
+    rows_data = []
     for summary in [*active, *saved]:
-        row = Text(summary.name)
-        row.append(
-            f"  {relative_time(summary.last_user_message_at)}",
-            style=theme.PALETTE["muted"],
-        )
-        state_word = STATE_WORDS.get(summary.state)
-        if state_word is not None:
-            word, color_key = state_word
-            row.append("  " + word.rjust(STATE_WIDTH), style=theme.PALETTE[color_key])
-        rows.append(Option(row, id=summary.name))
-    return rows
+        tracked = summary.tracking and (summary.additions or summary.deletions)
+        rows_data.append((
+            summary,
+            relative_time(summary.last_user_message_at),
+            f"+{summary.additions}" if tracked and summary.additions else "",
+            f"-{summary.deletions}" if tracked and summary.deletions else "",
+        ))
+    return [
+        Option(_session_row(summary, age, plus, minus), id=summary.name)
+        for summary, age, plus, minus in rows_data
+    ]
+
+
+def _session_row(
+    summary: SessionSummary,
+    age: str,
+    plus: str,
+    minus: str,
+) -> Text:
+    """One session row, table-aligned: name | age | +/- | ... | state.
+
+    The age, +/- and state columns keep their width even when a row has
+    nothing to show in them, so every column lines up across the list.
+    """
+    state_word = STATE_WORDS.get(summary.state)
+    word, color_key = state_word if state_word else ("", "")
+    # Segments after the name consume: 2+AGE_WIDTH (gap + age),
+    # PLUS_FIELD+1+MINUS_FIELD (+/- column), 2+len(word) (gap + state).
+    fixed = (
+        AGE_WIDTH + 2 + PLUS_FIELD + 1 + MINUS_FIELD
+        + (len(word) + 2 if word else 0)
+    )
+    name_width = max(8, SESSION_ROW_WIDTH - fixed)
+    name = summary.name
+    if len(name) > name_width:
+        name = name[:name_width - 1] + "…"
+    row = Text(name)
+    row.append(
+        " " * max(AGE_WIDTH - len(age), 0) + f"  {age}",
+        style=theme.PALETTE["muted"],
+    )
+    # Both fields are always emitted (blank when unused) so the +/-
+    # column keeps its width on every row.
+    row.append(
+        "  " + (plus.rjust(PLUS_FIELD) if plus else " " * PLUS_FIELD),
+        style=theme.PALETTE["success"],
+    )
+    row.append(
+        " " + (minus.rjust(MINUS_FIELD) if minus else " " * MINUS_FIELD),
+        style=theme.PALETTE["error"],
+    )
+    if word:
+        pad = SESSION_ROW_WIDTH - row.cell_len - len(word)
+        row.append(" " * max(pad, 2) + word, style=theme.PALETTE[color_key])
+    return row
 
 
 class ListPicker(ModalScreen[str | None]):

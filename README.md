@@ -228,7 +228,7 @@ Config is JSON at `~/.config/xarness/config.json` (override with
     the config itself. Set to `null` for providers that need no key (e.g.
     local models).
   - `model_id` — the model to request.
-  - `shown_name` — optional display name in the UI.
+  - `display_name` — optional display name in the UI.
   - `max_context` — context-window size used for compaction (default 128000).
   - `cot_strength` — reasoning effort sent to the provider: `off`, `low`,
     `medium`, or `high` (no interactive picker; set it here).
@@ -236,8 +236,12 @@ Config is JSON at `~/.config/xarness/config.json` (override with
     rounds (default `true`).
   - `supports_vision` — the model accepts image attachments (default
     `false`). The TUI refuses to attach images when this is false. When
-    `true`, paste an image file path into the input or `@`-mention it: each
-    image becomes a `[🖼 name W×H]` token in the text (deletable as one
+    `true`, paste an image file path into the input, `@`-mention it, or
+    copy an image (screenshot, browser image) and press Ctrl+V in the
+    input — the clipboard image attaches directly, no file needed (use
+    Ctrl+V for text too; the terminal's Ctrl+Shift+V cannot carry images):
+    each
+    image becomes a `[🖼 name W×H #id]` token in the text (deletable as one
     unit). Images are downsampled to at most 1 megapixel and sent as base64
     on every round.
   - `auto_compact` — compact automatically when the context estimate passes
@@ -307,10 +311,12 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 
 ## Behavior notes
 
-- **States while waiting**: `Processing` from request sent until the first
-  token of any kind, then `Thinking` (pulsing) while reasoning-channel tokens
-  arrive (`reasoning_content` / `reasoning` delta fields), then the streamed
-  answer. Models without a reasoning channel skip the thinking state.
+- **States while waiting**: `Processing` from a request being sent until the
+  first token of any kind, then `Thinking` (pulsing) while reasoning-channel
+  tokens arrive (`reasoning_content` / `reasoning` delta fields), then the
+  streamed answer. It appears only while an LLM request is in flight — tool
+  calls that execute between rounds show their own `Running …` line, not the
+  `Processing` strip. Models without a reasoning channel skip the thinking state.
   Compaction shows its own shimmering `Compacting` line while it summarizes.
 - **Interrupting**: one `Escape` only arms the interrupt and shows a
   `press esc again to interrupt` prompt; a second `Escape` within a couple of

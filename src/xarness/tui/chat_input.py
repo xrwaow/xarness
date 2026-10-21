@@ -21,8 +21,7 @@ from textual.message import Message
 from textual.widgets import TextArea
 from textual.widgets.text_area import Selection, TextAreaTheme
 
-from .. import images
-from .. import theme
+from .. import images, theme
 from ..images import ImageAttachment, ImageError, token_text
 
 _SLASH_RE = re.compile(r"^/(\w*)$")
@@ -202,6 +201,10 @@ class ChatInput(TextArea):
         """
         if "\n" in event.text:
             return
+        if not event.text.strip():
+            self.action_paste()
+            event.stop()
+            return
         path = images.parse_image_path(event.text)
         if path is None or not images.is_image_path(path) or not path.is_file():
             return
@@ -212,6 +215,21 @@ class ChatInput(TextArea):
         event.prevent_default()
         event.stop()
         self.insert_image(attachment)
+
+    def action_paste(self) -> None:
+        """Ctrl+V: image → attach, text → insert, from the system clipboard.
+
+        Image bytes and OSC 52 both die at the terminal, so Textual's own
+        paste is the last resort only."""
+        image = images.clipboard_image()
+        if image:
+            self.insert_image(image)
+            return
+        text = images.clipboard_text()
+        if text:
+            self.insert(text)
+        else:
+            super().action_paste()
 
     def insert_image(self, attachment: ImageAttachment) -> bool:
         """Attach an image; false (with a notice) when vision is unsupported."""

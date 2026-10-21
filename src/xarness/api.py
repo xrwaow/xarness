@@ -78,7 +78,9 @@ def sessions_router(host: Host) -> APIRouter:
     async def list_sessions(
         active: bool | None = None, workspace: str | None = None,
     ) -> list[SessionSummary]:
-        return host.list_sessions(active=active, workspace=workspace)
+        return await host.list_sessions_with_stats(
+            active=active, workspace=workspace,
+        )
 
     @router.post(
         "/sessions",

@@ -1419,12 +1419,11 @@ class AgentApp(App[None]):
                 and self._transcript.thinking is None
                 and not event.has_tool_calls):
             self._error("empty response from model")
-        if event.has_tool_calls:
-            # The turn continues with another round: back to waiting on the
-            # provider — the strip reappears below the settled tool blocks.
-            self._phase_pending()
-        else:
-            self._phase_idle()
+        # The round is over: clear the strip even when tool calls follow. The
+        # strip means "waiting on the provider", not "the turn is busy"; while
+        # the tools execute there is no LLM request in flight. The next round's
+        # ProcessingStarted (after the tools finish) puts it back up.
+        self._phase_idle()
         self._refresh_status()
 
     async def _on_history_replaced(self, event: HistoryReplaced) -> None:

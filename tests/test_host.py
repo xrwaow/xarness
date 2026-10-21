@@ -925,7 +925,76 @@ def test_daemon_import_does_not_pull_in_textual() -> None:
     import sys
 
     code = (
-        "import sys, xarness.host, xarness.themes; "
+        "import sys, xarness.host; "
         "assert 'textual' not in sys.modules, sorted(sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -> None:
+    """list_sessions_with_stats stamps each row with the session's
+    unaccepted (+/-) totals from the hosted git info — and degrades to
+    zeroed totals instead of failing when a stat cannot be computed."""
+    import types
+
+    from xarness import gitwork
+    from xarness.gitwork import DiffStat
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [[TurnComplete()]])
+            session = host.sessions[name]
+
+            # No git info: totals stay zero, listing still works.
+            session.git_info = None
+            rows = await host.list_sessions_with_stats()
+            row = next(r for r in rows if r.name == name)
+            assert (row.additions, row.deletions, row.tracking) == (0, 0, False)
+
+            # With git info the pending diff totals land on the row.
+            async def fake_diff_stat(info):
+                return DiffStat(additions=7, deletions=2, tracking=True)
+
+            monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
+            session.git_info = types.SimpleNamespace(baseline_tree="x")
+            rows = await host.list_sessions_with_stats()
+            row = next(r for r in rows if r.name == name)
+            assert (row.additions, row.deletions) == (7, 2)
+            assert row.tracking is True
+
+            # A failing stat must not break the listing.
+            async def broken_diff_stat(info):
+                raise RuntimeError("git blew up")
+
+            monkeypatch.setattr(gitwork, "diff_stat", broken_diff_stat)
+            rows = await host.list_sessions_with_stats()
+            row = next(r for r in rows if r.name == name)
+            assert (row.additions, row.deletions) == (0, 0)
+
+            # Saved (not hosted) sessions get no totals at all: the
+            # persisted numbers would be stale, so they stay blank.
+            monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
+            session.git_info = types.SimpleNamespace(
+                baseline_tree="x",
+                to_block=lambda: {"session_id": "s", "workspace": "/w",
+                                  "git_dir": "/w/.git"},
+            )
+            session._persist()
+            await host.unload_session(name)
+            assert name not in host.sessions
+            rows = await host.list_sessions_with_stats()
+            row = next(r for r in rows if r.name == name)
+            assert (row.additions, row.deletions) == (0, 0)
+            # ...and load_state was never called for the listing.
+            monkeypatch.setattr(
+                session_store, "load_state",
+                lambda *a, **kw: (_ for _ in ()).throw(
+                    AssertionError("full conversation parsed")),
+            )
+            assert await host.list_sessions_with_stats()
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                task.cancel()
+
+    asyncio.run(go())

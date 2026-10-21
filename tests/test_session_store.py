@@ -57,9 +57,12 @@ def test_usage_totals_round_trip(tmp_path, monkeypatch) -> None:
     conversation.add(Message(role="user", content="hi"))
     conversation.add(Message(role="assistant", content="hello"))
     session_store.save_state("s", session_store.SessionState(
-        conversation, "m", total_in=1200, total_out=340, last_in=1100, last_out=300,
+        conversation, "m", workspace="/w",
+        total_in=1200, total_out=340, last_in=1100, last_out=300,
     ))
     loaded = session_store.load_state("s")
+    # The model and context accounting a resumed session needs are all here.
+    assert loaded.profile == "m" and loaded.workspace == "/w"
     assert (loaded.total_in, loaded.total_out) == (1200, 340)
     assert (loaded.last_in, loaded.last_out) == (1100, 300)
 
@@ -190,7 +193,7 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
     # listing and last-used lookups stay cheap).
     def explode(*args, **kwargs):
         raise AssertionError("full conversation parsed")
-    monkeypatch.setattr(store, "_conversation_from", explode)
+    monkeypatch.setattr(store, "load_state", explode)
     meta = store.load_meta("s")
     assert meta["workspace"] == "/w" and meta["message_count"] == 2
     assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
@@ -216,61 +219,6 @@ def test_saved_files_carry_a_schema_version(tmp_path, monkeypatch) -> None:
     assert data["schema"] == session_store.SCHEMA_VERSION
 
 
-def test_legacy_checkpoint_fields_migrate_to_turns(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    _write_fixture(tmp_path, "old", {
-        "workspace": "/w",
-        "messages": [
-            {"role": "system", "content": "old prompt"},
-            {"role": "user", "content": "hi", "id": "u1",
-             "checkpoint_sha": "before", "after_tree": "after"},
-            {"role": "assistant", "content": "hello"},
-        ],
-    })
-    loaded = session_store.load_state("old")
-    assert [m.role for m in loaded.conversation.messages] == ["user", "assistant"]
-    assert loaded.conversation.turns[0].user_message_id == "u1"
-    assert loaded.conversation.turns[0].before_tree == "before"
-    assert loaded.conversation.turns[0].after_tree == "after"
-
-
-def test_legacy_compact_snapshot_migrates_to_epochs(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    _write_fixture(tmp_path, "old", {
-        "messages": [
-            {"role": "user", "content": "summary", "kind": "summary"},
-            {"role": "assistant", "content": "after"},
-        ],
-        "compact_snapshot": [
-            {"role": "user", "content": "pre", "id": "u0",
-             "checkpoint_sha": "tree0"},
-            {"role": "assistant", "content": "old answer"},
-        ],
-    })
-    loaded = session_store.load_state("old").conversation
-    assert loaded.epoch == 1
-    assert [m.content for m in loaded.messages] == [
-        "pre", "old answer", "summary", "after",
-    ]
-    assert [m.epoch for m in loaded.messages] == [0, 0, 1, 1]
-    assert loaded.turns[0].before_tree == "tree0"
-    assert [m.content for m in loaded.visible_messages()] == ["summary", "after"]
-
-
-def test_legacy_tool_error_prefix_migrates_to_ok(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    _write_fixture(tmp_path, "old", {
-        "messages": [
-            {"role": "user", "content": "go"},
-            {"role": "tool", "tool_call_id": "c1",
-             "content": "error: boom"},
-        ],
-    })
-    tool = session_store.load_state("old").conversation.messages[1]
-    assert tool.content == "boom"
-    assert tool.ok is False
-
-
 def test_tool_calls_persist_in_internal_shape(tmp_path, monkeypatch) -> None:
     import json
 
@@ -287,51 +235,25 @@ def test_tool_calls_persist_in_internal_shape(tmp_path, monkeypatch) -> None:
     ]
 
 
-def test_legacy_wire_tool_calls_migrate(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    _write_fixture(tmp_path, "old", {
-        "messages": [{
-            "role": "assistant", "content": "",
-            "tool_calls": [{
-                "id": "c1", "type": "function",
-                "function": {"name": "run_bash", "arguments": "{}"},
-            }],
-        }],
-    })
-    call = session_store.load_state("old").conversation.messages[0].tool_calls[0]
-    assert call.call_id == "c1"
-    assert call.name == "run_bash"
-    assert call.arguments_json == "{}"
-
-
-def test_newer_schema_is_rejected(tmp_path, monkeypatch) -> None:
+def test_unsupported_schemas_are_rejected(tmp_path, monkeypatch) -> None:
     import pytest
 
     monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
     _write_fixture(tmp_path, "future", {
         "schema": session_store.SCHEMA_VERSION + 1,
         "messages": [],
+        "turns": [],
     })
     with pytest.raises(ValueError, match="newer than supported"):
         session_store.load_state("future")
 
-
-def test_legacy_meta_sidecar_seeds_the_index(tmp_path, monkeypatch) -> None:
-    """An old .meta.json is folded into the index once and then removed."""
-    import json
-
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    conversation = Conversation()
-    conversation.add(Message(role="user", content="q"))
-    session_store.save_state("s", session_store.SessionState(conversation, "m"))
-    index_file = tmp_path / "index.json"
-    index_file.unlink()
-    sidecar = tmp_path / "s.meta.json"
-    sidecar.write_text(json.dumps({"workspace": "/legacy", "message_count": 1}))
-
-    assert session_store.load_meta("s")["workspace"] == "/legacy"
-    assert not sidecar.exists()
-    assert json.loads(index_file.read_text())["sessions"]["s"]["workspace"] == "/legacy"
+    _write_fixture(tmp_path, "old", {
+        "schema": session_store.SCHEMA_VERSION - 1,
+        "messages": [],
+        "turns": [],
+    })
+    with pytest.raises(ValueError, match="no longer supported"):
+        session_store.load_state("old")
 
 
 def test_meta_index_written_and_removed(tmp_path, monkeypatch) -> None:

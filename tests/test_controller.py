@@ -9,7 +9,7 @@ from xarness.config import CotStrength, ProviderProfile
 from xarness.controller import ChatController, PartialRound
 from xarness.conversation import Message, ToolCall, build_parts
 from xarness.gitwork import TurnCheckpoint
-from xarness.images import ImageAttachment
+from xarness.images import ImageAttachment, token_text
 from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
@@ -592,11 +592,10 @@ def test_rollback_plan_keeps_images() -> None:
 
 
 def test_image_token_maps_by_text_not_ordinal() -> None:
+    image = _image()
+    text = f"[🖼 stale 1×1 #0000] mid {token_text(image)} end"
     msg = Message(
-        role="user", content="[🖼 stale 1×1] mid [🖼 cat.png 1×1] end",
-        parts=build_parts(
-            "[🖼 stale 1×1] mid [🖼 cat.png 1×1] end", [_image()],
-        ),
+        role="user", content=text, parts=build_parts(text, [image]),
     )
     parts = msg.to_wire()["content"]
     image_at = next(i for i, p in enumerate(parts) if p["type"] == "image_url")

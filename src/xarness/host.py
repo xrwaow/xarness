@@ -362,6 +362,27 @@ class Host:
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
         return summaries
 
+    async def list_sessions_with_stats(
+        self, *, active: bool | None = None, workspace: str | None = None,
+    ) -> list[SessionSummary]:
+        """``list_sessions`` plus unaccepted (pending) diff totals for the
+        hosted sessions. Saved sessions get no totals: computing them from
+        the persisted git block is expensive and often stale. Best-effort —
+        a session whose diff cannot be computed lists with zeroed totals.
+        """
+        summaries = self.list_sessions(active=active, workspace=workspace)
+        for summary in summaries:
+            session = self.sessions.get(summary.name)
+            if session is None or session.git_info is None:
+                continue
+            try:
+                stat = await gitwork.diff_stat(session.git_info)
+            except Exception:  # noqa: BLE001, S112 - stats must not break listing
+                continue
+            summary.additions = stat.additions
+            summary.deletions = stat.deletions
+        return summaries
+
     # ------------------------------------------------------------------
     # read-only views of saved sessions
 

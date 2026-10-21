@@ -28,7 +28,7 @@ def test_profile_fields_parsed(tmp_path: Path) -> None:
             "base_url": "https://api.openai.com/v1/",
             "api_key_env": "MY_KEY",
             "model_id": "gpt-4.1",
-            "shown_name": "GPT-4.1",
+            "display_name": "GPT-4.1",
             "max_context": 128000,
             "cot_strength": "medium",
         }}},

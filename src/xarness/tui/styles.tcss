@@ -402,8 +402,8 @@ ConfirmScreen, RefsScreen, ListPicker {
 }
 
 #picker-modal {
-    width: 52;
-    max-height: 20;
+    width: 62;
+    max-height: 28;
 }
 
 #picker-list {

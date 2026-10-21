@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+import subprocess
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -157,11 +158,32 @@ def load_image(path: Path | str) -> ImageAttachment:
     a decodable image. Animated GIFs keep their first frame."""
     file = Path(path).expanduser()
     try:
-        img = Image.open(file)
+        data = file.read_bytes()
+    except OSError as exc:
+        raise ImageError(f"could not read image {file}: {exc}") from None
+    return load_image_bytes(data, name=file.name)
+
+
+def load_image_bytes(data: bytes, name: str = "clipboard.png") -> ImageAttachment:
+    """Decode, downsample if needed, and encode raw image bytes.
+
+    Raises :class:`ImageError` when the bytes are not a decodable image.
+    Animated GIFs keep their first frame."""
+    try:
+        img = Image.open(BytesIO(data))
         img.load()
     except (OSError, ValueError) as exc:
-        raise ImageError(f"could not read image {file}: {exc}") from None
-    name = file.name
+        raise ImageError(f"could not read image {name}: {exc}") from None
+    return _attachment_from_pil(img, name, data)
+
+
+def _attachment_from_pil(
+    img: Image.Image, name: str, original: bytes | None,
+) -> ImageAttachment:
+    """Turn a loaded Pillow image into an :class:`ImageAttachment`.
+
+    ``original`` is the source bytes, reused verbatim when the image was
+    untouched and already PNG/JPEG (no generation loss)."""
     fmt = img.format or "PNG"
 
     if img.width * img.height > MAX_PIXELS:
@@ -186,10 +208,10 @@ def load_image(path: Path | str) -> ImageAttachment:
     if fmt == "JPEG" and img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
-    if not downsampled and fmt in ("PNG", "JPEG"):
+    if not downsampled and fmt in ("PNG", "JPEG") and original is not None:
         # Untouched within the pixel budget: send the original bytes so no
         # generation loss sneaks in.
-        data = file.read_bytes()
+        data = original
         mime = "image/jpeg" if fmt == "JPEG" else "image/png"
         width, height = img.width, img.height
     else:
@@ -213,3 +235,51 @@ def load_image(path: Path | str) -> ImageAttachment:
         width=width,
         height=height,
     )
+
+
+def _clip_run(cmd: list[str]) -> bytes:
+    """Stdout of a clipboard read command; empty on any failure."""
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=3, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return b""
+
+
+def clipboard_image() -> ImageAttachment | None:
+    """Read an image straight from the system clipboard, if one is there.
+
+    Tries the platform tools in turn (wl-paste/xclip on Linux, osascript on
+    macOS); ``None`` when no image comes back. Nothing is written to disk."""
+    for cmd in (
+        ["wl-paste", "--type", "image/png"],
+        ["wl-paste"],  # default type (may be text/html for browser copies)
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["osascript", "-e", "the clipboard as «class PNGf»"],
+    ):
+        data = _clip_run(cmd)
+        if cmd[0] == "osascript":
+            # osascript reports the PNG as '«data PNGf<hex>»'.
+            hex_ = data.decode("ascii", "ignore").strip().removeprefix("«data PNGf")
+            try:
+                data = bytes.fromhex(hex_.strip().strip("«»\""))
+            except ValueError:
+                data = b""
+        if sniff_mime(data) != "application/octet-stream":
+            try:
+                return load_image_bytes(data)
+            except ImageError:
+                pass
+    return None
+
+
+def clipboard_text() -> str | None:
+    """Read plain text from the system clipboard, if there is any."""
+    for cmd in (
+        ["wl-paste", "--type", "text/plain"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["pbpaste"],
+    ):
+        text = _clip_run(cmd).decode("utf-8", "replace").strip("\n\r")
+        if text:
+            return text
+    return None

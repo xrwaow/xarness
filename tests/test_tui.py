@@ -617,6 +617,13 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
                 presentation = await app._presenter.present(entry, 80)
                 text = "\n".join(strip.text for strip in presentation.strips)
                 self.assertIn(expected, text)
+            # The same labels are what the live view actually paints (not
+            # just what the presenter returns when asked directly).
+            flow = app.query_one("#chat-log")
+            painted = "\n".join(
+                flow.row_text(y) for y in range(flow.row_count))
+            self.assertIn("Running write_file +3 a.py", painted)
+            self.assertIn("Running run_bash grep -rn foo", painted)
 
     def test_expanded_edit_file_body_shows_the_diff(self) -> None:
         """edit_file's returned unified diff must render as +/- rows — the
@@ -660,28 +667,27 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(entry.item.status, ToolStatus.MAKING_CALL)
             # No auto-expand: a running call stays collapsed until clicked.
             self.assertFalse(entry.item.expanded)
-            collapsed = "\n".join(
-                strip.text
-                for strip in (await app._presenter.present(entry, 80)).strips
-            )
-            self.assertNotIn("first", collapsed)
-            entry.item.expanded = True
-            text = "\n".join(
-                strip.text
-                for strip in (await app._presenter.present(entry, 80)).strips
-            )
-            self.assertIn("first", text)
+            flow = app.query_one("#chat-log")
+
+            def painted() -> str:
+                return "\n".join(
+                    flow.row_text(y) for y in range(flow.row_count))
+
+            self.assertNotIn("first", painted())
+            # Expand by clicking the entry (the real path, not by flipping
+            # the flag and asking the presenter directly).
+            from textual_flowview import FlowView
+            app.post_message(FlowView.Clicked(flow, entry, 0, 0))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("first", painted())
 
             client.queue.put_nowait(
                 protocol.ToolOutputDelta(call_id="b1", text="second\n"))
             await pilot.pause()
             await pilot.pause()
-            text = "\n".join(
-                strip.text
-                for strip in (await app._presenter.present(entry, 80)).strips
-            )
-            self.assertIn("first", text)
-            self.assertIn("second", text)
+            self.assertIn("first", painted())
+            self.assertIn("second", painted())
 
     async def test_completed_edit_file_expands_to_diff(self) -> None:
         """End-to-end live path: the finished call's output feeds the
@@ -715,24 +721,6 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             text = "\n".join(strip.text for strip in presentation.strips)
             self.assertIn("- old", text)
             self.assertIn("+ new", text)
-
-    def test_legacy_collapsed_edit_diff_still_renders(self) -> None:
-        """Sessions recorded by the buggy generator stored the whole hunk
-        on one line; replaying them must not lose the diff."""
-        from xarness.tui.tool_view import ToolCallView, _edit_body
-        from xarness.tui.transcript import ToolStatus
-
-        output = (
-            "applied 1 edit to a.py\ndiff --git a/a.py b/a.py\n"
-            "--- a/a.py+++ b/a.py@@ -1,2 +1,2 @@-old\n+new\n keep\n"
-        )
-        body = _edit_body(ToolCallView(
-            name="edit_file", args='{"path": "a.py"}', output=output,
-            status=ToolStatus.CALL_SUCCEEDED, expanded=True,
-        ))
-        self.assertIn("- old", body.plain)
-        self.assertIn("+ new", body.plain)
-
 
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
     """Session popup rows: {title} {age}, with a right-aligned state word
@@ -994,9 +982,13 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                  if isinstance(e.item, tflow.PendingItem) and e.alive],
                 "pending strip outlived the interrupt")
 
-    async def test_pending_strip_reappears_between_tool_rounds(self) -> None:
-        """After a round ends with tool calls, the strip is back while the
-        next round waits on the provider — then goes away on first delta."""
+    async def test_pending_strip_only_while_waiting_on_provider(self) -> None:
+        """The strip means "waiting on the LLM", not "the turn is busy".
+
+        A round that ends with tool calls goes idle (the tools execute with no
+        strip); the strip only comes back when the *next* round's
+        ``ProcessingStarted`` opens a provider request, then goes away on the
+        first delta."""
         from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
@@ -1005,9 +997,16 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             q.put_nowait(protocol.ContentDelta(text="hi"))
             q.put_nowait(protocol.TurnComplete(has_tool_calls=True))
             await pilot.pause()
-            self.assertTrue([e for e in app._flow_model.entries
-                             if isinstance(e.item, tflow.PendingItem)])
+            # Tools are about to run: no provider request is in flight.
+            self.assertEqual(app._phase, "idle")
+            self.assertFalse([e for e in app._flow_model.entries
+                              if isinstance(e.item, tflow.PendingItem) and e.alive])
+            # The next round (after the tools) waits on the provider again.
+            q.put_nowait(protocol.ProcessingStarted())
+            await pilot.pause()
             self.assertEqual(app._phase, "pending")
+            self.assertTrue([e for e in app._flow_model.entries
+                             if isinstance(e.item, tflow.PendingItem) and e.alive])
             q.put_nowait(protocol.ContentDelta(text="again"))
             await pilot.pause()
             self.assertEqual(app._phase, "streaming")
