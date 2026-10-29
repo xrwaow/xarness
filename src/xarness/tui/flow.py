@@ -28,11 +28,17 @@ import time
 import traceback
 from functools import singledispatch
 from pathlib import Path
+from typing import ClassVar
 
+from rich import box
 from rich.console import Console
+from rich.markdown import Heading as RichHeading
 from rich.markdown import Markdown as RichMarkdown
+from rich.markdown import TableElement as RichTableElement
+from rich.padding import Padding
 from rich.segment import Segment
 from rich.style import Style
+from rich.table import Table
 from rich.text import Text
 from textual.strip import Strip
 from textual_flowview import Presentation
@@ -273,10 +279,13 @@ class Presenter:
         if len(chunks) > 2_000:
             chunks.clear()
         for i, chunk in enumerate(item.chunks):
-            key = (i, self.epoch, width)
+            # A heading on the very first line of the answer gets no blank
+            # line above it; a heading that opens a later chunk does.
+            pad_leading = bool(body)
+            key = (i, self.epoch, width, pad_leading)
             cached = chunks.get(key)
             if cached is None:
-                cached = _settled_strips(chunk, body_w)
+                cached = _settled_strips(chunk, body_w, pad_leading=pad_leading)
                 chunks[key] = cached
             body.extend(cached)
         tail = item.live.rstrip()
@@ -399,30 +408,128 @@ class Presenter:
         return render_strips(text, width)
 
 
-def _settled_strips(text: str, width: int) -> list[Strip]:
-    """A settled assistant chunk: markdown prose + palette-highlighted fences
-    (ported from the 8957ce64 fast path). No blank lines between blocks —
-    rich.markdown's inter-block spacing is stripped after rendering."""
-    parts = []
+class _BorderedTableElement(RichTableElement):
+    """Rich's markdown table, drawn as a real boxed table.
+
+    rich.markdown defaults to ``box.SIMPLE`` (no outer or column borders),
+    which reads as loose text in the transcript. Render through rich's
+    ``Table`` with a rounded border instead, keeping the palette's
+    ``markdown.table.border``/``markdown.table.header`` styles and the
+    cell wrapping a narrow transcript needs."""
+
+    def __rich_console__(self, console, options):
+        table = Table(
+            box=box.ROUNDED,
+            style="markdown.table.border",
+            show_edge=True,
+            show_lines=True,
+            collapse_padding=False,
+        )
+
+        if self.header is not None and self.header.row is not None:
+            for column in self.header.row.cells:
+                heading = column.content.copy()
+                heading.stylize("markdown.table.header")
+                # overflow="fold" wraps cell text instead of ellipsizing it.
+                table.add_column(heading, justify="left", overflow="fold")
+
+        if self.body is not None:
+            for row in self.body.rows:
+                table.add_row(*[cell.content for cell in row.cells])
+
+        # Leave the last cell of the line blank: a table that reaches the
+        # terminal's final column sits in the pending-wrap state, and some
+        # terminals drop/overwrite that last glyph (usually a right border).
+        yield Padding(table, (0, 1, 0, 0))
+
+
+class _Heading(RichHeading):
+    """Left-aligned headings.
+
+    rich's Heading implementation differs between versions (14.1 renders h1
+    as a centered Panel; later versions center it via LEVEL_ALIGN), so
+    implement the small TextElement contract directly instead of relying on
+    either.
+    """
+
+    @classmethod
+    def create(cls, markdown, token):
+        return cls(token.tag)
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.style_name = f"markdown.{tag}"
+
+    def on_enter(self, context) -> None:
+        self.text = Text()
+        context.enter_style(self.style_name)
+
+    def on_leave(self, context) -> None:
+        context.leave_style()
+
+    def __rich_console__(self, console, options):
+        text = self.text.copy()
+        text.justify = "left"
+        yield text
+
+
+class _Markdown(RichMarkdown):
+    """rich.markdown with boxed tables and left-aligned headings."""
+
+    elements: ClassVar[dict[str, type]] = dict(
+        RichMarkdown.elements,
+        heading_open=_Heading,
+        table_open=_BorderedTableElement,
+    )
+
+
+_HEADING_LINE_RE = re.compile(r"(?m)^(?=#{1,6}[ \t])")
+
+
+def _settled_strips(
+    text: str, width: int, *, pad_leading: bool = False,
+) -> list[Strip]:
+    """Render a settled assistant chunk: markdown prose plus highlighted
+    fences.
+
+    rich.markdown's inter-block blank lines are dropped so prose stays
+    contiguous, except that each heading gets one blank line above it
+    (padding-top: 1). Headings are split into their own parts so that blank
+    can be inserted independently of rich's version-specific heading layout.
+    ``pad_leading`` controls whether a heading on the chunk's first line gets
+    that padding (False for the first line of an answer).
+    """
+    # (renderable, is_prose, blank_line_before)
+    parts: list[tuple[object, bool, bool]] = []
     pos = 0
 
     def add_prose(chunk: str) -> None:
         prose = chunk.strip("\n")
-        if prose.strip():
-            # rich.markdown collapses single newlines into spaces; make them
-            # hard breaks so "line1\nline2" renders as two lines.
-            prose = re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
-            parts.append((RichMarkdown(prose), True))
+        if not prose.strip():
+            return
+        # rich.markdown collapses single newlines into spaces; make them
+        # hard breaks so "line1\nline2" renders as two lines.
+        prose = re.sub(r"(?<!\n)\n(?!\n)", "  \n", prose)
+        seen_content = pad_leading or bool(parts)
+        for segment in _HEADING_LINE_RE.split(prose):
+            if not segment.strip():
+                continue
+            is_heading = _HEADING_LINE_RE.match(segment) is not None
+            parts.append((_Markdown(segment), True, is_heading and seen_content))
+            seen_content = True
 
     for match in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
         add_prose(text[pos: match.start()])
-        parts.append((highlight_code(match.group(2), language=match.group(1).strip()), False))
+        parts.append((
+            highlight_code(match.group(2), language=match.group(1).strip()),
+            False,
+            False,
+        ))
         pos = match.end()
     add_prose(text[pos:])
-    if not parts:
-        return []
+
     strips: list[Strip] = []
-    for part, is_prose in parts:
+    for part, is_prose, pad_top in parts:
         rendered = render_strips(part, width)
         if is_prose:
             # rich.markdown emits a blank line between every block
@@ -434,6 +541,8 @@ def _settled_strips(text: str, width: int) -> list[Strip]:
                 rendered = rendered[1:]
             while rendered and not rendered[-1].text.strip():
                 rendered = rendered[:-1]
+        if pad_top and rendered:
+            strips.append(Strip.blank(width))
         strips.extend(rendered)
     return strips
 
