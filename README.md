@@ -23,7 +23,11 @@ with `rg`/`find`/`ls` (pipe search output through `head`). Compaction is not
 a tool the model can call — it's automatic (`auto_compact`): when the context
 window crosses the configured threshold, the conversation is summarized into
 a handoff (the task, what's known so far, and what to do next) that continues
-as the next user message.
+as the next user message. The summarization round continues the same
+conversation with tools omitted, so the system prompt and history stay
+byte-identical and the provider's prompt cache covers that prefix; the
+"no tools, output only the handoff" notice is part of the appended user
+message rather than a changed system prompt.
 
 Switch between modes with `/mode`:
 
@@ -341,7 +345,10 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   summarization round is included in the totals, and the compaction notice
   reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
   The handoff itself is shown in the transcript as a distinct padded block
-  (also on resume), and `/undo` restores the pre-compaction history.
+  (also on resume), and `/undo` restores the pre-compaction history. Because
+  compaction re-sends the live history instead of a flattened transcript, the
+  summarization round is mostly a cache hit; only the handoff instruction is
+  new input.
 
 ## Layout of the code
 

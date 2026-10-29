@@ -213,6 +213,7 @@ def test_no_registry_sends_no_tools() -> None:
 def test_compact_replaces_history_with_summary() -> None:
     client = FakeClient([ContentDelta(text="one"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=3))])
     controller = ChatController(PROFILE, "key", client=client)
+    controller.system_prompt = "system prompt"
     asyncio.run(collect(controller, "first question"))
     client.script = [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second question"))
@@ -226,11 +227,21 @@ def test_compact_replaces_history_with_summary() -> None:
     assert [m.role for m in visible] == ["user"]
     assert visible[0].kind == "summary"
     assert "summary text" in visible[0].content
-    # The summarizer round saw the rendered transcript, with no tools attached.
-    summarizer_prompt = client.received_wire[-1][0]["content"]
-    assert "first question" in summarizer_prompt
-    assert "second question" in summarizer_prompt
-    assert "assistant: one" in summarizer_prompt
+    # The summarizer round continues the live conversation: the exact same
+    # system prompt and history the model just saw (cacheable prefix), plus
+    # one handoff instruction as a new final user message.
+    summarizer_wire = client.received_wire[-1]
+    assert summarizer_wire[0] == {"role": "system", "content": "system prompt"}
+    assert summarizer_wire[:5] == client.received_wire[1] + [
+        {"role": "assistant", "content": "two"},
+    ]
+    assert summarizer_wire[-1]["role"] == "user"
+    instruction = summarizer_wire[-1]["content"]
+    assert "handoff" in instruction.lower()
+    assert "without tools" in instruction
+    # The history is sent as-is, not flattened into the prompt.
+    assert "first question" not in instruction
+    assert "assistant: one" not in instruction
     # The summarizer round ran without tools.
     assert client.received_tools is None
 

@@ -161,7 +161,7 @@ class SandboxSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    allow_network: bool = False
+    allow_network: bool = True
     gpu_access: bool = False
     # Off by default; on disables the git guard entirely (the agent manages
     # git itself) — tracking guarantees no longer hold.

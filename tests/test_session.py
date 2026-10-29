@@ -1304,7 +1304,7 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
         await session.execute("s1", SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
-        async def fake_summarize(_transcript):
+        async def fake_summarize(_wire_messages):
             return "handoff summary", None
 
         session.controller._summarize = fake_summarize

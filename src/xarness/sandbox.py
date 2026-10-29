@@ -15,6 +15,7 @@ import atexit
 import hashlib
 import os
 import shutil
+import signal
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable
@@ -835,6 +836,9 @@ class SandboxSession:
             # longer lines (minified bundles), which surfaces as a confusing
             # tool error — allow chunky single lines instead.
             limit=8 * 1024 * 1024,
+            # Own process group, so an interrupt can kill the command and
+            # every child it spawned, not just the shell.
+            start_new_session=True,
         )
 
     async def run(
@@ -905,22 +909,32 @@ class SandboxSession:
                     _read_until_marker(),
                     timeout=timeout if timeout is not None else self._config.timeout_seconds,
                 )
+            except asyncio.CancelledError:
+                # Stop the command too, not just stop waiting for it.
+                await self.close(force=True)
+                raise
             except asyncio.TimeoutError:
-                await self.close()
+                await self.close(force=True)
                 return SandboxResult(exit_code=-1, stdout="".join(output), stderr="", timed_out=True)
 
             return SandboxResult(exit_code=exit_code, stdout="".join(output), stderr="")
 
-    async def close(self) -> None:
+    async def close(self, *, force: bool = False) -> None:
+        """Close the persistent shell (idempotent). ``force`` kills any
+        running command (and its children) immediately instead of waiting
+        for the shell to exit cleanly."""
         if self._proc is None:
             cleanup_mount_dirs_now()
             return
         try:
             if self._proc.stdin:
                 self._proc.stdin.close()
-            await asyncio.wait_for(self._proc.wait(), timeout=5)
+            await asyncio.wait_for(self._proc.wait(), timeout=0 if force else 5)
         except (asyncio.TimeoutError, ProcessLookupError):
-            self._proc.kill()
+            try:
+                os.killpg(self._proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             await self._proc.wait()
         finally:
             self._proc = None

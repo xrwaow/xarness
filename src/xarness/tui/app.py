@@ -1537,8 +1537,17 @@ class AgentApp(App[None]):
         if was_slash:
             command = COMMANDS.get(value)
             if command is not None and command.takes_arg:
-                # Complete the word and let the user type the argument
-                # instead of running with an empty one.
+                # If the user typed this command (any prefix of it) and hit
+                # Enter, run it right away — its empty-arg behavior is the
+                # picker/list view, never a destructive default. Only when
+                # the highlighted command is NOT what was typed (arrow
+                # navigation to a different command) do we just complete the
+                # word and let the user type the argument.
+                typed = chat_input.text.strip()
+                if typed.startswith("/") and f"/{value}".startswith(typed):
+                    chat_input.load_text("")
+                    self._handle_slash_command(f"/{value}")
+                    return
                 chat_input.load_text(f"/{value} ")
                 return
             chat_input.load_text("")

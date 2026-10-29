@@ -3,17 +3,25 @@
 A compaction replaces the visible conversation with a single handoff summary
 message, advancing the epoch. The old messages stay in the append-only list
 (and reappear if the compaction is undone); only ``Conversation.epoch``
-changes. Summarization is one tool-free round through the same stream client.
+changes.
+
+Summarization is one tool-free round through the same stream client, sent as
+a continuation of the live conversation: the exact system prompt and history
+the model just saw, plus one handoff instruction as a final user message.
+That keeps the whole prefix cacheable at the provider; only the instruction is
+new. The "no tools" notice lives in that message rather than in the system
+prompt (which would change the cached prefix).
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from .client import StreamClient
 from .conversation import SUMMARY_PREFIX, Conversation, Message
-from .prompts import compaction_prompt
+from .prompts import COMPACTION_PROMPT
 from .protocol import ContentDelta, StreamError, TurnComplete, Usage
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
@@ -44,29 +52,19 @@ def message_tokens(message: Message) -> int:
     return len(message.content or "") // _CHARS_PER_TOKEN
 
 
-def render_for_summary(message: Message) -> str:
-    """One message as plain text for the summarizer prompt."""
-    role = message.role
-    parts = [f"{role}: {message.content}"] if message.content else [f"{role}:"]
-    for call in message.tool_calls or []:
-        parts.append(f"  {role} called {call.name}({call.arguments_json})")
-    if role == "tool" and message.tool_call_id:
-        parts.append(f"  (result for call {message.tool_call_id})")
-    return "\n".join(parts)
-
-
 async def summarize(
-    client: StreamClient, transcript: str,
+    client: StreamClient, wire_messages: Sequence[dict[str, Any]],
 ) -> tuple[str, Usage | None]:
     """One-off handoff round through the same client, no tools.
 
-    Returns the handoff text and the round's usage, so its cost can be folded
-    into the session totals instead of being silently dropped.
+    ``wire_messages`` is the live conversation's wire history with the
+    handoff instruction appended, so the provider can serve every cached
+    prefix token. Returns the handoff text and the round's usage, so its cost
+    can be folded into the session totals instead of being silently dropped.
     """
-    prompt = compaction_prompt(transcript)
     parts: list[str] = []
     usage: Usage | None = None
-    async for event in client.stream([{"role": "user", "content": prompt}]):
+    async for event in client.stream(wire_messages):
         if isinstance(event, ContentDelta):
             parts.append(event.text)
         elif isinstance(event, StreamError):
@@ -82,9 +80,20 @@ async def summarize(
 
 async def compact(
     conversation: Conversation, client: StreamClient,
-    summarizer: Callable[[str], Awaitable[tuple[str, Usage | None]]] | None = None,
+    summarizer: Callable[
+        [Sequence[dict[str, Any]]], Awaitable[tuple[str, Usage | None]]
+    ] | None = None,
+    *,
+    system: str | None = None,
+    keep_reasoning: bool = False,
+    image_loader: Callable[[str], bytes | None] | None = None,
 ) -> CompactionResult | None:
     """Summarize the visible history and advance the epoch.
+
+    The summarizer request reuses the conversation's wire history (same
+    system prompt, reasoning setting and images as a normal round) and appends
+    the handoff instruction as a final user message. Tools are omitted for
+    this round.
 
     Returns None when there is nothing to compact yet. The caller is
     responsible for folding ``result.usage`` into its session totals and
@@ -94,11 +103,15 @@ async def compact(
     if not compactable:
         return None
     before_tokens = sum(message_tokens(m) for m in compactable)
-    transcript = "\n\n".join(render_for_summary(m) for m in compactable)
+    wire_messages = conversation.to_wire(
+        keep_reasoning=keep_reasoning, system=system,
+        image_loader=image_loader,
+    )
+    wire_messages.append({"role": "user", "content": COMPACTION_PROMPT})
     if summarizer is None:
-        summary, usage = await summarize(client, transcript)
+        summary, usage = await summarize(client, wire_messages)
     else:
-        summary, usage = await summarizer(transcript)
+        summary, usage = await summarizer(wire_messages)
     summary_message = Message(
         role="user", content=f"{SUMMARY_PREFIX}\n\n{summary}",
         kind="summary", usage=usage,

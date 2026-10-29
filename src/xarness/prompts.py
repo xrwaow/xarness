@@ -37,25 +37,25 @@ Change tracking:
 When the workspace is tracked, text-file edits are captured so /diff and /undo work. NOT tracked: gitignored files, binary/media file types (images, video, audio, archives, fonts, databases, compiled artifacts), and files over 1 MB. Edits to untracked files cannot be shown in /diff or reversed by /undo — treat destructive changes there as irreversible and say so."""
 
 
+# Appended as one extra user message to the live conversation, so the whole
+# prefix (system prompt + history) stays byte-identical to the round that just
+# ran and the provider's prompt cache still covers it. The instruction itself
+# carries the "no tools" notice on purpose: changing the system prompt or the
+# tool list would invalidate that cached prefix.
 COMPACTION_PROMPT = (
-    "You are handing this conversation off to a fresh context. Write the "
-    "handoff the next assistant instance needs to continue the work "
-    "seamlessly. Cover, in this order:\n"
+    "The conversation above is being handed off to a fresh context. This "
+    "round runs without tools: do not call a tool, do not attempt to make "
+    "changes, and do not continue the task. Instead write the handoff the "
+    "next assistant instance needs to continue the work seamlessly. Cover, "
+    "in this order:\n"
     "1. The task: what the user is trying to accomplish, in their terms.\n"
     "2. What's known so far: key decisions, file paths, relevant commands "
     "and their results, constraints discovered.\n"
     "3. What's next: the current state of any work in progress and the "
     "immediate next steps.\n"
     "Be concise — a few short paragraphs at most. Reply with the handoff "
-    "only.\n\n"
-    "--- conversation ---\n"
-    "{transcript}"
+    "only."
 )
-
-
-def compaction_prompt(transcript: str) -> str:
-    """The one-off summarization prompt that produces a handoff."""
-    return COMPACTION_PROMPT.format(transcript=transcript)
 
 
 def system_prompt_for(

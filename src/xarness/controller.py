@@ -313,6 +313,9 @@ class ChatController:
         in :attr:`last_compaction` for the compaction notice."""
         result = await run_compaction(
             self.conversation, self._client, summarizer=self._summarize,
+            system=self.system_prompt,
+            keep_reasoning=self.profile.keep_reasoning,
+            image_loader=self._image_loader,
         )
         if result is None:
             self.last_compaction = None
@@ -322,9 +325,11 @@ class ChatController:
         self.last_compaction = (result.before_tokens, result.after_tokens)
         return result.summary
 
-    async def _summarize(self, transcript: str) -> tuple[str, Usage | None]:
+    async def _summarize(
+        self, wire_messages: list[dict[str, Any]],
+    ) -> tuple[str, Usage | None]:
         """One-off handoff round through the same client, no tools."""
-        return await run_summarize(self._client, transcript)
+        return await run_summarize(self._client, wire_messages)
 
     # ------------------------------------------------------------------
     # streaming

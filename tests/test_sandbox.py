@@ -7,6 +7,7 @@ nested bwrap cannot start."""
 import asyncio
 import hashlib
 import os
+import shlex
 import tempfile
 import unittest
 import uuid
@@ -159,6 +160,39 @@ class SandboxSessionProtocolTest(unittest.TestCase):
         assert first.exit_code == 0
         assert second.exit_code == 0
         assert second.stdout == "after\n"
+
+    def test_cancel_kills_running_command_and_restarts_shell(self):
+        session = SandboxSession(SandboxConfig(workspace=self.workspace))
+        pidfile = self.workspace / "child.pid"
+
+        async def drive() -> None:
+            try:
+                task = asyncio.create_task(session.run(
+                    f"sleep 30 & echo $! > {shlex.quote(str(pidfile))}; wait"))
+                for _ in range(100):
+                    if pidfile.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(pidfile.exists())
+                child = int(pidfile.read_text())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertIsNone(session._proc)
+                for _ in range(100):
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("interrupted command's child is still running")
+                result = await session.run("echo alive")
+                self.assertEqual((result.exit_code, result.stdout), (0, "alive\n"))
+            finally:
+                await session.close(force=True)
+
+        asyncio.run(drive())
 
     def test_shell_exit_then_next_command_restarts(self):
         first, second = self._run_all("echo bye; exit 0", "echo back")
