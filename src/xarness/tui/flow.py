@@ -176,8 +176,14 @@ class Presenter:
 
     async def present(self, entry, width: int) -> Presentation:
         item = entry.item
+        # Reserve room for the left inset *before* rendering: non-user rows
+        # get one cell prepended below, so they must wrap to `width - 1`.
+        # Rendering them at `width` and then cropping the joined row back to
+        # `width` slices the last glyph off any line that reaches the edge
+        # (visible as words losing their final letter).
+        item_width = width if item.full_width else max(1, width - 1)
         try:
-            strips = render_item(item, self, entry, width)
+            strips = render_item(item, self, entry, item_width)
         except Exception as exc:
             # FlowView only surfaces `{type}: {exc}` — without the traceback
             # a render bug is undebuggable. Log the full trace (re-raise so

@@ -1385,6 +1385,52 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
             self.assertLess(len(flow._layout), 100)
 
 
+class PresenterWidthTest(unittest.IsolatedAsyncioTestCase):
+    """Non-user rows reserve the one-cell left inset before wrapping.
+
+    The presenter prepends that inset to every non-user strip, so rendering
+    at the full width and cropping the joined row back to the widget width
+    sliced the last glyph off any line that reached the right edge — read as
+    a word losing its final letter ("sometimes", because padded lines hid
+    it)."""
+
+    class _Entry:
+        def __init__(self, item) -> None:
+            from types import SimpleNamespace
+            self.item = item
+            self._model = SimpleNamespace(entries=[self])
+
+    async def test_status_line_keeps_every_character(self) -> None:
+        from xarness.tui.flow import Presenter
+        from xarness.tui.transcript import LineItem
+
+        width = 20
+        presentation = await Presenter().present(
+            self._Entry(LineItem(text="x" * 40, kind="info")), width,
+        )
+
+        self.assertEqual(
+            "".join(strip.text for strip in presentation.strips).count("x"),
+            40,
+        )
+        for strip in presentation.strips:
+            self.assertEqual(strip.cell_length, width)
+
+    async def test_assistant_paragraph_keeps_word_tails(self) -> None:
+        from xarness.tui.flow import Presenter
+        from xarness.tui.transcript import AssistantItem
+
+        width = 16
+        item = AssistantItem(chunks=["aaaaaa bbbb cc"])
+        presentation = await Presenter().present(self._Entry(item), width)
+        text = "".join(strip.text for strip in presentation.strips)
+
+        self.assertIn("cc", text)
+        self.assertEqual(text.count("a") + text.count("b") + text.count("c"), 12)
+        for strip in presentation.strips:
+            self.assertEqual(strip.cell_length, width)
+
+
 class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
     """Mouse drag over the transcript must both highlight and extract text.
 
