@@ -139,13 +139,48 @@ class TranscriptTest(unittest.TestCase):
             live.apply(event)
         replay = tr.Transcript()
         assistant = Message(role="assistant", content="hello", reasoning="think",
-                            timing=Timing(reasoning_seconds=1.0))
+                            timing=Timing(reasoning_seconds=0.5))
         items = replay.load(_snap([assistant]))
         self.assertEqual(live.thinking.reasoning, "think")
-        self.assertEqual(live.thinking.duration, 1.0)
+        self.assertEqual(live.thinking.duration, 0.5)
         self.assertEqual(live.assistant.chunks, ["hello"])
         self.assertEqual(items[0].reasoning, "think")
         self.assertEqual(items[1].chunks, ["hello"])
+
+    def test_cot_duration_is_stamped_when_the_block_ends(self):
+        """The pill gets its number at the first answer token, not at
+        TurnComplete: the answer stream must never read "Thought for …"
+        (and the number must not grow with the answer's length)."""
+        t = tr.Transcript()
+        t.apply(ProcessingStarted(t=0.0))
+        t.apply(ReasoningDelta(text="think", t=1.0))
+        t.apply(ReasoningDelta(text=" more", t=3.0))
+        changed = t.apply(ContentDelta(text="answer", t=4.5))
+        self.assertIn(t.thinking, changed)  # repainted, not left stale
+        self.assertEqual(t.thinking.summary_text(), "Thought for 3.5s")
+        t.apply(ContentDelta(text=" answer", t=9.0))
+        t.apply(TurnComplete(t=20.0))
+        self.assertEqual(t.thinking.duration, 3.5)
+
+    def test_tool_call_ends_the_cot_block_not_the_round(self):
+        """Tool-argument streaming is call time: the pill must stop at the
+        first tool call, not at TurnComplete (what it used to do)."""
+        t = tr.Transcript()
+        t.apply(ProcessingStarted(t=0.0))
+        t.apply(ReasoningDelta(text="think", t=1.0))
+        t.apply(ToolCallStarted(call_id="c", name="run_bash", t=2.0))
+        self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
+        t.apply(ToolCallArgumentsDelta(call_id="c", text='{"command":"ls"}',
+                                       t=8.0))
+        t.apply(TurnComplete(has_tool_calls=True, t=9.0))
+        self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
+
+    def test_reasoning_only_round_falls_back_to_turn_complete(self):
+        t = tr.Transcript()
+        t.apply(ProcessingStarted(t=0.0))
+        t.apply(ReasoningDelta(text="think", t=1.0))
+        t.apply(TurnComplete(t=6.0))
+        self.assertEqual(t.thinking.summary_text(), "Thought for 5.0s")
 
     def test_tool_lifecycle_and_cancel(self):
         t = tr.Transcript()
@@ -208,9 +243,9 @@ class TranscriptTest(unittest.TestCase):
 
     def test_finish_keeps_first_duration(self):
         item = tr.ThinkingItem(parts=["x"])
-        item.finish(None)
+        item.finish(None)  # e.g. settled from a snapshot mid-round
         self.assertEqual(item.summary_text(), "Thought for …")
-        item.finish(2.0)
+        item.finish(2.0)   # ...then stamped by a later event
         self.assertEqual(item.summary_text(), "Thought for 2.0s")
         item.finish(9.0)
         self.assertEqual(item.summary_text(), "Thought for 2.0s")

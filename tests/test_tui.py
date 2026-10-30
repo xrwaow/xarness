@@ -294,21 +294,20 @@ class _WidgetApp(App):
 
 
 class ThinkingDurationTest(unittest.IsolatedAsyncioTestCase):
-    """The live path settles WITHOUT a local estimate (the backend owns the
-    number); a later TurnComplete fills it in; the first backend number wins."""
+    """The duration belongs to the cot block alone: it is stamped when the
+    block ends (first answer token / first tool call), not when the round
+    ends, and it is never overwritten afterwards."""
 
-    def test_backend_duration_used_not_client_estimate(self) -> None:
+    def test_unknown_duration_is_backfilled_once(self) -> None:
+        # A block settled without a stamp (mid-round attach, interrupted
+        # round) shows "…" until a stamped settle arrives.
         thinking = tflow.ThinkingItem(parts=["hmm"])
         thinking.finish(None)
         self.assertEqual(thinking.summary_text(), "Thought for …")
         thinking.finish(7.0)
         self.assertEqual(thinking.summary_text(), "Thought for 7.0s")
-
-    def test_backend_duration_first_wins(self) -> None:
-        thinking = tflow.ThinkingItem()
-        thinking.finish(3.0)
-        thinking.finish(99.0)  # e.g. a stray second event
-        self.assertEqual(thinking.summary_text(), "Thought for 3.0s")
+        thinking.finish(99.0)  # a later event must not extend it
+        self.assertEqual(thinking.summary_text(), "Thought for 7.0s")
 
     def test_streaming_expands_then_finish_collapses_and_click_toggles(self) -> None:
         # Streaming: expanded by default, and clickable mid-stream.
@@ -319,10 +318,10 @@ class ThinkingDurationTest(unittest.IsolatedAsyncioTestCase):
         # Round end: auto-collapse, whatever the user's last toggle was.
         thinking.finish(2.0)
         self.assertFalse(thinking.expanded)
-        # A later duration override (TurnComplete) must not re-collapse an
+        # A later duration override (a stray settle) must not re-collapse an
         # item the user re-expanded after it finished.
         thinking.expanded = True
-        thinking.finish(3.0)  # _estimated was False: ignored
+        thinking.finish(3.0)
         self.assertTrue(thinking.expanded)
 
 

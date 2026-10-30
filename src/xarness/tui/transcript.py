@@ -215,8 +215,8 @@ class ThinkingItem(TranscriptItem):
         return "".join(self.parts)
 
     def finish(self, duration: float | None) -> None:
-        """Collapse to a summary. The first backend duration wins; a later
-        one fills an unknown ("…") duration."""
+        """Collapse to a summary. The first duration (stamped when the block
+        ends) wins; a later one only fills an unknown ("…") duration."""
         if self.done:
             if duration is not None and self.duration is None:
                 self.duration = duration
@@ -330,8 +330,9 @@ class Transcript:
         self.assistant: AssistantItem | None = None
         self.tool_blocks: dict[str, ToolItem] = {}
         self.cancelled = False
-        # Emission time of the first reasoning delta in this round, used to
-        # derive the "Thought for" duration from event stamps.
+        # Emission time of the first reasoning delta in this round. The cot
+        # block ends at the first answer/tool token, so that event's stamp
+        # minus this one is the block's own duration (never the round's).
         self._reasoning_t: float | None = None
 
     # -- replay -----------------------------------------------------------
@@ -427,7 +428,9 @@ class Transcript:
                 item.status = ToolStatus.CALL_FAILED
         if self.thinking is not None and (partial.content or partial.tool_calls):
             # Reasoning precedes the answer/tool phase; settle it without a
-            # duration (the event that carried the duration is not replayed).
+            # duration. The stamp that would have ended the block is not part
+            # of the snapshot, and inventing one here would be a client-side
+            # estimate of a number the host owns.
             self.thinking.finish(None)
 
     # -- live -------------------------------------------------------------
@@ -442,6 +445,26 @@ class Transcript:
 
     def _add(self, item):
         self.items.append(item)
+        return item
+
+    def _settle_thinking(self, at: float | None) -> ThinkingItem | None:
+        """Close the live cot block at event stamp ``at`` and return it.
+
+        ``at`` is the emission time of the first event *after* the reasoning
+        channel (first answer token or first tool call), which is exactly where
+        the host ends its ``reasoning_seconds`` measurement — so the live pill
+        matches what a replayed/resumed transcript shows. ``None`` settles the
+        block with an unknown duration instead of inventing a number.
+        """
+        item = self.thinking
+        if item is None:
+            return None
+        duration = (
+            at - self._reasoning_t
+            if at is not None and self._reasoning_t is not None
+            else None
+        )
+        item.finish(duration)
         return item
 
     def apply(self, event) -> list:
@@ -464,18 +487,25 @@ class Transcript:
             self.thinking.parts.append(event.text)
             return [self.thinking]
         if isinstance(event, ContentDelta):
+            changed = []
             if self.assistant is None:
-                if self.thinking is not None:
-                    self.thinking.finish(None)
+                # The first answer token ends the cot block: stamp its own
+                # duration now (and repaint the pill, or it would keep the
+                # shimmer text until some later event happened to update it).
+                settled = self._settle_thinking(event.t)
+                if settled is not None:
+                    changed.append(settled)
                 self.assistant = self._add(AssistantItem())
             self.assistant.append_delta(event.text)
-            return [self.assistant]
+            changed.append(self.assistant)
+            return changed
         if isinstance(event, ToolCallStarted):
-            if self.thinking is not None:
-                self.thinking.finish(None)
+            # The first tool call ends the cot block too — tool-argument
+            # streaming is call time, not thinking time.
+            settled = self._settle_thinking(event.t)
             item = self._add(ToolItem(call_id=event.call_id, name=event.name))
             self.tool_blocks[event.call_id] = item
-            return [item, self.thinking] if self.thinking else [item]
+            return [item, settled] if settled is not None else [item]
         if isinstance(event, ToolCallArgumentsDelta):
             item = self.tool_blocks.get(event.call_id)
             if item is None:
@@ -512,20 +542,22 @@ class Transcript:
             item.output = event.output or event.error
             return [item]
         if isinstance(event, TurnComplete):
-            duration = (
-                event.t - self._reasoning_t
-                if self._reasoning_t is not None else None
-            )
-            return self.settle(duration)
+            return self.settle(event.t)
         if isinstance(event, StreamError):
             return self.settle(None)
         return []
 
-    def settle(self, duration: float | None) -> list:
+    def settle(self, at: float | None) -> list:
+        """Settle the live round, ending any still-open cot block at ``at``.
+
+        Normally the block was already closed by the first answer/tool event;
+        this only stamps the duration for a round that never produced one
+        (e.g. reasoning-only), and leaves it unknown for errors/cancels.
+        """
         changed = []
-        if self.thinking is not None:
-            self.thinking.finish(duration)
-            changed.append(self.thinking)
+        settled = self._settle_thinking(at)
+        if settled is not None:
+            changed.append(settled)
         if self.assistant is not None:
             self.assistant.finalize()
             changed.append(self.assistant)

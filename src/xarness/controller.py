@@ -50,6 +50,7 @@ from .protocol import (
     ReasoningDelta,
     StreamEvent,
     ToolCallArgumentsDone,
+    ToolCallStarted,
     TurnComplete,
     Usage,
 )
@@ -338,7 +339,9 @@ class ChatController:
         partial = PartialRound(reasoning_parts=[], content_parts=[])
         done_calls: list[ToolCall] = []
         first_reasoning_at: float | None = None
-        first_content_at: float | None = None
+        # The cot block ends where the answer or the first tool call starts —
+        # tool-argument streaming counts as call time, not thinking time.
+        first_answer_at: float | None = None
         # Expose this round's partial output live, so a cancelled turn can
         # persist whatever had streamed before the interruption.
         self._partial_round = partial
@@ -357,10 +360,11 @@ class ChatController:
                 if first_reasoning_at is None:
                     first_reasoning_at = time.monotonic()
                 partial.reasoning_parts.append(event.text)
-            elif isinstance(event, ContentDelta):
-                if first_content_at is None:
-                    first_content_at = time.monotonic()
-                partial.content_parts.append(event.text)
+            elif isinstance(event, (ContentDelta, ToolCallStarted)):
+                if first_answer_at is None:
+                    first_answer_at = time.monotonic()
+                if isinstance(event, ContentDelta):
+                    partial.content_parts.append(event.text)
             elif isinstance(event, ToolCallArgumentsDone):
                 # Authoritative once the stream is done parsing; the client
                 # has already assembled the full arguments for this call.
@@ -373,7 +377,7 @@ class ChatController:
                 reasoning = "".join(partial.reasoning_parts) or None
                 reasoning_seconds: float | None = None
                 if first_reasoning_at is not None:
-                    end = first_content_at or time.monotonic()
+                    end = first_answer_at or time.monotonic()
                     reasoning_seconds = end - first_reasoning_at
                 usage = event.usage or self._estimate_usage(partial.content_parts)
                 self._fold_usage(usage)

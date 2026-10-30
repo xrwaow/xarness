@@ -87,6 +87,53 @@ def test_turn_builds_conversation_and_wire_messages() -> None:
     assert all("reasoning" not in msg for msg in client.received_wire[0])
 
 
+def test_reasoning_seconds_cover_the_cot_block_only() -> None:
+    """``reasoning_seconds`` ends at the first answer token: the answer's own
+    streaming time is not thinking time (and the live TUI pill derives the
+    same number from the same two event stamps)."""
+    client = FakeClient(
+        [
+            ReasoningDelta(text="let me think"),
+            ContentDelta(text="Hello"),
+            ContentDelta(text=" world"),
+            TurnComplete(),
+        ],
+        delay=0.05,
+    )
+    controller = ChatController(PROFILE, "key", client=client)
+
+    asyncio.run(collect(controller, "Hi there"))
+
+    assistant = controller.conversation.messages[1]
+    # One delay (reasoning → first content token), not three.
+    assert 0.03 < assistant.timing.reasoning_seconds < 0.09
+
+
+def test_reasoning_seconds_exclude_tool_argument_streaming() -> None:
+    """A tool call ends the cot block too: streaming its arguments is call
+    time, so it must not inflate the thinking number."""
+    client = FakeClient(
+        [
+            ReasoningDelta(text="read the file"),
+            ToolCallStarted(call_id="call_1", name="fake_tool"),
+            ToolCallArgumentsDelta(call_id="call_1", text='{"a"'),
+            ToolCallArgumentsDelta(call_id="call_1", text=": 1}"),
+            ToolCallArgumentsDone(
+                call_id="call_1", name="fake_tool", arguments_json='{"a": 1}',
+            ),
+            TurnComplete(has_tool_calls=True),
+        ],
+        delay=0.05,
+    )
+    controller = ChatController(PROFILE, "key", client=client)
+
+    asyncio.run(collect(controller, "use the tool"))
+
+    assistant = controller.conversation.messages[1]
+    # One delay (reasoning → first tool call), not four.
+    assert 0.03 < assistant.timing.reasoning_seconds < 0.09
+
+
 def test_usage_fallback_is_approximate_when_absent() -> None:
     client = FakeClient([ContentDelta(text="12345678"), TurnComplete(usage=None)])
     controller = ChatController(PROFILE, "key", client=client)
