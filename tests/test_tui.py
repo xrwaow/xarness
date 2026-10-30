@@ -723,10 +723,10 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("+ new", text)
 
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
-    """Session popup rows: {title} {age}, with a right-aligned state word
-    (padded to the longest state word) for loaded sessions — waiting=accent,
-    running/compacting=success, idle=muted; saved (not loaded) rows show no
-    state word at all."""
+    """Session popup rows: {title} {age} {dir} {diff}, with a right-aligned
+    state word (padded to the longest state word) for loaded sessions —
+    waiting=accent, running/compacting=success, idle=muted; saved (not
+    loaded) rows show no state word at all."""
 
     def _summaries(self):
         def s(name, state, active, attached=0):
@@ -796,6 +796,21 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                     any(name in p for p in prompts), f"{name} missing from rows")
             # Every row shows an age column.
             self.assertTrue(all("m" in p or "h" in p or "d" in p for p in prompts))
+
+    def test_workspace_column_shows_innermost_dir(self) -> None:
+        from xarness.tui.list_picker import session_options
+
+        entries = [
+            SessionSummary(
+                name="nested", workspace="/home/me/projects/my-app",
+                state="saved", last_user_message_at="2026-01-01T00:00:00+00:00",
+            ),
+            SessionSummary(name="elsewhere", state="saved"),
+        ]
+        rows = {str(o.id): str(o.prompt) for o in session_options(entries, None)}
+        self.assertIn("my-app", rows["nested"])
+        self.assertNotIn("/home/me/projects/my-app", rows["nested"])
+        self.assertNotIn("my-app", rows["elsewhere"])
 
     async def test_search_filters_and_restores_rows(self) -> None:
         """Regression: typing in the search box must narrow the list and

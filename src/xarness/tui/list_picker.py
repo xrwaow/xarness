@@ -11,7 +11,8 @@ options carry no mount restrictions.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,16 +42,45 @@ STATE_WIDTH = max(len(word) for word, _ in STATE_WORDS.values())
 # Usable row width inside the session picker, derived from the CSS:
 # #picker-modal is PICKER_MODAL_WIDTH wide, .modal-panel pads 2 per side
 # and each option pads 1 per side — width - 2*2 - 2*1 characters of
-# content. Keep in step with styles.tcss. The age and +/- columns are
-# fixed (age up to 6 chars like "23h58m", counts up to 4 digits); only
-# the name flexes.
+# content. Keep in step with styles.tcss. The age, dir and +/- columns are
+# fixed; only the name flexes.
 PICKER_MODAL_WIDTH = 62
 SESSION_ROW_WIDTH = PICKER_MODAL_WIDTH - 6
+
+# A blank between columns; the +/- fields are one blank apart (their signs
+# are part of the field).
+COLUMN_GAP = 2
+DIFF_GAP = 1
+NAME_MIN_WIDTH = 8
 AGE_WIDTH = 6
-# +/- fields: sign glued to a 3-digit number, each field right-aligned
-# ("  +2", "+410" / "  -1", "-431") and joined by one space.
+# +/- fields: sign glued to a 3-digit number, right-aligned ("  +2",
+# "+410" / "  -1", "-431").
 PLUS_FIELD = 4
 MINUS_FIELD = 4
+# Workspace column: the innermost directory, capped at a quarter of the
+# row so long names cannot squeeze the title out.
+DIR_MAX_WIDTH = SESSION_ROW_WIDTH // 4
+
+
+@dataclass(frozen=True)
+class _RowLayout:
+    """Column widths shared by every row of one session list."""
+
+    name_width: int
+    dir_width: int
+
+    @classmethod
+    def fit(cls, directories: Iterable[str]) -> _RowLayout:
+        """Widen the dir column to its longest value, then fit the name."""
+        dir_width = min(max(map(len, directories), default=0), DIR_MAX_WIDTH)
+        fixed = (
+            COLUMN_GAP + AGE_WIDTH
+            + (COLUMN_GAP + dir_width if dir_width else 0)
+            + COLUMN_GAP + PLUS_FIELD
+            + DIFF_GAP + MINUS_FIELD
+            + COLUMN_GAP + STATE_WIDTH
+        )
+        return cls(max(NAME_MIN_WIDTH, SESSION_ROW_WIDTH - fixed), dir_width)
 
 
 def relative_time(iso: str | None) -> str:
@@ -68,6 +98,13 @@ def relative_time(iso: str | None) -> str:
     if days:
         return f"{days}d"
     return format_duration(seconds)
+
+
+def innermost_dir(workspace: str | None) -> str:
+    """Last directory of a workspace path (``a/b/c`` -> ``c``)."""
+    if not workspace:
+        return ""
+    return Path(workspace).name or workspace
 
 
 def _same_path(a: str, b: Path | None) -> bool:
@@ -96,8 +133,9 @@ def session_options(
 ) -> list[Option]:
     """Global active sessions, then saved sessions of this workspace.
 
-    Each row is one Text: name, dimmed age, right-aligned state word. Both
-    sections are newest-user-message first.
+    Each row is one Text: name, dimmed age, innermost workspace directory,
+    unaccepted +/- totals, right-aligned state word. Both sections are
+    newest-user-message first.
     """
     resolved = Path(workspace).resolve() if workspace else None
     active = sorted(
@@ -110,65 +148,78 @@ def session_options(
         key=lambda s: s.last_user_message_at or "", reverse=True,
     )
     # Column widths are derived from the data so every row lines up as a
-    # table: age right-aligned, unaccepted +/- totals in fixed +/-
-    # sub-columns (blank for tracked-but-clean or untracked sessions),
-    # state word flush right. The name takes whatever width is left.
+    # table: age right-aligned, workspace dir left-aligned, unaccepted +/-
+    # totals in fixed +/- sub-columns (blank for tracked-but-clean or
+    # untracked sessions), state word flush right. The name takes whatever
+    # width is left.
     rows_data = []
     for summary in [*active, *saved]:
         tracked = summary.tracking and (summary.additions or summary.deletions)
         rows_data.append((
             summary,
             relative_time(summary.last_user_message_at),
+            innermost_dir(summary.workspace),
             f"+{summary.additions}" if tracked and summary.additions else "",
             f"-{summary.deletions}" if tracked and summary.deletions else "",
         ))
+    layout = _RowLayout.fit(directory for _, _, directory, _, _ in rows_data)
     return [
-        Option(_session_row(summary, age, plus, minus), id=summary.name)
-        for summary, age, plus, minus in rows_data
+        Option(
+            _session_row(summary, age, directory, plus, minus, layout),
+            id=summary.name,
+        )
+        for summary, age, directory, plus, minus in rows_data
     ]
 
 
 def _session_row(
     summary: SessionSummary,
     age: str,
+    directory: str,
     plus: str,
     minus: str,
+    layout: _RowLayout,
 ) -> Text:
-    """One session row, table-aligned: name | age | +/- | ... | state.
+    """One session row: name | age | dir | +/- | ... | state.
 
-    The age, +/- and state columns keep their width even when a row has
-    nothing to show in them, so every column lines up across the list.
+    The age, dir, +/- and state columns keep their width even when a row
+    has nothing to show in them, so every column lines up across the list.
     """
     state_word = STATE_WORDS.get(summary.state)
     word, color_key = state_word if state_word else ("", "")
-    # Segments after the name consume: 2+AGE_WIDTH (gap + age),
-    # PLUS_FIELD+1+MINUS_FIELD (+/- column), 2+len(word) (gap + state).
-    fixed = (
-        AGE_WIDTH + 2 + PLUS_FIELD + 1 + MINUS_FIELD
-        + (len(word) + 2 if word else 0)
-    )
-    name_width = max(8, SESSION_ROW_WIDTH - fixed)
     name = summary.name
-    if len(name) > name_width:
-        name = name[:name_width - 1] + "…"
+    if len(name) > layout.name_width:
+        name = name[:layout.name_width - 1] + "…"
     row = Text(name)
     row.append(
-        " " * max(AGE_WIDTH - len(age), 0) + f"  {age}",
+        " " * COLUMN_GAP + age.rjust(AGE_WIDTH),
         style=theme.PALETTE["muted"],
     )
+    if layout.dir_width:
+        if len(directory) > layout.dir_width:
+            directory = "…" + directory[-(layout.dir_width - 1):]
+        row.append(
+            " " * COLUMN_GAP + directory.ljust(layout.dir_width),
+            style=theme.PALETTE["muted"],
+        )
     # Both fields are always emitted (blank when unused) so the +/-
     # column keeps its width on every row.
     row.append(
-        "  " + (plus.rjust(PLUS_FIELD) if plus else " " * PLUS_FIELD),
+        " " * COLUMN_GAP
+        + (plus.rjust(PLUS_FIELD) if plus else " " * PLUS_FIELD),
         style=theme.PALETTE["success"],
     )
     row.append(
-        " " + (minus.rjust(MINUS_FIELD) if minus else " " * MINUS_FIELD),
+        " " * DIFF_GAP
+        + (minus.rjust(MINUS_FIELD) if minus else " " * MINUS_FIELD),
         style=theme.PALETTE["error"],
     )
     if word:
         pad = SESSION_ROW_WIDTH - row.cell_len - len(word)
-        row.append(" " * max(pad, 2) + word, style=theme.PALETTE[color_key])
+        row.append(
+            " " * max(pad, COLUMN_GAP) + word,
+            style=theme.PALETTE[color_key],
+        )
     return row
 
 
