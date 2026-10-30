@@ -596,6 +596,32 @@ def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> Non
     assert status.pending_drift.last_known == "aaa"
 
 
+def test_summary_does_not_let_pending_drift_mask_a_running_turn(tmp_path) -> None:
+    """The /sessions row is an activity state: a drift prompt the user has
+    not resolved yet must not make a running or compacting session read
+    "waiting". A pending ask DOES block the turn, so it still wins."""
+    async def go():
+        session = make_session([], tmp_path)
+        _, queue = session.subscribe()
+        session._pending_drift = ("aaa", "bbb", ["a.txt"])
+
+        session._state = "running"
+        assert session.summary().state == "running"
+        session._state = "compacting"
+        assert session.summary().state == "compacting"
+        # Idle + an unresolved drift prompt still asks for attention.
+        session._state = "idle"
+        assert session.summary().state == "waiting"
+
+        # The ask tool blocks the turn itself: waiting in every state.
+        session._pending_ask = ("ask-1", ["q?"], None)
+        session._state = "running"
+        assert session.summary().state == "waiting"
+        session.unsubscribe(queue)
+
+    asyncio.run(go())
+
+
 def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
     """Compaction hides old messages from the model, but the snapshot still
     carries them so a resumed/attached client can show the full transcript."""

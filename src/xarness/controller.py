@@ -273,6 +273,9 @@ class ChatController:
             turn.after_tree = await git_snapshot_state(info)
         except GitWorktreeError:
             return
+        # The turn's end state is now the workspace the session knows about;
+        # resume drift must measure from here, not from the previous turn.
+        info.last_seen_tree = turn.after_tree
 
     def open_turn_before(self) -> str | None:
         """The still-open turn's before tree, or None."""

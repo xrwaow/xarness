@@ -84,6 +84,11 @@ class GitInfo:
     # Tree sha of the workspace state at session start — the base /diff
     # measures against. A plain object-sha, not a ref or commit.
     baseline_tree: str = ""
+    # The workspace state the session has last accounted for: updated at
+    # turn end, on accept/keep-tracking, and after a rollback. Resume drift
+    # compares against this, so changes the user already acknowledged (or
+    # the session itself made) are not re-detected as external drift.
+    last_seen_tree: str = ""
     # Repo-root-relative paths the repo's ignore rules flagged at session
     # start. Snapshots exclude them as explicit pathspecs (not by re-reading
     # the worktree's .gitignore), so what /diff and /undo track is pinned for
@@ -122,6 +127,7 @@ class GitInfo:
             git_dir=Path(block["git_dir"]),
             subtree=block.get("subtree", ""),
             baseline_tree=block.get("baseline_tree", ""),
+            last_seen_tree=block.get("last_seen_tree", ""),
             ignored_paths=tuple(block.get("ignored_paths", ())),
             external=block.get("external", False),
         )
@@ -423,6 +429,7 @@ async def setup_tracking(
         git_dir=repo.git_common_dir,
         subtree=subtree,
         baseline_tree=baseline,
+        last_seen_tree=baseline,
         ignored_paths=ignored,
         external=repo.external,
     )
@@ -453,6 +460,7 @@ async def accept_changes(info: GitInfo) -> str:
     tree by the caller. Returns the accepted tree sha."""
     sha = await snapshot_state(info)
     info.baseline_tree = sha
+    info.last_seen_tree = sha
     return sha
 
 

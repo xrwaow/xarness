@@ -858,6 +858,55 @@ def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_kept_drift_is_not_re_prompted_after_reload(tmp_path) -> None:
+    """Acknowledging drift ("Keep tracking") is durable: reloading the
+    session must not re-detect the same external changes as drift, or the
+    /sessions row would say "waiting" forever. A later external change is
+    still reported."""
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        (tmp_path / "ws" / "base.txt").write_text("base\n")
+        summary = await host.create_session(
+            protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")),
+        )
+        name = summary.name
+        session = host.sessions[name]
+        assert session.git_info is not None
+        session._persist()
+        # Drift: the workspace changes outside the session after the save.
+        (tmp_path / "ws" / "drifted.txt").write_text("outside\n")
+        await host.unload_session(name)
+
+        loaded = await host.load_session(name)
+        await loaded.prompt_resume_drift()
+        assert loaded._pending_drift is not None
+        result = await loaded._cmd_resolve_drift(
+            protocol.ResolveDrift(accept=False),
+        )
+        assert result.ok
+        acked_tree = loaded.git_info.last_seen_tree
+        assert acked_tree
+        await host.unload_session(name)
+
+        # Reloaded: the acknowledged tree survived and the same drift is
+        # not prompted again.
+        reloaded = await host.load_session(name)
+        assert reloaded.git_info is not None
+        assert reloaded.git_info.last_seen_tree == acked_tree
+        await reloaded.prompt_resume_drift()
+        assert reloaded._pending_drift is None, "acknowledged drift re-prompted"
+        await host.unload_session(name)
+
+        # A genuinely new external change is still detected.
+        (tmp_path / "ws" / "again.txt").write_text("new\n")
+        reloaded_again = await host.load_session(name)
+        await reloaded_again.prompt_resume_drift()
+        assert reloaded_again._pending_drift is not None, "new drift not detected"
+
+    asyncio.run(go())
+
+
 def test_concurrent_load_yields_one_session(tmp_path) -> None:
     """Two simultaneous loads of the same saved session must share one
     Session object (no duplicate sandbox / tracking)."""

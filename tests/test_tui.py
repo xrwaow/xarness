@@ -59,7 +59,7 @@ class FakeClient:
         )
 
     async def sessions(self, **kwargs):
-        return []
+        return list(getattr(self, "session_list", []))
 
     async def config(self):
         return protocol.ConfigInfo(
@@ -795,6 +795,96 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                     any(name in p for p in prompts), f"{name} missing from rows")
             # Every row shows an age column.
             self.assertTrue(all("m" in p or "h" in p or "d" in p for p in prompts))
+
+    async def test_update_options_keeps_filter_and_highlight(self) -> None:
+        """The live /sessions refresh replaces rows without moving the
+        cursor off the highlighted session or clearing the search text."""
+        from textual.app import App, ComposeResult
+        from textual.widgets import Input, Label, OptionList
+
+        from xarness.tui.list_picker import ListPicker, session_options
+
+        class Host(App):
+            def compose(self) -> ComposeResult:
+                yield Label("")
+
+        app = Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(ListPicker(
+                session_options(self._summaries(), None),
+                title="Open session", filterable=True,
+            ))
+            await pilot.pause()
+            screen = app.screen
+            option_list = screen.query_one("#picker-list", OptionList)
+            option_list.highlighted = 1  # running-one
+            screen.query_one("#picker-search", Input).value = "one"
+            await pilot.pause()
+            self.assertEqual(option_list.option_count, 5)
+
+            # The host now reports different states for the same sessions.
+            def s(name, state, active, attached=0):
+                return SessionSummary(
+                    name=name, state=state, active=active,
+                    clients_attached=attached,
+                    last_user_message_at="2026-01-01T00:00:00+00:00",
+                )
+            updated = [
+                s("waiting-one", "idle", False),
+                s("running-one", "idle", False),
+                s("compacting-one", "idle", False),
+                s("idle-one", "idle", False),
+                s("saved-one", "saved", False),
+            ]
+            screen.update_options(session_options(updated, None))
+            await pilot.pause()
+            self.assertEqual(option_list.option_count, 5, "search text was lost")
+            self.assertEqual(
+                option_list.get_option_at_index(option_list.highlighted).id,
+                "running-one",
+            )
+            self.assertIn(
+                "idle",
+                str(option_list.get_option_at_index(option_list.highlighted).prompt),
+            )
+
+    async def test_open_picker_refreshes_while_it_stays_open(self) -> None:
+        """Rows are live: a session that goes running -> idle while the
+        picker is open updates without closing it."""
+        from textual.widgets import OptionList
+
+        from xarness.tui import app as app_module
+        from xarness.tui.app import AgentApp
+        from xarness.tui.list_picker import ListPicker
+
+        def summary(state: str) -> SessionSummary:
+            return SessionSummary(
+                name="s1", state=state, active=True, clients_attached=1,
+                last_user_message_at="2026-01-01T00:00:00+00:00",
+                message_count=1,
+            )
+
+        client = FakeClient(make_snapshot())
+        client.session_list = [summary("running")]
+        previous_interval = app_module.SESSIONS_REFRESH_SECONDS
+        app_module.SESSIONS_REFRESH_SECONDS = 0.02
+        try:
+            app = AgentApp(client, workspace=None, session_name="s1")
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._open_sessions_async()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ListPicker)
+                option_list = app.screen.query_one("#picker-list", OptionList)
+                self.assertIn("running", str(option_list.get_option_at_index(0).prompt))
+
+                client.session_list = [summary("idle")]
+                await asyncio.sleep(0.08)
+                await pilot.pause()
+                self.assertIn("idle", str(option_list.get_option_at_index(0).prompt))
+        finally:
+            app_module.SESSIONS_REFRESH_SECONDS = previous_interval
 
     def test_workspace_column_shows_innermost_dir(self) -> None:
         from xarness.tui.list_picker import session_options

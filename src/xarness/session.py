@@ -351,8 +351,14 @@ class Session:
     def summary(self) -> SessionSummary:
         """The list row for this hosted session."""
         state = self._state
+        # A pending ask blocks the turn itself, so it reads as waiting in
+        # every state. A pending drift prompt does not stop a running turn:
+        # it only takes over an otherwise idle row, so the picker keeps
+        # reporting running/compacting while the user has not resolved it.
         if self.pending_ask is not None or (
-            self.pending_drift is not None and self.clients_attached
+            self.pending_drift is not None
+            and self.clients_attached
+            and state == "idle"
         ):
             state = "waiting"
         # Active derives from the same predicate the grace loop uses — a
@@ -728,6 +734,16 @@ class Session:
                 "/undo now measure from here"
             )
         else:
+            # Acknowledge the drift durably: remember the tree the user just
+            # saw so a reload does not re-detect and re-prompt the same
+            # changes. /diff still shows them (the baseline is unchanged).
+            if info is not None:
+                try:
+                    info.last_seen_tree = await snapshot_state(info)
+                except GitWorktreeError:
+                    pass
+                self._persist()
+                await self._flush_persist()
             self._emit(protocol.DriftResolved(accepted=False))
             self._emit_notice(
                 "keeping tracking against the last known state — the drift "
@@ -803,6 +819,14 @@ class Session:
                 f"/{label} conflict: the turn's changes overlap edits made "
                 f"since — nothing was changed\n{exc}"
             ) from exc
+        # A rollback moves the files too: re-account the workspace before
+        # persisting, or the reverted state would look like external drift
+        # on the next resume.
+        if self.git_info is not None:
+            try:
+                self.git_info.last_seen_tree = await snapshot_state(self.git_info)
+            except GitWorktreeError:
+                pass
         self.controller.apply_rollback(plan)
         self._persist()
         self._emit_history()
@@ -925,6 +949,10 @@ class Session:
         except GitWorktreeError as exc:
             raise SessionError(f"/reject failed: {exc}") from exc
         self._rewrite_checkpoints(info.baseline_tree)
+        # The workspace is back at the baseline: that is now the last state
+        # the session has accounted for, so a resume must not call the
+        # discarded changes drift.
+        info.last_seen_tree = info.baseline_tree
         self._persist()
         self._emit_history()
         if mid_turn:
@@ -1376,7 +1404,14 @@ class Session:
         # known workspace state; using it here made a clean /accept look like
         # external drift on the next resume.
         known = [t.after_tree for t in self.conversation.turns if t.after_tree]
-        last_known = known[-1] if known else info.baseline_tree
+        # ``last_seen_tree`` is maintained at every point the workspace state
+        # is deliberately recorded (turn end, accept, keep-tracking, rollback)
+        # and persisted, so acknowledged drift is not re-prompted on reload.
+        # Older session files have no marker: fall back to the turn history.
+        last_known = (
+            info.last_seen_tree
+            or (known[-1] if known else info.baseline_tree)
+        )
         try:
             current = await snapshot_state(info)
             if current == last_known:

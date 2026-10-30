@@ -19,6 +19,7 @@ from pathlib import Path
 from rich.text import Text
 from textual import events
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, OptionList
 from textual.widgets.option_list import Option
@@ -269,11 +270,46 @@ class ListPicker(ModalScreen[str | None]):
             if query in str(option.prompt).lower()
         ]
         option_list = self.query_one("#picker-list", OptionList)
+        # Keep the cursor on the same entry across a live refresh or a
+        # keystroke when it still matches; only fall back to the first row.
+        highlighted_id = None
+        if option_list.option_count and option_list.highlighted is not None:
+            highlighted_id = option_list.get_option_at_index(
+                option_list.highlighted,
+            ).id
         option_list.clear_options()
         option_list.add_options(matches)
-        # Put the cursor on the first row so the highlight (and Enter) lands
-        # on a row that is actually shown.
-        option_list.highlighted = 0 if matches else None
+        if not matches:
+            option_list.highlighted = None
+            return
+        option_list.highlighted = next(
+            (i for i, option in enumerate(matches)
+             if option.id == highlighted_id),
+            0,
+        )
+
+    def _query(self) -> str:
+        """The current filter text (empty when not filterable/unmounted)."""
+        if not self._filterable:
+            return ""
+        try:
+            return self.query_one("#picker-search", Input).value
+        except NoMatches:
+            return ""
+
+    def update_options(self, options: Sequence[Option]) -> None:
+        """Replace the rows in place, keeping the filter and highlight.
+
+        Used by the live /sessions refresh: re-fetching the summaries must
+        not move the cursor or drop what the user typed. Safe to call
+        before the screen has mounted (the options are kept for compose)."""
+        self._options = list(options)
+        if not self.is_mounted:
+            return
+        try:
+            self._refilter(self._query())
+        except NoMatches:  # raced the mount: on_mount will render them
+            pass
 
     def on_key(self, event: events.Key) -> None:
         """Up/down in the search box moves the list highlight."""

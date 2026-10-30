@@ -302,6 +302,7 @@ class Host:
             if turns and turns[-1].after_tree is None and turns[-1].before_tree:
                 try:
                     turns[-1].after_tree = await gitwork.snapshot_state(session.git_info)
+                    session.git_info.last_seen_tree = turns[-1].after_tree
                     session._persist()
                 except GitWorktreeError:
                     pass

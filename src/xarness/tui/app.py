@@ -77,6 +77,9 @@ ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
 
+# How often an open /sessions picker re-reads the session list.
+SESSIONS_REFRESH_SECONDS = 1.5
+
 # How long to wait for a cancel command to unwind before exiting anyway.
 CANCEL_TIMEOUT = 2.0
 
@@ -1085,16 +1088,34 @@ class AgentApp(App[None]):
             entries = await self.client.sessions()
         if not entries:
             return
-        self.push_screen(
-            ListPicker(
-                session_options(
-                    entries,
-                    str(self.workspace) if self.workspace else None,
-                ),
-                title="Open session", filterable=True,
-            ),
-            self._on_session_selected,
+        workspace = str(self.workspace) if self.workspace else None
+        screen = ListPicker(
+            session_options(entries, workspace),
+            title="Open session", filterable=True,
         )
+        self.push_screen(screen, self._on_session_selected)
+        self._refresh_sessions_screen(screen, workspace)
+
+    @work(group="sessions-refresh", exclusive=True)
+    async def _refresh_sessions_screen(
+        self, screen: ListPicker, workspace: str | None,
+    ) -> None:
+        """Keep an open /sessions picker in step with the host.
+
+        The rows are a snapshot at open time, but sessions keep running and
+        going idle while the modal is up. Poll the cheap listing endpoint
+        until the picker closes; ``update_options`` preserves the filter and
+        the highlighted row, so this never fights the user."""
+        while screen in self.screen_stack:
+            await asyncio.sleep(SESSIONS_REFRESH_SECONDS)
+            if screen not in self.screen_stack:
+                return
+            try:
+                entries = await self.client.sessions()
+            except (ClientError, httpx.HTTPError):
+                continue
+            if entries and screen in self.screen_stack:
+                screen.update_options(session_options(entries, workspace))
 
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
