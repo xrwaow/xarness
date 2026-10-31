@@ -213,7 +213,9 @@ def test_bad_auto_compact_threshold_rejected(tmp_path: Path, threshold: float) -
 
 def test_sandbox_settings_defaults() -> None:
     settings = SandboxSettings()
-    assert settings.allow_network is False
+    # On by default; `xarness --no-network` (or a sandbox profile) turns it
+    # off, and the sandbox then sets UV_OFFLINE and drops the net namespace.
+    assert settings.allow_network is True
     assert settings.gpu_access is False
     assert settings.allow_git_write is False  # secure by default
     assert settings.use_container is True

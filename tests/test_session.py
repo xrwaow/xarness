@@ -865,11 +865,11 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
 
 
 def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
-    """Refs added via the command bind read-only under .refs/<alias> and are
-    persisted per workspace; a missing path is rejected and nothing is
-    created in the worktree (or at .refs)."""
+    """Refs added via the command bind read-only under /tmp/refs/<alias> and
+    are persisted per workspace; a missing path is rejected and nothing is
+    created in the worktree."""
     from xarness import session_store
-    from xarness.config import SandboxSettings
+    from xarness.config import REFS_ANCHOR, SandboxSettings
 
     monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "workspaces")
     session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
@@ -888,7 +888,8 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
         assert added.ok
         assert session.sandbox.settings.auto_include_refs == [expected]
         refs = session.status().refs
-        assert [(r.path, r.mount) for r in refs] == [(expected, ".refs/spec.md")]
+        assert [(r.path, r.mount) for r in refs] == [
+            (expected, f"{REFS_ANCHOR}/spec.md")]
         assert session_store.load_workspace_refs(str(tmp_path)) == [expected]
 
         removed = await session.execute("r2", protocol.RefRemove(path="spec.md"))

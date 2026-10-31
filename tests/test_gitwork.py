@@ -129,6 +129,70 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert "big.bin" in info.ignored_paths
         assert any("1 MB" in n for n in notes)
 
+    async def test_cargo_build_dirs_are_not_tracked(self):
+        """A Cargo project's build trees never enter snapshots: the sandbox
+        sets CARGO_TARGET_DIR=target-sandbox, so the agent's own first build
+        would otherwise bury /diff (and /undo) in object files."""
+        repo = self.make_repo()
+        (repo / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "cargo")
+
+        info, _ = await setup_tracking(repo, "sess-cargo")
+        assert info is not None
+        assert "target" in info.ignored_paths
+        assert "target-sandbox" in info.ignored_paths
+
+        # Both trees appear *after* the session started (first build).
+        for tree in ("target", "target-sandbox"):
+            (repo / tree / "debug").mkdir(parents=True)
+            (repo / tree / "debug" / "app.o").write_bytes(b"\x7fELF")
+        (repo / "src").mkdir()
+        (repo / "src" / "main.rs").write_text("fn main() {}\n")
+
+        stat = await diff_stat(info)
+        assert [f.path for f in stat.files] == ["src/main.rs"]
+
+    async def test_target_dir_tracked_without_cargo_toml(self):
+        """Not every `target/` is cargo's: without Cargo.toml it stays a
+        normal tracked directory."""
+        repo = self.make_repo()
+        (repo / "target").mkdir()
+        (repo / "target" / "notes.txt").write_text("user data\n")
+
+        info, _ = await setup_tracking(repo, "sess-plain")
+        assert info is not None
+        assert "target" not in info.ignored_paths
+
+        (repo / "target" / "notes.txt").write_text("edited\n")
+        stat = await diff_stat(info)
+        assert [f.path for f in stat.files] == ["target/notes.txt"]
+
+    async def test_cargo_build_dirs_follow_the_workspace_subtree(self):
+        """--workspace on a crate inside a bigger repo: only that crate's
+        build trees are excluded, and at their repo-root-relative paths."""
+        repo = self.make_repo()
+        (repo / "f").mkdir()
+        (repo / "f" / "Cargo.toml").write_text("[package]\nname = 'f'\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "crate")
+
+        info, _ = await setup_tracking(repo / "f", "sess-sub")
+        assert info is not None
+        assert "f/target" in info.ignored_paths
+        assert "f/target-sandbox" in info.ignored_paths
+        assert "target" not in info.ignored_paths
+
+        (repo / "f" / "target" / "debug").mkdir(parents=True)
+        (repo / "f" / "target" / "debug" / "build.o").write_bytes(b"\x7fELF")
+        (repo / "f" / "src").mkdir()
+        (repo / "f" / "src" / "lib.rs").write_text("pub fn f() {}\n")
+
+        stat = await diff_stat(info)
+        # Diff paths stay relative to the workspace, and the crate's build
+        # tree (repo-root-relative `f/target`) never shows up.
+        assert [f.path for f in stat.files] == ["src/lib.rs"]
+
     async def test_setup_tracking_snapshots_uncommitted_state(self):
         """The baseline tree captures uncommitted + untracked files, so /diff
         starts empty even in a dirty repo."""
@@ -279,6 +343,54 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert info is not None
         with self.assertRaises(gitwork.GitWorktreeError):
             await revert_to_tree(info, "0" * 40)
+
+    async def test_revert_deletes_created_non_ascii_paths(self):
+        """Without -z, git quotes non-ASCII paths and the file created since
+        the checkpoint silently survived /undo."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        sha = await snapshot_state(info)
+        (repo / "café.txt").write_text("new\n")
+        await revert_to_tree(info, sha)
+        assert not (repo / "café.txt").exists()
+
+    async def test_rename_is_reported_at_its_new_path(self):
+        """Brace-style renames ('a/{old => new}/f') used to lose the prefix."""
+        repo = self.make_repo()
+        (repo / "a" / "old").mkdir(parents=True)
+        (repo / "a" / "old" / "f.txt").write_text("x\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "add")
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "a" / "new").mkdir()
+        (repo / "a" / "old" / "f.txt").rename(repo / "a" / "new" / "f.txt")
+        (repo / "a" / "old").rmdir()
+
+        stat = await diff_stat(info)
+        assert {f.path for f in stat.files} == {"a/new/f.txt"}
+
+    async def test_grown_files_drop_out_of_the_snapshot(self):
+        """The 1 MB rule holds mid-session, not just at setup."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        (repo / "big.bin").write_text("x" * (gitwork._MAX_TRACKED_SIZE + 1))
+        sha = await snapshot_state(info)
+        names = _git(repo, "ls-tree", "-r", "--name-only", sha).splitlines()
+        assert "big.bin" not in names
+        assert "app.py" in names
+
+    async def test_snapshot_index_is_reused_across_snapshots(self):
+        """A persistent index keeps git's stat cache; a fresh one per
+        snapshot would re-hash the whole worktree twice per turn."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess1")
+        assert info is not None
+        await snapshot_state(info)
+        assert info.index_path.is_file()
+        assert repo not in info.index_path.parents  # never inside the repo
 
     # ------------------------------------------------------------------
     # revert_turn: reverse one turn's diff, preserving later edits
@@ -652,9 +764,33 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert self.guard("echo hi && git status") is None
         assert self.guard("FOO=1 git log") is None
         assert self.guard("sh -c 'git status'") is None
+        assert self.guard("(git status)") is None
         assert self.guard("echo hi && git reset --hard") is not None
         assert self.guard("FOO=1 git reset --hard") is not None
         assert self.guard("sh -c 'git reset --hard'") is not None
+        assert self.guard("(git commit -m x)") is not None
+
+    def test_list_forms_of_branch_tag_stash_remote_are_reads(self):
+        for cmd in (
+            "git branch", "git branch --show-current", "git branch -a",
+            "git branch --list 'feat*'", "git tag", "git tag -l 'v1*'",
+            "git stash list", "git stash show", "git remote -v",
+            "git remote show origin", "git reflog", "git reflog show",
+            "git check-ignore dist/",
+        ):
+            assert self.guard(cmd) is None, cmd
+        for cmd in (
+            "git branch feature", "git tag v1", "git stash", "git stash pop",
+            "git remote add origin url", "git reflog expire --all",
+            "git reflog delete HEAD@{0}",
+        ):
+            assert self.guard(cmd) is not None, cmd
+
+    def test_heredoc_bodies_are_data_not_commands(self):
+        script = "cat > run.sh <<'EOF'\ngit init .\ngit commit -qm x\nEOF\nbash run.sh"
+        assert self.guard(script) is None
+        # A real command after the heredoc is still checked.
+        assert self.guard("cat > x <<EOF\nhi\nEOF\ngit reset --hard") is not None
 
     def test_filter_blocks_even_without_branch_info(self):
         assert check_blocked_git("git reset --hard") is not None

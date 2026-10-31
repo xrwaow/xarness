@@ -53,8 +53,9 @@ class GitWorktreeError(Exception):
 class RevertConflict(GitWorktreeError):
     """A turn's changes overlap unresolvably with edits made since the turn.
 
-    Raised by the revert path so the caller can surface the conflict instead
-    of silently picking a side; the workspace is left untouched."""
+    Raised by the caller (controller.revert_changes) so the UI can surface
+    the conflict instead of silently picking a side; the workspace is left
+    untouched."""
 
 
 @dataclass(slots=True)
@@ -62,7 +63,7 @@ class RepoInfo:
     """What we need to know about the user's repo at session start."""
 
     root: Path
-    git_common_dir: Path  # shared .git dir — bound into the sandbox read-write
+    git_common_dir: Path  # shared .git dir — bound into the sandbox read-only
     # Tracked-with-no-.git mode: the git dir lives outside the workspace and
     # every git call sets GIT_DIR/GIT_WORK_TREE explicitly.
     external: bool = False
@@ -95,6 +96,17 @@ class GitInfo:
     # the whole session.
     ignored_paths: tuple[str, ...] = ()
     external: bool = False
+
+    @property
+    def index_path(self) -> Path:
+        """Persistent snapshot index for this session.
+
+        A fresh index per snapshot would re-hash every file in the worktree,
+        twice per turn; git's stat cache makes a persistent one incremental
+        (and, because previously snapshotted paths are then *tracked* in it,
+        it also makes the session-start ignore pinning real: a mid-session
+        .gitignore edit no longer changes what is snapshotted)."""
+        return _index_path(self.workspace, self.session_id)
 
     def git_env(self, **extra: str) -> dict[str, str]:
         """Env for a git subprocess: external mode addresses the store via
@@ -151,17 +163,21 @@ class TurnCheckpoint:
 
 
 async def _run_git(
-    args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+    args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
 ) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
         cwd=str(cwd) if cwd else None,
         env=env,
+        stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_GIT_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input_bytes), timeout=_GIT_TIMEOUT,
+        )
     except TimeoutError:
         proc.kill()
         await proc.wait()
@@ -254,6 +270,15 @@ def _temp_index():
             pass
 
 
+def _index_path(workspace: Path, session_id: str) -> Path:
+    """Persistent snapshot index for one session (see GitInfo.index_path)."""
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    key = hashlib.sha1(f"{workspace}\0{session_id}".encode()).hexdigest()[:16]
+    directory = Path(state) / "xarness" / "indexes"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{key}.index"
+
+
 async def _git_ignored_paths(
     root: Path, env: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
@@ -282,6 +307,27 @@ _UNTRACKED_EXTS: tuple[str, ...] = (
 
 # Files larger than this are excluded from tracking (snapshots/diffs/undo).
 _MAX_TRACKED_SIZE = 1024 * 1024
+
+# Directory names whose exclusion must survive the directory not existing yet:
+# a pinned build tree appears on the first build, while the exclude pathspecs
+# are built at snapshot time, before it exists.
+_BUILD_DIR_NAMES: tuple[str, ...] = ("target", "target-sandbox")
+
+
+def _cargo_build_dirs(workspace: Path, subtree: str = "") -> tuple[str, ...]:
+    """Repo-root-relative build trees of a Cargo project: cargo's own
+    ``target/`` and the sandbox's redirected ``target-sandbox/``.
+
+    Both are build output, not source. ``target-sandbox`` is created by the
+    agent's *own* builds (the sandbox sets CARGO_TARGET_DIR), so without this
+    the first ``cargo build`` would bury /diff in object files and make
+    /undo revert a tree full of them. Gated on ``Cargo.toml``: a directory
+    that merely happens to be called ``target`` elsewhere is still tracked.
+    """
+    if not (workspace / "Cargo.toml").is_file():
+        return ()
+    return tuple(f"{subtree}/{name}" if subtree else name
+                 for name in _BUILD_DIR_NAMES)
 
 
 def _oversized_paths(
@@ -318,17 +364,45 @@ def _oversized_paths(
     return tuple(sorted(oversized))
 
 
+async def _oversized_in_tree(
+    root: Path, tree: str, env: dict[str, str], limit: int = _MAX_TRACKED_SIZE,
+) -> list[str]:
+    """Paths in ``tree`` whose blob is over ``limit`` bytes.
+
+    Sizes come from the tree itself, so this costs one git call and no file
+    reads — cheap enough for every snapshot. The session-start pinning in
+    :func:`_oversized_paths` still catches files that were already big (so
+    they are never written to the object store); this catches the ones that
+    grew past the limit mid-session."""
+    rc, out, _ = await _run_git(["ls-tree", "-r", "-l", "-z", tree], cwd=root, env=env)
+    if rc != 0:
+        return []
+    oversized: list[str] = []
+    for entry in out.split("\0"):
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 4 or parts[1] != "blob":
+            continue
+        try:
+            size = int(parts[3])
+        except ValueError:
+            continue
+        if size > limit:
+            oversized.append(path)
+    return oversized
+
+
 async def snapshot_tree(
     root: Path, subtree: str = "", exclude: Iterable[str] = (),
-    env_base: dict[str, str] | None = None,
+    env_base: dict[str, str] | None = None, index: Path | None = None,
 ) -> str:
     """Tree sha capturing the workspace's *current* state.
 
-    Built with a throwaway index: ``git add -A`` stages tracked changes,
-    uncommitted changes, and untracked-not-ignored files into the temp index
-    (the user's real index is untouched), then ``write-tree`` records it as
-    a tree object. Ignored files are excluded — they are not reverted by
-    /undo and don't show in /diff, matching classic git semantics.
+    Built in a scratch index (``index`` when given, else a temp file):
+    ``git add -A`` stages tracked changes, uncommitted changes, and
+    untracked-not-ignored files (the user's real index is untouched), then
+    ``write-tree`` records it as a tree object. Ignored files are excluded —
+    they are not reverted by /undo and don't show in /diff.
 
     Exclusion is three-layered: git's own ignore rules; ``exclude``
     (session-start paths, pinned as explicit pathspecs so mid-session
@@ -340,8 +414,20 @@ async def snapshot_tree(
     GIT_WORK_TREE for external snapshot stores.
     """
     root = Path(root).resolve()
-    with _temp_index() as index:
-        env = {**(env_base if env_base is not None else os.environ), "GIT_INDEX_FILE": index}
+
+    @contextmanager
+    def _reusable_index():
+        """A persistent index keeps git's stat cache (and thus stops
+        re-hashing unchanged files); the caller owns it, so it is left in
+        place and pruned by git itself."""
+        if index is None:
+            with _temp_index() as temp:
+                yield temp
+        else:
+            yield str(index)
+
+    with _reusable_index() as index_file:
+        env = {**(env_base if env_base is not None else os.environ), "GIT_INDEX_FILE": index_file}
         args = ["add", "-A"]
         pathspecs: list[str] = []
         if subtree:
@@ -352,7 +438,13 @@ async def snapshot_tree(
         # paths we are excluding). The ``**/`` form avoids that and matches
         # the path at any depth.
         for p in exclude:
-            kind = "/**" if (root / p).is_dir() and not (root / p).is_symlink() else ""
+            target_path = root / p
+            # A pinned build tree may not exist yet (the session creates it by
+            # building), so match it as a directory either way; anything else
+            # is classified by what is on disk.
+            as_dir = ((target_path.is_dir() and not target_path.is_symlink())
+                      or Path(p).name in _BUILD_DIR_NAMES)
+            kind = "/**" if as_dir else ""
             pathspecs.append(f":(exclude,glob)**/{p}{kind}")
         for ext in _UNTRACKED_EXTS:
             pathspecs.append(f":(exclude,glob)**/*{ext}")
@@ -364,7 +456,25 @@ async def snapshot_tree(
         rc, out, err = await _run_git(["write-tree"], cwd=root, env=env)
         if rc != 0:
             raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
-        return out.strip()
+        tree = out.strip()
+        if oversized := await _oversized_in_tree(root, tree, env):
+            # Files that grew past the size limit mid-session: drop them from
+            # the snapshot rather than tracking (and diffing, and reverting) a
+            # multi-hundred-megabyte artifact every turn.
+            payload = b"\0".join(p.encode() for p in oversized)
+            rc, _, err = await _run_git(
+                ["rm", "--cached", "--force", "-z", "--stdin"],
+                cwd=root, env=env, input_bytes=payload,
+            )
+            if rc != 0:
+                raise GitWorktreeError(
+                    f"could not drop oversized files from the snapshot: {err.strip()}"
+                )
+            rc, out, err = await _run_git(["write-tree"], cwd=root, env=env)
+            if rc != 0:
+                raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
+            tree = out.strip()
+        return tree
 
 
 async def setup_tracking(
@@ -414,7 +524,11 @@ async def setup_tracking(
     )
     # Pin what snapshots track up front so ignore rules are not re-read
     # per snapshot (mid-session .gitignore edits stay out of the picture).
+    # A Cargo project's build trees are pinned alongside the repo's own
+    # ignore rules: they are build output the session itself creates.
     ignored = await _git_ignored_paths(repo.root, env=env)
+    agent_dir = repo.root / subtree if subtree else repo.root
+    ignored = tuple(dict.fromkeys((*ignored, *_cargo_build_dirs(agent_dir, subtree))))
     oversized = _oversized_paths(repo.root, subtree, ignored)
     ignored = (*ignored, *oversized)
     if oversized:
@@ -422,7 +536,10 @@ async def setup_tracking(
             f"{len(oversized)} file(s) over 1 MB are not tracked "
             "(excluded from /diff and /undo)"
         )
-    baseline = await snapshot_tree(repo.root, subtree, exclude=ignored, env_base=env)
+    baseline = await snapshot_tree(
+        repo.root, subtree, exclude=ignored, env_base=env,
+        index=_index_path(repo.root, session_id),
+    )
     info = GitInfo(
         session_id=session_id,
         workspace=repo.root,
@@ -446,7 +563,7 @@ async def snapshot_state(info: GitInfo) -> str:
     ignore exclusions applied."""
     return await snapshot_tree(
         info.workspace, info.subtree, exclude=info.ignored_paths,
-        env_base=info.git_env(),
+        env_base=info.git_env(), index=info.index_path,
     )
 
 
@@ -468,41 +585,44 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
     """Restore the workspace to a snapshot tree, discarding every file change
     made since it: modifications, deletions, and newly created files.
 
-    Two steps, both through throwaway indexes so the user's index and HEAD
-    are never touched:
-
-      1. files that exist now but not in the target tree (created since the
-         checkpoint) are deleted;
-      2. ``read-tree`` + ``checkout-index -f`` write every target-tree file
-         back over the working tree (restoring modified and deleted ones).
+    One ``diff-tree -z --name-status`` lists what differs; only paths that
+    actually differ are touched (rewriting the whole tree would bump every
+    mtime and wake every watcher): files created since the checkpoint are
+    deleted, the rest are written back from the tree through a scratch index.
 
     ``current`` is the workspace's current snapshot tree, when the caller
-    already has it (e.g. :func:`revert_turn`); passing it skips a redundant
+    already has it (e.g. :func:`revert_turns`); passing it skips a redundant
     re-snapshot. Only reverts files — anything run_bash did outside the
     workspace (installs, background jobs, network calls) is not undone."""
     root = info.workspace
-    env = info.git_env()
     if current is None:
         current = await snapshot_state(info)
+    if current == tree:
+        return
 
-    # Paths present now but absent in the target: created since the
-    # checkpoint. diff-tree current→tree reports them as deletions (D).
     rc, out, err = await _run_git(
-        ["diff-tree", "-r", "--name-only", "--diff-filter=D", current, tree],
-        cwd=root, env=env,
+        ["diff-tree", "-r", "-z", "--name-status", current, tree],
+        cwd=root, env=info.git_env(),
     )
     if rc != 0:
         raise GitWorktreeError(f"could not compare against the checkpoint: {err.strip()}")
-    for rel in out.splitlines():
-        if not rel.strip():
-            continue
-        path = root / rel
+
+    delete: list[str] = []
+    restore: list[str] = []
+    for status, path in _parse_status_z(out):
+        # current→tree: D = exists now, gone in the target (created since the
+        # checkpoint); anything else has to be written back.
+        (delete if status.startswith("D") else restore).append(path)
+
+    for rel in delete:
         try:
-            path.unlink()
+            (root / rel).unlink()
         except OSError:
             pass
+    if not restore:
+        return
 
-    # Write the target tree's files back over the working tree.
+    payload = b"\0".join(p.encode() for p in restore) + b"\0"
     with _temp_index() as index:
         env = info.git_env(GIT_INDEX_FILE=index)
         rc, _, err = await _run_git(["read-tree", tree], cwd=root, env=env)
@@ -510,7 +630,10 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
             raise GitWorktreeError(
                 f"could not restore checkpoint {tree[:8]}: {err.strip()}"
             )
-        rc, _, err = await _run_git(["checkout-index", "-a", "-f"], cwd=root, env=env)
+        rc, _, err = await _run_git(
+            ["checkout-index", "-f", "-z", "--stdin"], cwd=root, env=env,
+            input_bytes=payload,
+        )
         if rc != 0:
             raise GitWorktreeError(
                 f"could not restore checkpoint {tree[:8]}: {err.strip()}"
@@ -542,6 +665,23 @@ async def _wrap_commit(info: GitInfo, tree: str, parent: str | None = None) -> s
     return out.strip()
 
 
+async def _require_merge_tree() -> None:
+    """``merge-tree --write-tree`` (used to reverse a turn) needs git ≥ 2.38.
+
+    Checked before doing anything, so an old git fails with a clear message
+    instead of an obscure usage error halfway through an undo."""
+    rc, out, _ = await _run_git(["version"])
+    match = re.search(r"(\d+)\.(\d+)", out) if rc == 0 else None
+    if match is None:
+        return  # unknown format: let git report its own error
+    version = (int(match.group(1)), int(match.group(2)))
+    if version < (2, 38):
+        raise GitWorktreeError(
+            f"undoing a turn needs git >= 2.38 (merge-tree --write-tree); "
+            f"this git is {version[0]}.{version[1]}"
+        )
+
+
 _CONFLICT_STAGE_RE = re.compile(r"^\d+ [0-9a-f]+ [123]\t(.+)$")
 
 
@@ -555,7 +695,7 @@ def _conflict_summary(out: str) -> str:
     for line in out.splitlines():
         match = _CONFLICT_STAGE_RE.match(line)
         if match:
-            path = _clean_numstat_path(match.group(1))
+            path = match.group(1)
             if path not in paths:
                 paths.append(path)
     if not paths:
@@ -634,6 +774,7 @@ async def revert_turns(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None
     """
     if not turns:
         return None
+    await _require_merge_tree()
     current_tree = await snapshot_state(info)
     original_tree = current_tree
     for turn in reversed(turns):
@@ -648,13 +789,62 @@ async def revert_turns(info: GitInfo, turns: list[TurnCheckpoint]) -> str | None
     return None
 
 
-def _clean_numstat_path(raw: str) -> str:
-    path = raw.strip()
-    if path.startswith('"') and path.endswith('"') and len(path) >= 2:
-        path = path[1:-1]
-    if " => " in path:  # rename: "a/{old => new}/b" or "old => new"
-        path = path.rsplit(" => ", 1)[1].replace("{", "").replace("}", "")
-    return path
+def _parse_status_z(out: str) -> list[tuple[str, str]]:
+    """Parse ``git diff/diff-tree -z --name-status`` into (status, path) pairs.
+
+    NUL-separated, so paths with spaces, quotes or non-ASCII bytes survive
+    verbatim (without ``-z`` git quotes them, and the path then does not
+    exist on disk). Renames/copies carry two paths; the destination is the
+    one callers mean."""
+    fields = out.split("\0")
+    changes: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index].strip()
+        index += 1
+        if not status:
+            continue
+        if status[0] in "RC":
+            if index + 1 >= len(fields):
+                break
+            changes.append((status, fields[index + 1]))
+            index += 2
+        else:
+            if index >= len(fields):
+                break
+            changes.append((status, fields[index]))
+            index += 1
+    return changes
+
+
+def _parse_numstat_z(out: str) -> list[DiffFile]:
+    """Parse ``git diff --numstat -z`` into :class:`DiffFile` rows.
+
+    Renames are ``add\\tdel\\t\\0old\\0new\\0``; the destination path is
+    reported (a rename shows up as one row, like the UI expects)."""
+    fields = out.split("\0")
+    files: list[DiffFile] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        parts = entry.split("\t")
+        if len(parts) < 3:
+            continue
+        adds, dels, path = parts[0], parts[1], "\t".join(parts[2:])
+        if not path:
+            if index + 1 >= len(fields):
+                break
+            path = fields[index + 1]
+            index += 2
+        files.append(DiffFile(
+            path=path,
+            additions=0 if adds == "-" else int(adds or 0),
+            deletions=0 if dels == "-" else int(dels or 0),
+        ))
+    return files
 
 
 async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra: str) -> str:
@@ -687,32 +877,14 @@ async def _diff_trees(info: GitInfo, *extra: str, current: str | None = None) ->
     return await _diff_tree_pair(info, info.baseline_tree, current, *extra)
 
 
-def _parse_numstat(out: str) -> list[DiffFile]:
-    """Parse ``git diff --numstat`` output into :class:`DiffFile` rows."""
-    files: list[DiffFile] = []
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t", 2)
-        if len(parts) < 3:
-            continue
-        adds, dels, raw = parts
-        files.append(DiffFile(
-            path=_clean_numstat_path(raw),
-            additions=0 if adds == "-" else int(adds or 0),
-            deletions=0 if dels == "-" else int(dels or 0),
-        ))
-    return files
-
-
 # Snapshot trees are immutable, so a tree pair's diff never changes once the
 # objects exist. Cache it (keyed on the shas plus the subtree, since paths
 # are reported relative to it) so /diff stays cheap on long sessions. The
-# cached string is immutable, so callers can't corrupt the cache by mutating
-# what they get back. Bounded (oldest entry evicted) so a long-lived process
-# doesn't grow without end.
+# cached strings are immutable, so callers can't corrupt the cache by
+# mutating what they get back. Bounded (oldest entry evicted) so a
+# long-lived process doesn't grow without end.
 _CACHE_LIMIT = 512
-_numstat_cache: dict[tuple[str, str, str], str] = {}
+_numstat_cache: dict[tuple[str, str, str], tuple[str, str]] = {}
 
 
 def _cache_put(cache: dict, key, value):
@@ -721,43 +893,26 @@ def _cache_put(cache: dict, key, value):
     cache[key] = value
 
 
-async def _numstat_between(info: GitInfo, base_tree: str, other_tree: str) -> str:
-    """Cached ``git diff --numstat --summary`` between two snapshot trees.
-
-    The ``--summary`` block marks created (and deleted/renamed) files, which
-    is where ``is_new`` comes from — no second ``ls-tree -r`` per tree."""
+async def _diff_between(info: GitInfo, base_tree: str, other_tree: str) -> tuple[str, str]:
+    """Cached ``(--numstat, --name-status)`` NUL-separated output between two
+    snapshot trees. ``--name-status`` is where ``is_new`` comes from (the
+    ``A`` rows), so no second ``ls-tree`` pass per tree is needed."""
     key = (info.subtree, base_tree, other_tree)
     cached = _numstat_cache.get(key)
     if cached is None:
-        cached = await _diff_tree_pair(
-            info, base_tree, other_tree, "--numstat", "--summary"
-        )
+        numstat = await _diff_tree_pair(info, base_tree, other_tree, "--numstat", "-z")
+        status = await _diff_tree_pair(info, base_tree, other_tree, "--name-status", "-z")
+        cached = (numstat, status)
         _cache_put(_numstat_cache, key, cached)
     return cached
-
-
-def _created_paths(out: str, subtree: str = "") -> frozenset[str]:
-    """Paths the diff's ``--summary`` block reports as newly created.
-
-    Summary lines are always repo-root relative (``--relative`` does not
-    apply to them), so with a scoped subtree the prefix is stripped to make
-    them comparable to the numstat paths."""
-    created = set()
-    for line in out.splitlines():
-        if line.startswith(" create mode "):
-            path = line.rsplit(" ", 1)[-1]
-            if subtree:
-                path = path.removeprefix(subtree + "/")
-            created.add(path)
-    return frozenset(created)
 
 
 async def tree_diff_stat(info: GitInfo, base_tree: str, other_tree: str) -> DiffStat:
     """Per-file +/- counts between two snapshot trees, with ``is_new`` set
     relative to ``base_tree``."""
-    out = await _numstat_between(info, base_tree, other_tree)
-    files = _parse_numstat(out)
-    created = _created_paths(out, info.subtree)
+    numstat, status = await _diff_between(info, base_tree, other_tree)
+    files = _parse_numstat_z(numstat)
+    created = {path for change, path in _parse_status_z(status) if change.startswith("A")}
     for f in files:
         f.is_new = f.path in created
     return _diff_info(files)
@@ -849,22 +1004,44 @@ def _diff_info(files: list[DiffFile]) -> DiffStat:
 
 
 _BLOCK_REASON = (
-    "blocked: git in this shell is read-only — only inspection commands "
-    "(status, log, diff, show, blame, grep, ls-files, rev-parse, …) and "
-    "git config --get/--list are available. Anything that mutates the repo, "
-    "refs, or config is not. Continue editing files normally."
+    "blocked: git in this shell is read-only — inspection commands (status, "
+    "log, diff, show, blame, grep, ls-files, rev-parse, …), config reads "
+    "(git config --get/--list) and the list forms of branch/tag/stash/remote "
+    "(e.g. `git branch --show-current`, `git stash list`, `git remote -v`) "
+    "are available. Anything that stages, commits or rewrites refs/config "
+    "is not. Continue editing files normally."
 )
 
-# Deny by default: git in the shell is strictly read-only — only these
-# inspection subcommands pass. Everything else (add, commit, checkout,
-# branch, tag, reset, switch, rebase, stash, clean, push, config writes,
-# update-ref, …) is blocked.
+# Deny by default: only these inspection subcommands pass. Everything else
+# (add, commit, checkout, reset, switch, rebase, clean, push, update-ref, …)
+# is blocked. ``reflog expire``/``delete`` mutate, so reflog is _READ_FORMS.
 _ALLOWED_SUBCOMMANDS = {
     "status", "log", "diff", "show", "blame", "grep", "shortlog",
     "whatchanged", "rev-parse", "rev-list", "ls-files", "ls-tree",
     "ls-remote", "cat-file", "describe", "merge-base", "name-rev",
-    "reflog", "var", "version",
+    "var", "version", "check-ignore", "check-attr", "for-each-ref",
+    "show-ref", "count-objects", "diff-tree",
 }
+# Subcommands that are read-only only in some forms: the first token must be
+# one of these (or there must be no token at all, e.g. bare `git branch`
+# lists). A positional argument (`git branch feature`) is a mutation.
+_READ_FORMS: dict[str, frozenset[str]] = {
+    "branch": frozenset({
+        "--list", "-l", "--show-current", "-a", "--all", "-r", "--remotes",
+        "-v", "-vv", "--verbose", "-i", "--ignore-case", "--omit-empty",
+    }),
+    "tag": frozenset({
+        "--list", "-l", "-n", "--contains", "--no-contains", "--merged",
+        "--no-merged", "--points-at", "--sort", "-i", "--ignore-case",
+        "-v", "--verify",
+    }),
+    "stash": frozenset({"list", "show"}),
+    "remote": frozenset({"-v", "--verbose", "show", "get-url"}),
+    "reflog": frozenset({"show"}),
+}
+# Subcommands whose no-argument form just lists (bare `git stash` *creates* a
+# stash, so it is not here).
+_BARE_IS_READ = {"branch", "tag", "remote", "reflog"}
 _CONFIG_READ_FLAGS = {"--get", "--get-all", "--get-regexp", "--list", "-l"}
 # Global git flags that consume a following value.
 _GIT_VALUE_FLAGS = {
@@ -873,9 +1050,108 @@ _GIT_VALUE_FLAGS = {
 }
 _SHELL_SPLIT_RE = re.compile(r"&&|\|\||[;|&\n]")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def git_shim_script() -> str:
+    """A POSIX-sh ``git`` wrapper that enforces the read-only policy at
+    execution time.
+
+    Installed first on the sandbox's PATH, it lets statement-level git
+    through exactly where :func:`check_blocked_git` would block the whole
+    command string: ``cmd1; git commit; cmd2`` runs cmd1, prints the block
+    message in place, and still runs cmd2, while ``cmd1 && git commit &&
+    cmd2`` stops at the block as ``&&`` should. Commands that merely mention
+    the word git (``grep "git is read" …``) never invoke it, so the string
+    scanner's false positives disappear.
+
+    The allow-lists are generated from the same constants
+    :func:`_check_git_args` reads, so the two can't drift.
+
+    This is an accident guardrail, not a security boundary: a determined
+    bypass (``/usr/bin/git``, ``command git``) is out of scope by design —
+    the read-only ``.git`` mount is the real boundary.
+    """
+    value_flags = "|".join(sorted(_GIT_VALUE_FLAGS))
+    always = "|".join(sorted(_ALLOWED_SUBCOMMANDS))
+    config_flags = "|".join(sorted(_CONFIG_READ_FLAGS))
+
+    def form_branch(sub: str, forms: frozenset[str], bare_ok: bool) -> str:
+        pat = "|".join(sorted(forms))
+        bare = f'\n        if [ -z "$rest" ]; then exec "$real" "$@"; fi' if bare_ok else ""
+        return (
+            f"        {sub}){bare}\n"
+            f"        case $rest in {pat}) exec \"$real\" \"$@\" ;; *) blocked ;; esac ;;"
+        )
+
+    form_branches = "\n".join(
+        form_branch(sub, forms, sub in _BARE_IS_READ)
+        for sub, forms in sorted(_READ_FORMS.items())
+    )
+    return f'''#!/bin/sh
+# Generated by xarness.gitwork.git_shim_script(); do not edit.
+# An accident guardrail, not a security boundary: PATH can be bypassed
+# (/usr/bin/git, `command git`); the read-only .git mount is the real
+# boundary.
+real=
+for c in /usr/bin/git /bin/git /usr/local/bin/git; do
+    if [ -x "$c" ]; then real=$c; break; fi
+done
+if [ -z "$real" ]; then
+    echo "git: shim found no real git binary" >&2
+    exit 127
+fi
+
+# The first non-global-flag token is the subcommand; global flags that
+# consume a value skip their value too.
+sub=
+pending=0
+for a in "$@"; do
+    if [ "$pending" = 1 ]; then pending=0; continue; fi
+    case $a in
+        {value_flags}) pending=1 ;;
+        -*) ;;
+        *) sub=$a; break ;;
+    esac
+done
+if [ -z "$sub" ]; then
+    # No subcommand: git prints its usage; nothing to guard.
+    exec "$real" "$@"
+fi
+
+# First token after the subcommand, for the allow-forms check.
+rest=
+seen=0
+for a in "$@"; do
+    if [ $seen = 1 ]; then rest=$a; break; fi
+    if [ "$a" = "$sub" ]; then seen=1; fi
+done
+
+blocked() {{
+    echo "git: '$sub' blocked, read-only here (this command did not run)." >&2
+    echo "Inspection commands (status, log, diff, show, ...) work; continue editing files normally." >&2
+    exit 1
+}}
+
+case $sub in
+    {always}) exec "$real" "$@" ;;
+    config)
+        for a in "$@"; do
+            case $a in
+                {config_flags}) exec "$real" "$@" ;;
+            esac
+        done
+        blocked ;;
+{form_branches}
+    *) blocked ;;
+esac
+'''
 
 
 def _check_git_args(args: list[str]) -> str | None:
+    # Subshell spelling: "(git commit)" tokenizes as "(git", "commit)".
+    if args and args[-1].endswith(")"):
+        args = [*args[:-1], args[-1].rstrip(")")]
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in _GIT_VALUE_FLAGS else 1
@@ -887,7 +1163,35 @@ def _check_git_args(args: list[str]) -> str | None:
         return None
     if sub == "config" and any(a in _CONFIG_READ_FLAGS for a in rest):
         return None
+    if read_forms := _READ_FORMS.get(sub):
+        if not rest and sub in _BARE_IS_READ:
+            return None
+        if rest and rest[0] in read_forms:
+            return None
     return _BLOCK_REASON
+
+
+def _split_segments(command: str) -> list[str]:
+    """Split a shell command on operators, dropping heredoc bodies.
+
+    A heredoc body is data (a script being written, a commit message), not
+    commands to run; scanning it blocked harmless commands like
+    ``cat > run.sh <<'EOF' … EOF``."""
+    segments = _SHELL_SPLIT_RE.split(command)
+    kept: list[str] = []
+    index = 0
+    while index < len(segments):
+        segment = segments[index]
+        kept.append(segment)
+        index += 1
+        match = _HEREDOC_RE.search(segment)
+        if match is None:
+            continue
+        terminator = match.group(1)
+        while index < len(segments) and segments[index].strip() != terminator:
+            index += 1
+        index += 1  # the terminator line itself
+    return kept
 
 
 def check_blocked_git(command: str) -> str | None:
@@ -896,11 +1200,12 @@ def check_blocked_git(command: str) -> str | None:
 
     Best effort: splits on shell operators and inspects each segment's
     command word (env assignments, subshell parens, sudo/env prefixes, and
-    ``sh -c`` recursion are handled). Anything more adversarial
-    (command substitution indirection, aliases, a git binary earlier in
-    PATH…) can route around it by design — see the module docstring.
+    ``sh -c`` recursion are handled; heredoc bodies are ignored). Anything
+    more adversarial (command substitution indirection, aliases, a git
+    binary earlier in PATH…) can route around it by design — see the module
+    docstring.
     """
-    for segment in _SHELL_SPLIT_RE.split(command):
+    for segment in _split_segments(command):
         try:
             tokens = shlex.split(segment)
         except ValueError:
@@ -912,7 +1217,8 @@ def check_blocked_git(command: str) -> str | None:
             idx += 1
         if idx >= len(tokens):
             continue
-        head = tokens[idx]
+        # Subshell spelling: "(git commit)" tokenizes as "(git".
+        head = tokens[idx].lstrip("({")
         if os.path.basename(head) == "git":
             reason = _check_git_args(tokens[idx + 1:])
             if reason:

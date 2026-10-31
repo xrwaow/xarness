@@ -3,6 +3,7 @@
 import asyncio
 import json
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,6 +114,35 @@ def test_write_registry_exposes_write_tools(tmp_path) -> None:
     }
 
 
+def _descriptions(registry: ToolRegistry) -> dict[str, str]:
+    return {
+        t["function"]["name"]: t["function"]["description"]
+        for t in registry.schema()
+    }
+
+
+def test_refs_are_described_at_their_canonical_path(tmp_path) -> None:
+    """Refs are ordinary absolute paths to the tools; the file tool describes
+    them (run_bash leaves that to the system prompt). Neither is advertised
+    when no refs exist."""
+    sandbox = _sandbox(tmp_path)
+    notes = tmp_path / "notes.md"
+    notes.write_text("x")
+
+    before = _descriptions(build_registry(
+        sandbox, SimpleNamespace(config=sandbox), mode="write"))
+    assert "/tmp/refs" not in before["read_file"]
+    assert "/tmp/refs" not in before["run_bash"]
+    assert "git in the shell is read-only" not in before["run_bash"]
+
+    sandbox.add_ref(notes, alias="notes")
+    after = _descriptions(build_registry(
+        sandbox, SimpleNamespace(config=sandbox), mode="write"))
+    assert "/tmp/refs/<alias>" in after["read_file"]
+    assert "/tmp/refs" not in after["run_bash"]
+    assert ".refs/" not in after["read_file"]
+
+
 # ---------------------------------------------------------------------------
 # read_file
 
@@ -178,7 +208,9 @@ def test_read_large_python_file_returns_outline(tmp_path) -> None:
         "File outline retrieved. This file is too large to read all at once"
     )
     assert "Do NOT retry this call without line numbers" in result.output
-    assert f"# File outline for {tmp_path / 'big.py'}" in result.output
+    # The outline names the path the caller passed, never the host path.
+    assert "# File outline for big.py" in result.output
+    assert str(tmp_path) not in result.output
     # Ranges are 1-based, include the whole body, exclude decorators, and
     # methods are indented under their class.
     assert "class Big [L4-11]" in result.output
@@ -264,6 +296,57 @@ def test_read_outline_threshold_ignores_missing_trailing_newline(tmp_path) -> No
     assert "def top [L500-501]" in result.output
 
 
+def test_write_file_creates_missing_parent_directories(tmp_path) -> None:
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "write_file", '{"path": "a/b/c.txt", "content": "hi\\n"}'
+    ))
+    assert result.ok, result.error
+    assert (tmp_path / "a" / "b" / "c.txt").read_text() == "hi\n"
+
+
+def test_write_file_reports_bytes_not_characters(tmp_path) -> None:
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "write_file", json.dumps({"path": "u.txt", "content": "héllo"})
+    ))
+    assert result.ok
+    assert "(6 bytes)" in result.output
+
+
+def test_write_tools_reject_the_read_only_refs_area(tmp_path) -> None:
+    """The canonical refs path is absolute; writes there must say read-only,
+    not "use a workspace-relative path". Dot segments cannot escape it."""
+    for path in ("/tmp/refs/x", "/tmp/refs/./x", "/tmp/refs/../refs/x"):
+        result = asyncio.run(_registry_for(tmp_path).call(
+            "write_file", json.dumps({"path": path, "content": "no"})
+        ))
+        assert not result.ok, path
+        assert "read-only" in result.error, path
+
+
+def test_string_integers_are_coerced(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("one\ntwo\nthree\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", '{"path": "a.txt", "start_line": "2"}'
+    ))
+    assert result.ok, result.error
+    assert result.output == "two\nthree\n"
+
+
+def test_missing_required_argument_is_a_parse_error(tmp_path) -> None:
+    result = asyncio.run(_registry_for(tmp_path).call("read_file", "{}"))
+    assert not result.ok and result.parse_error
+    assert "missing required argument 'path'" in result.error
+
+
+def test_read_start_past_eof_names_the_length(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("one\ntwo\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", '{"path": "a.txt", "start_line": 9}'
+    ))
+    assert not result.ok
+    assert "2 lines" in result.error
+
+
 # ---------------------------------------------------------------------------
 # write_file / edit_file
 
@@ -285,7 +368,7 @@ def test_write_file_creates_then_overwrites(tmp_path) -> None:
 
 def test_write_file_rejects_refs(tmp_path) -> None:
     result = asyncio.run(_registry_for(tmp_path).call(
-        "write_file", '{"path": ".refs/x", "content": "nope"}'
+        "write_file", '{"path": "/tmp/refs/x", "content": "nope"}'
     ))
     assert not result.ok
     assert "read-only" in result.error
@@ -366,7 +449,7 @@ def test_edit_file_edits_apply_in_order(tmp_path) -> None:
     assert (tmp_path / "f.txt").read_text() == "UNO\ntwo\n"
 
 
-def test_edit_file_applies_edits_before_a_failure(tmp_path) -> None:
+def test_edit_file_is_atomic_on_a_failed_batch(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\nbeta\n")
     result = asyncio.run(_registry_for(tmp_path).call(
         "edit_file",
@@ -378,10 +461,9 @@ def test_edit_file_applies_edits_before_a_failure(tmp_path) -> None:
     assert not result.ok
     assert "edit 2" in result.error
     assert "not found" in result.error
-    # Edit 1 was applied even though edit 2 failed.
-    assert (tmp_path / "f.txt").read_text() == "ALPHA\nbeta\n"
-    assert "applied edit to f.txt" in result.output
-    assert "+ALPHA" in result.output
+    # Nothing was written: a failed batch never leaves a half-edited file.
+    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\n"
+    assert "ALPHA" not in result.output
 
 
 def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
@@ -396,9 +478,21 @@ def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
     assert not result.ok
     assert "edit 2" in result.error
     assert "not unique" in result.error
-    # Edit 1 was applied even though edit 2 was ambiguous.
-    assert (tmp_path / "f.txt").read_text() == "alpha\nBETA\nalpha\n"
-    assert "applied edit to f.txt" in result.output
+    assert "replace_all" in result.error
+    # Atomic: the ambiguous edit means edit 1 is not applied either.
+    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\nalpha\n"
+
+
+def test_edit_file_replace_all(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("old\nold\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({"path": "f.txt", "edits": [
+            {"old_string": "old", "new_string": "new", "replace_all": True},
+        ]}),
+    ))
+    assert result.ok
+    assert (tmp_path / "f.txt").read_text() == "new\nnew\n"
 
 
 def test_edit_file_rejects_empty_edits_list(tmp_path) -> None:
@@ -418,7 +512,7 @@ def test_edit_file_rejects_malformed_edit_item(tmp_path) -> None:
     ))
     assert not result.ok
     assert result.parse_error is True
-    assert "edit 1" in result.error
+    assert "old_string" in result.error
     assert (tmp_path / "f.txt").read_text() == "alpha\n"
 
 

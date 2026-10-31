@@ -24,7 +24,9 @@ from xarness.sandbox import (
     SandboxSession,
     SandboxUnavailable,
     _etc_skeleton,
+    _host_venv_python,
     _shadow_placeholders,
+    sandbox_cache_root,
 )
 
 
@@ -81,6 +83,12 @@ class SandboxArgvTest(unittest.TestCase):
         patcher = mock.patch("shutil.which", return_value="/usr/bin/bwrap")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Keep the sandbox's cache root (project venvs, pip/cargo/npm caches)
+        # out of the real home for the duration of each test.
+        cache = mock.patch.dict(os.environ, {
+            "XARNESS_SANDBOX_CACHE": str(Path(self._tmp.name) / "cache")})
+        cache.start()
+        self.addCleanup(cache.stop)
 
     def config(self, **kw) -> SandboxConfig:
         kw.setdefault("workspace", self.workspace)
@@ -404,7 +412,7 @@ class ContainerMountsTest(SandboxArgvTest):
         i = argv.index(f"{REFS_ANCHOR}/spec.md")
         self.assertEqual(argv[i - 2:i],
                          ["--ro-bind", str(self.workspace / "docs" / "spec.md")])
-        i = argv.index("/workspace/.venv")
+        i = len(argv) - 1 - argv[::-1].index("/workspace/.venv")
         self.assertEqual(argv[i - 2:i], ["--bind", str(other)])
         # Nothing in the argv asks bwrap to create anything under the
         # workspace mount for refs.
@@ -429,10 +437,116 @@ class ContainerMountsTest(SandboxArgvTest):
         external = Path(self._tmp.name) / "ext.txt"
         external.write_text("x\n")
         for bad in (".", ".git", ".git/hooks"):
-            with self.assertRaises(SandboxUnavailable):
+            with self.assertRaises(ValueError):
                 config.add_ref(external, alias="x", mount=bad)
-        ref = config.add_ref(external, alias="x", mount=".refs/x")
-        self.assertEqual(ref.mount, ".refs/x")
+        for bad_abs in (REFS_ANCHOR, "/usr", "/tmp/other"):
+            with self.assertRaises(ValueError):
+                config.add_ref(external, alias="x", mount=bad_abs)
+        ref = config.add_ref(external, alias="x", mount=f"{REFS_ANCHOR}/x")
+        self.assertEqual(ref.mount, f"{REFS_ANCHOR}/x")
+
+    # --------------------------------------------------------------
+    # project venv: the agent's .venv is the sandbox's env
+
+    def project_venv_dir(self) -> Path:
+        """Cache-side project env for this workspace (the sandbox's own hash)."""
+        digest = hashlib.sha1(str(self.workspace.resolve()).encode()).hexdigest()
+        return sandbox_cache_root() / "venvs" / digest[:12]
+
+    def venv_binds(self, argv: list[str]) -> list[tuple[str, str, str]]:
+        return [b for b in argv_binds(argv) if b[2] == "/workspace/.venv"]
+
+    def test_project_venv_bound_at_conventional_path(self):
+        """The workspace's .venv is the host's (its interpreter does not
+        exist in the container), so the project env is bound over it: the
+        agent gets a working venv at the path it expects."""
+        (self.workspace / "pyproject.toml").write_text("[project]\nname='x'\n")
+        argv = self.argv()
+        self.assertEqual(self.venv_binds(argv), [
+            ("--bind", str(self.project_venv_dir()), "/workspace/.venv")])
+        self.assertTrue((self.workspace / ".venv").is_dir(),
+                        "mountpoint not created on the host")
+
+    def test_project_venv_mountpoint_created_in_plan_mode(self):
+        """bwrap cannot create a mountpoint inside the read-only workspace
+        bind, so the host creates it: plan mode must still start, and the
+        bind stays writable (the state lives in the cache, not the worktree)."""
+        (self.workspace / "uv.lock").write_text("")
+        argv = self.argv(read_only=True)
+        self.assertEqual(self.venv_binds(argv), [
+            ("--bind", str(self.project_venv_dir()), "/workspace/.venv")])
+        self.assertTrue((self.workspace / ".venv").is_dir())
+
+    def test_no_project_venv_outside_a_python_project(self):
+        argv = self.argv()
+        self.assertEqual(self.venv_binds(argv), [])
+        self.assertFalse((self.workspace / ".venv").exists())
+
+    def test_project_venv_not_bound_when_filtered(self):
+        (self.workspace / "pyproject.toml").write_text("[project]\n")
+        (self.workspace / ".venv").mkdir()
+        argv = self.argv(filter_list=[".venv"])
+        _, empty_dir = _shadow_placeholders()
+        self.assertEqual(self.venv_binds(argv),
+                         [("--ro-bind", empty_dir, "/workspace/.venv")])
+
+    def test_ref_mounted_host_venv_wins_over_project_env(self):
+        """A host-built venv dropped in via a ref (the documented escape
+        hatch) is mounted after the project env, so it shadows it."""
+        (self.workspace / "pyproject.toml").write_text("[project]\n")
+        other = Path(self._tmp.name) / "hostvenv"
+        other.mkdir()
+        config = self.config(external_refs=SandboxConfig.resolve_auto_refs(
+            self.workspace,
+            [RefSpec(path=str(other), mount=".venv", read_only=False)],
+        ))
+        binds = self.venv_binds(config.build_argv(["/bin/sh"]))
+        self.assertEqual([b[1] for b in binds],
+                         [str(self.project_venv_dir()), str(other)])
+        self.assertEqual(binds[-1][0], "--bind")
+
+    def test_project_venv_joins_mount_key(self):
+        config = self.config()
+        key = config.mount_key
+        (self.workspace / "pyproject.toml").write_text("[project]\n")
+        self.assertNotEqual(config.mount_key, key,
+                            "a project venv appearing must restart the shell")
+
+    # --------------------------------------------------------------
+    # interpreter pin
+
+    def test_host_venv_python_pinned_from_uv_pyvenv_cfg(self):
+        pythons = Path(self._tmp.name) / "uv-python"
+        (pythons / "cpython-3.13.11-linux-x86_64-gnu" / "bin").mkdir(parents=True)
+        (self.workspace / ".venv").mkdir()
+        (self.workspace / ".venv" / "pyvenv.cfg").write_text(
+            "home = " + str(pythons / "cpython-3.13.11-linux-x86_64-gnu" / "bin") + "\n"
+            "implementation = CPython\nuv = 0.12.5\nversion_info = 3.13.11\n")
+        self.assertEqual(_host_venv_python(self.workspace, pythons), "3.13.11")
+
+    def test_host_venv_python_accepts_cpython_venv_key(self):
+        pythons = Path(self._tmp.name) / "uv-python"
+        (pythons / "cpython-3.12.4" / "bin").mkdir(parents=True)
+        (self.workspace / ".venv").mkdir()
+        (self.workspace / ".venv" / "pyvenv.cfg").write_text(
+            "home = " + str(pythons / "cpython-3.12.4" / "bin") + "\n"
+            "version = 3.12.4\n")
+        self.assertEqual(_host_venv_python(self.workspace, pythons), "3.12.4")
+
+    def test_host_venv_python_not_pinned_for_system_interpreter(self):
+        """A venv built on /usr/bin/python3 names an interpreter the
+        container does not have: pinning it would fail every uv call."""
+        pythons = Path(self._tmp.name) / "uv-python"
+        pythons.mkdir()
+        (self.workspace / ".venv").mkdir()
+        (self.workspace / ".venv" / "pyvenv.cfg").write_text(
+            "home = /usr/bin\nversion_info = 3.12.3\n")
+        self.assertIsNone(_host_venv_python(self.workspace, pythons))
+
+    def test_host_venv_python_absent_without_pyvenv_cfg(self):
+        pythons = Path(self._tmp.name) / "uv-python"
+        pythons.mkdir()
+        self.assertIsNone(_host_venv_python(self.workspace, pythons))
 
     # --------------------------------------------------------------
     # filter_list
@@ -640,7 +754,7 @@ class ConfigFlagsTest(SandboxArgvTest):
         self.assertEqual(set(config.external_refs), {"spec.md"})
         ref = config.external_refs["spec.md"]
         self.assertEqual(ref.host, self.workspace / "docs" / "spec.md")
-        self.assertEqual(ref.mount, ".refs/spec.md")
+        self.assertEqual(ref.mount, f"{REFS_ANCHOR}/spec.md")
         self.assertTrue(ref.read_only)
         argv = config.build_argv(["/bin/sh"])
         self.assertIn(("--ro-bind", str(self.workspace / "docs" / "spec.md"),
@@ -722,6 +836,10 @@ class ConfigFlagsTest(SandboxArgvTest):
             external_refs=SandboxConfig.resolve_auto_refs(
                 workspace, settings.auto_include_refs),
             git_dir=git_dir,
+            # from_settings installs the shim whenever tracking is active
+            # and allow_git_write is off; mirror that here so the matrix
+            # compares argv, not shim policy.
+            git_shim=(git_dir is not None),
         )
 
     def test_from_settings_matches_explicit_construction_matrix(self):
@@ -788,8 +906,10 @@ class UnsandboxedTest(unittest.TestCase):
         config = SandboxConfig.from_settings(self.workspace, settings)
         argv = config.build_argv(["/bin/sh", "-c", "echo"])
         self.assertEqual(argv, ["/bin/sh", "-c", "echo"])
-        self.assertEqual(config.tool_path(".refs/spec.md"),
-                         str(self.workspace) + "/.refs/spec.md")
+        # The canonical path is passed through; without a container there is
+        # nothing mounted there.
+        self.assertEqual(config.tool_path("/tmp/refs/spec.md"),
+                         "/tmp/refs/spec.md")
 
 
 # ----------------------------------------------------------------------
@@ -1058,6 +1178,47 @@ class ContainerExecTest(unittest.TestCase):
         result = asyncio.run(drive())
         self.assertTrue(result.timed_out)
         self.assertNotEqual(result.exit_code, 0)
+
+    # 8. project venv at the conventional path
+
+    def project_venv_dir(self) -> Path:
+        digest = hashlib.sha1(str(self.workspace.resolve()).encode()).hexdigest()
+        return sandbox_cache_root() / "venvs" / digest[:12]
+
+    def test_project_venv_shadows_host_dot_venv(self):
+        """The agent's .venv is the sandbox's project env: the host venv is
+        invisible in there (its interpreter and console scripts name host
+        paths that do not exist), and the host's files stay untouched."""
+        venv = self.project_venv_dir()
+        venv.mkdir(parents=True, exist_ok=True)
+        (venv / "cache-marker").write_text("cache\n")
+        (self.workspace / ".venv").mkdir()
+        (self.workspace / ".venv" / "host-marker").write_text("host\n")
+        (r,) = self.run_session(SandboxSession(self.session_config()),
+                                "cat /workspace/.venv/cache-marker; "
+                                "ls -A /workspace/.venv; "
+                                "echo x > /workspace/.venv/from-sandbox")
+        self.assertEqual(r.exit_code, 0, r.stdout)
+        self.assertIn("cache", r.stdout)
+        self.assertNotIn("host-marker", r.stdout)
+        self.assertEqual((self.workspace / ".venv" / "host-marker").read_text(),
+                         "host\n")
+        # Writes through /workspace/.venv land in the cache, not the worktree.
+        self.assertEqual((venv / "from-sandbox").read_text(), "x\n")
+        self.assertFalse((self.workspace / ".venv" / "from-sandbox").exists())
+
+    def test_plan_mode_starts_without_a_host_venv(self):
+        """Regression: the .venv mountpoint was left to bwrap, which cannot
+        create one inside the read-only workspace bind, so plan mode refused
+        to start ("Can't create file /workspace/.venv")."""
+        self.assertFalse((self.workspace / ".venv").exists())
+        (r,) = self.run_session(
+            SandboxSession(self.session_config(read_only=True)),
+            "test -d /workspace/.venv && echo VENV_DIR")
+        self.assertEqual(r.exit_code, 0, r.stdout)
+        self.assertIn("VENV_DIR", r.stdout)
+        # The mountpoint the sandbox created is gone again afterwards.
+        self.assertFalse((self.workspace / ".venv").exists())
 
 
 if __name__ == "__main__":

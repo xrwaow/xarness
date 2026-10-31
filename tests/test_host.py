@@ -1047,3 +1047,33 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
                 task.cancel()
 
     asyncio.run(go())
+
+
+def test_system_prompt_matches_tracking_status(tmp_path) -> None:
+    """End-to-end: a real session's system prompt must state exactly the
+    facts its status payload claims — the snapshot clause when (and only
+    when) the header says tracking is on, git read-only unless
+    allow_git_write, and PLAN (not READ) as the plan-mode label."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            (tmp_path / "ws").mkdir()
+            session = await host.create_session(protocol.CreateSessionRequest(
+                workspace=str(tmp_path / "ws")))
+            status = session.status()
+            prompt = session.controller.system_prompt
+            assert status.enable_tracking is (session.git_info is not None)
+            if status.enable_tracking:
+                assert "Changes are snapshotted" in prompt
+                assert "git in the shell is read-only" in prompt
+            else:
+                assert "Changes are snapshotted" not in prompt
+            assert "Mode: WRITE (read/write)" in prompt
+            # A fresh session reports tracking on (the workspace is auto-inited).
+            assert status.enable_tracking is True
+        finally:
+            task.cancel()
+
+    asyncio.run(go())

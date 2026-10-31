@@ -464,8 +464,11 @@ class Transcript:
             if at is not None and self._reasoning_t is not None
             else None
         )
+        before = (item.done, item.duration)
         item.finish(duration)
-        return item
+        # Already closed and unchanged (settle() is idempotent): report
+        # nothing rather than making the caller repaint a settled block.
+        return None if (item.done, item.duration) == before else item
 
     def apply(self, event) -> list:
         """Fold one live event; return the items created or mutated."""
@@ -539,7 +542,12 @@ class Transcript:
                 item.status = ToolStatus.CALL_SUCCEEDED
             else:
                 item.status = ToolStatus.CALL_FAILED
-            item.output = event.output or event.error
+            # A failed call can carry both: run_bash returns what the command
+            # printed before a timeout, plus the reason it failed.
+            if event.output and event.error:
+                item.output = f"{event.output}\n{event.error}"
+            else:
+                item.output = event.output or event.error
             return [item]
         if isinstance(event, TurnComplete):
             return self.settle(event.t)
@@ -566,4 +574,14 @@ class Transcript:
     def cancel(self) -> list:
         """Settle the round for an interrupted turn; ignore later events."""
         self.cancelled = True
-        return self.settle(None)
+        changed = self.settle(None)
+        # A call still in flight when the turn was killed has no ToolFinished
+        # coming: settle it as failed here, or its "Running" shimmer (and its
+        # repaint timer) outlives the interrupt. Mirrors the "interrupted"
+        # result the host persists, so a reload shows the same state.
+        for item in self.tool_blocks.values():
+            if item.status is ToolStatus.MAKING_CALL:
+                item.status = ToolStatus.CALL_FAILED
+                item.output = item.output or "interrupted"
+                changed.append(item)
+        return changed

@@ -55,14 +55,30 @@ Everything the model can reach:
 | workspace → `/workspace` | read-write, or read-only in plan mode | your real directory, edited in place |
 | `.git` directory (same host path) | read-only | `git status`/`diff`/`log` work in the container; the harness does all git writes on the host |
 | `uv.lock` | read-only | `uv` may read it to build the project env, never rewrite it |
+| `.venv` | read-write | the project env the agent should use (see below) — your worktree's `.venv` is shadowed by it |
 | shared caches (`uv`, `pip`, `cargo`, `npm`) | read-write | offline installs from warm host caches; `~/.cargo`, `~/.rustup`, `~/.local` are bound read-only so PATH tools still resolve |
 | external refs → `/tmp/refs/<alias>` | read-only | the only bridge to host paths outside the workspace; writable mounts (e.g. a host-built `.venv`) are forced read-only in plan mode |
-| `.refs/` anchor | tmpfs | purely container-side (nested under the container `/tmp` tmpfs) — nothing, not even an empty folder, ever appears in your worktree; tool paths use `.refs/<alias>`, shell uses `/tmp/refs/<alias>` |
+| `/tmp/refs` anchor | tmpfs | purely container-side (nested under the container `/tmp` tmpfs) — nothing, not even an empty folder, ever appears in your worktree; tools and shell both use `/tmp/refs/<alias>` |
 
 Everything else — the rest of `/`, `/home`, other users' files — does not
 exist as far as the model can tell. Stray writes outside the mounts land in
 an ephemeral container layer that dies with the process; they never reach
 the host.
+
+**The project venv.** uv's env for the project lives outside the workspace
+(`$UV_PROJECT_ENVIRONMENT`, under the shared cache and keyed by the
+workspace path) and is bound over `/workspace/.venv`, so the agent finds a
+working interpreter and console scripts at the conventional path —
+`uv run pytest`, `.venv/bin/python`, `.venv/bin/pytest` all work. It is not
+your worktree's `.venv`: that one was built on the host, and its interpreter
+symlink and console-script shebangs name host paths that do not exist inside
+the container (invoking them there fails with exit 127). Writes through
+`/workspace/.venv` land in the cache, never in the worktree, so the agent can
+`uv sync` without touching your files (a directory the sandbox had to create
+for the mountpoint is removed again on exit). To use a
+host-built venv inside the sandbox instead, mount it explicitly
+(`RefSpec(path=..., mount=".venv")`) — ref mounts come after this one and
+win.
 
 **Plan mode** is the same container with the workspace and every ref bound
 read-only, plus the editing tools removed from the tool set — so shell
@@ -89,7 +105,7 @@ the container cannot shift what `/diff` tracks.
 
 Expose external files to the agent with `/refs add <path>` (or the
 `auto_include_refs` sandbox setting); the model addresses them as
-`.refs/<alias>` in tool calls (and `/tmp/refs/<alias>` in shell commands).
+`/tmp/refs/<alias>` from both the file tools and the shell.
 Plain entries are read-only; a `RefSpec` object can choose a different
 mount and mark it writable.
 
@@ -143,6 +159,13 @@ If your `--workspace` is a subdirectory of a bigger repo, the session is
 scoped to that subdirectory: the agent's sandbox mounts *your* directory as
 its workspace root (`/workspace`) — the rest of the repo isn't mounted in
 the container at all — and diffs/reverts cover only your directory.
+
+What never enters a snapshot: paths your ignore rules already cover,
+binary/media file types, files over 1 MB, and — in a project with a
+`Cargo.toml` — cargo's build trees: `target/` and the sandbox's own
+`target-sandbox/` (where `CARGO_TARGET_DIR` points, so every build inside
+xarness lands there). Tracking those would bury `/diff` in object files the
+agent's own `cargo build` just produced.
 
 ### Undo and retry
 
@@ -292,7 +315,7 @@ xarness --server                     # run the host in the foreground
 | `/sessions` | Resume a previous session |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
-| `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `.refs/<alias>` (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
+| `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `/tmp/refs/<alias>` — the same path tool calls and the shell use (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
 | `/new` | Start a new chat |
 | `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
 | `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
@@ -376,3 +399,17 @@ src/xarness/
 The UI consumes an async generator of typed stream events and knows nothing
 about HTTP; conversation state is plain data, and the tool registry is built
 per session/mode, so adding tools doesn't touch widget code.
+
+## Development
+
+```sh
+uv sync                          # create/refresh the project env
+uv run pytest                    # full suite
+uv run pytest -q tests/test_sandbox.py -k ContainerExec   # real bwrap runs
+```
+
+The container tests need `bwrap` and skip themselves when nested sandboxing is
+unavailable. Everything else fakes `bwrap` and inspects the argv instead.
+When xarness runs against its own repo, the sandbox exposes this env at
+`.venv` (see “The project venv” above), so `.venv/bin/pytest` works inside
+`run_bash` too.

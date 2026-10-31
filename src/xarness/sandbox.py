@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import hashlib
 import os
+import posixpath
 import shutil
 import signal
 import tempfile
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable
 
 from dataclasses import dataclass, field
@@ -27,6 +30,31 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .config import RefSpec, SandboxSettings
     from .gitwork import GitInfo
+
+# Runtime import: RefSpec validation and the sandbox must agree on the
+# canonical refs path.
+from .config import REFS_ANCHOR
+from .gitwork import git_shim_script
+
+
+def has_ref_mounts(sandbox: "SandboxConfig") -> bool:
+    """True when the canonical refs area is actually mounted.
+
+    Refs only exist inside the container; unsandboxed sessions have no refs
+    area at all, so neither the tools nor the prompt should advertise one.
+    """
+    return sandbox.use_container and any(
+        ref.mount.startswith(REFS_ANCHOR + "/")
+        for ref in sandbox.external_refs.values()
+    )
+
+
+def is_refs_path(path: str) -> bool:
+    """True for an absolute path inside the canonical refs area."""
+    if not Path(path).is_absolute():
+        return False
+    norm = posixpath.normpath("/" + path.lstrip("/"))
+    return norm == REFS_ANCHOR or norm.startswith(REFS_ANCHOR + "/")
 
 
 def bind_ref(
@@ -40,7 +68,7 @@ def bind_ref(
 ) -> ContainerRef:
     """Bind a host path into the container (appended to ``refs``); returns
     the (possibly disambiguated) entry. ``mount`` defaults to
-    ``.refs/<alias>`` with the alias from the path's basename; duplicate
+    ``/tmp/refs/<alias>`` with the alias from the path's basename; duplicate
     basenames prepend parent segments until unique."""
     host_path = Path(host).expanduser()
     host_path = host_path if host_path.is_absolute() else workspace / host_path
@@ -55,15 +83,25 @@ def bind_ref(
                 break
             alias = "-".join(host_path.parts[-depth:])
     if mount is None:
-        mount = f".refs/{alias}"
-    mount = mount.strip("/")
-    if not mount or ".." in Path(mount).parts:
-        raise SandboxUnavailable(f"invalid ref mount point: {mount!r}")
-    if mount in (".", ".git") or mount.startswith(".git/"):
-        # '.' would mount over the workspace root; '.git' would shadow
-        # the harness's read-only git bind (the git guard assumes that
-        # mount stays ro).
-        raise SandboxUnavailable(f"ref mount point {mount!r} is not allowed")
+        mount = f"{REFS_ANCHOR}/{alias}"
+    mount = mount.strip()
+    if mount.startswith("/"):
+        # Absolute mounts are only the canonical refs area (see REFS_ANCHOR);
+        # a ref must never shadow /usr, /etc, the workspace or the caches.
+        mount = posixpath.normpath(mount)
+        if mount == REFS_ANCHOR or not mount.startswith(REFS_ANCHOR + "/"):
+            raise ValueError(
+                f"absolute ref mount must be below {REFS_ANCHOR}/: {mount!r}"
+            )
+    else:
+        mount = mount.strip("/")
+        if not mount or ".." in Path(mount).parts:
+            raise ValueError(f"invalid ref mount point: {mount!r}")
+        if mount in (".", ".git") or mount.startswith(".git/"):
+            # '.' would mount over the workspace root; '.git' would shadow
+            # the harness's read-only git bind (the git guard assumes that
+            # mount stays ro).
+            raise ValueError(f"ref mount point {mount!r} is not allowed")
     ref = ContainerRef(host=host_path, mount=mount, read_only=read_only)
     refs[alias] = ref
     return ref
@@ -72,21 +110,38 @@ def bind_ref(
 # Subdirectories of the persistent sandbox cache, created on demand.
 _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
 
-# Container path of the external-references area. It is a tmpfs nested under
-# the container-only /tmp tmpfs (mounted at the top of build_argv, before the
-# workspace bind), so bwrap creates its mountpoint — and every per-alias
-# mountpoint below it — inside that tmpfs. Nothing, not even an empty anchor
-# directory, ever appears in the host worktree. (An earlier design mounted
-# the anchor at <workspace>/.refs, which forced a transient .refs directory
-# into the real worktree on every run and failed outright in plan mode,
-# where the workspace bind is read-only.) Agent-facing tool paths keep the
-# workspace-relative '.refs/<alias>' spelling; this is where they land.
-REFS_ANCHOR = "/tmp/refs"
+# Container path of the external-references area (REFS_ANCHOR, imported from
+# config). It is a tmpfs nested under the container-only /tmp tmpfs (mounted
+# at the top of build_argv, before the workspace bind), so bwrap creates its
+# mountpoint — and every per-alias mountpoint below it — inside that tmpfs.
+# Nothing, not even an empty anchor directory, ever appears in the host
+# worktree. (An earlier design mounted the anchor at <workspace>/.refs, which
+# forced a transient .refs directory into the real worktree on every run and
+# failed outright in plan mode, where the workspace bind is read-only.)
+# Container path the agent's workspace is mounted at (the only one tools and
+# argv building ever name).
+_WORKSPACE = "/workspace"
 # Container path the external (no-.git) snapshot store is bound at, when a
 # session tracks a workspace that has no repo of its own. GIT_DIR/GIT_WORK
 # _TREE are set to point here so the agent's read-only git reads work.
 EXTERNAL_GIT_ANCHOR = "/.xarness-snapshot-store"
-_REFS_PREFIX = ".refs"
+
+# Subdirectory of the sandbox cache holding the read-only git shim, bound at
+# <CACHE_ANCHOR>/<GIT_SHIM_DIR> and prepended to the container's PATH when
+# SandboxConfig.git_shim is set (see gitwork.git_shim_script).
+GIT_SHIM_DIR = "git-shim"
+
+
+def _write_git_shim(directory: Path) -> Path:
+    """Materialize the git shim script into the sandbox cache (idempotent:
+    rewritten only when the generated text changes)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "git"
+    script = git_shim_script()
+    if not shim.exists() or shim.read_text(encoding="utf-8") != script:
+        shim.write_text(script, encoding="utf-8")
+        shim.chmod(0o755)
+    return shim
 
 # Container anchor for shared toolchain state (caches, uv-managed pythons,
 # rustup). Everything the sandbox shares with the host is bound *under this
@@ -109,25 +164,43 @@ CACHE_ANCHOR = "/cache"
 # build switches between host and sandbox, forcing a full rebuild. A
 # sandbox-only target dir keeps the two build graphs (and their absolute
 # paths) disjoint; host builds keep using ./target.
-SANDBOX_CARGO_TARGET_DIR = "/workspace/target-sandbox"
+SANDBOX_CARGO_TARGET_DIR = f"{_WORKSPACE}/target-sandbox"
 
-# Host paths bwrap creates as bind mountpoints inside the workspace (a
-# custom ref's target, e.g. a dropped-in ``.venv``). They are empty; removed
-# at exit so the worktree looks untouched (git ignores empty dirs anyway,
-# but ls doesn't). The refs tmpfs anchor is not here: it lives under the
-# container-only /tmp tmpfs and never touches the host at all.
+# Bind mountpoints that have to exist in the workspace on the host (a
+# custom ref's target, the project venv at .venv). bwrap can create a
+# missing mountpoint itself, but only inside a writable mount: in plan mode
+# the workspace is read-only and the container would refuse to start, so the
+# host creates the directory up front. Directories the sandbox created are
+# empty and removed at exit, so the worktree looks untouched (git ignores
+# empty dirs anyway, but ls doesn't). The refs tmpfs anchor is not here: it
+# lives under the container-only /tmp tmpfs and never touches the host at
+# all.
 _MOUNT_DIRS: set[Path] = set()
 _CLEANUP_REGISTERED = False
 
 
-def _note_mount_dir(path: Path) -> None:
+def _ensure_mount_dir(path: Path) -> bool:
+    """Make ``path`` a directory bwrap can bind onto; False if impossible.
+
+    A pre-existing directory is used as-is and never cleaned up; one the
+    sandbox creates is empty and removed at exit. A file (or a dangling
+    symlink) is refused — binding over it would replace something of the
+    user's, and the caller can just skip that mount.
+    """
     global _CLEANUP_REGISTERED
-    if path.exists():
-        return  # pre-existing content — never touch it
+    if path.is_dir():
+        return True
+    if path.exists() or path.is_symlink():
+        return False
+    try:
+        path.mkdir(parents=True)
+    except OSError:
+        return False
     _MOUNT_DIRS.add(path)
     if not _CLEANUP_REGISTERED:
         atexit.register(_cleanup_mount_dirs)
         _CLEANUP_REGISTERED = True
+    return True
 
 
 def _cleanup_mount_dirs() -> None:
@@ -141,9 +214,17 @@ def _cleanup_mount_dirs() -> None:
             pass
 
 
-_ETC_SKELETON: Path | None = None
+# Workspace markers meaning "this project has a venv the agent should reach at
+# the conventional path" (see SandboxConfig.uses_project_venv). The nested
+# .venv/pyvenv.cfg entry covers a bare venv next to no project file; it is
+# never created here, so it cannot feed back into the decision.
+_PROJECT_VENV_MARKERS = (
+    "pyproject.toml", "uv.lock", "setup.py", "requirements.txt", "Pipfile",
+    ".venv/pyvenv.cfg",
+)
 
 
+@functools.cache
 def _etc_skeleton() -> Path:
     """Host directory bound over /etc (read-only). Pre-creates every
     mountpoint bwrap will bind into /etc (it cannot create mountpoints
@@ -152,23 +233,20 @@ def _etc_skeleton() -> Path:
     the container's real uid/gid) — so nothing from the host's identity is
     needed or leaked. The result: an /etc that carries no host identity and
     is not writable."""
-    global _ETC_SKELETON
-    if _ETC_SKELETON is None:
-        root = Path(tempfile.mkdtemp(prefix="xarness-etc-"))
-        for sub in ("ssl", "pki", "alternatives"):
-            (root / sub).mkdir()
-        (root / "resolv.conf").touch()
-        uid, gid = os.getuid(), os.getgid()
-        (root / "passwd").write_text(
-            f"sandbox:x:{uid}:{gid}:sandbox:/tmp:/bin/sh\n"
-        )
-        (root / "group").write_text(f"sandbox:x:{gid}:\n")
-        (root / "hosts").write_text(
-            "127.0.0.1 localhost\n::1 localhost\n"
-        )
-        atexit.register(shutil.rmtree, root, True)
-        _ETC_SKELETON = root
-    return _ETC_SKELETON
+    root = Path(tempfile.mkdtemp(prefix="xarness-etc-"))
+    for sub in ("ssl", "pki", "alternatives"):
+        (root / sub).mkdir()
+    (root / "resolv.conf").touch()
+    uid, gid = os.getuid(), os.getgid()
+    (root / "passwd").write_text(
+        f"sandbox:x:{uid}:{gid}:sandbox:/tmp:/bin/sh\n"
+    )
+    (root / "group").write_text(f"sandbox:x:{gid}:\n")
+    (root / "hosts").write_text(
+        "127.0.0.1 localhost\n::1 localhost\n"
+    )
+    atexit.register(shutil.rmtree, root, True)
+    return root
 
 
 def cleanup_mount_dirs_now() -> None:
@@ -195,34 +273,64 @@ class SandboxUnavailable(Exception):
     session falls back to filesystem/bash tools being disabled)."""
 
 
-_SHADOW: tuple[str, str] | None = None
-
-
+@functools.cache
 def _shadow_placeholders() -> tuple[str, str]:
     """Host paths of an empty file and an empty directory, bind-mounted
     (read-only) over hidden paths to make them vanish: reads see emptiness,
     writes fail. One set is reused for the process lifetime and cleaned up
     at exit."""
-    global _SHADOW
-    if _SHADOW is None:
-        root = tempfile.mkdtemp(prefix="xarness-shadow-")
-        file_path = os.path.join(root, "f")
-        dir_path = os.path.join(root, "d")
-        open(file_path, "w").close()
-        os.mkdir(dir_path)
-        atexit.register(shutil.rmtree, root, True)
-        _SHADOW = (file_path, dir_path)
-    return _SHADOW
+    root = tempfile.mkdtemp(prefix="xarness-shadow-")
+    file_path = os.path.join(root, "f")
+    dir_path = os.path.join(root, "d")
+    open(file_path, "w").close()
+    os.mkdir(dir_path)
+    atexit.register(shutil.rmtree, root, True)
+    return file_path, dir_path
+
+
+def _read_pyvenv_cfg(path: Path) -> dict[str, str]:
+    """Parse the ``key = value`` lines of a venv's pyvenv.cfg; {} if absent."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    cfg: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and value.strip():
+            cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def _host_venv_python(workspace: Path, python_dir: Path) -> str | None:
+    """Python version the host venv was built with, if it can be pinned.
+
+    Only uv-managed interpreters are bound into the container (read-only, at
+    ``/cache/uv-python``), so a pin is returned only for a venv built on one:
+    a system-python venv would name an interpreter that does not exist in
+    here, turning the pin into "no interpreter found". uv writes
+    ``version_info``; CPython's own venv writes ``version``.
+    """
+    cfg = _read_pyvenv_cfg(workspace / ".venv" / "pyvenv.cfg")
+    version = cfg.get("version_info") or cfg.get("version")
+    home = cfg.get("home")
+    if not (version and home) or not python_dir.is_dir():
+        return None
+    try:
+        Path(home).resolve().relative_to(python_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return version
 
 
 @dataclass(slots=True)
 class ContainerRef:
     """One external path bound into the container.
 
-    ``mount`` is relative to the tool root: ``.refs/<alias>`` (the read-only
-    references area the system prompt describes — a purely container-side
-    tmpfs, nothing is ever created in the worktree) or any workspace-relative
-    path (e.g. ``.venv``, to drop a host-built venv into the project)."""
+    ``mount`` is the canonical container path (``/tmp/refs/<alias>``, a
+    purely container-side tmpfs, nothing is ever created in the worktree) or
+    any workspace-relative path (e.g. ``.venv``, to drop a host-built venv
+    into the project)."""
 
     host: Path
     mount: str
@@ -256,6 +364,13 @@ class SandboxConfig:
     # this mode (see tools.build_registry): there is no read-only mount to
     # enforce it with.
     use_container: bool = True
+    # Install the read-only git shim (gitwork.git_shim_script) first on the
+    # container's PATH: blocked subcommands fail in place at execution time
+    # instead of the whole command string being vetoed before it runs. Set
+    # by from_settings when git tracking is active and allow_git_write is
+    # off; unsandboxed sessions keep the string-scanning guard instead.
+    # Part of mount_key, so enabling it restarts the persistent shell.
+    git_shim: bool = False
     # Workspace-root-relative paths excluded from the container's mounts
     # (a mount exclusion, not a gitignore). Part of mount_key, so changing
     # it restarts the persistent shell.
@@ -293,17 +408,44 @@ class SandboxConfig:
         restarts its shell when it differs, so runtime changes (mode flips,
         ref edits) take effect without losing the shell more often than
         necessary."""
+        home = Path.home()
         return (
             self.read_only,
             self.allow_network,
             self.gpu_access,
             self.use_container,
+            self.git_shim,
             tuple(sorted(self.filter_list)),
+            self.uses_project_venv(),
+            # Inputs of _cache_binds_and_env's mounts and env, which can
+            # appear after session start (a first `uv lock`, a first
+            # `cargo install`).
+            (self.workspace / "uv.lock").is_file(),
+            (home / ".cargo" / "bin").is_dir(),
+            (home / ".local" / "bin").is_dir(),
+            (home / ".rustup").is_dir(),
+            (home / ".local" / "share" / "uv" / "python").is_dir(),
+            _host_venv_python(self.workspace, home / ".local" / "share" / "uv" / "python"),
             tuple(sorted(
                 (alias, str(ref.host), ref.mount, ref.read_only)
                 for alias, ref in self.external_refs.items()
             )),
         )
+
+    def uses_project_venv(self) -> bool:
+        """True when the workspace is a Python project whose venv the agent
+        should reach at ``.venv`` (see ``_cache_binds_and_env``).
+
+        Deliberately decided from marker files only: the mountpoint itself
+        may be created by the sandbox, and a decision that flipped once that
+        directory existed would change ``mount_key`` and restart the shell
+        for nothing. ``.venv`` in ``filter_list`` means the user wants it
+        hidden, so it is not exposed.
+        """
+        if ".venv" in {rel.strip("/") for rel in self.filter_list}:
+            return False
+        return any((self.workspace / marker).exists()
+                   for marker in _PROJECT_VENV_MARKERS)
 
     # ------------------------------------------------------------------
     # External references
@@ -347,6 +489,7 @@ class SandboxConfig:
             ),
             git_dir=git_info.git_dir if git_info is not None else None,
             git_external=git_info.external if git_info is not None else False,
+            git_shim=(git_info is not None and not settings.allow_git_write),
         )
 
     @staticmethod
@@ -379,24 +522,24 @@ class SandboxConfig:
 
     @property
     def tool_root(self) -> str:
-        """Sandbox path the agent's workspace is anchored at."""
-        return "/workspace"
+        """Path the agent's workspace is anchored at: the container mount,
+        or the real directory in unsandboxed mode. Every use of this for
+        argv building is inside a container-only branch."""
+        return _WORKSPACE if self.use_container else str(self.workspace)
 
     def tool_path(self, path: str) -> str:
-        """Anchor a validated agent-workspace-relative path at its sandbox
-        mount point. Commands must not rely on the process cwd.
+        """Anchor a validated agent-workspace-relative path at its mount point.
+        Absolute container paths (e.g. /tmp/refs/<alias>) are returned as-is.
+        Commands must not rely on the process cwd.
 
         Unsandboxed mode (use_container=False) has no container mount: paths
         resolve to the real workspace on the host."""
-        norm = "." if path in ("", ".") else path.removeprefix("./")
+        norm = posixpath.normpath(path) if path else "."
+        if posixpath.isabs(norm):
+            return norm
         if not self.use_container:
-            resolved = self.workspace if norm == "." else self.workspace / norm
-            return str(resolved)
-        if norm == _REFS_PREFIX or norm.startswith(_REFS_PREFIX + "/"):
-            # The references area lives at REFS_ANCHOR in the container, not
-            # under the workspace mount (see REFS_ANCHOR above).
-            return REFS_ANCHOR + norm[len(_REFS_PREFIX):]
-        return f"{self.tool_root}/{norm}"
+            return str(self.workspace / norm) if norm != "." else str(self.workspace)
+        return f"{_WORKSPACE}/{norm}"
 
     def validate_relpath(self, path: str) -> str | None:
         """Defense-in-depth path check; bwrap's mount namespace is the real
@@ -444,21 +587,14 @@ class SandboxConfig:
         return args
 
     def _cache_binds_and_env(self) -> list[str]:
-        """Shared toolchain state, bound under the neutral CACHE_ANCHOR —
-        never at a host path, so the container has no /home and no trace of
-        the host layout. Sources are the host's real directories, so caches
-        are shared as-is and stay warm across sessions.
+        """Shared toolchain state, bound under the neutral CACHE_ANCHOR (see
+        the CACHE_ANCHOR note for why never at a host path). Sources are the
+        host's real directories, so caches stay warm across sessions.
 
-        Writable (rw): the sandbox cache root (pip/cargo/npm caches, project
-        venvs) and the host's own ``~/.cache/uv`` — content-addressed and
-        safe to share, already warm, so uv sync / uv run install offline
-        from day one, with no cache-warming step.
-
-        Read-only: uv-managed interpreters (``~/.local/share/uv/python``),
-        rustup (``~/.rustup``) and the tool binaries on PATH (``~/.cargo/bin``
-        and ``~/.local/bin``, prepended to PATH at their container paths).
-        The agent can read them, never write; anything a tool installs lands
-        in the writable caches."""
+        Writable: the sandbox cache root (pip/cargo/npm caches, project
+        venvs) and the host's own ``~/.cache/uv``. Read-only: uv-managed
+        interpreters, rustup and the toolchain bins on PATH. Anything a tool
+        installs therefore lands in the writable caches."""
         root = sandbox_cache_root()
         anchor = CACHE_ANCHOR
         argv = ["--bind", str(root), anchor]
@@ -476,10 +612,8 @@ class SandboxConfig:
         # first build and persists alongside the user's sources.
         argv += ["--setenv", "CARGO_TARGET_DIR", SANDBOX_CARGO_TARGET_DIR]
         argv += ["--setenv", "UV_LINK_MODE", "copy"]
-        # The shell must not inherit a HOME that names a host path: '~' would
-        # point somewhere that looks meaningful but is empty (or, worse, a
-        # bind destination that recreates host layout). /tmp is the
-        # container's own writable tmpfs.
+        # The shell must not inherit a HOME that names a host path (see
+        # CACHE_ANCHOR); /tmp is the container's own writable tmpfs.
         argv += ["--setenv", "HOME", "/tmp"]
         # uv's cache is the host's own (~/.cache/uv), bound read-write.
         host_uv_cache = Path.home() / ".cache" / "uv"
@@ -511,15 +645,23 @@ class SandboxConfig:
         if host_python_dir.is_dir():
             argv += ["--ro-bind", str(host_python_dir), f"{anchor}/uv-python"]
             argv += ["--setenv", "UV_PYTHON_INSTALL_DIR", f"{anchor}/uv-python"]
-        host_venv_cfg = self.workspace / ".venv" / "pyvenv.cfg"
-        try:
-            for line in host_venv_cfg.read_text().splitlines():
-                key, _, value = line.partition("=")
-                if key.strip() == "version":
-                    argv += ["--setenv", "UV_PYTHON", value.strip()]
-                    break
-        except OSError:
-            pass
+        # Pin the interpreter to the host venv's so the wheels already in the
+        # host cache fit (e.g. host on 3.13 while the sandbox's default
+        # python3 is 3.14 — different wheel tags).
+        if pinned := _host_venv_python(self.workspace, host_python_dir):
+            argv += ["--setenv", "UV_PYTHON", pinned]
+        # The venv the agent reaches is the project env, at the path it
+        # expects: bind the uv-managed env over the workspace's .venv. The
+        # workspace's own .venv belongs to the host — its interpreter symlink
+        # and its console-script shebangs name host paths that do not exist
+        # in here, so leaving it in place reads as "python is missing" (exit
+        # 127) and invites the agent to "repair" the user's worktree. Bind
+        # read-write even in plan mode: the state lives in the cache, and uv
+        # must be able to sync there to run a test. Ref mounts are emitted
+        # after this, so a deliberately dropped-in host venv still wins.
+        if (self.uses_project_venv()
+                and _ensure_mount_dir(self.workspace / ".venv")):
+            argv += ["--bind", str(venv), f"{self.tool_root}/.venv"]
         # No network: never reach for the index — cached index data and
         # wheels must be enough (otherwise every uv call stalls on DNS
         # retries before failing).
@@ -544,21 +686,17 @@ class SandboxConfig:
         if local_bin.is_dir():
             argv += ["--ro-bind", str(local_bin), f"{anchor}/local-bin"]
             path_prepend.append(f"{anchor}/local-bin")
-        if path_prepend:
-            # Keep only PATH entries that exist inside the container: the
-            # inherited PATH names host paths (~/..., toolchain dirs) that
-            # are not mounted — dead entries would only leak the host layout
-            # through env. /usr is bound wholesale, so /usr/* entries are
-            # real in here.
-            def _in_container(entry: str) -> bool:
-                return (entry == "/bin" or entry == "/sbin"
-                        or entry.startswith(("/usr/", "/bin/", "/sbin/", "/cache/"))
-                        and not entry.startswith("/usr/home"))
-            inherited = ":".join([
-                e for e in os.environ.get("PATH", "").split(":")
-                if _in_container(e)
-            ] or ["/usr/local/bin:/usr/bin"])
-            argv += ["--setenv", "PATH", ":".join([*path_prepend, inherited])]
+        if self.git_shim:
+            # First on PATH, ahead of every real bin dir: the shim is the
+            # `git` the shell resolves. The cache root is already bound at
+            # the anchor, so only the PATH entry is needed here.
+            path_prepend.append(f"{anchor}/{GIT_SHIM_DIR}")
+            _write_git_shim(sandbox_cache_root() / GIT_SHIM_DIR)
+        # PATH is always set: --clearenv left none, and the inherited one
+        # names host paths that do not exist in here. /usr is bound
+        # wholesale, so its entries are real; the toolchain bins come from
+        # the host, read-only, at container paths.
+        argv += ["--setenv", "PATH", ":".join([*path_prepend, "/usr/local/bin", "/usr/bin", "/bin"])]
         return argv
 
     def _gpu_binds(self) -> list[str]:
@@ -625,7 +763,7 @@ class SandboxConfig:
             if not rel_path.exists():
                 continue
             empty_file, empty_dir = _shadow_placeholders()
-            target = f"/workspace/{rel.strip('/')}"
+            target = f"{_WORKSPACE}/{rel.strip('/')}"
             if rel_path.is_dir():
                 argv += ["--ro-bind", empty_dir, target]
             else:
@@ -638,19 +776,20 @@ class SandboxConfig:
         argv: list[str] = []
         refs_anchor = False
         for ref in self.external_refs.values():
-            if ref.mount == _REFS_PREFIX or ref.mount.startswith(_REFS_PREFIX + "/"):
-                # The references area is a tmpfs nested under the
-                # container-only /tmp tmpfs (mounted at the top of
-                # build_argv — that ordering is what makes the anchor
-                # virtual: bwrap creates the mountpoint inside the tmpfs,
-                # so the host worktree is never touched, even transiently).
+            if ref.mount.startswith("/"):
+                # Canonical refs area, a tmpfs nested under the container-only
+                # /tmp tmpfs (mounted at the top of build_argv — that ordering
+                # is what makes the anchor virtual: bwrap creates the
+                # mountpoint inside the tmpfs, so the host worktree is never
+                # touched, even transiently).
                 if not refs_anchor:
                     argv += ["--tmpfs", REFS_ANCHOR]
                     refs_anchor = True
-                target = REFS_ANCHOR + ref.mount[len(_REFS_PREFIX):]
+                target = ref.mount
             else:
                 target = f"{self.tool_root}/{ref.mount}"
-                _note_mount_dir(self.workspace / ref.mount)
+                if not _ensure_mount_dir(self.workspace / ref.mount):
+                    continue  # no mountpoint possible: refs are conveniences
             # Plan mode forces every ref read-only, like the rest of the
             # workspace.
             argv += ["--ro-bind" if (ref.read_only or self.read_only) else "--bind",
@@ -689,31 +828,29 @@ class SandboxConfig:
             # more than read access). NVIDIA userland lives in /usr/lib(64),
             # already bound read-only by _system_ro_binds.
             argv += self._gpu_binds()
-        chdir = "/workspace"
+        chdir = _WORKSPACE
         argv += ["--ro-bind" if self.read_only else "--bind",
-                 str(self.workspace), "/workspace"]
+                 str(self.workspace), _WORKSPACE]
         argv += self._filter_binds()
         uv_lock = self.workspace / "uv.lock"
         if uv_lock.is_file():
             # Read-only: uv run may read the lock to build the project env
             # (UV_PROJECT_ENVIRONMENT, outside the workspace) but must not
             # rewrite the user's lockfile from inside the sandbox.
-            argv += ["--ro-bind", str(uv_lock), "/workspace/uv.lock"]
+            argv += ["--ro-bind", str(uv_lock), f"{_WORKSPACE}/uv.lock"]
         if self.git_dir is not None:
             # Bound read-only over the workspace bind (later binds shadow
-            # earlier ones) at its container path, so git reads work in
-            # write mode too while the agent never touches the index or
-            # object store — the harness checkpoints on the host (gitwork).
-            # Never bound at its host path: that destination would make
-            # bwrap recreate /home/<user>/... inside the container, leaking
-            # the host layout and giving the agent a fake project root.
+            # earlier ones), so git reads work in write mode too while the
+            # agent never touches the index or object store — the harness
+            # checkpoints on the host (gitwork). Never at its host path: see
+            # the CACHE_ANCHOR note.
             if self.git_external:
                 # External snapshot store (tracked-with-no-.git mode): bind
                 # at a fixed anchor and point git at it explicitly, so the
                 # agent's read-only git status/diff see the tracked state.
                 argv += ["--ro-bind", str(self.git_dir), EXTERNAL_GIT_ANCHOR]
                 argv += ["--setenv", "GIT_DIR", EXTERNAL_GIT_ANCHOR]
-                argv += ["--setenv", "GIT_WORK_TREE", "/workspace"]
+                argv += ["--setenv", "GIT_WORK_TREE", _WORKSPACE]
             else:
                 try:
                     rel_git = self.git_dir.relative_to(self.workspace)
@@ -724,11 +861,15 @@ class SandboxConfig:
                              f"{self.tool_root}/{rel_git}"]
         argv += self._cache_binds_and_env()
         argv += self._ref_binds()
-        argv += ["--chdir", chdir, "--unshare-all"]
+        argv += ["--chdir", chdir, "--unshare-all", "--new-session"]
         # Fresh hostname: --unshare-all unshares the UTS ns but the host's
         # hostname would still be inherited.
         argv += ["--hostname", "sandbox"]
         argv += ["--setenv", "LANG", "C.UTF-8"]
+        # Python block-buffers stdout when it is not a tty, so a long
+        # pytest run would stream nothing until it exits. --clearenv dropped
+        # any inherited value, so it has to be set in here.
+        argv += ["--setenv", "PYTHONUNBUFFERED", "1"]
         if self.allow_network:
             for var in ("http_proxy", "https_proxy", "no_proxy",
                         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
@@ -746,6 +887,13 @@ class SandboxResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+
+
+# How much of a command's output SandboxSession keeps: the first MiB and the
+# last MiB, with the middle replaced by a marker.
+_CAPTURE_HEAD = 1 << 20
+_CAPTURE_TAIL = 1 << 20
+_ELIDED = "\n[... {chars} chars of output elided ...]\n"
 
 
 def _caps_unusable() -> bool:
@@ -771,7 +919,9 @@ async def run_in_sandbox(
     argv = config.build_argv(command)
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.PIPE if input_bytes is not None else None,
+        # DEVNULL, not an inherited stdin: a one-shot read must never
+        # consume the harness's own stdin.
+        stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -820,9 +970,9 @@ class SandboxSession:
             await self.close()
         self._mount_key = self._config.mount_key
         argv = self._config.build_argv(["/bin/sh"])
-        # Python block-buffers stdout when it is a pipe, so a long `pytest` /
-        # script run would show nothing until it exits. The persistent shell's
-        # children inherit this, letting run_bash stream their output live.
+        # Container mode sets PYTHONUNBUFFERED via --setenv (--clearenv drops
+        # an inherited value); unsandboxed mode has no bwrap, so hand it to
+        # the shell's own environment.
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -877,7 +1027,32 @@ class SandboxSession:
                 self._proc.stdin.write(payload)
                 await self._proc.stdin.drain()
 
-            output: list[str] = []
+            # What is kept of the output: a head and a tail with the middle
+            # elided, so a runaway command (`yes`, a huge log) cannot grow
+            # this until the timeout. on_output still sees every line.
+            head: list[str] = []
+            tail: deque[str] = deque()
+            head_size = tail_size = dropped = 0
+
+            def keep(text: str) -> None:
+                nonlocal head_size, tail_size, dropped
+                if on_output is not None:
+                    on_output(text)
+                if head_size + len(text) <= _CAPTURE_HEAD:
+                    head.append(text)
+                    head_size += len(text)
+                    return
+                tail.append(text)
+                tail_size += len(text)
+                while tail and tail_size > _CAPTURE_TAIL:
+                    dropped += len(tail.popleft())
+
+            def captured() -> str:
+                parts = ["".join(head)]
+                if dropped:
+                    parts.append(_ELIDED.format(chars=dropped))
+                parts.extend(tail)
+                return "".join(parts)
 
             async def _read_until_marker() -> int:
                 while True:
@@ -891,18 +1066,14 @@ class SandboxSession:
                     # whatever precedes it as output.
                     idx = text.find(marker)
                     if idx != -1:
-                        head, tail = text[:idx], text[idx + len(marker):].strip()
-                        if head:
-                            output.append(head)
-                            if on_output is not None:
-                                on_output(head)
+                        before, status = text[:idx], text[idx + len(marker):].strip()
+                        if before:
+                            keep(before)
                         try:
-                            return int(tail or "-1")
+                            return int(status or "-1")
                         except ValueError:
                             return -1
-                    output.append(text)
-                    if on_output is not None:
-                        on_output(text)
+                    keep(text)
 
             try:
                 exit_code = await asyncio.wait_for(
@@ -914,10 +1085,12 @@ class SandboxSession:
                 await self.close(force=True)
                 raise
             except asyncio.TimeoutError:
+                # Keep what the command printed so far: for a hung test run
+                # that output is the most useful thing the caller can see.
+                partial = captured()
                 await self.close(force=True)
-                return SandboxResult(exit_code=-1, stdout="".join(output), stderr="", timed_out=True)
-
-            return SandboxResult(exit_code=exit_code, stdout="".join(output), stderr="")
+                return SandboxResult(exit_code=-1, stdout=partial, stderr="", timed_out=True)
+            return SandboxResult(exit_code=exit_code, stdout=captured(), stderr="")
 
     async def close(self, *, force: bool = False) -> None:
         """Close the persistent shell (idempotent). ``force`` kills any
@@ -985,6 +1158,13 @@ class SandboxRuntime:
     @property
     def allow_git_write(self) -> bool:
         return self.settings.allow_git_write if self.settings is not None else False
+
+    @property
+    def git_shim_active(self) -> bool:
+        """True when the container enforces read-only git via the PATH shim
+        (so the string-scanning guard must stay off — it would veto whole
+        commands the shim now handles statement by statement)."""
+        return self.config.git_shim if self.config is not None else False
 
     def set_mode(self, mode: str) -> None:
         if self.config is not None:

@@ -198,6 +198,39 @@ class TranscriptTest(unittest.TestCase):
         # Events after cancel are ignored.
         self.assertEqual(t.apply(ContentDelta(text="late")), [])
 
+    def test_failed_call_keeps_both_output_and_reason(self):
+        """A timed-out run_bash returns what it printed *and* the reason;
+        the transcript must show both, not drop the reason."""
+        t = tr.Transcript()
+        t.apply(UserMessageAdded(text="u"))
+        t.apply(ToolCallStarted(call_id="c", name="run_bash"))
+        t.apply(ToolFinished(
+            call_id="c", ok=False,
+            output="partial\n", error="command timed out",
+        ))
+        tool = t.tool_blocks["c"]
+        self.assertEqual(tool.status, tr.ToolStatus.CALL_FAILED)
+        self.assertIn("partial", tool.output)
+        self.assertIn("command timed out", tool.output)
+
+    def test_cancel_settles_in_flight_tool_calls(self):
+        """An interrupt kills a running call: it must settle as failed and
+        be reported, or the app never stops its Running shimmer."""
+        t = tr.Transcript()
+        t.apply(ProcessingStarted())
+        t.apply(ReasoningDelta(text="think"))
+        t.apply(ToolCallStarted(call_id="c", name="run_bash"))
+        t.apply(ToolCallArgumentsDelta(call_id="c", text='{"command":'))
+        changed = t.cancel()
+        tool = t.tool_blocks["c"]
+        self.assertEqual(tool.status, tr.ToolStatus.CALL_FAILED)
+        self.assertEqual(tool.output, "interrupted")
+        self.assertIn(tool, changed)
+        # Settling twice is a no-op; a late result is ignored after cancel.
+        self.assertEqual(t.cancel(), [])
+        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
+        self.assertEqual(tool.status, tr.ToolStatus.CALL_FAILED)
+
     def test_processing_started_opens_a_fresh_round(self):
         """Every round (post-tool included) is opened by ProcessingStarted:
         the previous round's settled entries are never appended to."""

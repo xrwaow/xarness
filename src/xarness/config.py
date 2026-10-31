@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,12 @@ from pydantic import (
 DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
 
 DEFAULT_THEME = "ayu-darker"
+
+# Canonical container path of the external-references area. Refs are bound
+# read-only under this absolute path (a tmpfs nested in the container-only
+# /tmp), and both the tools and the shell address them here directly. See
+# sandbox._ref_binds for why it cannot live under /workspace.
+REFS_ANCHOR = "/tmp/refs"
 
 # Config written on first run (no file at DEFAULT_CONFIG_PATH yet): one
 # OpenAI-shaped model using the built-in defaults for everything else.
@@ -114,7 +121,7 @@ class ProviderProfile(BaseModel):
 class RefSpec(BaseModel):
     """One ``auto_include_refs`` entry with an explicit mount point.
 
-    Plain string entries mean "bind at ``.refs/<alias>``"; a RefSpec can
+    Plain string entries mean "bind at ``/tmp/refs/<alias>``"; a RefSpec can
     instead mount the host path anywhere workspace-relative (e.g. ``mount:
     ".venv"`` to drop a host-built venv into the project) and mark it
     writable."""
@@ -122,9 +129,10 @@ class RefSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
-    # Container path of the mount (None = the container-only refs tmpfs,
-    # addressed as ``.refs/<alias>`` with the alias derived from the path's
-    # basename); an empty string is normalized to None.
+    # Container path of the mount (None = the canonical refs area,
+    # ``/tmp/refs/<alias>`` with the alias derived from the path's basename);
+    # an empty string is normalized to None. Explicit mounts are either under
+    # /tmp/refs/ or workspace-relative.
     mount: str | None = None
     read_only: bool = True
 
@@ -143,7 +151,19 @@ class RefSpec(BaseModel):
     def _validate_mount(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        value = value.strip().strip("/")
+        value = value.strip()
+        if not value:
+            return None
+        if value.startswith("/"):
+            # Absolute mounts are only the canonical refs area: a RefSpec
+            # must not shadow /usr, /etc, the workspace or the caches.
+            mount = posixpath.normpath(value)
+            if mount == REFS_ANCHOR or not mount.startswith(REFS_ANCHOR + "/"):
+                raise ValueError(
+                    f"absolute mount must be below {REFS_ANCHOR}/: {value!r}"
+                )
+            return mount
+        value = value.strip("/")
         if not value:
             return None
         if ".." in Path(value).parts or value.startswith(".git"):
@@ -194,7 +214,7 @@ class SandboxSettings(BaseModel):
         """Plain string entries become ``{"path": ...}`` so RefSpec's own
         validation (non-empty, no '..') applies uniformly; the normalized
         field always holds ``str | RefSpec`` — a str meaning "bind at
-        ``.refs/<alias>``", a RefSpec mounting wherever it says."""
+        ``/tmp/refs/<alias>``", a RefSpec mounting wherever it says."""
         if not isinstance(value, list):
             return value
         return [{"path": entry} if isinstance(entry, str) else entry for entry in value]

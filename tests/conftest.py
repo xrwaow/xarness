@@ -17,6 +17,14 @@ def _bwrap_failed(result) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def isolated_state_dir(tmp_path_factory, monkeypatch):
+    """Keep xarness's own state (external snapshot stores, per-session
+    snapshot indexes) out of the real ``~/.local/state``: it is keyed by
+    workspace path, so tests would otherwise leave files behind there."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("state")))
+
+
+@pytest.fixture(autouse=True)
 def skip_when_bwrap_unusable(monkeypatch):
     orig_run_in_sandbox = sandbox_mod.run_in_sandbox
 

@@ -174,8 +174,8 @@ class PendingDrift(BaseModel):
 
 class RefInfo(BaseModel):
     """One external reference bound into the sandbox: the host ``path`` and
-    the workspace-relative ``mount`` the model addresses it by (normally
-    ``.refs/<alias>``; nothing is created there in the worktree)."""
+    the canonical container ``mount`` the model addresses it by (normally
+    ``/tmp/refs/<alias>``; nothing is created there in the worktree)."""
 
     path: str
     mount: str
@@ -204,7 +204,9 @@ class StatusPayload(BaseModel):
     supports_vision: bool = False
     sandbox_name: str | None = None
     use_container: bool = True
-    enable_tracking: bool = True
+    # Default False: a payload that doesn't know (e.g. the TUI's draft
+    # status, which has no session yet) must not claim tracking exists.
+    enable_tracking: bool = False
     filter_list: list[str] = Field(default_factory=list)
     # External reference paths currently bound into the sandbox.
     refs: list[RefInfo] = Field(default_factory=list)

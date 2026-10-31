@@ -64,7 +64,7 @@ from .gitwork import (
     tree_diff_stat,
 )
 from .images import ImageAttachment, ImageRef
-from .prompts import GENERAL_SYSTEM_PROMPT, system_prompt_for
+from .prompts import prompt_facts, system_prompt_for
 from .protocol import (
     Command,
     CommandResult,
@@ -1069,9 +1069,9 @@ class Session:
     async def _cmd_ref(self, path: str, add: bool) -> CommandResult:
         """Add/remove an external reference path for this workspace.
 
-        It is bound read-only under the container-only refs tmpfs and saved
-        per workspace. Nothing is ever created in the worktree (or at
-        ``.refs``) — the mount exists only inside the container namespace."""
+        It is bound read-only under the container-only refs tmpfs at
+        ``/tmp/refs/<alias>`` and saved per workspace. Nothing is ever
+        created in the worktree (or at any ref path)"""
         raw = path.strip()
         settings = self.sandbox.settings
         if not raw or settings is None:
@@ -1349,6 +1349,12 @@ class Session:
             # The git guard is off entirely: the agent manages git itself;
             # tracking guarantees no longer hold.
             return lambda command: None
+        if self.sandbox.git_shim_active:
+            # In-container mode: the PATH shim blocks bad git subcommands at
+            # execution time, statement by statement (see gitwork.py). The
+            # string scanner would only veto whole commands the shim now
+            # handles better.
+            return lambda command: None
 
         def guard(command: str) -> str | None:
             info = self.git_info
@@ -1471,10 +1477,11 @@ class Session:
     def _refresh_system_prompt(self) -> None:
         """Derive the mode-aware system prompt for the next request. It is
         never persisted in the conversation."""
-        self.controller.system_prompt = system_prompt_for(
-            GENERAL_SYSTEM_PROMPT, self.mode, self.sandbox.config,
-            tracking=self.git_info is not None,
-        )
+        self.controller.system_prompt = system_prompt_for(prompt_facts(
+            self.sandbox.config, self.mode,
+            tracked=self.git_info is not None,
+            git_write=self.sandbox.allow_git_write,
+        ))
 
     def _rebuild_tools(self, output_limit: int | None = None) -> None:
         """Rebuild tools for the current mode/sandbox, preserving the output cap."""

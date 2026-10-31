@@ -2,8 +2,8 @@
 
 Typing a path into ``add path:`` hands it to ``add_ref``; each row's ``x``
 hands the path to ``remove_ref``. Rows come from the session status, so the
-dimmed line is the alias the sandbox resolved (``.refs/<alias>``) — nothing
-is ever created at that path in the worktree.
+dimmed line is the canonical container path (``/tmp/refs/<alias>``) — nothing
+is ever created there in the worktree.
 """
 
 from __future__ import annotations

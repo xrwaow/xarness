@@ -84,7 +84,7 @@ class FakeClient:
     ) -> list[protocol.RefInfo]:
         self.ref_updates.append((workspace, path, add))
         if add:
-            self.refs.append(protocol.RefInfo(path=path, mount=f".refs/{path}"))
+            self.refs.append(protocol.RefInfo(path=path, mount=f"/tmp/refs/{path}"))
         else:
             self.refs = [ref for ref in self.refs if ref.path != path]
         return list(self.refs)
@@ -397,7 +397,7 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
-    """The /refs manager lists container mounts (`.refs/<alias>`) and
+    """The /refs manager lists container mounts (/tmp/refs/<alias>) and
     dispatches add/remove without ever touching the worktree."""
 
     async def test_lists_mounts_and_dispatches_remove(self) -> None:
@@ -409,14 +409,14 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            refs = [RefInfo(path="/tmp/notes.md", mount=".refs/notes.md")]
+            refs = [RefInfo(path="/tmp/notes.md", mount="/tmp/refs/notes.md")]
             client.refs = list(refs)
             app.push_screen(RefsScreen(refs))
             await pilot.pause()
             screen = app.screen
             self.assertIsInstance(screen, RefsScreen)
             # The dimmed line is the container path the model uses; the
-            # worktree never gets a .refs directory.
+            # worktree never gets a refs directory.
             self.assertEqual(screen._refs, refs)
             await pilot.click("#refs-remove-0")
             await pilot.pause()
@@ -1021,9 +1021,9 @@ class TerminalTitlePathTest(unittest.IsolatedAsyncioTestCase):
 class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
     """An interrupt ends the turn without a TurnComplete for this client:
     the Thinking shimmer (or a half-streamed tool's writing shimmer) must
-    settle when the idle StatusChanged arrives, not shimmer forever."""
+    settle when the explicit TurnEnded arrives, not shimmer forever."""
 
-    async def test_idle_status_settles_thinking_shimmer(self) -> None:
+    async def test_turn_end_settles_thinking_shimmer(self) -> None:
         from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
@@ -1050,7 +1050,7 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await script(pilot, client, app)
 
-    async def test_idle_status_settles_tool_writing_shimmer(self) -> None:
+    async def test_turn_end_settles_tool_writing_shimmer(self) -> None:
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
             # The call starts waiting: pending strip first, then the tool's
@@ -1071,20 +1071,24 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(blocks[0].item.args, '{"f"')
             self.assertIsNone(app._pending_entry, "strip outlived the first content")
             q.put_nowait(protocol.Notice(text="interrupted", level="error"))
-            q.put_nowait(protocol.StatusChanged(
-                status=StatusPayload(
-                    state="idle", session_name="s1", workspace="/tmp/ws",
-                    mode="write", model_name="m", model_display_name="m", model_id="m",
-                )
-            ))
+            q.put_nowait(protocol.TurnEnded(outcome="cancelled"))
             await pilot.pause()
             # The half-streamed call settles as failed — no eternal shimmer.
             self.assertEqual(blocks[0].item.status, ToolStatus.CALL_FAILED)
             self.assertEqual(app._phase, "idle")
+            self.assertEqual(app._anim, {}, "repaint timer outlived the interrupt")
             self.assertFalse(
                 [e for e in app._flow_model.entries
                  if isinstance(e.item, tflow.PendingItem) and e.alive],
                 "pending strip outlived the interrupt")
+
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot(state="running"))
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await script(pilot, client, app)
 
     async def test_pending_strip_only_while_waiting_on_provider(self) -> None:
         """The strip means "waiting on the LLM", not "the turn is busy".
