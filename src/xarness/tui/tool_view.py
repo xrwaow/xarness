@@ -18,7 +18,10 @@ from rich.text import Text
 
 from .. import theme
 from .widgets import (
-    _render_diff, _render_read_file, _split_tool_diff, highlight_code,
+    _render_diff,
+    _render_read_file,
+    _split_tool_diff,
+    highlight_code,
 )
 
 

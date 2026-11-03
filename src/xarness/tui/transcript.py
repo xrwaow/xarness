@@ -13,11 +13,25 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+from ..conversation import SUMMARY_PREFIX
 from ..protocol import (
-    SUMMARY_PREFIX, ContentDelta, Level, Message as ConversationMessage,
-    ProcessingStarted, ReasoningDelta, StreamError, ToolCallArgumentsDelta,
-    ToolCallArgumentsDone, ToolCallStarted, ToolFinished, ToolOutputDelta,
-    TurnComplete, UserMessageAdded, image_refs, is_summary,
+    ContentDelta,
+    Level,
+    MessageAdded,
+    ProcessingStarted,
+    ReasoningDelta,
+    RoundComplete,
+    StreamError,
+    ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
+    ToolFinished,
+    ToolOutputDelta,
+    image_refs,
+    is_summary,
+)
+from ..protocol import (
+    Message as ConversationMessage,
 )
 from ..util import format_duration
 
@@ -137,7 +151,7 @@ class TranscriptItem:
 
 @dataclass
 class UserItem(TranscriptItem):
-    """A submitted user message (no local echo: created on UserMessageAdded)."""
+    """A submitted user message (no local echo: created on MessageAdded)."""
 
     full_width = True
 
@@ -383,7 +397,8 @@ class Transcript:
                 result = results.get(call.call_id)
                 if result is not None:
                     item.status = (
-                        ToolStatus.CALL_SUCCEEDED if result.ok
+                        ToolStatus.CALL_SUCCEEDED if result.status == "ok"
+                        else ToolStatus.PARSING_ERROR if result.status == "parse_error"
                         else ToolStatus.CALL_FAILED
                     )
                     item.output = result.content
@@ -417,12 +432,12 @@ class Transcript:
                 self.items.append(item)
             item.name = call.name or item.name
             item.args = call.arguments
-            item.output = call.output
-            if call.ok is None:
+            item.output = call.content
+            if call.status is None:
                 item.status = ToolStatus.MAKING_CALL
-            elif call.parse_error:
+            elif call.status == "parse_error":
                 item.status = ToolStatus.PARSING_ERROR
-            elif call.ok:
+            elif call.status == "ok":
                 item.status = ToolStatus.CALL_SUCCEEDED
             else:
                 item.status = ToolStatus.CALL_FAILED
@@ -472,12 +487,13 @@ class Transcript:
 
     def apply(self, event) -> list:
         """Fold one live event; return the items created or mutated."""
-        if isinstance(event, UserMessageAdded):
-            return [self._add(UserItem(
-                text=event.text,
-                images=list(event.images or []),
-                message_id=event.message_id,
-            ))]
+        if isinstance(event, MessageAdded):
+            message = event.message
+            if message.role != "user" or is_summary(message):
+                # Assistant/tool messages were already rendered from their
+                # stream events (or arrive with the next snapshot).
+                return []
+            return [self._add(UserItem.from_message(message))]
         if isinstance(event, ProcessingStarted):
             self.start_round()
             return []
@@ -536,20 +552,15 @@ class Transcript:
             item = self.tool_blocks.get(event.call_id)
             if item is None:
                 return []
-            if event.parse_error:
+            if event.status == "parse_error":
                 item.status = ToolStatus.PARSING_ERROR
-            elif event.ok:
+            elif event.status == "ok":
                 item.status = ToolStatus.CALL_SUCCEEDED
             else:
                 item.status = ToolStatus.CALL_FAILED
-            # A failed call can carry both: run_bash returns what the command
-            # printed before a timeout, plus the reason it failed.
-            if event.output and event.error:
-                item.output = f"{event.output}\n{event.error}"
-            else:
-                item.output = event.output or event.error
+            item.output = event.content
             return [item]
-        if isinstance(event, TurnComplete):
+        if isinstance(event, RoundComplete):
             return self.settle(event.t)
         if isinstance(event, StreamError):
             return self.settle(None)

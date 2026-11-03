@@ -8,7 +8,7 @@ Sectioned layout:
       "presets":   {"<name>": {"model": ..., "sandbox": ...}},
       "ui":        {"theme": "..."},
       "defaults":  {"preset": "default"},
-      "server":    {"port": 0}
+      "tool_output_limit": 32768
     }
 
 A model's ``name`` is implied by its key in ``models``. The API key is never
@@ -19,6 +19,7 @@ needed).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import posixpath
 from enum import Enum
@@ -26,11 +27,17 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import (
-    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
     model_validator,
 )
 
 DEFAULT_CONFIG_PATH = Path("~/.config/xarness/config.json").expanduser()
+
+LOG = logging.getLogger(__name__)
 
 DEFAULT_THEME = "ayu-darker"
 
@@ -186,7 +193,7 @@ class SandboxSettings(BaseModel):
     # Off by default; on disables the git guard entirely (the agent manages
     # git itself) — tracking guarantees no longer hold.
     allow_git_write: bool = False
-    auto_include_refs: list[str | RefSpec] = Field(default_factory=list)
+    auto_include_refs: list[RefSpec] = Field(default_factory=list)
     # Paths not mounted into the container (a mount exclusion, not a
     # gitignore). Part of SandboxConfig.mount_key, so the persistent shell
     # restarts when it changes.
@@ -194,12 +201,16 @@ class SandboxSettings(BaseModel):
     # False = tools run as a user-level stateful bash on the host (an
     # unsandboxed mode; the TUI shows a visible marker).
     use_container: bool = True
-    tool_output_limit: int | None = Field(default=None, ge=256)
     # Replaces the hardcoded 120 s; a per-command timeout_seconds overrides.
     default_timeout: float = Field(default=120.0, gt=0)
     # False: no checkpoints, diff bar, accept/reject or file revert; undo is
     # conversation-only; no auto-init of a repo.
     enable_tracking: bool = True
+
+    # Deprecated (moved to the config root); honoured as a fallback when
+    # the root does not set one. Excluded from dumps: it must not leak into
+    # saved session settings or round-trip as a live field.
+    tool_output_limit: int | None = Field(default=None, ge=256, exclude=True)
 
     @field_validator("filter_list")
     @classmethod
@@ -213,11 +224,28 @@ class SandboxSettings(BaseModel):
     def _normalize_refs(cls, value: Any) -> Any:
         """Plain string entries become ``{"path": ...}`` so RefSpec's own
         validation (non-empty, no '..') applies uniformly; the normalized
-        field always holds ``str | RefSpec`` — a str meaning "bind at
-        ``/tmp/refs/<alias>``", a RefSpec mounting wherever it says."""
+        field always holds :class:`RefSpec` — a plain-path spec meaning
+        "bind at ``/tmp/refs/<alias>``"."""
         if not isinstance(value, list):
             return value
         return [{"path": entry} if isinstance(entry, str) else entry for entry in value]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _deprecate_tool_output_limit(cls, data: Any) -> Any:
+        """``tool_output_limit`` used to live on sandbox profiles; it moved
+        to the config root. Accept it here (deprecation warning) instead of
+        failing every pre-existing config with extra="forbid" — and honour
+        it as a fallback when the root does not set one."""
+        if isinstance(data, dict) and "tool_output_limit" in data:
+            # A DeprecationWarning is hidden by Python's default filters —
+            # log instead, so the user actually sees it.
+            LOG.warning(
+                "tool_output_limit belongs at the top level of the config "
+                "file, not inside a sandbox profile; the sandbox-level key "
+                "still works as a fallback"
+            )
+        return data
 
     def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
         """Inheritance: keys this profile sets explicitly win over ``base``."""
@@ -248,6 +276,8 @@ class SectionedConfig(BaseModel):
     presets: dict[str, PresetSettings] = Field(default_factory=dict)
     theme: str = DEFAULT_THEME
     default_preset: str = "default"
+    # Not a sandbox concern: the cap on tool-result text sent to the model.
+    tool_output_limit: int | None = Field(default=None, ge=256)
 
     @field_validator("models", mode="before")
     @classmethod

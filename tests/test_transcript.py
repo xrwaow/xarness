@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from xarness.conversation import SUMMARY_PREFIX, Message, Timing, ToolCall
+from xarness.conversation import SUMMARY_PREFIX, Timing, ToolCall
+from xarness.conversation import AssistantMessage, ToolMessage, user_message
 from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
@@ -16,8 +17,8 @@ from xarness.protocol import (
     ToolCallArgumentsDone,
     ToolCallStarted,
     ToolFinished,
-    TurnComplete,
-    UserMessageAdded,
+    RoundComplete,
+    MessageAdded,
 )
 from xarness.tui import transcript as tr
 
@@ -27,23 +28,21 @@ def _snap(messages):
 
 
 def _user(text, mid="u"):
-    return Message(role="user", content=text, id=mid)
+    return user_message(text, id=mid)
 
 
 class TranscriptTest(unittest.TestCase):
     def test_load_rebuilds_messages_tools_and_timing(self):
-        user = Message(role="user", content="hi", id="u",
+        user = user_message("hi", id="u",
                        timing=Timing(send="2025-01-01T00:00:00+00:00"))
         call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
-        assistant = Message(
-            role="assistant", content="", tool_calls=[call],
+        assistant = AssistantMessage(content="", tool_calls=[call],
             timing=Timing(
                 start="2025-01-01T00:00:00+00:00",
                 end="2025-01-01T00:00:01+00:00",
             ),
         )
-        result = Message(role="tool", content="body", tool_call_id="c1",
-                         ok=False)
+        result = ToolMessage(tool_call_id="c1", content="body", status="error")
         t = tr.Transcript()
         items = t.load(_snap([user, assistant, result]))
         self.assertIsInstance(items[0], tr.UserItem)
@@ -56,16 +55,15 @@ class TranscriptTest(unittest.TestCase):
         """Compaction hides old epochs from the model, not from the human:
         a resumed session must still show the pre-handoff transcript."""
         old_user = _user("before", mid="u1")
-        old_answer = Message(role="assistant", content="old answer", id="a1")
-        summary = Message(
-            role="user", id="s1", kind="summary",
-            content=f"{SUMMARY_PREFIX}\n\nthe handoff",
+        old_answer = AssistantMessage(content="old answer", id="a1")
+        summary = user_message(
+            f"{SUMMARY_PREFIX}\n\nthe handoff", id="s1", is_summary=True,
         )
-        new_answer = Message(role="assistant", content="after", id="a2")
+        new_answer = AssistantMessage(content="after", id="a2")
         snap = Snapshot(
             status=StatusPayload(state="idle"),
-            history=[old_user, old_answer, summary],
-            messages=[new_answer],
+            history=[old_user, old_answer],
+            messages=[summary, new_answer],
         )
         items = tr.Transcript().load(snap)
         self.assertEqual(
@@ -78,13 +76,12 @@ class TranscriptTest(unittest.TestCase):
 
     def test_history_tool_results_resolve_across_the_epoch_boundary(self):
         call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
-        assistant = Message(role="assistant", content="", tool_calls=[call], id="a1")
-        result = Message(role="tool", content="body", tool_call_id="c1",
-                         ok=True, id="t1")
+        assistant = AssistantMessage(content="", tool_calls=[call], id="a1")
+        result = ToolMessage(tool_call_id="c1", content="body", id="t1")
         snap = Snapshot(
             status=StatusPayload(state="idle"),
-            history=[_user("hi"), assistant],
-            messages=[result],
+            history=[_user("hi"), assistant, result],
+            messages=[],
         )
         items = tr.Transcript().load(snap)
         tool = next(item for item in items if isinstance(item, tr.ToolItem))
@@ -94,8 +91,7 @@ class TranscriptTest(unittest.TestCase):
     def test_partial_round_renders_without_replay(self):
         from xarness.protocol import PartialRound, PartialToolCall
 
-        assistant = Message(
-            role="assistant", content="",
+        assistant = AssistantMessage(content="",
             tool_calls=[ToolCall(call_id="c1", name="read_file",
                                  arguments_json="{")],
         )
@@ -104,7 +100,7 @@ class TranscriptTest(unittest.TestCase):
             reasoning="still thinking", content="partial",
             tool_calls=[PartialToolCall(
                 call_id="c1", name="read_file", arguments="{\"path\": \"a\"}",
-                output="body",
+                content="body",
             )],
         )
         items = tr.Transcript().load(snap)
@@ -132,13 +128,13 @@ class TranscriptTest(unittest.TestCase):
         events = [
             ReasoningDelta(text="think", t=0.0),
             ContentDelta(text="hello", t=0.5),
-            TurnComplete(t=1.0),
+            RoundComplete(t=1.0),
         ]
         live = tr.Transcript()
         for event in events:
             live.apply(event)
         replay = tr.Transcript()
-        assistant = Message(role="assistant", content="hello", reasoning="think",
+        assistant = AssistantMessage(content="hello", reasoning="think",
                             timing=Timing(reasoning_seconds=0.5))
         items = replay.load(_snap([assistant]))
         self.assertEqual(live.thinking.reasoning, "think")
@@ -149,7 +145,7 @@ class TranscriptTest(unittest.TestCase):
 
     def test_cot_duration_is_stamped_when_the_block_ends(self):
         """The pill gets its number at the first answer token, not at
-        TurnComplete: the answer stream must never read "Thought for …"
+        RoundComplete: the answer stream must never read "Thought for …"
         (and the number must not grow with the answer's length)."""
         t = tr.Transcript()
         t.apply(ProcessingStarted(t=0.0))
@@ -159,12 +155,12 @@ class TranscriptTest(unittest.TestCase):
         self.assertIn(t.thinking, changed)  # repainted, not left stale
         self.assertEqual(t.thinking.summary_text(), "Thought for 3.5s")
         t.apply(ContentDelta(text=" answer", t=9.0))
-        t.apply(TurnComplete(t=20.0))
+        t.apply(RoundComplete(t=20.0))
         self.assertEqual(t.thinking.duration, 3.5)
 
     def test_tool_call_ends_the_cot_block_not_the_round(self):
         """Tool-argument streaming is call time: the pill must stop at the
-        first tool call, not at TurnComplete (what it used to do)."""
+        first tool call, not at RoundComplete (what it used to do)."""
         t = tr.Transcript()
         t.apply(ProcessingStarted(t=0.0))
         t.apply(ReasoningDelta(text="think", t=1.0))
@@ -172,26 +168,26 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
         t.apply(ToolCallArgumentsDelta(call_id="c", text='{"command":"ls"}',
                                        t=8.0))
-        t.apply(TurnComplete(has_tool_calls=True, t=9.0))
+        t.apply(RoundComplete(has_tool_calls=True, t=9.0))
         self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
 
-    def test_reasoning_only_round_falls_back_to_turn_complete(self):
+    def test_reasoning_only_round_falls_back_to_round_complete(self):
         t = tr.Transcript()
         t.apply(ProcessingStarted(t=0.0))
         t.apply(ReasoningDelta(text="think", t=1.0))
-        t.apply(TurnComplete(t=6.0))
+        t.apply(RoundComplete(t=6.0))
         self.assertEqual(t.thinking.summary_text(), "Thought for 5.0s")
 
     def test_tool_lifecycle_and_cancel(self):
         t = tr.Transcript()
-        self.assertEqual(t.apply(UserMessageAdded(text="u")), t.items)
+        self.assertEqual(t.apply(MessageAdded(message=user_message("u"))), t.items)
         t.apply(ToolCallStarted(call_id="c", name="run_bash"))
         t.apply(ToolCallArgumentsDelta(call_id="c", text='{"command":'))
         t.apply(ToolCallArgumentsDone(call_id="c", name="run_bash",
                                       arguments_json='{"command": "ls"}'))
         tool = t.tool_blocks["c"]
         self.assertEqual(tool.args, '{"command": "ls"}')
-        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
+        t.apply(ToolFinished(call_id="c", status='ok', content="ok"))
         self.assertEqual(tool.status, tr.ToolStatus.CALL_SUCCEEDED)
         t.apply(StreamError(message="boom"))
         self.assertEqual(t.cancel(), [])
@@ -202,11 +198,11 @@ class TranscriptTest(unittest.TestCase):
         """A timed-out run_bash returns what it printed *and* the reason;
         the transcript must show both, not drop the reason."""
         t = tr.Transcript()
-        t.apply(UserMessageAdded(text="u"))
+        t.apply(MessageAdded(message=user_message("u")))
         t.apply(ToolCallStarted(call_id="c", name="run_bash"))
         t.apply(ToolFinished(
-            call_id="c", ok=False,
-            output="partial\n", error="command timed out",
+            call_id="c", status="error",
+            content="partial\ncommand timed out",
         ))
         tool = t.tool_blocks["c"]
         self.assertEqual(tool.status, tr.ToolStatus.CALL_FAILED)
@@ -228,7 +224,7 @@ class TranscriptTest(unittest.TestCase):
         self.assertIn(tool, changed)
         # Settling twice is a no-op; a late result is ignored after cancel.
         self.assertEqual(t.cancel(), [])
-        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
+        t.apply(ToolFinished(call_id="c", status="error", content="it broke"))
         self.assertEqual(tool.status, tr.ToolStatus.CALL_FAILED)
 
     def test_processing_started_opens_a_fresh_round(self):
@@ -239,7 +235,7 @@ class TranscriptTest(unittest.TestCase):
         t.apply(ReasoningDelta(text="one", t=0.0))
         t.apply(ContentDelta(text="answer one", t=0.5))
         first_thinking, first_answer = t.thinking, t.assistant
-        t.apply(TurnComplete(has_tool_calls=True, t=1.0))
+        t.apply(RoundComplete(has_tool_calls=True, t=1.0))
         self.assertTrue(first_thinking.done)
         self.assertTrue(first_answer.finalized)
 
@@ -257,10 +253,10 @@ class TranscriptTest(unittest.TestCase):
         t = tr.Transcript()
         t.apply(ProcessingStarted())
         t.apply(ToolCallStarted(call_id="c", name="read_file"))
-        t.apply(TurnComplete(has_tool_calls=True))
+        t.apply(RoundComplete(has_tool_calls=True))
         self.assertEqual(t.settle(None), [])  # nothing live to settle twice
         # The tool result lands after the round closed and still resolves.
-        t.apply(ToolFinished(call_id="c", ok=True, output="ok"))
+        t.apply(ToolFinished(call_id="c", status='ok', content="ok"))
         self.assertEqual(t.tool_blocks["c"].status, tr.ToolStatus.CALL_SUCCEEDED)
 
     def test_processing_started_reopens_after_cancel(self):

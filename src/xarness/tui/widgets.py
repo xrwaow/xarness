@@ -66,7 +66,7 @@ def _content_to_rich_text(content: Content) -> Text:
     for span in content.spans:
         try:
             text.stylize(Style.parse(resolve(span.style)), span.start, span.end)
-        except Exception:  # noqa: BLE001 - an unparsable style beats no code
+        except Exception:
             pass
     return text
 
@@ -393,5 +393,5 @@ class StatusBar(Static):
 # ChatInput (and its image-token machinery) live in chat_input.py;
 # DiffSummary/DiffText in diff_summary.py. Re-exported here for the
 # historical import path.
-from .chat_input import ChatInput  # noqa: E402,F401
-from .diff_summary import DiffSummary, DiffText  # noqa: E402,F401
+from .chat_input import ChatInput  # noqa: F401
+from .diff_summary import DiffSummary, DiffText  # noqa: F401

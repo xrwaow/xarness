@@ -22,7 +22,7 @@ from xarness.prompts import (
     prompt_facts,
     system_prompt_for,
 )
-from xarness.sandbox import SandboxConfig
+from xarness.sandbox import SandboxConfig, bind_ref
 
 
 def _facts(config: SandboxConfig | None, mode: str = "write", **kw):
@@ -113,7 +113,7 @@ def test_refs_mentioned_only_when_mounted(sandbox, tmp_path):
     ref = tmp_path / "notes.md"
     ref.write_text("x")
     host = SandboxConfig(workspace=sandbox.workspace)
-    host.add_ref(ref, alias="notes")
+    bind_ref(host.workspace, host.external_refs, ref, alias="notes")
     with_refs = system_prompt_for(_facts(host, "write", tracked=True))
     assert "/tmp/refs" in with_refs
     assert "/diff" not in with_refs and "/undo" not in with_refs

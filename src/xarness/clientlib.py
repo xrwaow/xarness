@@ -27,9 +27,15 @@ from pydantic import ValidationError
 
 from . import protocol
 from .protocol import (
-    Command, CommandEnvelope, CommandResult, Event, Snapshot, SessionSummary,
+    Command,
+    CommandEnvelope,
+    CommandResult,
+    Event,
     ServerInfo,
+    SessionSummary,
+    Snapshot,
 )
+
 
 async def ensure_host(timeout: float = 5.0) -> None:
     """Make sure a host process is running (spawning one if needed).
@@ -169,12 +175,15 @@ class XarnessClient:
 
     async def sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
+        stats: bool = False,
     ) -> list[SessionSummary]:
         params: dict[str, Any] = {}
         if active is not None:
             params["active"] = str(active).lower()
         if workspace is not None:
             params["workspace"] = workspace
+        if stats:
+            params["stats"] = "true"
         return [
             SessionSummary.model_validate(s)
             for s in await self._get("/v1/sessions", params=params)
@@ -199,6 +208,24 @@ class XarnessClient:
         return protocol.DiffInfo.model_validate(
             await self._get(f"/v1/sessions/{name}/diff", params=params)
         )
+
+    async def upload_image(self, name: str, data: bytes, image_id: str) -> None:
+        response = await _wrap_http(
+            self._request(
+                "PUT",
+                f"/v1/sessions/{name}/images/{image_id}",
+                content=data,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        )
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            raise ClientError(
+                f"image upload failed: HTTP {response.status_code}: {detail}"
+            ) from None
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:
         return protocol.DeleteResult.model_validate(
@@ -237,10 +264,6 @@ class XarnessClient:
         propagate to the caller, which owns reconnection (and can respawn the
         host): keeping one recovery layer avoids two loops racing to
         reattach."""
-        async for item in self._stream_once(name):
-            yield item
-
-    async def _stream_once(self, name: str) -> AsyncIterator[Snapshot | Event]:
         headers = {"Accept": "text/event-stream"}
 
         @asynccontextmanager
@@ -284,7 +307,7 @@ class XarnessClient:
         if response.status_code >= 400:
             try:
                 detail = response.json().get("detail", response.text)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 detail = response.text
             raise ClientError(f"HTTP {response.status_code}: {detail}")
         return response.json()

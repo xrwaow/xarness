@@ -45,15 +45,27 @@ from textual_flowview import Presentation
 
 from .. import images, theme
 from ..images import token_text
+from ..theme import blend_hex as _lerp_hex
 from .tool_view import (
-    ToolCallView, body_renderable, live_parts as _stream_parts,
+    ToolCallView,
+    body_renderable,
+)
+from .tool_view import (
+    live_parts as _stream_parts,
+)
+from .tool_view import (
     summary_text as _tool_summary_text,
 )
 from .transcript import (
-    AssistantItem, DividerItem, LineItem, PendingItem, ThinkingItem, ToolItem,
-    ToolStatus, UserItem,
+    AssistantItem,
+    DividerItem,
+    LineItem,
+    PendingItem,
+    ThinkingItem,
+    ToolItem,
+    ToolStatus,
+    UserItem,
 )
-from ..theme import blend_hex as _lerp_hex
 from .widgets import highlight_code
 
 __all__ = [
@@ -107,7 +119,7 @@ def _log_render_traceback(item, exc: BaseException) -> None:
         with open(_RENDER_LOG, "a", encoding="utf-8") as f:
             f.write(f"--- render failed for {type(item).__name__} ---\n")
             f.write(traceback.format_exc(limit=50))
-    except BaseException:  # noqa: BLE001 - logging must never raise
+    except BaseException:
         pass
 
 
@@ -495,17 +507,18 @@ _HEADING_LINE_RE = re.compile(r"(?m)^(?=#{1,6}[ \t])")
 def _settled_strips(
     text: str, width: int, *, pad_leading: bool = False,
 ) -> list[Strip]:
-    """Render a settled assistant chunk: markdown prose plus highlighted
-    fences.
+    """Render a settled assistant chunk: markdown prose plus code fences.
 
     rich.markdown's inter-block blank lines are dropped so prose stays
-    contiguous, except that each heading gets one blank line above it
-    (padding-top: 1). Headings are split into their own parts so that blank
-    can be inserted independently of rich's version-specific heading layout.
-    ``pad_leading`` controls whether a heading on the chunk's first line gets
-    that padding (False for the first line of an answer).
+    contiguous, except that headings get one blank line above and code
+    blocks one above and below. Headings are split into their own parts so
+    that blank can be inserted independently of rich's version-specific
+    heading layout. Bare fences stay uncolored. ``pad_leading`` controls
+    whether a block on the chunk's first line gets top padding (False for
+    the first line of an answer).
     """
-    # (renderable, is_prose, blank_line_before)
+    # (renderable, is_prose, blank_line_before); code blocks always get a
+    # blank line after as well.
     parts: list[tuple[object, bool, bool]] = []
     pos = 0
 
@@ -526,11 +539,14 @@ def _settled_strips(
 
     for match in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
         add_prose(text[pos: match.start()])
-        parts.append((
-            highlight_code(match.group(2), language=match.group(1).strip()),
-            False,
-            False,
-        ))
+        language = match.group(1).strip()
+        code = match.group(2)
+        # Bare fences stay plain: pygments would guess a lexer and paint
+        # prose-like blocks in arbitrary token colors.
+        body = highlight_code(code, language=language) if language else Text(code)
+        # No blank above a block that opens the answer — the '• ' marker
+        # would sit alone on an empty row.
+        parts.append((body, False, pad_leading or bool(parts)))
         pos = match.end()
     add_prose(text[pos:])
 
@@ -547,9 +563,12 @@ def _settled_strips(
                 rendered = rendered[1:]
             while rendered and not rendered[-1].text.strip():
                 rendered = rendered[:-1]
-        if pad_top and rendered:
+        # Never stack two gap rows (e.g. code bottom padding + heading top).
+        if pad_top and rendered and (not strips or strips[-1].text.strip()):
             strips.append(Strip.blank(width))
         strips.extend(rendered)
+        if not is_prose and rendered:
+            strips.append(Strip.blank(width))
     return strips
 
 

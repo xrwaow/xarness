@@ -8,9 +8,10 @@ Plan mode exposes read_file plus run_bash against a read-only workspace
 mount; write mode exposes read_file plus the editing tools (write_file,
 edit_file). ask_user is available in both modes.
 
-Every call is validated against the tool's own ``parameters_schema`` in one
-place (:meth:`ToolRegistry.call`), so handlers can read ``args["x"]``
-directly instead of re-checking types.
+Every tool declares a pydantic args model: the JSON schema for the provider
+is generated from it, and :meth:`ToolRegistry.call` validates the call's
+arguments with it in one place — so handlers read ``args.x`` (typed, with
+defaults applied) instead of re-checking types.
 """
 
 from __future__ import annotations
@@ -23,61 +24,50 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from .conversation import ToolResult
 from .sandbox import (
-    REFS_ANCHOR, SandboxConfig, SandboxSession, has_ref_mounts, is_refs_path,
+    DEFAULT_TIMEOUT,
+    REFS_ANCHOR,
+    SandboxConfig,
+    SandboxSession,
+    is_refs_path,
     run_in_sandbox,
 )
-
-
-@dataclass(slots=True)
-class ToolResult:
-    ok: bool
-    output: str = ""
-    error: str = ""
-    parse_error: bool = False
 
 
 @dataclass(slots=True)
 class Tool:
     name: str
     description: str
-    parameters_schema: dict[str, Any]
-    handler: Callable[[dict[str, Any]], Awaitable[ToolResult]]
+    args_model: "type[BaseModel]"
+    handler: "Callable[[BaseModel], Awaitable[ToolResult]]"
+    # The provider-facing JSON schema, computed once at registration (it is
+    # immutable; regenerating it per tool per round was pure waste).
+    schema: dict[str, Any] = field(default_factory=dict)
 
 
-def tool(name: str, description: str, required: tuple[str, ...] = (), **params: Any) -> Callable:
-    """Decorator: turn an async handler into a Tool with a generated schema.
+def tool(name: str, description: str, args_model: "type[BaseModel]") -> Callable:
+    """Decorator: pair an async handler with its pydantic args model.
 
-    Each keyword argument after ``required`` declares one parameter. Its
-    value is the JSON-schema type (``path="string"``), a ``(type,
-    description)`` pair (``start_line=("integer", "1-based …")``), or a full
-    schema dict for structured params (arrays, items, …).
-    """
-    properties = {
-        pname: spec if isinstance(spec, dict)
-        else {"type": spec[0], "description": spec[1]} if isinstance(spec, tuple)
-        else {"type": spec}
-        for pname, spec in params.items()
-    }
+    The provider-facing JSON schema is generated from the model, and the
+    registry validates each call's arguments with it, so the handler
+    receives typed, defaulted fields instead of a raw dict."""
 
     def deco(handler):
-        return Tool(
-            name=name,
-            description=description,
-            parameters_schema={
-                "type": "object",
-                "properties": properties,
-                "required": list(required),
-            },
-            handler=handler,
+        built = Tool(
+            name=name, description=description,
+            args_model=args_model, handler=handler,
         )
+        built.schema = ToolRegistry._schema_of(built)
+        return built
 
     return deco
 
 
 # Per-tool cap on the text sent back to the model (config key
-# "container"."tool_output_limit"). Applies to every tool via
-# ToolRegistry.call.
+# "tool_output_limit"). Applies to every tool via ToolRegistry.call.
 DEFAULT_OUTPUT_LIMIT = 32768
 
 
@@ -97,8 +87,66 @@ def _truncate_output(text: str, limit: int) -> str:
     return text[:head] + marker + text[-keep + head:]
 
 
+def _ok(content: str) -> ToolResult:
+    return ToolResult(status="ok", content=content)
+
+
 def _bad(error: str) -> ToolResult:
-    return ToolResult(ok=False, error=error, parse_error=True)
+    """An argument error: the model should retry with valid arguments."""
+    return ToolResult(status="parse_error", content=error)
+
+
+# ----------------------------------------------------------------------
+# per-tool argument models (schema + validation in one place)
+
+
+class _ToolArgs(BaseModel):
+    """Base for tool arguments: unknown keys are IGNORED (a model emitting a
+    stray key must not fail the call — the schema does not advertise
+    ``additionalProperties: false`` either), and models emitting digit
+    strings for integers are handled by pydantic's lax coercion."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class ReadFileArgs(_ToolArgs):
+    path: str
+    start_line: int | None = Field(
+        default=None, description="1-based line to start reading from (default 1)")
+    end_line: int | None = Field(
+        default=None, description="1-based last line to read (default: end of file)")
+
+
+class WriteFileArgs(_ToolArgs):
+    path: str
+    content: str = Field(description="the full new file contents")
+
+
+class EditSpec(_ToolArgs):
+    old_string: str = Field(description="the exact text to replace")
+    new_string: str = Field(description="the replacement text")
+    replace_all: bool = Field(
+        default=False,
+        description="replace every occurrence (default: the old_string must be unique)")
+
+
+class EditFileArgs(_ToolArgs):
+    path: str
+    edits: list[EditSpec] = Field(
+        description="replacements to apply, in order (all or nothing)")
+
+
+class RunBashArgs(_ToolArgs):
+    command: str
+    timeout_seconds: int | None = Field(
+        default=None, ge=1,
+        description="kill the command after this many seconds (default: the session "
+                    "timeout); on timeout the shell is restarted and the output so "
+                    "far is returned")
+
+
+class AskUserArgs(_ToolArgs):
+    questions: list[str] = Field(description="the questions to ask (one or more)")
 
 
 # Output sink for the call in flight: registry.call sets it around the
@@ -108,69 +156,20 @@ _output_sink: ContextVar[Callable[[str], None] | None] = ContextVar(
     "tool_output_sink", default=None
 )
 
+# The registry's output cap during the call in flight. read_file sizes its
+# line window to it, so a long range is not later spliced head/tail by
+# _truncate_output (which would contradict its own "[showing lines …]" footer).
+_output_limit: ContextVar[int | None] = ContextVar(
+    "tool_output_limit", default=None
+)
+
 
 def _exec_error(result, fallback: str) -> ToolResult:
-    return ToolResult(ok=False, error=result.stderr.strip() or fallback)
+    return ToolResult(status="error", content=result.stderr.strip() or fallback)
 
 
 # ----------------------------------------------------------------------
 # argument validation
-
-
-def _coerce(path: str, value: Any, schema: dict[str, Any]) -> tuple[Any, str | None]:
-    """Check one value against its schema; returns (value, error).
-
-    Only the types the built-in tools actually declare are handled: string,
-    integer (accepting digit strings, since models emit ``"50"``), array,
-    object. Unknown schemas pass through untouched.
-    """
-    kind = schema.get("type")
-    if kind == "integer":
-        if isinstance(value, bool):
-            return value, f"'{path}' must be an integer"
-        if isinstance(value, int):
-            return value, None
-        if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
-            return int(value.strip()), None
-        return value, f"'{path}' must be an integer"
-    if kind == "string":
-        return (value, None) if isinstance(value, str) else (value, f"'{path}' must be a string")
-    if kind == "array":
-        if not isinstance(value, list):
-            return value, f"'{path}' must be a list"
-        items = schema.get("items") or {}
-        if items:
-            coerced = []
-            for index, item in enumerate(value):
-                new, error = _coerce(f"{path}[{index}]", item, items)
-                if error:
-                    return value, error
-                coerced.append(new)
-            return coerced, None
-        return value, None
-    if kind == "object":
-        if not isinstance(value, dict):
-            return value, f"'{path}' must be an object"
-        return _validate(value, schema, path)
-    return value, None
-
-
-def _validate(args: dict[str, Any], schema: dict[str, Any], where: str = "") -> tuple[Any, str | None]:
-    """Coerce/validate ``args`` against a tool's object schema."""
-    properties = schema.get("properties") or {}
-    for name in schema.get("required") or []:
-        if name not in args:
-            prefix = f"{where}." if where else ""
-            return args, f"missing required argument '{prefix}{name}'"
-    for name, value in list(args.items()):
-        sub = properties.get(name)
-        if sub is None:
-            continue  # undeclared keys are the handler's business
-        new, error = _coerce(name, value, sub)
-        if error:
-            return args, error
-        args[name] = new
-    return args, None
 
 
 @dataclass(slots=True)
@@ -179,13 +178,70 @@ class ToolRegistry:
 
     ``max_output_chars`` caps the text of every tool result before it goes
     on the wire (see _truncate_output); set from the config's
-    "container"."tool_output_limit".
+    "tool_output_limit". It is also published to the running handler as
+    ``_output_limit`` so a tool that returns structured line ranges
+    (read_file) can size itself to the cap instead of being cut mid-way.
     """
 
     max_output_chars: int = DEFAULT_OUTPUT_LIMIT
+    # Default per-command timeout for one-shot sandbox runs (from the
+    # sandbox profile's default_timeout).
+    default_timeout: float = DEFAULT_TIMEOUT
     _tools: dict[str, Tool] = field(default_factory=dict)
 
+    @staticmethod
+    def _flatten_schema(node: Any, defs: dict[str, Any]) -> Any:
+        """Make a JSON schema palatable to small local servers.
+
+        llama.cpp and older vLLM reject ``anyOf: [..., null]``, ``$defs``
+        and ``$ref``. Optional fields become their plain type (null is
+        optional, not a type), and ``$ref``s are inlined — tool argument
+        models are tiny, so duplication is harmless."""
+        if isinstance(node, list):
+            return [ToolRegistry._flatten_schema(item, defs) for item in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            ref = node.pop("$ref")
+            target = defs.get(ref.rsplit("/", 1)[-1], {})
+            merged = {
+                k: ToolRegistry._flatten_schema(v, defs)
+                for k, v in {**target, **node}.items()
+            }
+            merged.pop("title", None)
+            return merged
+        if "anyOf" in node and len(node["anyOf"]) > 1:
+            variants = [v for v in node["anyOf"] if v.get("type") != "null"]
+            rest = {k: v for k, v in node.items() if k != "anyOf"}
+            if len(variants) == 1:
+                # Optional single type: flatten to that type, keeping the
+                # other keys (default, description, …).
+                return ToolRegistry._flatten_schema({**variants[0], **rest}, defs)
+            return ToolRegistry._flatten_schema({**node, "anyOf": variants}, defs)
+        return {
+            k: ToolRegistry._flatten_schema(v, defs)
+            for k, v in node.items() if k != "$defs"
+        }
+
+    @staticmethod
+    def _schema_of(tool: Tool) -> dict[str, Any]:
+        """The provider-facing ``parameters`` object for one tool.
+
+        Generated from the args model; ``title`` keys are stripped (noise
+        for the model, and they would make otherwise-identical schemas
+        differ by class name) and the schema is flattened for local
+        servers (see :meth:`_flatten_schema`)."""
+        schema = tool.args_model.model_json_schema()
+        defs = schema.pop("$defs", {})
+        schema = ToolRegistry._flatten_schema(schema, defs)
+        schema.pop("title", None)
+        for prop in (schema.get("properties") or {}).values():
+            prop.pop("title", None)
+        return schema
+
     def register(self, tool: Tool) -> None:
+        if not tool.schema:
+            tool.schema = self._schema_of(tool)
         self._tools[tool.name] = tool
 
     def tools(self) -> list[Tool]:
@@ -199,7 +255,7 @@ class ToolRegistry:
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.parameters_schema,
+                    "parameters": tool.schema,
                 },
             }
             for tool in self._tools.values()
@@ -216,29 +272,41 @@ class ToolRegistry:
         live; the final ToolResult is unchanged either way."""
         tool = self._tools.get(name)
         if tool is None:
-            return ToolResult(ok=False, error=f"unknown tool '{name}'")
+            return ToolResult(status="error", content=f"unknown tool '{name}'")
         try:
             args = json.loads(arguments_json) if arguments_json.strip() else {}
         except json.JSONDecodeError as exc:
-            return ToolResult(ok=False, error=f"invalid arguments JSON: {exc}", parse_error=True)
+            return ToolResult(status="parse_error", content=f"invalid arguments JSON: {exc}")
         if not isinstance(args, dict):
             return _bad(
                 f"invalid arguments JSON: expected an object, got {type(args).__name__}"
             )
-        args, error = _validate(args, tool.parameters_schema)
-        if error:
-            return _bad(error)
+        try:
+            args = tool.args_model.model_validate(args)
+        except ValidationError as exc:
+            return _bad("; ".join(_validation_error(e) for e in exc.errors()))
         try:
             token = _output_sink.set(output_sink)
+            limit_token = _output_limit.set(self.max_output_chars)
             try:
                 result = await tool.handler(args)
             finally:
+                _output_limit.reset(limit_token)
                 _output_sink.reset(token)
-        except Exception as exc:  # noqa: BLE001
-            result = ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
-        result.output = _truncate_output(result.output, self.max_output_chars)
-        result.error = _truncate_output(result.error, self.max_output_chars)
+        except Exception as exc:
+            result = ToolResult(status="error", content=f"{type(exc).__name__}: {exc}")
+        result = result._replace(
+            content=_truncate_output(result.content, self.max_output_chars),
+        )
         return result
+
+
+def _validation_error(error: dict[str, Any]) -> str:
+    """One pydantic ValidationError entry as a short, model-readable line:
+    ``path.start_line: Input should be a valid integer``."""
+    loc = ".".join(str(part) for part in error.get("loc", ()))
+    message = error.get("msg", "invalid value")
+    return f"{loc}: {message}" if loc else message
 
 
 # ----------------------------------------------------------------------
@@ -295,36 +363,48 @@ def _check_write_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
     """Workspace-relative path checks shared by the writing tools: no
     absolute paths except the read-only refs area, no traversal."""
     if sandbox.use_container and is_refs_path(path):
-        return ToolResult(ok=False, error=f"'{REFS_ANCHOR}/' is read-only")
+        return ToolResult(status="error", content=f"'{REFS_ANCHOR}/' is read-only")
     return _check_path(sandbox, path)
 
 
-def _make_read_tool(sandbox: SandboxConfig) -> Tool:
-    absolute = (
-        f"{REFS_ANCHOR}/<alias>, /cache/..."
-        if has_ref_mounts(sandbox)
-        else "/cache/..."
-    )
-    absolute_clause = (
-        f"Absolute container paths (e.g. {absolute}) are also accepted for reads. "
-        if sandbox.use_container
-        else ""
-    )
+def _line_window(
+    lines: list[str], start: int, end: int, total: int, limit: int | None,
+) -> str:
+    """Join a file's ``lines`` (its ``start..end`` slice, 1-based), keeping
+    the longest whole-line prefix that fits ``limit`` — contiguously, so
+    read_file never hands back a head/tail splice with a hole in it — and
+    say in the footer where to resume."""
+    def render(kept: int) -> str:
+        last = start + kept - 1
+        if not kept or last >= total:  # nothing left over: plain contents
+            return "".join(lines[:kept])
+        note = "" if last >= end else f"; output limit reached — continue from line {last + 1}"
+        return "".join(lines[:kept]) + f"\n[showing lines {start}-{last} of {total}{note}]"
 
+    if limit is not None and len(render(len(lines))) > limit:
+        low, high = 0, len(lines)  # largest count that fits
+        while low < high:
+            middle = (low + high + 1) // 2
+            low, high = ((middle, high) if len(render(middle)) <= limit
+                         else (low, middle - 1))
+        return render(max(low, 1) if lines else 0)  # a lone oversized line: let _truncate_output cut it
+    return render(len(lines))
+
+
+def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
     @tool(
         "read_file",
         "Read a file's contents. Paths are relative to the workspace root. "
-        f"{absolute_clause}"
+        "Absolute paths are accepted for reads when the session runs in a "
+        "container (e.g. /cache/...); use workspace-relative paths "
+        "otherwise. "
         f"Files over {OUTLINE_THRESHOLD} lines return a structural outline with line "
         "numbers instead of contents; read specific sections of those by "
         "passing start_line and end_line (1-based, inclusive).",
-        required=("path",),
-        path="string",
-        start_line=("integer", "1-based line to start reading from (default 1)"),
-        end_line=("integer", "1-based last line to read (default: end of file)"),
+        ReadFileArgs,
     )
-    async def read_file(args: dict[str, Any]) -> ToolResult:
-        path = args["path"]
+    async def read_file(args: ReadFileArgs) -> ToolResult:
+        path = args.path
         if Path(path).is_absolute():
             if not sandbox.use_container:
                 return _bad(
@@ -337,8 +417,8 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
         else:
             target = sandbox.tool_path(path)
 
-        start = args.get("start_line")
-        end = args.get("end_line")
+        start = args.start_line
+        end = args.end_line
         ranged = start is not None or end is not None
         start = start or 1
         if start < 1:
@@ -355,7 +435,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             ]
         else:
             command = ["head", "-c", str(READ_CAP), "--", target]
-        result = await run_in_sandbox(sandbox, command)
+        result = await run_in_sandbox(sandbox, command, timeout=default_timeout)
         if result.exit_code != 0:
             return _exec_error(result, "read failed")
         if ranged:
@@ -363,7 +443,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             try:
                 total_lines = int(result.stdout[:first_nl].strip())
             except ValueError:
-                return ToolResult(ok=False, error=f"could not count lines in {path}")
+                return ToolResult(status="error", content=f"could not count lines in {path}")
             contents = result.stdout[first_nl + 1:]
             if end is None or end > total_lines:
                 end = total_lines
@@ -374,16 +454,21 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
             if end - start + 1 > MAX_READ_LINES:
                 end = start + MAX_READ_LINES - 1
             # keepends: preserve the exact trailing-newline behavior of sed.
-            output = "".join(contents.splitlines(keepends=True)[: end - start + 1])
-            if end < total_lines:
-                output += f"\n[showing lines {start}-{end} of {total_lines}]"
-            return ToolResult(ok=True, output=output)
+            return _ok(_line_window(
+                contents.splitlines(keepends=True)[: end - start + 1],
+                start, end, total_lines, _output_limit.get(),
+            ))
 
         contents = result.stdout
         truncated = len(contents.encode(errors="replace")) >= READ_CAP
         total_lines = contents.count("\n") + (0 if not contents or contents.endswith("\n") else 1)
         if not truncated and total_lines <= OUTLINE_THRESHOLD:
-            return ToolResult(ok=True, output=contents)
+            # A full read is just the 1..total_lines range: under the output
+            # cap it must still come back contiguous, not spliced.
+            return _ok(_line_window(
+                contents.splitlines(keepends=True),
+                1, total_lines, total_lines, _output_limit.get(),
+            ))
         return _outline_result(path, total_lines, contents, truncated)
 
     return read_file
@@ -392,7 +477,7 @@ def _make_read_tool(sandbox: SandboxConfig) -> Tool:
 def _outline_result(path: str, total_lines: int, contents: str, truncated: bool) -> ToolResult:
     """Outline (Python) or preview (anything else) of a large file."""
     if truncated:
-        return ToolResult(ok=True, output=(
+        return _ok((
             f"[this file is larger than {READ_CAP // (1024 * 1024)} MiB, so only "
             "its first part was read; pass start_line/end_line to read specific "
             "sections]\n"
@@ -400,13 +485,13 @@ def _outline_result(path: str, total_lines: int, contents: str, truncated: bool)
         ))
     outline = _python_outline(contents) if path.lower().endswith(".py") else None
     if outline is None:
-        return ToolResult(ok=True, output=(
+        return _ok((
             f"[showing lines 1-{min(PREVIEW_LINES, total_lines)} of {total_lines}; this "
             "file is too large to read all at once and has no outline — pass "
             "start_line/end_line to read specific sections]\n"
             f"{_preview(contents)}"
         ))
-    return ToolResult(ok=True, output=(
+    return _ok((
         "File outline retrieved. This file is too large to read all at once, so "
         "the outline below shows the file's structure with line numbers.\n"
         "\n"
@@ -435,19 +520,17 @@ def _preview(contents: str) -> str:
 # write_file
 
 
-def _make_write_tool(sandbox: SandboxConfig) -> Tool:
+def _make_write_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
     @tool(
         "write_file",
         "Create a new file or overwrite an existing one with completely new "
         "contents (parent directories are created as needed). Prefer "
         "edit_file for changing part of an existing file.",
-        required=("path", "content"),
-        path="string",
-        content=("string", "the full new file contents"),
+        WriteFileArgs,
     )
-    async def write_file(args: dict[str, Any]) -> ToolResult:
-        path = args["path"]
-        content = args["content"]
+    async def write_file(args: WriteFileArgs) -> ToolResult:
+        path = args.path
+        content = args.content
         if err := _check_write_path(sandbox, path):
             return err
 
@@ -462,15 +545,13 @@ def _make_write_tool(sandbox: SandboxConfig) -> Tool:
              '{ if [ -e "$1" ]; then echo existing; else echo new; fi; '
              'tee -- "$1" >/dev/null; }',
              "write_file", target],
+            timeout=default_timeout,
             input_bytes=content.encode(),
         )
         if result.exit_code != 0:
             return _exec_error(result, "write failed")
         verb = "overwrote" if result.stdout.startswith("existing") else "created"
-        return ToolResult(
-            ok=True,
-            output=f"{verb} {path} ({len(content.encode())} bytes)",
-        )
+        return _ok(f"{verb} {path} ({len(content.encode())} bytes)")
 
     return write_file
 
@@ -486,7 +567,7 @@ class _EditError(Exception):
     """One edit in a batch did not match; nothing was written."""
 
 
-def _apply_edits(current: str, edits: list[dict[str, Any]]) -> str:
+def _apply_edits(current: str, edits: "list[EditSpec]") -> str:
     """Apply every edit in order, or raise: the batch is all-or-nothing.
 
     Each edit is matched against the text the previous ones produced (so a
@@ -495,17 +576,19 @@ def _apply_edits(current: str, edits: list[dict[str, Any]]) -> str:
     """
     updated = current
     for index, edit in enumerate(edits, 1):
-        old, new = edit["old_string"], edit["new_string"]
         where = f"edit {index}" if len(edits) > 1 else "old_string"
-        occurrences = updated.count(old)
+        occurrences = updated.count(edit.old_string)
         if occurrences == 0:
             raise _EditError(f"{where}: old_string not found in file")
-        if occurrences > 1 and not edit.get("replace_all"):
+        if occurrences > 1 and not edit.replace_all:
             raise _EditError(
                 f"{where}: old_string is not unique ({occurrences} matches); "
                 "include more surrounding context, or set replace_all"
             )
-        updated = updated.replace(old, new, occurrences if edit.get("replace_all") else 1)
+        updated = updated.replace(
+            edit.old_string, edit.new_string,
+            occurrences if edit.replace_all else 1,
+        )
     return updated
 
 
@@ -541,7 +624,7 @@ def _format_edit_diff(path: str, before: str, after: str) -> str:
     return f"diff --git a/{path} b/{path}\n" + diff.rstrip("\n") + "\n"
 
 
-def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
+def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
     @tool(
         "edit_file",
         "Edit an existing file by replacing exact strings with new text. Pass "
@@ -554,45 +637,22 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
         "and the error names the edit. The result includes a diff of what "
         "changed. Use write_file to create a file or replace its whole "
         "contents; use run_bash on non-UTF-8 files.",
-        required=("path", "edits"),
-        path="string",
-        edits={
-            "type": "array",
-            "description": "replacements to apply, in order (all or nothing)",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "old_string": {
-                        "type": "string",
-                        "description": "the exact text to replace",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "the replacement text",
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "replace every occurrence (default: the "
-                                       "old_string must be unique)",
-                    },
-                },
-                "required": ["old_string", "new_string"],
-            },
-        },
+        EditFileArgs,
     )
-    async def edit_file(args: dict[str, Any]) -> ToolResult:
-        path = args["path"]
+    async def edit_file(args: EditFileArgs) -> ToolResult:
+        path = args.path
         if err := _check_write_path(sandbox, path):
             return err
 
-        edits = args["edits"]
+        edits = args.edits
         if not edits:
             return _bad("'edits' must be a non-empty list")
         for index, edit in enumerate(edits, 1):
-            if not edit.get("old_string"):
+            if not edit.old_string:
                 return _bad(f"edit {index} needs a non-empty 'old_string'")
 
-        read_result = await run_in_sandbox(sandbox, ["cat", "--", sandbox.tool_path(path)])
+        read_result = await run_in_sandbox(
+            sandbox, ["cat", "--", sandbox.tool_path(path)], timeout=default_timeout)
         if read_result.exit_code != 0:
             return _exec_error(read_result, "read failed")
         current = read_result.stdout
@@ -600,27 +660,24 @@ def _make_edit_tool(sandbox: SandboxConfig) -> Tool:
             # run_in_sandbox decodes with errors="replace": writing this back
             # would bake U+FFFD into the user's file.
             return ToolResult(
-                ok=False,
-                error=f"{path} is not valid UTF-8; edit it with run_bash instead",
+                status="error",
+                content=f"{path} is not valid UTF-8; edit it with run_bash instead",
             )
 
         try:
             updated = _apply_edits(current, edits)
         except _EditError as exc:
-            return ToolResult(ok=False, error=str(exc))
+            return ToolResult(status="error", content=str(exc))
 
         write_result = await run_in_sandbox(
             sandbox,
             ["sh", "-c", 'tee -- "$1" >/dev/null', "edit_file", sandbox.tool_path(path)],
-            input_bytes=updated.encode(),
+            input_bytes=updated.encode(), timeout=default_timeout,
         )
         if write_result.exit_code != 0:
             return _exec_error(write_result, "write failed")
         plural = "edit" if len(edits) == 1 else f"{len(edits)} edits"
-        return ToolResult(
-            ok=True,
-            output=f"applied {plural} to {path}\n{_format_edit_diff(path, current, updated)}",
-        )
+        return _ok(f"applied {plural} to {path}\n{_format_edit_diff(path, current, updated)}")
 
     return edit_file
 
@@ -633,7 +690,6 @@ def _make_run_bash_tool(
     session: SandboxSession,
     git_guard: Callable[[str], str | None] | None = None,
 ) -> Tool:
-    config = session.config
     description = ["Run a shell command inside the sandboxed workspace, as /bin/sh."]
     description.append(
         "The shell persists across calls within this chat — cd and exported "
@@ -649,50 +705,38 @@ def _make_run_bash_tool(
         "ends with an `[exit N]` status line."
     )
 
-    @tool(
-        "run_bash",
-        " ".join(description),
-        required=("command",),
-        command="string",
-        timeout_seconds=(
-            "integer",
-            (f"kill the command after this many seconds (default: the session "
-             f"timeout, {config.timeout_seconds:g}); on timeout the shell is "
-             "restarted and the output so far is returned"),
-        ),
-    )
-    async def run_bash(args: dict[str, Any]) -> ToolResult:
-        command = args["command"]
+    @tool("run_bash", " ".join(description), RunBashArgs)
+    async def run_bash(args: RunBashArgs) -> ToolResult:
+        command = args.command
         if not command.strip():
             # Whitespace-only would make the persistent-shell group below an
             # empty `{ }`, a syntax error that kills the shell.
             return _bad("'command' is required")
-        timeout = args.get("timeout_seconds")
-        if timeout is not None and timeout < 1:
-            return _bad("'timeout_seconds' must be >= 1")
+        timeout = args.timeout_seconds
         if git_guard is not None:
             block_reason = git_guard(command)
             if block_reason:
-                return ToolResult(ok=False, error=block_reason)
+                return ToolResult(status="error", content=block_reason)
         result = await session.run(command, on_output=_output_sink.get(), timeout=timeout)
         if result.timed_out:
             label = f" after {timeout}s" if timeout is not None else ""
             return ToolResult(
-                ok=False,
-                output=result.stdout,
-                error=f"command timed out{label} (shell restarted); the rest "
-                      "of the command did not run; output above is what it "
-                      "printed before the timeout",
+                status="error",
+                content=(
+                    f"{result.stdout}\n[command timed out{label} (shell "
+                    "restarted); the rest of the command did not run; the "
+                    "output above is what it printed before the timeout]"
+                ),
             )
         # Status line on every result: empty output plus a non-zero exit is
-        # otherwise indistinguishable from success with no output.
+        # otherwise indistinguishable from success with no output. A failing
+        # call keeps its output — the model must see what the command printed.
         output = result.stdout
         if output and not output.endswith("\n"):
             output += "\n"
         return ToolResult(
-            ok=result.exit_code == 0,
-            output=f"{output}[exit {result.exit_code}]",
-            error="" if result.exit_code == 0 else f"exit code {result.exit_code}",
+            status="ok" if result.exit_code == 0 else "error",
+            content=f"{output}[exit {result.exit_code}]",
         )
 
     return run_bash
@@ -712,23 +756,18 @@ def _make_ask_user_tool(
         "Ask the user one or more questions and wait for their answers. "
         "Use when you need a decision, a missing detail, or confirmation "
         "before acting. Keep questions short and self-contained.",
-        required=("questions",),
-        questions={
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "the questions to ask (one or more)",
-        },
+        AskUserArgs,
     )
-    async def ask_user(args: dict[str, Any]) -> ToolResult:
-        raw = args["questions"]
+    async def ask_user(args: AskUserArgs) -> ToolResult:
+        raw = args.questions
         questions = [q.strip() for q in raw if q.strip()]
         if not questions:
             return _bad("'questions' must be a non-empty list")
         answers = await ask_callback(questions)
         if answers is None:
-            return ToolResult(ok=True, output="(user skipped the questions — no answers given)")
+            return _ok("(user skipped the questions — no answers given)")
         pairs = [f"Q: {q}\nA: {a}" for q, a in zip(questions, answers)]
-        return ToolResult(ok=True, output="\n\n".join(pairs))
+        return _ok("\n\n".join(pairs))
 
     return ask_user
 
@@ -739,6 +778,7 @@ def build_registry(
     mode: str = "write",
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
     git_guard: Callable[[str], str | None] | None = None,
+    default_timeout: float = DEFAULT_TIMEOUT,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
@@ -752,11 +792,11 @@ def build_registry(
     (set it to ``mode != "write"`` before calling; a persistent
     SandboxSession restarts its shell to pick up the new mounts).
     """
-    registry = ToolRegistry()
+    registry = ToolRegistry(default_timeout=default_timeout)
     if ask_callback is not None:
         registry.register(_make_ask_user_tool(ask_callback))
     if sandbox is not None:
-        registry.register(_make_read_tool(sandbox))  # read_file always available
+        registry.register(_make_read_tool(sandbox, default_timeout))  # read_file always available
         # Plan mode is fully read-only: the workspace is mounted read-only
         # (sandbox.read_only) and the persistent shell restarts under those
         # mounts, so run_bash cannot change files. Write mode drops the
@@ -771,6 +811,6 @@ def build_registry(
         if session is not None and (sandbox.use_container or mode != "plan"):
             registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
         if mode == "write":
-            registry.register(_make_write_tool(sandbox))  # write_file
-            registry.register(_make_edit_tool(sandbox))  # edit_file
+            registry.register(_make_write_tool(sandbox, default_timeout))  # write_file
+            registry.register(_make_edit_tool(sandbox, default_timeout))  # edit_file
     return registry

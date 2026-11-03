@@ -129,6 +129,73 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert "big.bin" in info.ignored_paths
         assert any("1 MB" in n for n in notes)
 
+    async def test_mid_session_oversized_file_is_dropped(self):
+        """A file that is small at session start but grows past 1 MB later is
+        dropped from the snapshot instead of being diffed/reverted forever.
+
+        The drop runs ``git rm`` over the growing path; git rm has no
+        ``-z``/``--stdin``, so this covers the pathspec-from-file form — and
+        a glob-looking name (``odd[1].dat``) must not take ``odd1.dat`` with it.
+        """
+        repo = self.make_repo()
+        (repo / "data.dat").write_text("small\n")
+        (repo / "odd[1].dat").write_text("small\n")
+        (repo / "odd1.dat").write_text("keep me\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "bins")
+
+        info, _ = await setup_tracking(repo, "sess-grow")
+        assert info is not None
+        assert "data.dat" not in info.ignored_paths
+
+        big = b"0" * (gitwork._MAX_TRACKED_SIZE + 1)
+        (repo / "data.dat").write_bytes(big)
+        (repo / "odd[1].dat").write_bytes(big)
+        (repo / "app.py").write_text("edited\n")
+
+        stat = await diff_stat(info)
+        paths = [f.path for f in stat.files]
+        # Neither the grown files nor a phantom "deleted" row for them: the
+        # file is ignored, so /diff says nothing about it.
+        assert paths == ["app.py"]
+        # Grown files are pinned now, so the next snapshot does not re-hash them.
+        assert "data.dat" in info.ignored_paths
+        assert "odd[1].dat" in info.ignored_paths
+
+        # The snapshot keeps the pre-growth blob for each of them...
+        tree = await snapshot_state(info)
+        tracked = {
+            path: meta.split()[2]
+            for meta, path in (
+                line.split("\t", 1)
+                for line in _git(repo, "ls-tree", "-r", tree).splitlines()
+            )
+        }
+        # ...and the glob-looking name did not take its lookalike with it.
+        assert "odd1.dat" in tracked
+        assert tracked["odd1.dat"] == _git(
+            repo, "rev-parse", "HEAD:odd1.dat").strip()
+        assert tracked["odd[1].dat"] == _git(
+            repo, "rev-parse", "HEAD:odd[1].dat").strip()
+        assert tracked["data.dat"] == _git(repo, "rev-parse", "HEAD:data.dat").strip()
+
+    async def test_oversized_file_created_mid_session_is_not_tracked(self):
+        """A file that appears mid-session already over the limit is left out
+        of the snapshot (mode-0 index record), so /diff never shows it."""
+        repo = self.make_repo()
+        info, _ = await setup_tracking(repo, "sess-new-big")
+        assert info is not None
+
+        big = b"0" * (gitwork._MAX_TRACKED_SIZE + 1)
+        (repo / "dump.dat").write_bytes(big)
+        (repo / "app.py").write_text("edited\n")
+
+        stat = await diff_stat(info)
+        assert [f.path for f in stat.files] == ["app.py"]
+        assert "dump.dat" in info.ignored_paths
+        tree = await snapshot_state(info)
+        assert "dump.dat" not in _git(repo, "ls-tree", "-r", "--name-only", tree).split()
+
     async def test_cargo_build_dirs_are_not_tracked(self):
         """A Cargo project's build trees never enter snapshots: the sandbox
         sets CARGO_TARGET_DIR=target-sandbox, so the agent's own first build
@@ -709,9 +776,12 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         restored = GitInfo.from_block(block)
         assert restored == info
 
-    async def test_from_block_rejects_legacy_worktree_block(self):
-        with self.assertRaises(KeyError):
-            GitInfo.from_block({
+    async def test_git_info_rejects_legacy_worktree_block(self):
+        """GitInfo is a plain pydantic model now; the legacy worktree block
+        (removed fields, no repo_root) must not validate."""
+        import pydantic
+        with self.assertRaises(pydantic.ValidationError):
+            GitInfo.model_validate({
                 "session_id": "old",
                 "base_ref": "abc",
                 "branch": "agent/old",

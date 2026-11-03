@@ -18,6 +18,7 @@ from xarness.config import RefSpec, SandboxSettings
 from xarness.sandbox import (
     CACHE_ANCHOR,
     REFS_ANCHOR,
+    bind_ref,
     SANDBOX_CARGO_TARGET_DIR,
     SandboxConfig,
     SandboxResult,
@@ -438,11 +439,14 @@ class ContainerMountsTest(SandboxArgvTest):
         external.write_text("x\n")
         for bad in (".", ".git", ".git/hooks"):
             with self.assertRaises(ValueError):
-                config.add_ref(external, alias="x", mount=bad)
+                bind_ref(config.workspace, config.external_refs, external,
+                         alias="x", mount=bad)
         for bad_abs in (REFS_ANCHOR, "/usr", "/tmp/other"):
             with self.assertRaises(ValueError):
-                config.add_ref(external, alias="x", mount=bad_abs)
-        ref = config.add_ref(external, alias="x", mount=f"{REFS_ANCHOR}/x")
+                bind_ref(config.workspace, config.external_refs, external,
+                         alias="x", mount=bad_abs)
+        ref = bind_ref(config.workspace, config.external_refs, external,
+                       alias="x", mount=f"{REFS_ANCHOR}/x")
         self.assertEqual(ref.mount, f"{REFS_ANCHOR}/x")
 
     # --------------------------------------------------------------
@@ -641,7 +645,8 @@ class ContainerMountsTest(SandboxArgvTest):
         config = self.config(**base)
         key = config.mount_key
         (Path(self._tmp.name) / "docs2").mkdir()
-        config.add_ref(Path(self._tmp.name) / "docs2", alias="d2")
+        bind_ref(config.workspace, config.external_refs,
+                 Path(self._tmp.name) / "docs2", alias="d2")
         self.assertNotEqual(config.mount_key, key)
         # And irrelevant fields do NOT change it (fresh config).
         config2 = self.config(**base)

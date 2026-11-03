@@ -2,13 +2,17 @@
 
 import asyncio
 import base64
+import time
 from typing import Any
 
 import pytest
 
 from xarness import gitwork, protocol, session_store
 from xarness.config import ProviderProfile
-from xarness.conversation import SUMMARY_PREFIX, Message, Timing, Turn
+from xarness.conversation import (
+    SUMMARY_PREFIX, AssistantMessage, Timing, ToolMessage, user_message,
+    Conversation,
+)
 from xarness.images import ImageAttachment
 from xarness.protocol import (
     Accept,
@@ -16,22 +20,22 @@ from xarness.protocol import (
     Cancel,
     Compact,
     ContentDelta,
-    FilterAdd,
+    Filter,
     ProcessingStarted,
     ReasoningDelta,
     Reject,
-    Retry,
     SendMessage,
     SetMode,
     StreamError,
     ToolCallArgumentsDone,
     ToolCallStarted,
-    TurnComplete,
-    Undo,
-    UndoTo,
+    RoundComplete,
+    Rollback,
     Usage,
 )
 from xarness.session import Session
+from pydantic import BaseModel as _PydanticBase
+
 from xarness.tools import ToolRegistry, ToolResult, tool
 from xarness.tui.transcript import turn_time_summary
 
@@ -85,21 +89,24 @@ def _image() -> ImageAttachment:
 
 
 def _round(text: str = "ok") -> list[Any]:
-    return [ContentDelta(text=text), TurnComplete(usage=Usage(input_tokens=1, output_tokens=1))]
+    return [ContentDelta(text=text), RoundComplete(usage=Usage(input_tokens=1, output_tokens=1))]
 
 
 def test_undo_and_retry_keep_images(tmp_path) -> None:
     session = make_session([_round("one"), _round("two")], tmp_path)
 
     async def go():
-        await session.execute("s1", SendMessage(text="look [x]", images=[_image()]))
+        session.images.save(_image())
+        await session.execute("s1", SendMessage(
+            text="look [x]", images=[_image().to_ref()],
+        ))
         await wait_idle(session)
-        await session.execute("r1", Retry())
+        await session.execute("r1", Rollback(resend=True))
         await wait_idle(session)
-        return await session.execute("u1", Undo())
+        return await session.execute("u1", Rollback())
 
     undone = asyncio.run(go())
-    assert undone.payload.images[0].name == "cat.png"
+    assert undone.images[0].name == "cat.png"
     wire = session.controller._client.received_wire[-1]
     assert any(
         isinstance(m["content"], list)
@@ -117,7 +124,7 @@ def test_rebuilds_preserve_output_limit_and_reject_bad_filters(tmp_path) -> None
     async def go():
         await session.execute("m1", SetMode(mode="plan"))
         for i, bad in enumerate((".", "..", "/etc")):
-            assert not (await session.execute(f"f{i}", FilterAdd(path=bad))).ok
+            assert not (await session.execute(f"f{i}", Filter(path=bad, add=True))).ok
         assert session.tool_registry.max_output_chars == 4096
 
     asyncio.run(go())
@@ -125,7 +132,7 @@ def test_rebuilds_preserve_output_limit_and_reject_bad_filters(tmp_path) -> None
 
 def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:
     session = make_session(
-        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
+        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
     )
 
@@ -143,25 +150,29 @@ def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:
     # No local echo: the user message arrives via the stream (after the
     # running status), then the round's events.
     assert types[0] == "StatusChanged"
-    assert types[1] == "UserMessageAdded"
-    assert "TurnFinished" in types
+    assert types[1] == "MessageAdded"
+    assert "TurnEnded" in types
     # Snapshot + subscribe has no gap and no duplicate.
     assert snapshot.messages == []
+
+
+class _NoArgs(_PydanticBase):
+    pass
 
 
 def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
     """Each round folds its usage; a StatusChanged must follow so clients
     update in/out/ctx per round, not only when the turn ends."""
-    noop = tool("noop", "does nothing")(lambda: "ok")
+    noop = tool("noop", "does nothing", _NoArgs)(lambda: "ok")
     session = make_session(
         [
             [
                 ContentDelta(text="one"),
                 ToolCallStarted(call_id="c1", name="noop"),
                 ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
-                TurnComplete(usage=Usage(input_tokens=100, output_tokens=10)),
+                RoundComplete(usage=Usage(input_tokens=100, output_tokens=10)),
             ],
-            [ContentDelta(text="two"), TurnComplete(usage=Usage(input_tokens=200, output_tokens=20))],
+            [ContentDelta(text="two"), RoundComplete(usage=Usage(input_tokens=200, output_tokens=20))],
         ],
         tmp_path, tools=ToolRegistry([noop]),
     )
@@ -176,25 +187,25 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
         return snapshot, events
 
     snapshot, events = asyncio.run(go())
-    statuses = [e.status for e in events if isinstance(e, protocol.StatusChanged)]
-    totals = [(s.total_in, s.total_out) for s in statuses]
+    statuses = [e.activity for e in events if isinstance(e, protocol.StatusChanged)]
+    totals = [(s.usage_total.input_tokens, s.usage_total.output_tokens) for s in statuses]
     # The per-round refreshes appear in order: after round 1 and after round 2.
     assert (100, 10) in totals and (300, 30) in totals, totals
     assert totals.index((100, 10)) < totals.index((300, 30))
-    assert statuses[-1].context_used > 0
+    assert statuses[-1].last_usage.output_tokens > 0
 
 
 def test_history_replaced_keeps_live_partial_round(tmp_path) -> None:
     """A rewrite mid-turn must not lose the partial answer: the snapshot
     carries it alongside the fresh history, so attach renders once."""
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
         session._set_state("running")
         session._emit(protocol.ContentDelta(text="before"))
         assert session.snapshot().partial_round.content == "before"
-        session._emit_history()
+        session._commit_history('accept')
         assert session.snapshot().partial_round.content == "before"
 
     asyncio.run(go())
@@ -203,10 +214,10 @@ def test_history_replaced_keeps_live_partial_round(tmp_path) -> None:
 def test_send_while_running_becomes_steering(tmp_path) -> None:
     release = asyncio.Event()
 
-    @tool("noop", "does nothing")
+    @tool("noop", "does nothing", _NoArgs)
     async def noop(args) -> ToolResult:
         await release.wait()
-        return ToolResult(ok=True)
+        return ToolResult()
 
     registry = ToolRegistry()
     registry.register(noop)
@@ -215,9 +226,9 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
             [
                 ToolCallStarted(call_id="c1", name="noop"),
                 ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
-                TurnComplete(has_tool_calls=True),
+                RoundComplete(has_tool_calls=True),
             ],
-            [ContentDelta(text="second round"), TurnComplete()],
+            [ContentDelta(text="second round"), RoundComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -226,7 +237,7 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
         session.subscribe()
         await session.execute("c1", SendMessage(text="go"))
         result = await session.execute("c2", SendMessage(text="steer me"))
-        assert result.ok and result.payload.queued is True
+        assert result.ok and result.queued is True
         assert session._queued, "message should be queued while running"
         release.set()
         await wait_idle(session)
@@ -241,10 +252,10 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
 def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
     release = asyncio.Event()
 
-    @tool("blocker", "blocks")
+    @tool("blocker", "blocks", _NoArgs)
     async def blocker(args) -> ToolResult:
         await release.wait()
-        return ToolResult(ok=True)
+        return ToolResult()
 
     registry = ToolRegistry()
     registry.register(blocker)
@@ -253,9 +264,9 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
             [
                 ToolCallStarted(call_id="c1", name="blocker"),
                 ToolCallArgumentsDone(call_id="c1", name="blocker", arguments_json="{}"),
-                TurnComplete(has_tool_calls=True),
+                RoundComplete(has_tool_calls=True),
             ],
-            [ContentDelta(text="x"), TurnComplete()],
+            [ContentDelta(text="x"), RoundComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -263,7 +274,7 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
     async def go():
         session.subscribe()
         await session.execute("c1", SendMessage(text="hi"))
-        result = await session.execute("c2", UndoTo(message_id="whatever"))
+        result = await session.execute("c2", Rollback(message_id="whatever"))
         assert not result.ok and "wait for" in (result.error or "")
         release.set()
         await wait_idle(session)
@@ -272,7 +283,7 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
 
 
 def test_cancel_interrupts_turn(tmp_path) -> None:
-    session = make_session([[ContentDelta(text="partial"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="partial"), RoundComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -286,7 +297,7 @@ def test_cancel_interrupts_turn(tmp_path) -> None:
 
 
 def test_cmd_id_dedupe(tmp_path) -> None:
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
     async def go():
         first = await session.execute("same-id", SendMessage(text="hi"))
@@ -301,7 +312,7 @@ def test_cmd_id_dedupe(tmp_path) -> None:
 
 
 def test_ask_first_answer_wins(tmp_path) -> None:
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
     async def go():
         queue = session.subscribe()[1]
@@ -310,10 +321,12 @@ def test_ask_first_answer_wins(tmp_path) -> None:
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        asked = [e for e in events if type(e).__name__ == "AskRequested"]
+        asked = [e for e in events if isinstance(e, protocol.StatusChanged)
+                 and e.activity.pending_ask is not None]
         assert len(asked) == 1
-        first = await session.execute("a1", AnswerAsk(ask_id=asked[0].ask_id, answers=["do it"]))
-        second = await session.execute("a2", AnswerAsk(ask_id=asked[0].ask_id, answers=["no"]))
+        ask_id = asked[0].activity.pending_ask.ask_id
+        first = await session.execute("a1", AnswerAsk(ask_id=ask_id, answers=["do it"]))
+        second = await session.execute("a2", AnswerAsk(ask_id=ask_id, answers=["no"]))
         assert first.ok and not second.ok  # first answer wins
         assert await ask_task == ["do it"]
 
@@ -321,10 +334,10 @@ def test_ask_first_answer_wins(tmp_path) -> None:
 
 
 def test_tool_call_repair_after_cancel(tmp_path) -> None:
-    @tool("slow", "slow tool")
+    @tool("slow", "slow tool", _NoArgs)
     async def slow(args) -> ToolResult:
         await asyncio.sleep(30)
-        return ToolResult(ok=True)
+        return ToolResult()
 
     registry = ToolRegistry()
     registry.register(slow)
@@ -332,7 +345,7 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
         [[
             ToolCallStarted(call_id="c1", name="slow"),
             ToolCallArgumentsDone(call_id="c1", name="slow", arguments_json="{}"),
-            TurnComplete(has_tool_calls=True),
+            RoundComplete(has_tool_calls=True),
         ]],
         tmp_path, tools=registry,
     )
@@ -348,7 +361,7 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
     # request is valid (every tool call is answered).
     tool_messages = [m for m in session.conversation.messages if m.role == "tool"]
     assert [m.content for m in tool_messages] == ["interrupted"]
-    assert all(not m.ok for m in tool_messages)
+    assert all(m.status != 'ok' for m in tool_messages)
     wire = session.conversation.to_wire()
     answered = {m["tool_call_id"] for m in wire if m["role"] == "tool"}
     for m in wire:
@@ -358,25 +371,25 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
 
 def test_undo_to_by_message_id(tmp_path) -> None:
     session = make_session(
-        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
+        [[ContentDelta(text="answer"), RoundComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
     )
 
     async def go():
         await session.execute("c1", SendMessage(text="first question"))
         await wait_idle(session)
         user = next(m for m in session.conversation.messages if m.role == "user")
-        return await session.execute("u1", UndoTo(message_id=user.id))
+        return await session.execute("u1", Rollback(message_id=user.id))
 
     result = asyncio.run(go())
     assert result.ok
-    assert result.payload.user_text == "first question"
+    assert result.user_text == "first question"
     # The turn was dropped: nothing remains.
     assert session.conversation.messages == []
 
 
 def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
     session = make_session(
-        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
+        [[ContentDelta(text="answer"), RoundComplete(usage=Usage(input_tokens=5, output_tokens=2))]], tmp_path,
     )
 
     async def go():
@@ -406,9 +419,9 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
     drops the last turn and reports the user text; retry drops the turn and
     resends it."""
     script = [
-        [ContentDelta(text="first answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
-        [ContentDelta(text="second answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
-        [ContentDelta(text="second answer"), TurnComplete(usage=Usage(input_tokens=5, output_tokens=2))],
+        [ContentDelta(text="first answer"), RoundComplete(usage=Usage(input_tokens=5, output_tokens=2))],
+        [ContentDelta(text="second answer"), RoundComplete(usage=Usage(input_tokens=5, output_tokens=2))],
+        [ContentDelta(text="second answer"), RoundComplete(usage=Usage(input_tokens=5, output_tokens=2))],
     ]
 
     async def go():
@@ -418,9 +431,9 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
         await wait_idle(session)
         await session.execute("c2", SendMessage(text="second question"))
         await wait_idle(session)
-        undo = await session.execute("u1", Undo())
+        undo = await session.execute("u1", Rollback())
         assert undo.ok, undo.error
-        assert undo.payload.user_text == "second question"
+        assert undo.user_text == "second question"
         return session
 
     undone = asyncio.run(go())
@@ -435,7 +448,7 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
         await wait_idle(session)
         await session.execute("c2", SendMessage(text="second question"))
         await wait_idle(session)
-        retry = await session.execute("r1", Retry())
+        retry = await session.execute("r1", Rollback(resend=True))
         assert retry.ok, retry.error
         async def _wait_answers():
             # The retry replaces the turn: the resent question gets a fresh
@@ -464,13 +477,13 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
     finish_gate = asyncio.Event()
 
     session = make_session(
-        [[ContentDelta(text="answer"), TurnComplete(usage=Usage(input_tokens=900, output_tokens=100))]],
+        [[ContentDelta(text="answer"), RoundComplete(usage=Usage(input_tokens=900, output_tokens=100))]],
         tmp_path,
     )
     session.auto_compact = True
 
-    async def fake_compact() -> str:
-        return "summary"
+    async def fake_compact():
+        return None  # nothing to compact
 
     async def fake_finish_turn() -> None:
         finish_started.set()
@@ -486,8 +499,8 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
         # Auto-compact ran; the session is NOT idle while finish_turn blocks.
         assert session._state != "idle"
         second = await session.execute("c2", SendMessage(text="go again"))
-        assert second.ok and second.payload.queued is True
-        assert session._queued and session._queued[0][0] == "go again"
+        assert second.ok and second.queued is True
+        assert session._queued and session._queued[0].text == "go again"
         finish_gate.set()
         await first
         await wait_idle(session)
@@ -502,11 +515,11 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
     """A manual compaction runs as a task (the inbox keeps serving commands)
     and the steering queue is drained when it finishes."""
     gate = asyncio.Event()
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
-    async def fake_compact() -> str:
+    async def fake_compact():
         await gate.wait()
-        return "summary"
+        return None  # nothing to compact
 
     session.controller.compact = fake_compact
 
@@ -516,14 +529,14 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
         result = await asyncio.wait_for(
             session.execute("c1", Compact()), timeout=2,
         )
-        assert result.ok and result.payload.started is True
+        assert result.ok and result.started is True
         assert session._state == "compacting"
         assert session._compact_task is not None
         # The inbox is still responsive while compaction runs.
         sent = await asyncio.wait_for(
             session.execute("c2", SendMessage(text="after compact")), timeout=2,
         )
-        assert sent.ok and sent.payload.queued is True
+        assert sent.ok and sent.queued is True
         gate.set()
         await wait_idle(session)
 
@@ -533,12 +546,13 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
 
 
 def test_compaction_emits_typed_outcome_event(tmp_path) -> None:
-    """Compaction reports its outcome as CompactionDone, not prose Notice."""
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    """Compaction reports its outcome as a HistoryReplaced, not prose."""
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
-    async def fake_compact() -> str:
-        session.controller.last_compaction = (100, 30)
-        return "handoff summary"
+    async def fake_compact():
+        from xarness.compaction import CompactionResult
+        return CompactionResult(summary="handoff summary", usage=None,
+                                before_tokens=100, after_tokens=30)
 
     session.controller.compact = fake_compact
 
@@ -549,30 +563,30 @@ def test_compaction_emits_typed_outcome_event(tmp_path) -> None:
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        done = [e for e in events if isinstance(e, protocol.CompactionDone)]
+        done = [e for e in events if isinstance(e, protocol.HistoryReplaced)]
         assert len(done) == 1, done
-        assert (done[0].before, done[0].after) == (100, 30)
-        assert done[0].summary == "handoff summary"
+        assert done[0].reason == "compaction"
+        assert (done[0].before_tokens, done[0].after_tokens) == (100, 30)
         assert done[0].automatic is False
 
     asyncio.run(go())
 
 
 def test_undo_emits_typed_rollback_event(tmp_path) -> None:
-    """Undo reports its outcome as RollbackApplied, not prose."""
+    """Undo reports its outcome as a HistoryReplaced, not prose."""
     session = make_session(
-        [[ContentDelta(text="answer"), TurnComplete()]], tmp_path,
+        [[ContentDelta(text="answer"), RoundComplete()]], tmp_path,
     )
 
     async def go():
         await session.execute("c1", SendMessage(text="question"))
         await wait_idle(session)
         queue = session.subscribe()[1]
-        assert (await session.execute("u1", Undo())).ok
+        assert (await session.execute("u1", Rollback())).ok
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        applied = [e for e in events if isinstance(e, protocol.RollbackApplied)]
+        applied = [e for e in events if isinstance(e, protocol.HistoryReplaced)]
         assert len(applied) == 1, applied
         assert applied[0].resend is False
         assert applied[0].scope == "last turn"
@@ -587,7 +601,9 @@ def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> Non
     session = make_session([], tmp_path)
     session.sandbox.name = "netless"
     session.sandbox.settings = SandboxSettings(filter_list=["secrets"])
-    session._pending_drift = ("aaa", "bbb", ["a.txt"])
+    session._pending_drift = protocol.PendingDrift(
+            workspace="ws", last_known="aaa", current="bbb", files=["a.txt"],
+        )
     status = session.status()
     assert status.sandbox_name == "netless"
     assert status.filter_list == ["secrets"]
@@ -603,7 +619,9 @@ def test_summary_does_not_let_pending_drift_mask_a_running_turn(tmp_path) -> Non
     async def go():
         session = make_session([], tmp_path)
         _, queue = session.subscribe()
-        session._pending_drift = ("aaa", "bbb", ["a.txt"])
+        session._pending_drift = protocol.PendingDrift(
+            workspace="ws", last_known="aaa", current="bbb", files=["a.txt"],
+        )
 
         session._state = "running"
         assert session.summary().state == "running"
@@ -614,7 +632,7 @@ def test_summary_does_not_let_pending_drift_mask_a_running_turn(tmp_path) -> Non
         assert session.summary().state == "waiting"
 
         # The ask tool blocks the turn itself: waiting in every state.
-        session._pending_ask = ("ask-1", ["q?"], None)
+        session._pending_ask = protocol.PendingAsk(ask_id="ask-1", questions=["q?"])
         session._state = "running"
         assert session.summary().state == "waiting"
         session.unsubscribe(queue)
@@ -626,11 +644,9 @@ def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
     """Compaction hides old messages from the model, but the snapshot still
     carries them so a resumed/attached client can show the full transcript."""
     session = make_session([], tmp_path)
-    old = session.conversation.add(Message(role="user", content="before"))
-    session.conversation.epoch += 1
-    summary = session.conversation.add(Message(
-        role="user", kind="summary",
-        content=f"{SUMMARY_PREFIX}\n\nthe handoff",
+    old = session.conversation.add(user_message("before"))
+    summary = session.conversation.add(user_message(
+        f"{SUMMARY_PREFIX}\n\nthe handoff", is_summary=True,
     ))
 
     snap = session.snapshot()
@@ -643,18 +659,17 @@ def test_resume_drift_uses_accepted_turns_too(tmp_path, monkeypatch) -> None:
     known workspace state. Comparing against the older baseline made a clean
     accept look like external drift on the next resume."""
     import xarness.session as session_mod
-    from xarness.gitwork import GitInfo
+    from xarness.gitwork import GitInfo, TurnCheckpoint
 
     session = make_session([], tmp_path)
     session.git_info = GitInfo(
-        session_id="s", workspace=tmp_path, git_dir=tmp_path,
+        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
         baseline_tree="a" * 40,
     )
-    user = session.conversation.add(Message(role="user", content="hi"))
-    session.conversation.turns.append(Turn(
-        user_message_id=user.id,
-        before_tree="b" * 40, after_tree="c" * 40, locked=True,
-    ))
+    user = session.conversation.add(user_message("hi"))
+    session.conversation.turns[user.id] = TurnCheckpoint(
+        before_tree="b" * 40, after_tree="c" * 40,
+    )
 
     async def fake_snapshot(_info):
         return "c" * 40
@@ -675,13 +690,13 @@ def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(session_mod, "accept_changes", fake_accept)
     session.git_info = GitInfo(
-        session_id="s", workspace=tmp_path, git_dir=tmp_path,
+        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
         baseline_tree="a" * 40,
     )
 
     async def go():
         queue = session.subscribe()[1]
-        session._pending_drift = ("aaa", "bbb", [])
+        session._pending_drift = protocol.PendingDrift(workspace="ws", last_known="aaa", current="bbb", files=[])
         result = await session.execute("d1", protocol.ResolveDrift(accept=False))
         assert result.ok
         events = []
@@ -696,7 +711,7 @@ def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
     # is emitted.
     async def go2():
         queue = session.subscribe()[1]
-        session._pending_drift = ("aaa", "bbb", [])
+        session._pending_drift = protocol.PendingDrift(workspace="ws", last_known="aaa", current="bbb", files=[])
         result = await session.execute("d2", protocol.ResolveDrift(accept=True))
         assert result.ok
         events = []
@@ -716,7 +731,7 @@ def test_stream_events_are_protocol_models() -> None:
         (ReasoningDelta(text="x"), "reasoning_delta"),
         (ContentDelta(text="y"), "content_delta"),
         (StreamError(message="bad"), "stream_error"),
-        (TurnComplete(usage=Usage(input_tokens=1, output_tokens=2), has_tool_calls=True), "turn_complete"),
+        (RoundComplete(usage=Usage(input_tokens=1, output_tokens=2), has_tool_calls=True), "round_complete"),
     ]
     for internal, expected_type in cases:
         assert internal.model_dump()["type"] == expected_type
@@ -729,10 +744,10 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
     next dispatch cannot still see "idle" and start a second turn."""
     release = asyncio.Event()
 
-    @tool("noop", "does nothing")
+    @tool("noop", "does nothing", _NoArgs)
     async def noop(args) -> ToolResult:
         await release.wait()
-        return ToolResult(ok=True)
+        return ToolResult()
 
     registry = ToolRegistry()
     registry.register(noop)
@@ -741,9 +756,9 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
             [
                 ToolCallStarted(call_id="c1", name="noop"),
                 ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
-                TurnComplete(has_tool_calls=True),
+                RoundComplete(has_tool_calls=True),
             ],
-            [ContentDelta(text="second round"), TurnComplete()],
+            [ContentDelta(text="second round"), RoundComplete()],
         ],
         tmp_path, tools=registry,
     )
@@ -753,8 +768,8 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
         # Back-to-back: no awaiting of turn progress between the two sends.
         first = await session.execute("c1", SendMessage(text="one"))
         second = await session.execute("c2", SendMessage(text="two"))
-        assert first.ok and first.payload.started is True
-        assert second.ok and second.payload.queued is True, (
+        assert first.ok and first.started is True
+        assert second.ok and second.queued is True, (
             "back-to-back send must steer, not start a second turn"
         )
         release.set()
@@ -762,7 +777,7 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        finished = [e for e in events if type(e).__name__ == "TurnFinished"]
+        finished = [e for e in events if type(e).__name__ == "TurnEnded"]
         assert len(finished) == 1, f"expected one turn, got {len(finished)}"
         # The steered text was injected inside the SAME turn (the second LLM
         # round saw it), not replayed as a fresh turn afterwards.
@@ -775,7 +790,7 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
 
 
 def test_partial_round_is_none_when_idle(tmp_path) -> None:
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
@@ -793,7 +808,7 @@ def test_only_round_content_updates_partial_round(tmp_path) -> None:
     async def go():
         session._set_state("running")
         session._emit(protocol.Notice(text="stale notice"))
-        session._emit(protocol.StatusChanged(status=session.status()))
+        session._emit(protocol.StatusChanged(activity=session._activity()))
         assert session.snapshot().partial_round is None
         session._emit(protocol.ContentDelta(text="live"))
         partial = session.snapshot().partial_round
@@ -813,20 +828,20 @@ def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
             call_id="c1", name="read_file", arguments_json='{"path": "a"}',
         ))
         session._emit(protocol.ToolOutputDelta(call_id="c1", text="body"))
-        session._emit(protocol.TurnComplete())
+        session._emit(protocol.RoundComplete())
         partial = session.snapshot().partial_round
         assert partial is not None
         assert partial.content == ""  # persisted in the assistant message
         assert len(partial.tool_calls) == 1
         call = partial.tool_calls[0]
         assert call.arguments == '{"path": "a"}'
-        assert call.output == "body"
-        assert call.ok is None  # still running
+        assert call.content == "body"
+        assert call.status is None  # still running
         session._emit(protocol.ToolFinished(
-            call_id="c1", ok=True, output="full body",
+            call_id="c1", status="ok", content="full body",
         ))
         call = session.snapshot().partial_round.tool_calls[0]
-        assert call.ok is True
+        assert call.status == "ok"
 
     asyncio.run(go())
 
@@ -849,15 +864,15 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
     created in the worktree and the filter list is unchanged."""
     from xarness.config import SandboxSettings
 
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
     session.sandbox.settings = SandboxSettings()
     (tmp_path / "real.txt").write_text("x")
 
     async def go():
-        result = await session.execute("f1", protocol.FilterAdd(path="ghost.txt"))
+        result = await session.execute("f1", protocol.Filter(path="ghost.txt", add=True))
         assert not result.ok and "no such path" in (result.error or "")
         assert not (tmp_path / "ghost.txt").exists()
-        ok = await session.execute("f2", protocol.FilterAdd(path="real.txt"))
+        ok = await session.execute("f2", protocol.Filter(path="real.txt", add=True))
         assert ok.ok
         assert session.sandbox.settings.filter_list == ["real.txt"]
 
@@ -872,29 +887,29 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
     from xarness.config import REFS_ANCHOR, SandboxSettings
 
     monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "workspaces")
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
     session.sandbox.settings = SandboxSettings()
     (tmp_path / "spec.md").write_text("x")
     expected = str((tmp_path / "spec.md").resolve())
 
     async def go():
-        bad = await session.execute("r0", protocol.RefAdd(path="ghost.md"))
+        bad = await session.execute("r0", protocol.Ref(path="ghost.md", add=True))
         assert not bad.ok and "no such path" in (bad.error or "")
         # Never mkdir a reference (and never create the container anchor).
         assert not (tmp_path / "ghost.md").exists()
         assert not (tmp_path / ".refs").exists()
 
-        added = await session.execute("r1", protocol.RefAdd(path="spec.md"))
+        added = await session.execute("r1", protocol.Ref(path="spec.md", add=True))
         assert added.ok
-        assert session.sandbox.settings.auto_include_refs == [expected]
+        assert session.workspace_refs == [expected]
         refs = session.status().refs
         assert [(r.path, r.mount) for r in refs] == [
             (expected, f"{REFS_ANCHOR}/spec.md")]
         assert session_store.load_workspace_refs(str(tmp_path)) == [expected]
 
-        removed = await session.execute("r2", protocol.RefRemove(path="spec.md"))
+        removed = await session.execute("r2", protocol.Ref(path="spec.md", add=False))
         assert removed.ok
-        assert session.sandbox.settings.auto_include_refs == []
+        assert session.workspace_refs == []
         assert session_store.load_workspace_refs(str(tmp_path)) == []
 
     asyncio.run(go())
@@ -903,13 +918,13 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
 def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
     """After an /undo (a rewrite) an attaching client's snapshot has no
     live round: the history is rendered exactly once."""
-    session = make_session([[ContentDelta(text="x"), TurnComplete()]], tmp_path)
+    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
     async def go():
         session.subscribe()
         await session.execute("c1", SendMessage(text="hi"))
         await wait_idle(session)
-        result = await session.execute("c2", Undo())
+        result = await session.execute("c2", Rollback())
         assert result.ok
         assert session.snapshot().partial_round is None
         # A client attaching now sees the rewritten history exactly once.
@@ -989,7 +1004,7 @@ def test_forced_steer_saves_partial_cot(tmp_path) -> None:
         await asyncio.wait_for(started.wait(), timeout=5)
         await session.execute("c2", SendMessage(text="second"))  # queued
         result = await session.execute("c3", protocol.FlushQueued())
-        assert result.ok and result.payload.flushed is True
+        assert result.ok and result.flushed is True
         release.set()
         await wait_idle(session)
 
@@ -1008,9 +1023,9 @@ def test_stop_cancels_a_running_compaction(tmp_path) -> None:
     gate = asyncio.Event()
     session = make_session([], tmp_path)
 
-    async def fake_compact() -> str:
+    async def fake_compact():
         await gate.wait()
-        return "summary"
+        return None  # nothing to compact
 
     session.controller.compact = fake_compact
 
@@ -1035,9 +1050,9 @@ def test_no_save_disables_persistence(tmp_path) -> None:
         profile_name="test", api_key="key", client=FakeClient([]),
         no_save=True,
     )
-    session.conversation.add(Message(role="user", content="q"))
+    session.conversation.add(user_message("q"))
     session._persist()
-    assert not session_store.session_path("nosave").exists()
+    assert not session_store.session_dir("nosave").exists()
 
 
 def test_turn_time_summary_format(tmp_path) -> None:
@@ -1049,25 +1064,20 @@ def test_turn_time_summary_format(tmp_path) -> None:
     base = datetime.now(timezone.utc)
     iso = base.isoformat
 
-    session.conversation.add(Message(
-        role="user", content="hi", timing=Timing(send=iso()),
-    ))
-    session.conversation.add(Message(
-        role="assistant", content="thinking about it",
+    session.conversation.add(user_message("hi", timing=Timing(send=iso())))
+    session.conversation.add(AssistantMessage(content="thinking about it",
         timing=Timing(
             start=iso(), end=(base + timedelta(seconds=2)).isoformat(),
             reasoning_seconds=1.7,
         ),
     ))
-    session.conversation.add(Message(
-        role="tool", tool_call_id="c1",
+    session.conversation.add(ToolMessage(tool_call_id="c1",
         timing=Timing(
             start=(base + timedelta(seconds=2)).isoformat(),
             end=(base + timedelta(seconds=5)).isoformat(),
         ),
     ))
-    session.conversation.add(Message(
-        role="assistant", content="done",
+    session.conversation.add(AssistantMessage(content="done",
         timing=Timing(
             start=(base + timedelta(seconds=5)).isoformat(),
             end=(base + timedelta(seconds=8)).isoformat(),
@@ -1085,11 +1095,11 @@ def test_turn_time_summary_format(tmp_path) -> None:
     assert idle == "0.3s"
 
 
-def test_turn_finished_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
+def test_turn_ended_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
     """TurnFinished carries elapsed only; the timing line is derived from
     the persisted stamps on load (no second, preformatted copy)."""
     session = make_session(
-        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
+        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
     )
 
@@ -1100,7 +1110,7 @@ def test_turn_finished_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
         finished = None
         while not queue.empty():
             event = queue.get_nowait()
-            if isinstance(event, protocol.TurnFinished):
+            if isinstance(event, protocol.TurnEnded):
                 finished = event
         return finished
 
@@ -1119,8 +1129,8 @@ def test_turn_finished_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
 def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
     """Messages without stamps (old sessions) produce no summary."""
     session = make_session([], tmp_path)
-    session.conversation.add(Message(role="user", content="hi"))
-    session.conversation.add(Message(role="assistant", content="hello"))
+    session.conversation.add(user_message("hi"))
+    session.conversation.add(AssistantMessage(content="hello"))
     assert turn_time_summary(session.conversation.messages) is None
 
 
@@ -1147,7 +1157,7 @@ async def _tracked_session(tmp_path, script, registry=None):
         session.controller.tools = registry
     session.git_info = info
     session.controller.git_info = info
-    session.conversation.add(Message(role="system", content="sys"))
+    
     return session, info
 
 
@@ -1157,12 +1167,12 @@ def _blocking_edit(tmp_path, name="a.txt"):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    @tool("edit", "edit a file")
+    @tool("edit", "edit a file", _NoArgs)
     async def edit(args) -> ToolResult:
         (tmp_path / name).write_text("agent\n")
         started.set()
         await release.wait()
-        return ToolResult(ok=True, output="ok")
+        return ToolResult(content="ok")
 
     registry = ToolRegistry()
     registry.register(edit)
@@ -1173,7 +1183,7 @@ def _tool_round(call_id="c1"):
     return [
         ToolCallStarted(call_id=call_id, name="edit"),
         ToolCallArgumentsDone(call_id=call_id, name="edit", arguments_json="{}"),
-        TurnComplete(has_tool_calls=True),
+        RoundComplete(has_tool_calls=True),
     ]
 
 
@@ -1183,10 +1193,10 @@ def test_mutating_tool_and_turn_end_emit_diff_changed(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
-        @tool("edit_file", "edit a file")
+        @tool("edit_file", "edit a file", _NoArgs)
         async def edit(args) -> ToolResult:
             (tmp_path / "ws" / "a.txt").write_text("agent\n")
-            return ToolResult(ok=True, output="ok")
+            return ToolResult(content="ok")
 
         registry = ToolRegistry()
         registry.register(edit)
@@ -1196,17 +1206,24 @@ def test_mutating_tool_and_turn_end_emit_diff_changed(tmp_path, monkeypatch) -> 
                 ToolCallArgumentsDone(
                     call_id="c1", name="edit_file", arguments_json="{}",
                 ),
-                TurnComplete(has_tool_calls=True),
+                RoundComplete(has_tool_calls=True),
             ],
-            [ContentDelta(text="done"), TurnComplete()],
+            [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         queue = session.subscribe()[1]
         await session.execute("s1", SendMessage(text="hi"))
         await wait_idle(session)
-        events = []
-        while not queue.empty():
-            events.append(queue.get_nowait())
-        changed = [e for e in events if isinstance(e, protocol.DiffChanged)]
+        # The turn-end DiffChanged is emitted after the state flips to idle
+        # (the emit itself snapshots the workspace), so give it a moment.
+        changed: list = []
+        for _ in range(100):
+            while not queue.empty():
+                event = queue.get_nowait()
+                if isinstance(event, protocol.DiffChanged):
+                    changed.append(event)
+            if changed:
+                break
+            await asyncio.sleep(0.02)
         assert changed, "expected at least one DiffChanged"
         paths = {f.path for event in changed for f in event.summary.files}
         assert paths == {"a.txt"}, paths
@@ -1250,13 +1267,13 @@ def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
         registry, started, release = _blocking_edit(tmp_path / "ws")
         session, _info = await _tracked_session(tmp_path, [
             _tool_round(),
-            [ContentDelta(text="done"), TurnComplete()],
+            [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
         await session.execute("s1", SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         by_path = {f.path: f.source for f in stat.files}
         assert by_path["a.txt"] == "agent"
 
@@ -1266,14 +1283,14 @@ def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
 
         # The turn keeps editing after the accept.
         (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         by_path = {f.path: f.source for f in stat.files}
         assert by_path == {"b.txt": "agent"}, by_path
 
         release.set()
         await wait_idle(session)
 
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         by_path = {f.path: f.source for f in stat.files}
         assert by_path["b.txt"] == "agent"
         # finish_turn still recorded the open turn's real after tree.
@@ -1292,7 +1309,7 @@ def test_mid_turn_reject_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
         registry, started, release = _blocking_edit(tmp_path / "ws")
         session, _info = await _tracked_session(tmp_path, [
             _tool_round(),
-            [ContentDelta(text="done"), TurnComplete()],
+            [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
         await session.execute("s1", SendMessage(text="hi"))
@@ -1303,7 +1320,7 @@ def test_mid_turn_reject_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
         assert not (tmp_path / "ws" / "a.txt").exists()
 
         (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         by_path = {f.path: f.source for f in stat.files}
         assert by_path == {"b.txt": "agent"}, by_path
 
@@ -1325,7 +1342,7 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
         registry, started, release = _blocking_edit(tmp_path / "ws")
         session, _info = await _tracked_session(tmp_path, [
             _tool_round(),
-            [ContentDelta(text="done"), TurnComplete()],
+            [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
         await session.execute("s1", SendMessage(text="hi"))
@@ -1339,7 +1356,7 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
         assert session.controller.open_turn_before() is not None
 
         (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         by_path = {f.path: f.source for f in stat.files}
         assert by_path["a.txt"] == "agent"
         assert by_path["b.txt"] == "agent"
@@ -1350,7 +1367,7 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
         # The open turn survived compaction and now has a reversible diff.
         turns = session.turn_checkpoints()
         assert len(turns) == 1 and turns[0].after_tree
-        stat = await session.diff_summary()
+        stat = await session.diff_info(None)
         assert {f.path: f.source for f in stat.files}["b.txt"] == "agent"
 
     asyncio.run(go())
@@ -1364,15 +1381,18 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
     async def go():
         registry, started, release = _blocking_edit(tmp_path / "ws", "b.txt")
         session, _info = await _tracked_session(tmp_path, [
-            [ContentDelta(text="first"), TurnComplete()],
+            [ContentDelta(text="first"), RoundComplete()],
             _tool_round(),
-            [ContentDelta(text="done"), TurnComplete()],
+            [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
 
         await session.execute("s1", SendMessage(text="first"))
         await wait_idle(session)
-        first_turn = session.conversation.turns[0]
+        user_messages = [
+            m for m in session.conversation.messages if m.role == "user"
+        ]
+        first_turn = session.conversation.turns[user_messages[0].id]
         first_after = first_turn.after_tree
         assert first_after
 
@@ -1391,9 +1411,301 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
         await wait_idle(session)
 
         assert first_turn.after_tree == first_after
-        second_turn = session.conversation.turns[1]
+        user_messages = [
+            m for m in session.conversation.messages if m.role == "user"
+        ]
+        second_turn = session.conversation.turns[user_messages[1].id]
+        # The failed checkpoint left the second turn unattributed.
         assert second_turn.before_tree is None
-        assert second_turn.after_tree is None
-        assert len(session.turn_checkpoints()) == 1
+        # The first turn made no file edits (the blocked edit belongs to the
+        # second, unattributed turn), so nothing is reversible.
+        assert session.turn_checkpoints() == []
+
+    asyncio.run(go())
+
+
+def test_compaction_undo_does_not_resend_an_empty_turn(tmp_path) -> None:
+    """/retry right after a compaction pops the summary; it must NOT start a
+    turn with an empty user message."""
+    async def go():
+        session = make_session([], tmp_path)
+        conversation = session.conversation
+        user = conversation.add(user_message("real question"))
+        conversation.begin_turn(user, None)
+        conversation.add(AssistantMessage(content="answer"))
+        conversation.add(user_message("summary", is_summary=True))
+        result = await session.execute("r1", Rollback(resend=True))
+        assert result.ok, result.error
+        # The summary was popped, but no turn started (the state went idle
+        # and no empty user message landed in the history).
+        assert session._state == "idle"
+        assert session._turn_task is None
+        assert [m.content for m in conversation.visible_messages()] == [
+            "real question", "answer",
+        ]
+        return session
+
+    asyncio.run(go())
+
+
+def test_send_rejects_image_refs_missing_from_the_store(tmp_path) -> None:
+    """A referenced blob that was never uploaded is rejected up front — it
+    must not degrade to a text token on the wire."""
+    from xarness.images import ImageRef
+
+    async def go():
+        session = make_session([], tmp_path)
+        ghost = ImageRef(
+            id="f" * 64, name="ghost.png", mime="image/png", width=1, height=1,
+        )
+        result = await session.execute(
+            "c1", SendMessage(text="look", images=[ghost]),
+        )
+        assert not result.ok and "never uploaded" in (result.error or "")
+        # The known-good path still works.
+        session.images.store(b"cat")
+        real = ImageRef(
+            id=session.images.store(b"cat"), name="cat.png",
+            mime="image/png", width=1, height=1,
+        )
+        result = await session.execute(
+            "c2", SendMessage(text="look", images=[real]),
+        )
+        assert result.ok, result.error
+
+    asyncio.run(go())
+
+
+def test_patch_settings_validates_before_applying(tmp_path) -> None:
+    """PATCH validates the whole request first: a bad sandbox name must not
+    leave a switched model behind, and it answers ok=False like a command."""
+    async def go():
+        session = make_session([], tmp_path)  # no config path known
+        result = await session.update_settings(protocol.SessionUpdate(
+            model="other-model", sandbox="other-sandbox",
+        ))
+        assert result.ok is False and result.error
+        # Nothing was applied.
+        assert session.profile_name == "test"
+        # Mode-only PATCH is allowed mid-turn (like SetMode).
+        session._set_state("running")
+        result = await session.update_settings(
+            protocol.SessionUpdate(mode="plan"))
+        assert result.ok, result.error
+        assert session.mode == "plan"
+
+    asyncio.run(go())
+
+
+def test_accept_emits_checkpoints_changed_not_history_replaced(tmp_path, monkeypatch) -> None:
+    """/accept rebaselines the checkpoints: clients get a lightweight
+    CheckpointsChanged, not a full HistoryReplaced snapshot."""
+    import xarness.session as session_mod
+    from xarness.gitwork import GitInfo
+
+    session = make_session([_round("one")], tmp_path)
+
+    async def fake_accept(info):
+        return "f" * 40
+
+    monkeypatch.setattr(session_mod, "accept_changes", fake_accept)
+    session.git_info = GitInfo(
+        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
+        baseline_tree="a" * 40,
+    )
+
+    async def go():
+        queue = session.subscribe()[1]
+        result = await session.execute("a1", protocol.Accept())
+        assert result.ok
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(
+            isinstance(e, protocol.CheckpointsChanged) and e.reason == "accept"
+            for e in events
+        ), [type(e).__name__ for e in events]
+        assert not any(isinstance(e, protocol.HistoryReplaced) for e in events)
+
+    asyncio.run(go())
+
+
+def test_rollback_watermark_survives_inflight_write(tmp_path, monkeypatch) -> None:
+    """A rollback that races the background write moves the watermark back,
+    and the in-flight write's completion must not advance it past the cut —
+    the next write rewrites the truncated rows so nothing is lost."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    session = make_session([], tmp_path)
+    real = session_store.write_state
+    started, release = asyncio.Event(), asyncio.Event()
+
+    def slow(name, payload, meta):
+        started.set()
+        deadline = time.monotonic() + 5
+        while not release.is_set() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return real(name, payload, meta)
+
+    monkeypatch.setattr(session_store, "write_state", slow)
+
+    async def go():
+        session.conversation.add(user_message("hi"))
+        session.conversation.add(AssistantMessage(content="hello"))
+        session._persist_from = 0
+        session._persist()
+        await asyncio.wait_for(started.wait(), 5)
+        # The rollback lands while the write thread is running.
+        session._persist_from = 1  # plan.drop_from
+        release.set()
+        await session._flush_persist()
+        assert session._persist_from == 1, session._persist_from
+
+        # A follow-up write covers the cut onward; the reload keeps both
+        # messages (the truncated row was rewritten, not skipped).
+        session._persist()
+        await session._flush_persist()
+        stored = session_store.load_state("test")
+        assert [m.role for m in stored.conversation.messages] == ["user", "assistant"]
+
+    asyncio.run(go())
+
+
+def test_no_message_is_mutated_after_first_persist(tmp_path, monkeypatch) -> None:
+    """Tail-only persistence is sound because messages are immutable: once
+    a message has been serialized for a write, nothing may ever change it
+    (turn stamping happens before the first persist of the message)."""
+    session = make_session([_round("one"), _round("two")], tmp_path)
+    real = session_store.serialize_state
+    seen: dict[str, Any] = {}
+
+    def spy(stored, from_seq):
+        for message in stored.conversation.messages:
+            snapshot = message.model_copy(deep=True)
+            if message.id in seen:
+                assert seen[message.id] == snapshot, (
+                    f"message {message.id} mutated after being persisted"
+                )
+            seen[message.id] = snapshot
+        return real(stored, from_seq)
+
+    monkeypatch.setattr(session_store, "serialize_state", spy)
+
+    async def go():
+        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await wait_idle(session)
+        # Accept rewrites checkpoints (not messages); a second turn then a
+        # rollback exercises truncation too.
+        await session.execute("a1", protocol.Accept())
+        await session.execute("s2", protocol.SendMessage(text="again"))
+        await wait_idle(session)
+        await session.execute("u1", protocol.Rollback())
+
+    asyncio.run(go())
+    assert seen, "expected at least one persist"
+
+
+def test_load_starts_watermark_at_end_and_closes_crashed_turns(tmp_path) -> None:
+    """A loaded session must not rewrite its whole history on the first
+    persist (the watermark starts at the end), and turns left open by a
+    crash are closed — including untracked ones (before_tree None), which
+    the tree-based repair never saw."""
+    async def go():
+        session = make_session([], tmp_path)
+        user = session.conversation.add(user_message("hi"))
+        session.conversation.begin_turn(user, None)  # untracked: never closed
+        stored = session_store.StoredSession(
+            conversation=session.conversation,
+            profile="test", workspace=str(tmp_path),
+        )
+        loaded = Session.load(
+            "test", parts=_parts(tmp_path), state=stored,
+        )
+        assert loaded._persist_from == len(loaded.conversation.messages)
+        assert loaded.conversation.open_turn is None  # closed on load
+        assert all(t.closed for t in loaded.conversation.turns.values())
+        assert loaded._crash_repaired == []  # untracked: nothing to stamp
+
+    asyncio.run(go())
+
+
+def _parts(tmp_path):
+    from xarness.sandbox import SandboxRuntime
+    from xarness.session import SessionParts
+    return SessionParts(
+        workspace=tmp_path, profile=PROFILE, profile_name="test",
+        api_key="key", config_path=None,
+        sandbox=SandboxRuntime(), git_info=None, tool_output_limit=None,
+    )
+
+
+def test_repair_inserts_synthetic_result_next_to_its_call() -> None:
+    """A session saved mid-tool-loop and then steered has the orphaned tool
+    call in the middle of the history: the synthetic result must be
+    inserted right after the owning assistant message (providers require
+    adjacency), not appended at the end."""
+    from xarness.conversation import AssistantMessage, ToolCall
+
+    conversation = Conversation()
+    conversation.add(user_message("go"))
+    call = ToolCall(call_id="c1", name="run_bash", arguments_json="{}")
+    conversation.add(AssistantMessage(content="", tool_calls=[call]))
+    conversation.add(user_message("steer"))  # appended mid-loop
+    changed = conversation.repair_orphaned_tool_calls()
+    assert changed
+    roles = [m.role for m in conversation.messages]
+    assert roles == ["user", "assistant", "tool", "user"], roles
+    assert conversation.messages[2].tool_call_id == "c1"
+    assert conversation.messages[2].status == "interrupted"
+
+
+def test_persist_watermark_advances_across_writes(tmp_path, monkeypatch) -> None:
+    """The optimistic watermark must advance: after the first write, later
+    persists serialize only the tail (O(tail), not O(history))."""
+    session = make_session([_round("one"), _round("two")], tmp_path)
+    from_seqs: list[int] = []
+    real = session_store.serialize_state
+
+    def spy(stored, from_seq):
+        from_seqs.append(from_seq)
+        return real(stored, from_seq)
+
+    monkeypatch.setattr(session_store, "serialize_state", spy)
+
+    async def go():
+        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await wait_idle(session)
+        first_end = len(session.conversation.messages)
+        await session.execute("s2", protocol.SendMessage(text="again"))
+        await wait_idle(session)
+        return first_end
+
+    first_end = asyncio.run(go())
+    assert from_seqs, "no persist happened"
+    assert from_seqs[-1] >= 1, from_seqs
+    assert session._persist_from == len(session.conversation.messages)
+    assert session._persist_from >= first_end
+
+
+def test_persist_failure_does_not_stall_the_turn(tmp_path, monkeypatch) -> None:
+    """A failing write (SQLite busy, disk full) is logged and swallowed: the
+    turn still ends idle with TurnEnded, and the watermark rewinds so the
+    next persist rewrites from the last known-good point."""
+    session = make_session([_round("one")], tmp_path)
+
+    def boom(name, payload, meta):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session_store, "write_state", boom)
+
+    async def go():
+        queue = session.subscribe()[1]
+        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await wait_idle(session)
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert session._state == "idle"
+        assert any(isinstance(e, protocol.TurnEnded) for e in events)
+        assert session._persist_from == 0  # rewound: retry from scratch
 
     asyncio.run(go())

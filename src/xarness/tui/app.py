@@ -11,17 +11,16 @@ session, tools, gitwork or sandbox modules.
 from __future__ import annotations
 
 import asyncio
-import httpx
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+import httpx
 from rich.cells import cell_len
 from rich.segment import Segment
 from rich.style import Style
-
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
@@ -31,37 +30,68 @@ from textual.screen import ModalScreen
 from textual.strip import Strip
 from textual.widgets import OptionList, Static, TextArea
 from textual.worker import Worker
+from textual_flowview import Anchor, FlowModel, FlowView
 
 from .. import theme
 from ..clientlib import ClientError, XarnessClient, ensure_host
 from ..config import DEFAULT_CONFIG_PATH, save_preferences
-from ..images import ImageAttachment
+from ..images import ImageAttachment, ImageRef
 from ..protocol import (
-    AnswerAsk, AskRequested, AskResolved, Cancel, Command, ContentDelta,
-    CreateSessionRequest, DiffChanged, DiscardQueued, DriftDetected,
-    DriftResolved, Event, CompactionDone, RollbackApplied,
-    CommandPayload, RollbackResult,
-    FilterAdd, FilterRemove,
-    FlushQueued, HistoryReplaced,
-    Notice, ProcessingStarted, ReasoningDelta, Reject, ResolveDrift,
-    Retry, SendMessage, SessionDeleted, SetMode, SetSandbox, Snapshot,
-    StatusChanged, StatusPayload, StreamError, Accept, SwitchModel,
-    ToolCallStarted, TurnComplete,
-    TurnEnded, TurnFinished, Undo, UndoTo, UserMessageAdded,
+    Accept,
+    Activity,
+    AnswerAsk,
+    AskResolved,
+    Cancel,
+    CheckpointsChanged,
+    Command,
+    CommandResult,
+    ConfigChanged,
+    ContentDelta,
+    CreateSessionRequest,
+    DiffChanged,
+    DiscardQueued,
+    DriftResolved,
+    Event,
+    Filter,
+    FlushQueued,
+    HistoryReplaced,
+    MessageAdded,
+    Notice,
+    ProcessingStarted,
+    ReasoningDelta,
+    Reject,
+    ResolveDrift,
+    Rollback,
+    RoundComplete,
+    SendMessage,
+    SessionConfigView,
+    SessionDeleted,
+    SetMode,
+    SetSandbox,
+    Snapshot,
+    StatusChanged,
+    StatusPayload,
+    StreamError,
+    SwitchModel,
+    ToolCallStarted,
+    TurnEnded,
+    is_summary,
 )
-from textual_flowview import Anchor, FlowModel, FlowView
-
 from ..util import format_duration as _format_duration
 from . import flow as tflow
-from .flow import LineItem, PendingItem
-from .transcript import Transcript
 from .confirm_screen import ConfirmScreen
+from .diff_summary import DiffSummary
+from .flow import LineItem, PendingItem
 from .list_picker import ListPicker, name_options, session_options
 from .refs_screen import RefsScreen
-from .diff_summary import DiffSummary
+from .transcript import Transcript
 from .widgets import (
-    AskBar, ChatInput, GeneratingBar, StatusBar,
-    SteerQueueBar, SuggestionPopup,
+    AskBar,
+    ChatInput,
+    GeneratingBar,
+    StatusBar,
+    SteerQueueBar,
+    SuggestionPopup,
 )
 
 # Reconnect backoff for the one recovery loop (seconds).
@@ -139,7 +169,7 @@ _command("reject", "discard all changes made since the last /accept",
 _command("undo", "drop the last turn and revert its file edits",
          lambda s, a: s.call_later(s._run_undo))
 _command("retry", "revert the last turn's file edits and resend your message",
-         lambda s, a: s._post_command(Retry()))
+         lambda s, a: s._post_command(Rollback(resend=True)))
 
 
 # Transcript virtualization: the chat log is a textual_flowview.FlowView —
@@ -276,8 +306,11 @@ class AgentApp(App[None]):
         self.no_init_repo = no_init_repo
         self.no_session = no_session
         self.startup_notices = startup_notices or []
-        # Latest status from the session (drives the bars); a draft has none.
-        self.status: StatusPayload | None = None
+        # Latest status from the session (drives the bars); a draft has
+        # none. Split halves: the config view only changes on a settings
+        # command, the activity on every round/tool/prompt event.
+        self._config: SessionConfigView | None = None
+        self._activity: Activity | None = None
         # The pure reducer owns the transcript data; the FlowModel holds one
         # widget entry per item. _entries maps id(item) -> entry so live
         # mutations repaint the right row without a second copy of state.
@@ -418,7 +451,8 @@ class AgentApp(App[None]):
         try:
             async for item in self.client.attach(name):
                 if isinstance(item, Snapshot):
-                    self.status = item.status
+                    self._config = item.status.config
+                    self._activity = item.status.activity
                     self._set_vision(item.status.supports_vision)
                     self._refresh_title()
                     await self._render_history(item)
@@ -435,7 +469,7 @@ class AgentApp(App[None]):
             raise
         except (ClientError, httpx.HTTPError) as exc:
             self.call_later(self._recover, name, exc)
-        except Exception as exc:  # noqa: BLE001 - never crash on connection loss
+        except Exception as exc:
             self.call_later(self._recover, name, exc)
 
     async def _recover(self, name: str, exc: Exception) -> None:
@@ -457,9 +491,14 @@ class AgentApp(App[None]):
 
     async def _handle_event(self, event: Event) -> None:
         """Route one live event to the widgets."""
+        if isinstance(event, ConfigChanged):
+            self._config = event.config
+            self._set_vision(event.config.supports_vision)
+            self._refresh_bars()
+            self._sync_refs_screen()
+            return
         if isinstance(event, StatusChanged):
-            self.status = event.status
-            self._set_vision(event.status.supports_vision)
+            self._activity = event.activity
             self._refresh_bars()
             self._sync_refs_screen()
             self._sync_ask()
@@ -475,14 +514,16 @@ class AgentApp(App[None]):
             else:
                 self._notice(event.text)
             return
-        if isinstance(event, UserMessageAdded):
+        if isinstance(event, MessageAdded):
             self._sync_entries(self._transcript.apply(event))
             return
         if isinstance(event, HistoryReplaced):
             await self._on_history_replaced(event)
             return
-        if isinstance(event, AskRequested):
-            self._ask_worker = self._ask_flow(event.ask_id, event.questions)
+        if isinstance(event, CheckpointsChanged):
+            # Checkpoints were rebaselined (accept/reject/drift) but no
+            # message changed: only the diff/pending view moves.
+            self.call_later(self.refresh_diff_summary)
             return
         if isinstance(event, AskResolved):
             self._on_ask_resolved(event)
@@ -490,23 +531,13 @@ class AgentApp(App[None]):
         if isinstance(event, DiffChanged):
             await self._show_diff_summary(event.summary)
             return
-        if isinstance(event, CompactionDone):
-            self._notice(self._compaction_text(event))
-            return
-        if isinstance(event, RollbackApplied):
-            self._notice(self._rollback_text(event))
-            return
-        if isinstance(event, DriftDetected):
-            # The prompt is session state (see _maybe_prompt_drift); the
-            # status carries it. No separate UI action needed.
-            return
         if isinstance(event, DriftResolved):
             self._drift_modal_open = False
             # The prompt is resolved: drop the pending flag locally too, or
             # the next StatusChanged would reopen the modal for a drift that
             # no longer exists.
-            if self.status is not None:
-                self.status.pending_drift = None
+            if self._activity is not None:
+                self._activity.pending_drift = None
             return
         if isinstance(event, TurnEnded):
             # The turn is fully unwound: settle anything still live and stop
@@ -515,13 +546,10 @@ class AgentApp(App[None]):
             self._phase_idle()
             self._clear_hint_lines()
             if event.outcome == "finished":
+                self._notice(f"Worked for {_format_duration(event.elapsed)}")
                 self._set_title_state("finished")
             else:
                 self._set_default_title()
-            return
-        if isinstance(event, TurnFinished):
-            self._notice(f"Worked for {_format_duration(event.elapsed)}")
-            self._set_title_state("finished")
             return
         if isinstance(event, SessionDeleted):
             # The session went away (deleted, or closed by this or another
@@ -542,7 +570,7 @@ class AgentApp(App[None]):
         if isinstance(event, (ReasoningDelta, ContentDelta, ToolCallStarted)):
             self._phase_streaming()
         self._sync_entries(self._transcript.apply(event))
-        if isinstance(event, TurnComplete):
+        if isinstance(event, RoundComplete):
             self._complete_round(event)
         elif isinstance(event, StreamError):
             self._phase_idle()
@@ -550,23 +578,24 @@ class AgentApp(App[None]):
             self._clear_hint_lines()
 
     @staticmethod
-    def _compaction_text(event: CompactionDone) -> str:
-        """Render a compaction outcome (counts + model summary) as one line."""
-        if not event.before:
-            if event.automatic:
-                return "auto-compacted: nothing to compact yet"
-            return event.summary or "nothing to compact yet"
-        counts = (
-            f"{event.before:,} → {event.after:,} tokens "
-            f"(freed {max(0, event.before - event.after):,})"
-        )
-        prefix = "auto-compacted" if event.automatic else "compacted"
-        return f"{prefix}: {counts}\n{event.summary}"
-
-    @staticmethod
-    def _rollback_text(event: RollbackApplied) -> str:
-        """Render an undo/retry outcome from the typed fields."""
-        if event.compaction_undone:
+    def _history_text(event: HistoryReplaced) -> str:
+        """Render a history rewrite's outcome (compaction or rollback)."""
+        if event.reason == "compaction":
+            if not event.before_tokens:
+                prefix = "auto-compacted" if event.automatic else "compacted"
+                return f"{prefix}: nothing to compact yet"
+            counts = (
+                f"{event.before_tokens:,} → {event.after_tokens:,} tokens "
+                f"(freed {max(0, event.before_tokens - event.after_tokens):,})"
+            )
+            prefix = "auto-compacted" if event.automatic else "compacted"
+            summary = next(
+                (m.content for m in event.snapshot.messages if is_summary(m)),
+                "",
+            )
+            return f"{prefix}: {counts}\n{summary}"
+        # rollback
+        if not event.scope and not event.resend:
             text = "compaction undone: pre-compaction history restored"
             if event.resend:
                 text += " — nothing to retry (the turn is still in the conversation)"
@@ -594,19 +623,18 @@ class AgentApp(App[None]):
         except ClientError as exc:
             self._error(f"{prefix}{exc}")
 
-    async def _send_command(self, command: Command) -> CommandPayload | None:
-        """Send one command to the session; returns its result payload.
+    async def _send_command(self, command: Command) -> CommandResult | None:
+        """Send one command to the session; returns its result.
 
         Errors (busy rejection, unknown target, git failure) surface as an
         error line — the session broadcast the effects to everyone anyway."""
         if self.session_name is None:
             return None
         try:
-            result = await self.client.command(self.session_name, command)
+            return await self.client.command(self.session_name, command)
         except ClientError as exc:
             self._error(str(exc))
             return None
-        return result.payload
 
     def _post_command(self, command: Command) -> None:
         """Queue a fire-and-forget command: results are ignored (the effects
@@ -671,7 +699,7 @@ class AgentApp(App[None]):
     # Status bar / bars
 
     def _refresh_bars(self) -> None:
-        """Refresh everything driven by ``self.status``: the status bar, the
+        """Refresh everything driven by the status halves: the status bar, the
         generating bar and the steer queue."""
         self._refresh_status()
         self._refresh_steer_bar()
@@ -683,9 +711,9 @@ class AgentApp(App[None]):
             display_name=status.model_display_name,
             effort=status.cot_strength,
             mode=status.mode,
-            total_in=status.total_in,
-            total_out=status.total_out,
-            context_used=status.context_used,
+            total_in=status.usage_total.input_tokens,
+            total_out=status.usage_total.output_tokens,
+            context_used=status.last_usage.context_tokens(),
             max_context=status.max_context,
             workspace=status.workspace,
         )
@@ -696,18 +724,21 @@ class AgentApp(App[None]):
         chat — one synthesized from ``/config`` defaults plus the pre-session
         model/mode choices. Never ``None``, so view code has no fake-status
         branch and ``session_name``/``supports_vision`` need not be mirrored."""
-        if self.status is not None:
-            return self.status
+        if self._activity is not None:
+            return StatusPayload(
+                config=self._config or SessionConfigView(),
+                activity=self._activity,
+            )
         config = self._config_cache
         target = self.model or (config.default_model if config else None)
         entry = next(
-            (m for m in (config.models if config else []) if m.get("name") == target),
+            (m for m in (config.models if config else []) if m.name == target),
             None,
         )
         if entry is not None:
-            display_name = entry.get("display_name") or entry.get("name") or "—"
-            effort = entry.get("cot_strength") or "medium"
-            max_context = entry.get("max_context") or 128_000
+            display_name = entry.display_name or entry.name or "—"
+            effort = entry.cot_strength or "medium"
+            max_context = entry.max_context or 128_000
         else:
             display_name = (
                 config.default_model_display_name if config else None
@@ -715,13 +746,15 @@ class AgentApp(App[None]):
             effort = "medium"
             max_context = 128_000
         return StatusPayload(
-            state="idle",
-            mode=self._draft_mode,
-            model_name=target or "",
-            model_display_name=display_name,
-            cot_strength=effort,
-            max_context=max_context,
-            workspace=str(self.workspace) if self.workspace else None,
+            config=SessionConfigView(
+                mode=self._draft_mode,
+                model_name=target or "",
+                model_display_name=display_name,
+                cot_strength=effort,
+                max_context=max_context,
+                workspace=str(self.workspace) if self.workspace else None,
+            ),
+            activity=Activity(state="idle"),
         )
 
     @work(group="draft-status", exit_on_error=False)
@@ -750,9 +783,9 @@ class AgentApp(App[None]):
         if config is None:
             return
         name = model or config.default_model
-        entry = next((m for m in config.models if m.get("name") == name), None)
+        entry = next((m for m in config.models if m.name == name), None)
         if entry is not None:
-            self._set_vision(bool(entry.get("supports_vision")))
+            self._set_vision(entry.supports_vision)
 
     def on_chat_input_image_refused(
         self, event: ChatInput.ImageRefused,
@@ -835,9 +868,9 @@ class AgentApp(App[None]):
             return
         self._submit(text, event.images)
 
-    def _submit(self, text: str, images: list[ImageAttachment] | None = None) -> None:
+    def _submit(self, text: str, images: list[ImageAttachment | ImageRef] | None = None) -> None:
         """Send a message. No local echo: the message lands in the transcript
-        when UserMessageAdded arrives, identically for every client."""
+        when MessageAdded arrives, identically for every client."""
         self.call_later(self._submit_async, text, images)
 
     async def _ensure_session(self) -> bool:
@@ -872,15 +905,31 @@ class AgentApp(App[None]):
         self._draft_mode = "write"
         return True
 
-    async def _submit_async(self, text: str, images: list[ImageAttachment] | None) -> None:
+    async def _submit_async(
+        self, text: str, images: list[ImageAttachment | ImageRef] | None,
+    ) -> None:
         # Draft chat: the session comes into existence on the server with
         # the first message.
         if self.session_name is None and not await self._ensure_session():
             return
-        # Pasted/dragged images ride along as base64 attachments; SendMessage
-        # and UserMessageAdded carry the same ImageAttachment shape the input
-        # produced, so they pass through unchanged.
-        await self._send_command(SendMessage(text=text, images=images or None))
+        # Images travel as content-addressed references: the bytes are
+        # uploaded once (PUT /images/{sha}), the command carries only the
+        # refs. An attachment that is already a ref (an undone message put
+        # back in the input) is already stored.
+        refs: list[ImageRef] = []
+        for image in images or ():
+            if isinstance(image, ImageRef):
+                refs.append(image)
+                continue
+            data = image.data()
+            ref = image.to_ref()
+            try:
+                await self.client.upload_image(self.session_name, data, ref.id)
+            except ClientError as exc:
+                self._error(f"could not upload {image.name}: {exc}")
+                continue
+            refs.append(ref)
+        await self._send_command(SendMessage(text=text, images=refs or None))
 
     # ------------------------------------------------------------------
     # Ask tool (event-driven)
@@ -961,12 +1010,12 @@ class AgentApp(App[None]):
         requires one, and blocking the pump on a modal would stall the
         event stream while the prompt is open."""
         if (
-            self.status is None or self.status.pending_drift is None
+            self._activity is None or self._activity.pending_drift is None
             or self._drift_modal_open
         ):
             return
         self._drift_modal_open = True
-        detail = self._drift_detail(self.status.pending_drift)
+        detail = self._drift_detail(self._activity.pending_drift)
         choice = await self.push_screen_wait(ConfirmScreen(
             "Workspace changed outside this session since it was last open:",
             detail=detail,
@@ -974,7 +1023,7 @@ class AgentApp(App[None]):
             cancel_label="Keep tracking",
         ))
         self._drift_modal_open = False
-        if self.status is None or self.status.pending_drift is None:
+        if self._activity is None or self._activity.pending_drift is None:
             return  # resolved elsewhere while the modal was open
         if choice is None:
             return  # dismissed: leave the prompt pending
@@ -1026,18 +1075,18 @@ class AgentApp(App[None]):
     async def _run_undo_to(self, message_id: str) -> None:
         """Click-to-undo: drop the clicked user message and everything after
         it (file edits reverted), putting that message back in the input."""
-        payload = await self._send_command(UndoTo(message_id=message_id))
+        payload = await self._send_command(Rollback(message_id=message_id))
         self._put_back_user_text(payload)
 
     async def _run_undo(self) -> None:
-        self._put_back_user_text(await self._send_command(Undo()))
+        self._put_back_user_text(await self._send_command(Rollback()))
 
-    def _put_back_user_text(self, payload: CommandPayload | None) -> None:
+    def _put_back_user_text(self, result: CommandResult | None) -> None:
         """Restore an undone message's text and images to the input box."""
-        if not isinstance(payload, RollbackResult) or not payload.user_text:
+        if result is None or not result.user_text:
             return
         chat_input = self.query_one("#chat-input", ChatInput)
-        chat_input.restore(payload.user_text, list(payload.images or ()))
+        chat_input.restore(result.user_text, list(result.images or ()))
         chat_input.focus()
 
     def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
@@ -1062,7 +1111,8 @@ class AgentApp(App[None]):
             self._pump_worker.cancel()
             self._pump_worker = None
         self.session_name = None
-        self.status = None
+        self._config = None
+        self._activity = None
         self._refresh_title()
         self._flow_model.clear()
         self._hint_entries = []
@@ -1145,7 +1195,7 @@ class AgentApp(App[None]):
         if self._config_cache is None:
             return
         name = await self._pick(
-            [m["name"] for m in self._config_cache.models],
+            [m.name for m in self._config_cache.models],
             current=self.view_status.model_name or None,
             title="Switch model",
         )
@@ -1172,12 +1222,12 @@ class AgentApp(App[None]):
         config = self._config_cache
         if config is not None:
             entry = next(
-                (m for m in config.models if m.get("name") == name), None,
+                (m for m in config.models if m.name == name), None,
             )
             config.default_model = name
             config.default_model_display_name = (
-                (entry or {}).get("display_name") or name
-            )
+                entry.display_name if entry is not None else None
+            ) or name
             self._refresh_status()
 
     @work(group="picker", exclusive=True)
@@ -1187,7 +1237,7 @@ class AgentApp(App[None]):
         if self._config_cache is None:
             return
         name = await self._pick(
-            [s["name"] for s in self._config_cache.sandboxes],
+            [s.name for s in self._config_cache.sandboxes],
             current=self.view_status.sandbox_name,
             title="Sandbox profile (applies when the session is idle)",
         )
@@ -1199,9 +1249,9 @@ class AgentApp(App[None]):
         action = sub[0] if sub else "list"
         path = sub[1].strip() if len(sub) > 1 else ""
         if action == "add" and path:
-            self._post_command(FilterAdd(path=path))
+            self._post_command(Filter(path=path, add=True))
         elif action == "remove" and path:
-            self._post_command(FilterRemove(path=path))
+            self._post_command(Filter(path=path, add=False))
         elif action == "list":
             filters = self.view_status.filter_list
             if filters:
@@ -1260,8 +1310,8 @@ class AgentApp(App[None]):
         except ClientError as exc:
             self._error(str(exc))
             return
-        if self.status is not None:
-            self.status.refs = refs
+        if self._config is not None:
+            self._config.refs = refs
             self._refresh_bars()
         if isinstance(self.screen, RefsScreen):
             self.screen.post_message(RefsScreen.RefsChanged(refs))
@@ -1294,7 +1344,7 @@ class AgentApp(App[None]):
             save_preferences(
                 self.config_path, default_theme=default_theme,
             )
-        except Exception as exc:  # noqa: BLE001 - preference save is best-effort
+        except Exception as exc:
             self._notice(f"note: could not save preference: {exc}")
 
     def _apply_theme(self, name: str) -> None:
@@ -1434,7 +1484,7 @@ class AgentApp(App[None]):
             self._remove_entry(entry)
         self._hint_entries = []
 
-    def _complete_round(self, event: TurnComplete) -> None:
+    def _complete_round(self, event: RoundComplete) -> None:
         self._clear_hint_lines()
         if (self._transcript.assistant is None
                 and self._transcript.thinking is None
@@ -1454,9 +1504,12 @@ class AgentApp(App[None]):
         # The snapshot also carries the fresh status (a drift resolve clears
         # pending_drift there); adopt it so local prompts/bars don't keep
         # showing state the host already moved past.
-        self.status = event.snapshot.status
+        self._config = event.snapshot.status.config
+        self._activity = event.snapshot.status.activity
         self._refresh_bars()
         await self._render_history(event.snapshot)
+        if event.reason in ("compaction", "rollback"):
+            self._notice(self._history_text(event))
         self._refresh_status()
         self.call_later(self.refresh_diff_summary)
 
@@ -1640,7 +1693,7 @@ class AgentApp(App[None]):
             # Another client has the session open: the session keeps running
             # for them regardless, and "stop and quit" would yank it away —
             # so don't ask, just detach and exit.
-            if self.status is not None and self.status.clients_attached > 1:
+            if self._activity is not None and self._activity.clients_attached > 1:
                 self.exit()
                 return
             choice = await self.push_screen_wait(ConfirmScreen(
@@ -1704,7 +1757,10 @@ class AgentApp(App[None]):
             # Second esc: close the file list too; only the summary remains.
             diff_summary.collapse()
             return
-        if self.status is not None and self.status.state in ("running", "compacting"):
+        if (
+            self._activity is not None
+            and self._activity.state in ("running", "compacting")
+        ):
             if self._interrupt_armed:
                 # Second esc within the window: actually stop the turn.
                 self._disarm_interrupt()

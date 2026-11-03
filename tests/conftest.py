@@ -28,7 +28,7 @@ def isolated_state_dir(tmp_path_factory, monkeypatch):
 def skip_when_bwrap_unusable(monkeypatch):
     orig_run_in_sandbox = sandbox_mod.run_in_sandbox
 
-    async def run_in_sandbox(config, command, input_bytes=None):
+    async def run_in_sandbox(config, command, input_bytes=None, timeout=120.0):
         result = await orig_run_in_sandbox(config, command, input_bytes)
         if _bwrap_failed(result):
             pytest.skip("nested bwrap cannot start in this environment")

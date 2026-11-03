@@ -22,7 +22,6 @@ import tempfile
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterable
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -35,6 +34,10 @@ if TYPE_CHECKING:
 # canonical refs path.
 from .config import REFS_ANCHOR
 from .gitwork import git_shim_script
+
+# Per-command default when neither the sandbox profile's default_timeout nor
+# a per-command timeout applies (one-shot runs keep the same default).
+DEFAULT_TIMEOUT = 120.0
 
 
 def has_ref_mounts(sandbox: "SandboxConfig") -> bool:
@@ -118,6 +121,7 @@ _CACHE_SUBDIRS = ("pip", "cargo", "npm", "venvs")
 # worktree. (An earlier design mounted the anchor at <workspace>/.refs, which
 # forced a transient .refs directory into the real worktree on every run and
 # failed outright in plan mode, where the workspace bind is read-only.)
+
 # Container path the agent's workspace is mounted at (the only one tools and
 # argv building ever name).
 _WORKSPACE = "/workspace"
@@ -353,7 +357,6 @@ class SandboxConfig:
     # inside the container. Off by default; driver userland ships in
     # /usr/lib(64), which is already bound read-only.
     gpu_access: bool = False
-    timeout_seconds: float = 120.0
     # False = tools run as a user-level stateful bash on the host (an
     # unsandboxed mode): no bwrap container, no mount isolation. Documented
     # in the config; the TUI shows a visible marker when it is off.
@@ -448,25 +451,6 @@ class SandboxConfig:
                    for marker in _PROJECT_VENV_MARKERS)
 
     # ------------------------------------------------------------------
-    # External references
-
-    def add_ref(
-        self,
-        host: str | Path,
-        *,
-        alias: str | None = None,
-        mount: str | None = None,
-        read_only: bool = True,
-    ) -> ContainerRef:
-        """Bind a host path into the container; returns the (possibly
-        disambiguated) entry. See :func:`bind_ref`."""
-        return bind_ref(self.workspace, self.external_refs, host,
-                        alias=alias, mount=mount, read_only=read_only)
-
-    def remove_ref(self, alias: str) -> bool:
-        return self.external_refs.pop(alias, None) is not None
-
-    # ------------------------------------------------------------------
     # Config construction
 
     @classmethod
@@ -475,17 +459,22 @@ class SandboxConfig:
         workspace: Path,
         settings: "SandboxSettings",
         git_info: "GitInfo | None" = None,
+        extra_refs: "Iterable[str | RefSpec] | None" = None,
     ) -> "SandboxConfig":
-        """Build a config from a config.SandboxSettings profile."""
+        """Build a config from a config.SandboxSettings profile.
+
+        ``extra_refs`` are the workspace refs merged on top of the
+        profile's own ``auto_include_refs`` (the session owns the merge;
+        settings stay profile-only)."""
         return cls(
             workspace=workspace,
             allow_network=settings.allow_network,
             gpu_access=settings.gpu_access,
             use_container=settings.use_container,
             filter_list=list(settings.filter_list),
-            timeout_seconds=settings.default_timeout,
             external_refs=cls.resolve_auto_refs(
-                workspace, settings.auto_include_refs,
+                workspace,
+                [*settings.auto_include_refs, *(extra_refs or [])],
             ),
             git_dir=git_info.git_dir if git_info is not None else None,
             git_external=git_info.external if git_info is not None else False,
@@ -498,7 +487,7 @@ class SandboxConfig:
         specs: Iterable["str | RefSpec"],
         external: dict[str, ContainerRef] | None = None,
     ) -> dict[str, ContainerRef]:
-        """Turn config ``auto_include_refs`` entries (plain path strings or
+        """Turn ``auto_include_refs`` entries (plain path strings or
         ``RefSpec`` objects with ``path``/``mount``/``read_only``) into the
         alias → ContainerRef map bound into the container.
 
@@ -914,6 +903,7 @@ async def run_in_sandbox(
     config: SandboxConfig,
     command: list[str],
     input_bytes: bytes | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> SandboxResult:
     """One-shot: spawn, run, tear down. Used by read_file/edit_file."""
     argv = config.build_argv(command)
@@ -927,7 +917,7 @@ async def run_in_sandbox(
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input_bytes), timeout=config.timeout_seconds
+            proc.communicate(input_bytes), timeout=timeout
         )
     except asyncio.TimeoutError:
         proc.kill()
@@ -948,8 +938,15 @@ class SandboxSession:
     other via a lock — one command completes before the next starts.
     """
 
-    def __init__(self, config: SandboxConfig) -> None:
+    def __init__(
+        self, config: SandboxConfig,
+        default_timeout: float = DEFAULT_TIMEOUT,
+    ) -> None:
         self._config = config
+        # Lives on the session, not on SandboxConfig: it comes from the
+        # sandbox profile's default_timeout, and the config would otherwise
+        # duplicate it.
+        self.default_timeout = default_timeout
         self._mount_key: tuple | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -957,6 +954,18 @@ class SandboxSession:
     @property
     def config(self) -> SandboxConfig:
         return self._config
+
+    def adopt(
+        self, config: "SandboxConfig",
+        default_timeout: float | None = None,
+    ) -> None:
+        """Swap in a new config for the same shell: the next ``run`` sees
+        the changed ``mount_key`` and restarts itself under the new mounts
+        (a settings/refs/mode change needs no new process, just a new
+        argv)."""
+        self._config = config
+        if default_timeout is not None:
+            self.default_timeout = default_timeout
 
     async def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
@@ -1001,8 +1010,8 @@ class SandboxSession:
 
         ``on_output``, when given, is called with each output line as it
         arrives (so a TUI can show live output while the command runs).
-        ``timeout`` overrides the sandbox's default ``timeout_seconds`` for
-        this one command (None = default)."""
+        ``timeout`` overrides the session's default timeout for this one
+        command (None = default)."""
         async with self._lock:
             await self._ensure_started()
             assert self._proc is not None and self._proc.stdin and self._proc.stdout
@@ -1078,7 +1087,7 @@ class SandboxSession:
             try:
                 exit_code = await asyncio.wait_for(
                     _read_until_marker(),
-                    timeout=timeout if timeout is not None else self._config.timeout_seconds,
+                    timeout=timeout if timeout is not None else self.default_timeout,
                 )
             except asyncio.CancelledError:
                 # Stop the command too, not just stop waiting for it.
@@ -1116,19 +1125,6 @@ class SandboxSession:
             cleanup_mount_dirs_now()
 
 
-def make_sandbox(
-    workspace: Path,
-    settings: "SandboxSettings",
-    git_info: "GitInfo | None",
-) -> tuple[SandboxConfig | None, SandboxSession | None]:
-    """Build a sandbox config + persistent shell from a settings profile.
-
-    Raises :class:`SandboxUnavailable` when the sandbox can't be built
-    (callers fall back to filesystem/bash tools being disabled)."""
-    config = SandboxConfig.from_settings(workspace, settings, git_info)
-    return config, SandboxSession(config)
-
-
 @dataclass
 class SandboxRuntime:
     """A session's resolved sandbox: profile identity, config and shell.
@@ -1147,9 +1143,16 @@ class SandboxRuntime:
     def make(
         cls, workspace: Path, settings: "SandboxSettings",
         git_info: "GitInfo | None", *, name: str | None = None,
+        extra_refs: "Iterable[str | RefSpec] | None" = None,
     ) -> "SandboxRuntime":
-        config, shell = make_sandbox(workspace, settings, git_info)
-        return cls(config=config, shell=shell, name=name, settings=settings)
+        config = SandboxConfig.from_settings(
+            workspace, settings, git_info, extra_refs=extra_refs,
+        )
+        return cls(
+            config=config,
+            shell=SandboxSession(config, default_timeout=settings.default_timeout),
+            name=name, settings=settings,
+        )
 
     @property
     def use_container(self) -> bool:

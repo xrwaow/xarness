@@ -14,9 +14,9 @@ import pytest
 
 from xarness import host as host_mod
 from xarness import protocol, session_store
-from xarness.conversation import Message
+from xarness.conversation import user_message
 from xarness.host import GRACE_SECONDS, Host
-from xarness.protocol import ContentDelta, SendMessage, Snapshot, TurnComplete, Usage
+from xarness.protocol import ContentDelta, SendMessage, Snapshot, RoundComplete, Usage
 from xarness.session import SessionError
 
 
@@ -118,30 +118,44 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
         try:
             name = await _make_session(host, tmp_path, [[]])
             session = host.sessions[name]
-            # No real git repo here: stub the two git-backed methods.
+            # No real git repo here: stub the git-backed pieces of
+            # build_diff_info and give the session a tracking git block.
+            from xarness.gitwork import GitInfo
+            from xarness.gitwork import DiffStat
             from xarness.protocol import DiffFileInfo
 
-            async def fake_summary(current=None):
-                return protocol.DiffInfo(files=[DiffFileInfo(
+            async def fake_stat(info, turns, open_before=None, current=None):
+                return DiffStat(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
                     source="agent",
                 )], additions=1, deletions=0)
 
-            async def fake_text(path, current=None):
+            async def fake_text(info, path, current=None):
                 return f"diff for {path}"
 
-            session.diff_summary = fake_summary
-            session.diff_text = fake_text
-            async with _unix_http(host.unix_socket) as http:
-                whole_resp = await http.get(f"/v1/sessions/{name}/diff")
-                per_file_resp = await http.get(
-                    f"/v1/sessions/{name}/diff", params={"path": "a.txt"},
-                )
-                assert whole_resp.status_code == 200, whole_resp.text
-                assert per_file_resp.status_code == 200, per_file_resp.text
-                whole = whole_resp.json()
-                per_file = per_file_resp.json()
-                return whole, per_file
+            session.git_info = GitInfo(
+                session_id="test", repo_root=tmp_path, git_dir=tmp_path / ".git",
+                baseline_tree="t" * 40,
+            )
+            from xarness import diffview as diffview_mod
+            monkey = pytest.MonkeyPatch()
+            async def fake_snapshot(info):
+                return "t" * 40
+
+            monkey.setattr(diffview_mod, "attributed_diff_stat", fake_stat)
+            monkey.setattr(diffview_mod, "git_diff", fake_text)
+            monkey.setattr(diffview_mod, "snapshot_state", fake_snapshot)
+            try:
+                async with _unix_http(host.unix_socket) as http:
+                    whole_resp = await http.get(f"/v1/sessions/{name}/diff")
+                    per_file_resp = await http.get(
+                        f"/v1/sessions/{name}/diff", params={"path": "a.txt"},
+                    )
+                    assert whole_resp.status_code == 200, whole_resp.text
+                    assert per_file_resp.status_code == 200, per_file_resp.text
+                    return whole_resp.json(), per_file_resp.json()
+            finally:
+                monkey.undo()
         finally:
             task.cancel()
 
@@ -166,7 +180,7 @@ def test_saved_session_reads_do_not_host_or_build_a_sandbox(tmp_path, monkeypatc
             def boom(*args, **kwargs):
                 raise AssertionError("saved read built a sandbox")
 
-            monkeypatch.setattr("xarness.sandbox.make_sandbox", boom)
+            monkeypatch.setattr("xarness.sandbox.SandboxRuntime.make", boom)
             async with _unix_http(host.unix_socket) as http:
                 snap_resp = await http.get(f"/v1/sessions/{name}")
                 diff_resp = await http.get(f"/v1/sessions/{name}/diff")
@@ -191,7 +205,7 @@ def test_host_survives_client_disconnect(tmp_path) -> None:
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta(text="late answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="late answer"), RoundComplete()]],
             )
             # A client sends and disconnects immediately after.
             async with _unix_http(host.unix_socket) as http:
@@ -236,17 +250,22 @@ def test_host_stays_alive_while_turn_runs(tmp_path) -> None:
         task = await _serve(host)
         try:
             release = asyncio.Event()
+            from pydantic import BaseModel
+
             from xarness.tools import ToolRegistry, ToolResult, tool
 
-            @tool("blocker", "blocks")
+            class _NoArgs(BaseModel):
+                pass
+
+            @tool("blocker", "blocks", _NoArgs)
             async def blocker(args) -> ToolResult:
                 await release.wait()
-                return ToolResult(ok=True)
+                return ToolResult()
 
             name = await _make_session(host, tmp_path, [[
                 __import__("xarness.protocol", fromlist=["ToolCallArgumentsDone"])
                 .ToolCallArgumentsDone(call_id="c1", name="blocker", arguments_json="{}"),
-                TurnComplete(has_tool_calls=True),
+                RoundComplete(has_tool_calls=True),
             ]])
             session = host.sessions[name]
             registry = ToolRegistry()
@@ -319,9 +338,9 @@ def test_load_session_restores_saved_baseline(tmp_path) -> None:
         assert session.git_info is not None
         # Simulate a finished turn that changed the workspace (never accepted).
         session.git_info.baseline_tree = "b" * 40
-        user = session.conversation.add(Message(role="user", content="do things"))
+        user = session.conversation.add(user_message("do things"))
         session.conversation.begin_turn(user, "b" * 40)
-        session.conversation.turns[-1].after_tree = "c" * 40
+        session.conversation.turns[user.id].after_tree = "c" * 40
         session._persist()
         await host.unload_session(name)
 
@@ -356,9 +375,9 @@ def test_no_false_drift_after_clean_exit(tmp_path) -> None:
         assert session.git_info is not None
         from xarness.gitwork import snapshot_state
         current = await snapshot_state(session.git_info)
-        user = session.conversation.add(Message(role="user", content="edit"))
+        user = session.conversation.add(user_message("edit"))
         session.conversation.begin_turn(user, current)
-        session.conversation.turns[-1].after_tree = current
+        session.conversation.turns[user.id].after_tree = current
         session._persist()
         await host.unload_session(name)
 
@@ -384,7 +403,7 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
         from xarness.gitwork import snapshot_state
         current = await snapshot_state(session.git_info)
         # A turn with a checkpoint but no after-tree: finish_turn never ran.
-        user = session.conversation.add(Message(role="user", content="still working"))
+        user = session.conversation.add(user_message("still working"))
         session.conversation.begin_turn(user, current)
         session._persist()
         await host.unload_session(name)
@@ -464,7 +483,7 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta(text="answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="answer"), RoundComplete()]],
             )
             client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
             try:
@@ -506,7 +525,7 @@ def test_default_preset_resolves_model(tmp_path) -> None:
 def test_tui_end_to_end_draft_flow(tmp_path) -> None:
     """The full stack: TUI (pilot) -> clientlib -> host API -> Session turn.
 
-    Regression: the event pump died on the first UserMessageAdded (a sync
+    Regression: the event pump died on the first MessageAdded (a sync
     handler was awaited), killing the TUI's view while the turn kept
     running in the host."""
     from xarness.clientlib import XarnessClient
@@ -525,7 +544,7 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
             async def create_session(request):
                 summary = await orig_create(request)
                 host.sessions[summary.name].controller._client = FakeClient(
-                    [[ContentDelta(text="Hello!"), TurnComplete(usage=Usage(input_tokens=10, output_tokens=2))]]
+                    [[ContentDelta(text="Hello!"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]]
                 )
                 return summary
 
@@ -538,7 +557,7 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
                 await pilot.press("enter")
                 await pilot.pause(1.0)
                 assert app.session_name is not None
-                assert app.status is not None and app.status.state == "idle"
+                assert app.view_status.state == "idle"
                 # No local echo: the user message arrived via the stream.
                 from xarness.tui import flow as tflow
                 users = [e for e in app._flow_model.entries
@@ -649,7 +668,7 @@ def test_host_stays_alive_while_a_client_is_attached(tmp_path) -> None:
         host = make_host(tmp_path)
         task = await _serve(host)
         try:
-            name = await _make_session(host, tmp_path, [[ContentDelta(text="x"), TurnComplete()]])
+            name = await _make_session(host, tmp_path, [[ContentDelta(text="x"), RoundComplete()]])
             session = host.sessions[name]
             session._subscribers.append(asyncio.Queue())
             await asyncio.sleep(GRACE_SECONDS + 1)
@@ -724,7 +743,7 @@ def test_session_listing_uses_meta_not_conversations(tmp_path, monkeypatch) -> N
         monkeypatch.setattr(session_store, "load_state", explode)
         monkeypatch.setattr(session_store, "load_meta", explode)
 
-        summaries = host.list_sessions()
+        summaries = await host.list_sessions()
         saved = [s for s in summaries if s.name == name and not s.active]
         assert saved and saved[0].workspace
         assert saved[0].model == "test"
@@ -785,16 +804,19 @@ def test_config_defaults_endpoint_is_host_owned(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_idle_session_is_released_and_listed_as_saved(tmp_path) -> None:
+def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> None:
     """Send a message, let the turn finish, close the stream: the session
     leaves host.sessions (its sandbox shell released), is not listed as
-    active, and /sessions lists it as saved."""
+    active, and /sessions lists it as saved. (Idle sessions stay hosted for
+    a TTL by default; the test disables it.)"""
+    monkeypatch.setenv("XARNESS_IDLE_TTL_SECONDS", "0")
+
     async def go():
         host = make_host(tmp_path)
         task = await _serve(host)
         try:
             name = await _make_session(
-                host, tmp_path, [[ContentDelta(text="answer"), TurnComplete()]],
+                host, tmp_path, [[ContentDelta(text="answer"), RoundComplete()]],
             )
             session = host.sessions[name]
             snapshot, queue = session.subscribe()  # a client attaches
@@ -806,8 +828,8 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path) -> None:
             await asyncio.sleep(0.1)  # let the release task run
             assert name not in host.sessions, "idle session must be released"
             # It is saved, and /sessions lists it as saved (not active).
-            assert session_store.session_path(name).exists()
-            summaries = host.list_sessions()
+            assert name in session_store.list_sessions()
+            summaries = await host.list_sessions()
             row = next(s for s in summaries if s.name == name)
             assert row.active is False
             assert row.state == "saved"
@@ -982,21 +1004,21 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
     """list_sessions_with_stats stamps each row with the session's
     unaccepted (+/-) totals from the hosted git info — and degrades to
     zeroed totals instead of failing when a stat cannot be computed."""
-    import types
+
 
     from xarness import gitwork
-    from xarness.gitwork import DiffStat
+    from xarness.gitwork import DiffStat, GitInfo
 
     async def go():
         host = make_host(tmp_path)
         task = await _serve(host)
         try:
-            name = await _make_session(host, tmp_path, [[TurnComplete()]])
+            name = await _make_session(host, tmp_path, [[RoundComplete()]])
             session = host.sessions[name]
 
             # No git info: totals stay zero, listing still works.
             session.git_info = None
-            rows = await host.list_sessions_with_stats()
+            rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions, row.tracking) == (0, 0, False)
 
@@ -1005,8 +1027,11 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
                 return DiffStat(additions=7, deletions=2, tracking=True)
 
             monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
-            session.git_info = types.SimpleNamespace(baseline_tree="x")
-            rows = await host.list_sessions_with_stats()
+            session.git_info = GitInfo(
+                session_id="s", repo_root=tmp_path, git_dir=tmp_path / ".git",
+                baseline_tree="x",
+            )
+            rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions) == (7, 2)
             assert row.tracking is True
@@ -1016,22 +1041,21 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
                 raise RuntimeError("git blew up")
 
             monkeypatch.setattr(gitwork, "diff_stat", broken_diff_stat)
-            rows = await host.list_sessions_with_stats()
+            rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions) == (0, 0)
 
             # Saved (not hosted) sessions get no totals at all: the
             # persisted numbers would be stale, so they stay blank.
             monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
-            session.git_info = types.SimpleNamespace(
+            session.git_info = GitInfo(
+                session_id="s", repo_root=tmp_path, git_dir=tmp_path / ".git",
                 baseline_tree="x",
-                to_block=lambda: {"session_id": "s", "workspace": "/w",
-                                  "git_dir": "/w/.git"},
             )
             session._persist()
             await host.unload_session(name)
             assert name not in host.sessions
-            rows = await host.list_sessions_with_stats()
+            rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions) == (0, 0)
             # ...and load_state was never called for the listing.
@@ -1040,7 +1064,7 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
                 lambda *a, **kw: (_ for _ in ()).throw(
                     AssertionError("full conversation parsed")),
             )
-            assert await host.list_sessions_with_stats()
+            assert await host.list_sessions(stats=True)
         finally:
             await host.request_shutdown()
             if not task.done():

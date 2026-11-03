@@ -11,7 +11,7 @@ from pathlib import Path
 from PIL import Image
 
 from xarness.config import ProviderProfile
-from xarness.conversation import Message, build_parts
+from xarness.conversation import MESSAGE_ADAPTER, Message, user_message
 from xarness.images import (
     MAX_PIXELS, ImageAttachment, ImageError, is_image_path, load_image, token_text,
 )
@@ -22,7 +22,7 @@ from xarness.session_store import (
 
 
 def _user_message(text: str, images: list[ImageAttachment]) -> Message:
-    return Message(role="user", content=text, parts=build_parts(text, images))
+    return user_message(text, images)
 
 
 def _png(width: int, height: int, color=(255, 0, 0)) -> bytes:
@@ -120,7 +120,7 @@ class TestWireFormat(unittest.TestCase):
         self.assertTrue(url.startswith("data:image/png;base64,"))
 
     def test_text_only_message_stays_a_string(self) -> None:
-        self.assertEqual(Message(role="user", content="hi").to_wire()["content"], "hi")
+        self.assertEqual(user_message("hi").to_wire()["content"], "hi")
 
     def test_empty_content_with_images_still_emits_image_parts(self) -> None:
         att = ImageAttachment(
@@ -189,7 +189,7 @@ class TestPersistence(unittest.TestCase):
         )
         message = _user_message("see attached", [att])
         raw = json.loads(json.dumps(message.model_dump(exclude_none=True)))
-        loaded = Message.model_validate(raw)
+        loaded = MESSAGE_ADAPTER.validate_python(raw)
         # The persisted shape carries only the content hash, never base64.
         self.assertNotIn("data_b64", json.dumps(raw))
         self.assertNotIn("data", json.dumps(raw))
@@ -244,21 +244,26 @@ class TestBlobStore(unittest.TestCase):
     def test_session_file_has_no_base64_payloads(self) -> None:
         conversation = session_store.Conversation()
         att = self._attachment()
-        conversation.add(Message(
-            role="user", content="look [x]",
-            parts=build_parts("look [x]", [att], SessionImageStore("s1")),
+        conversation.add(user_message(
+            "look [x]", [att], SessionImageStore("s1"),
         ))
-        state = session_store.SessionState(conversation=conversation)
-        session_store.save_state("s1", state)
-        raw = (self.tmp / "sessions" / "s1.json").read_text()
+        state = session_store.StoredSession(conversation=conversation)
+        payload, meta = session_store.serialize_state(state)
+        session_store.write_state("s1", payload, meta)
+        raw = (self.tmp / "sessions" / "sessions.db").read_text(errors="replace")
         self.assertNotIn(att.data_b64, raw)
         self.assertNotIn("data_b64", raw)
         loaded = session_store.load_state("s1")
         ref = loaded.conversation.messages[0].parts[1].ref
         self.assertEqual(ref.id, att.to_ref().id)
-        # The provider wire still gets the bytes, resolved from the blob.
+        # The provider wire still gets the image, resolved from the blob
+        # (the loader returns a data URL for the ref).
         wire = loaded.conversation.to_wire(
-            image_loader=lambda image_id: load_blob("s1", image_id),
+            image_loader=lambda ref: (
+                f"data:{ref.mime};base64,"
+                f"{base64.b64encode(load_blob('s1', ref.id)).decode('ascii')}"
+                if load_blob("s1", ref.id) else None
+            ),
         )
         self.assertEqual(wire[0]["content"][1]["type"], "image_url")
 

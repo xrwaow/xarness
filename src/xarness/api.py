@@ -4,15 +4,16 @@ Every route is typed with the pydantic models from :mod:`xarness.protocol`,
 so FastAPI generates the OpenAPI docs (``/docs``, ``/redoc``,
 ``/openapi.json``) straight from the same shapes the clients use.
 
-Handlers enqueue commands on the session's inbox and await the command's
-result — they never touch the controller. Pure read-only queries
-(snapshots, diffs, lists) bypass the inbox; they are safe because only the
+Handlers run commands through the session's serialized ``execute`` and
+await the result — they never touch the controller. Pure read-only queries
+(snapshots, diffs, lists) bypass that lock; they are safe because only the
 session mutates that state.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -22,13 +23,21 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__, protocol, session_store
 from .config import ConfigError
-from .images import sniff_mime
 from .host import Host
+from .images import sniff_mime
 from .protocol import (
-    CommandEnvelope, CommandResult, Snapshot, SessionSummary,
-    ServerInfo, ServerStats,
+    CommandEnvelope,
+    CommandResult,
+    ServerInfo,
+    ServerStats,
+    SessionSummary,
+    Snapshot,
 )
 from .session import Session, SessionError
+
+# Cap on one uploaded image blob (base64 inflation happens client-side; this
+# bounds the raw bytes the host buffers).
+MAX_IMAGE_UPLOAD = 20 * 1024 * 1024
 
 
 def create_app(host: Host) -> FastAPI:
@@ -77,9 +86,12 @@ def sessions_router(host: Host) -> APIRouter:
     )
     async def list_sessions(
         active: bool | None = None, workspace: str | None = None,
+        stats: bool = False,
     ) -> list[SessionSummary]:
-        return await host.list_sessions_with_stats(
-            active=active, workspace=workspace,
+        """``stats`` adds pending-diff totals per hosted session — one git
+        snapshot each, so it is opt-in (the CLI listing leaves it off)."""
+        return await host.list_sessions(
+            active=active, workspace=workspace, stats=stats,
         )
 
     @router.post(
@@ -111,7 +123,7 @@ def sessions_router(host: Host) -> APIRouter:
         if session is not None:
             return session.snapshot()
         try:
-            return host.saved_snapshot(name)
+            return await host.saved_snapshot(name)
         except SessionError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -153,11 +165,68 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Fetch one stored image blob by content hash",
         response_class=Response,
     )
-    async def image(name: str, image_id: str) -> Response:
-        data = session_store.load_blob(name, image_id)
+    async def get_image(name: str, image_id: str) -> Response:
+        session = host.sessions.get(name) if host is not None else None
+        if session is not None:
+            # The session's own store first: a no_save session keeps blobs
+            # in memory only, where the disk lookup below would 404.
+            data = session.images.load(image_id)
+        else:
+            data = None
+        if data is None:
+            data = session_store.load_blob(name, image_id)
         if data is None:
             raise HTTPException(status_code=404, detail="image not found")
         return Response(content=data, media_type=sniff_mime(data))
+
+    @router.put(
+        "/sessions/{name}/images/{image_id}",
+        status_code=201,
+        summary="Upload one image blob (content-addressed); reference it by hash in SendMessage",
+    )
+    async def put_image(name: str, image_id: str, request: Request) -> Response:
+        session = await _session_or_load(host, name)
+        # Cap the body BEFORE reading it: an unbounded upload would let one
+        # request balloon the host's memory.
+        length = request.headers.get("content-length")
+        try:
+            if length and int(length) > MAX_IMAGE_UPLOAD:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"image too large: {length} bytes (limit {MAX_IMAGE_UPLOAD})",
+                )
+        except ValueError:
+            pass
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty image body")
+        if len(data) > MAX_IMAGE_UPLOAD:
+            raise HTTPException(
+                status_code=413,
+                detail=f"image too large: {len(data)} bytes (limit {MAX_IMAGE_UPLOAD})",
+            )
+        # Hash first, store second: a mismatched body must not write a blob
+        # under an id nothing will ever reference.
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != image_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"body hash {digest} does not match the requested id {image_id}",
+            )
+        # Through the session's store: a no_save session keeps the blob in
+        # memory (and visible to the provider round) instead of on disk.
+        # The write (with its up-to-20 MB fsync) runs off the event loop.
+        await asyncio.to_thread(session.images.store, data)
+        return Response(status_code=201)
+
+    @router.patch(
+        "/sessions/{name}",
+        response_model=protocol.CommandResult,
+        summary="Update session settings (mode, model, sandbox, filters, refs)",
+    )
+    async def patch_session(name: str, body: protocol.SessionUpdate) -> protocol.CommandResult:
+        session = await _session_or_load(host, name)
+        return await session.update_settings(body)
 
     @router.get(
         "/sessions/{name}/diff",
@@ -168,7 +237,7 @@ def sessions_router(host: Host) -> APIRouter:
         session = host.sessions.get(name)
         if session is not None:
             return await session.diff_info(path)
-        if not session_store.session_path(name).exists():
+        if session_store.load_meta(name) is None:
             raise HTTPException(
                 status_code=404, detail=f"no saved session named {name!r}",
             )

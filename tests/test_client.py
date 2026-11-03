@@ -14,7 +14,7 @@ from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
     StreamError,
-    TurnComplete,
+    RoundComplete,
     Usage,
 )
 
@@ -100,7 +100,7 @@ def test_transient_connect_error_is_retried() -> None:
 
     assert transport.calls == 2  # one drop, one retry
     assert isinstance(events[0], ProcessingStarted)
-    assert isinstance(events[-1], TurnComplete)
+    assert isinstance(events[-1], RoundComplete)
     assert events[-1].usage == Usage(input_tokens=3, output_tokens=2)
     assert any(isinstance(e, ContentDelta) and e.text == "hello" for e in events)
 

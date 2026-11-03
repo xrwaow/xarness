@@ -1,9 +1,9 @@
 """Context compaction, independent of the controller/UI.
 
-A compaction replaces the visible conversation with a single handoff summary
-message, advancing the epoch. The old messages stay in the append-only list
-(and reappear if the compaction is undone); only ``Conversation.epoch``
-changes.
+A compaction appends one summary user message to the append-only history;
+the visible slice (everything after the last summary) shrinks to that
+summary alone. Undoing a compaction pops the summary, which brings the old
+messages back — there is no epoch counter to keep in step.
 
 Summarization is one tool-free round through the same stream client, sent as
 a continuation of the live conversation: the exact system prompt and history
@@ -20,14 +20,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from .client import StreamClient
-from .conversation import SUMMARY_PREFIX, Conversation, Message
+from .conversation import (
+    SUMMARY_PREFIX,
+    Conversation,
+    Message,
+    Usage,
+    user_message,
+)
+from .images import ImageRef
 from .prompts import COMPACTION_PROMPT
-from .protocol import ContentDelta, StreamError, TurnComplete, Usage
+from .protocol import ContentDelta, RoundComplete, StreamError
 
 # Rough chars-per-token for the fallback estimate when the provider sends no
 # usage data. Deliberately conservative; results are labeled approximate.
-_CHARS_PER_TOKEN = 4
-
+CHARS_PER_TOKEN = 4
 
 @dataclass(slots=True)
 class CompactionResult:
@@ -39,17 +45,24 @@ class CompactionResult:
     after_tokens: int
 
 
-def message_tokens(message: Message) -> int:
-    """Rough context contribution of one message, in tokens.
+def context_tokens(messages: Sequence[Message]) -> int:
+    """Rough context size of ``messages``, in tokens.
 
-    Assistant messages carry their round's real usage; its output tokens are
-    what the message added to the context (input tokens would count the whole
-    prompt again). Everything else falls back to the chars-per-token
-    heuristic.
-    """
-    if message.usage is not None:
-        return message.usage.output_tokens
-    return len(message.content or "") // _CHARS_PER_TOKEN
+    The last real usage (the provider counted the whole prompt it saw) is
+    authoritative; messages appended after that round — tool results,
+    steering — are estimated from their characters."""
+    total = 0
+    estimated_from = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        usage = getattr(messages[index], "usage", None)
+        if usage is not None:
+            total += usage.input_tokens + usage.output_tokens
+            estimated_from = index
+            break
+    return total + sum(
+        len(messages[i].content or "") // CHARS_PER_TOKEN
+        for i in range(estimated_from + 1, len(messages))
+    )
 
 
 async def summarize(
@@ -69,7 +82,7 @@ async def summarize(
             parts.append(event.text)
         elif isinstance(event, StreamError):
             raise RuntimeError(event.message)
-        elif isinstance(event, TurnComplete):
+        elif isinstance(event, RoundComplete):
             usage = event.usage
             break
     summary = "".join(parts).strip()
@@ -86,23 +99,25 @@ async def compact(
     *,
     system: str | None = None,
     keep_reasoning: bool = False,
-    image_loader: Callable[[str], bytes | None] | None = None,
+    image_loader: Callable[[ImageRef], str | None] | None = None,
 ) -> CompactionResult | None:
-    """Summarize the visible history and advance the epoch.
+    """Summarize the visible history and shrink the visible slice to the
+    summary message.
 
     The summarizer request reuses the conversation's wire history (same
     system prompt, reasoning setting and images as a normal round) and appends
     the handoff instruction as a final user message. Tools are omitted for
     this round.
 
-    Returns None when there is nothing to compact yet. The caller is
-    responsible for folding ``result.usage`` into its session totals and
-    recording ``before_tokens`` / ``after_tokens`` for the notice.
-    """
-    compactable = conversation.visible_messages()
-    if not compactable:
+    Returns None when there is nothing to compact yet. The summary message
+    carries no usage of its own — the summarization round's usage is folded
+    into the session totals by the caller instead, so "the last
+    usage-bearing visible message" is None right after a compaction and the
+    auto-compactor cannot loop on it."""
+    visible = conversation.visible_messages()
+    if not visible:
         return None
-    before_tokens = sum(message_tokens(m) for m in compactable)
+    before_tokens = context_tokens(visible)
     wire_messages = conversation.to_wire(
         keep_reasoning=keep_reasoning, system=system,
         image_loader=image_loader,
@@ -112,13 +127,10 @@ async def compact(
         summary, usage = await summarize(client, wire_messages)
     else:
         summary, usage = await summarizer(wire_messages)
-    summary_message = Message(
-        role="user", content=f"{SUMMARY_PREFIX}\n\n{summary}",
-        kind="summary", usage=usage,
-    )
-    conversation.epoch += 1
-    conversation.add(summary_message)
+    conversation.add(user_message(
+        f"{SUMMARY_PREFIX}\n\n{summary}", is_summary=True,
+    ))
     return CompactionResult(
         summary=summary, usage=usage, before_tokens=before_tokens,
-        after_tokens=message_tokens(summary_message),
+        after_tokens=len(summary) // CHARS_PER_TOKEN,
     )

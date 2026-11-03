@@ -62,7 +62,7 @@ def test_plan_mode_binds_workspace_read_only(tmp_path) -> None:
 
     reads = _call(registry, "run_bash", '{"command": "cat app.py"}')
     assert reads.ok
-    assert "print('hi')" in reads.output
+    assert "print('hi')" in reads.content
 
     # The read-only mount blocks writes from the shell.
     write = _call(registry, "run_bash", '{"command": "touch blocked.txt"}')
@@ -166,10 +166,10 @@ def test_git_shim_blocks_in_place(tmp_path) -> None:
     # The blocked call fails in place; the shell keeps going and the last
     # statement's status (echo after) is the command's own.
     assert semi.ok
-    assert "before" in semi.output and "after" in semi.output
-    assert "blocked, read-only here" in semi.output
+    assert "before" in semi.output and "after" in semi.content
+    assert "blocked, read-only here" in semi.content
 
-    assert "before" in amp.output and "after" not in amp.output
+    assert "before" in amp.output and "after" not in amp.content
 
     assert inspect_.ok  # inspection subcommands pass the shim
     assert mention.ok  # mentioning git is not running git

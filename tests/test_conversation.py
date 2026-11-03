@@ -1,61 +1,85 @@
-"""Domain invariants for the conversation model (Phase 2 guard rails)."""
+"""Domain invariants for the conversation model."""
 
-from xarness.conversation import Conversation, Message
+from xarness.conversation import Conversation, user_message
 
 
 def test_sent_user_message_owns_a_turn_checkpoint() -> None:
     conversation = Conversation()
-    user = conversation.add(Message(role="user", content="hi"))
-    turn = conversation.begin_turn(user, "before")
+    user = conversation.add(user_message("hi"))
+    conversation.begin_turn(user, "before")
 
-    assert turn.user_message_id == user.id
+    turn = conversation.turns[user.id]
     assert turn.before_tree == "before"
     assert turn.after_tree is None  # open
     assert conversation.open_turn is turn
+    # The message itself stays immutable: the checkpoint lives in the
+    # conversation's side table, keyed by the message id.
+    assert "turn" not in user.model_dump()
 
 
 def test_steered_user_message_does_not_own_a_checkpoint() -> None:
     conversation = Conversation()
-    user = conversation.add(Message(role="user", content="hi"))
+    user = conversation.add(user_message("hi"))
     conversation.begin_turn(user, "before")
-    conversation.add(Message(role="user", content="steered"))
+    steered = conversation.add(user_message("steered"))
 
-    assert len(conversation.turns) == 1
-    assert conversation.turns[0].user_message_id == user.id
+    assert user.id in conversation.turns
+    assert steered.id not in conversation.turns
 
 
 def test_open_and_closed_turn() -> None:
     conversation = Conversation()
-    user = conversation.add(Message(role="user", content="hi"))
-    turn = conversation.begin_turn(user, "before")
+    user = conversation.add(user_message("hi"))
+    conversation.begin_turn(user, "before")
+    turn = conversation.turns[user.id]
     assert conversation.open_turn is turn
 
-    turn.after_tree = "after"
+    turn.closed = True
     assert conversation.open_turn is None
 
 
 def test_lock_turns_leaves_only_the_open_turn_unlocked() -> None:
     conversation = Conversation()
-    first = conversation.add(Message(role="user", content="one"))
+    first = conversation.add(user_message("one"))
     conversation.begin_turn(first, "a")
-    conversation.turns[-1].after_tree = "b"
-    second = conversation.add(Message(role="user", content="two"))
+    conversation.turns[first.id].after_tree = "b"
+    second = conversation.add(user_message("two"))
     conversation.begin_turn(second, "b")
 
     conversation.lock_turns("c")
 
-    closed, opened = conversation.turns
-    assert closed.locked and closed.before_tree == closed.after_tree == "c"
-    assert not opened.locked and opened.before_tree == "c"
-    assert opened.after_tree is None  # still open
+    first_turn = conversation.turns[first.id]
+    second_turn = conversation.turns[second.id]
+    assert first_turn.before_tree == first_turn.after_tree == "c"
+    assert second_turn.before_tree == "c"
+    assert second_turn.after_tree is None  # still open
 
 
-def test_epochs_hide_compacted_history() -> None:
+def test_rollback_prunes_dropped_turns() -> None:
     conversation = Conversation()
-    conversation.add(Message(role="user", content="old"))
-    conversation.epoch += 1
-    conversation.add(Message(role="user", content="summary", kind="summary"))
+    first = conversation.add(user_message("one"))
+    conversation.begin_turn(first, "a")
+    second = conversation.add(user_message("two"))
+    conversation.begin_turn(second, "b")
+
+    plan = conversation.rollback_plan_to(first)
+    conversation.apply_rollback(plan)
+
+    # Rolling back TO first truncates at first: both turns are gone.
+    assert second.id not in conversation.turns
+    assert first.id not in conversation.turns
+    assert conversation.turns == {}
+
+
+def test_the_last_summary_defines_the_visible_slice() -> None:
+    conversation = Conversation()
+    conversation.add(user_message("old"))
+    conversation.add(user_message("summary", is_summary=True))
 
     assert [m.content for m in conversation.visible_messages()] == ["summary"]
-    conversation.epoch -= 1
+    assert [m.content for m in conversation.history_messages()] == ["old"]
+    # Undoing a compaction pops the summary: the old messages come back.
+    conversation.apply_rollback(
+        conversation.rollback_plan()
+    )
     assert [m.content for m in conversation.visible_messages()] == ["old"]

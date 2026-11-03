@@ -1,15 +1,20 @@
 """In-memory conversation state, kept separate from the widget tree.
 
-Roles are modeled faithfully to the OpenAI wire format — including the
-reserved ``tool`` role and tool-call fields — so a future tool-calling layer
-can append tool-call/tool-result messages here without touching UI code.
-Reasoning text and token usage are stored locally per assistant message; by
-default reasoning is also sent back on later rounds (``keep_reasoning``), but
-usage never reaches the wire.
+Messages are a discriminated union on ``role`` — :class:`UserMessage`,
+:class:`AssistantMessage`, :class:`ToolMessage` — so every field is valid
+for exactly the role that uses it. They are pydantic models so the very
+same objects are persisted (session JSON) and shown to clients
+(snapshots) — there is no second mirrored model to keep in sync.
 
-``ToolCall`` and ``Message`` are pydantic models so the very same objects
-are persisted (session JSON) and shown to clients (snapshots) — there is no
-second mirrored model to keep in sync.
+History is append-only across compaction: a compaction appends one summary
+user message, and the *visible* slice is ``messages[i:]`` where ``i`` is
+just past the last summary. Undoing a compaction pops that summary; a
+rollback to an earlier message simply truncates (which drops the summary
+with it, when one is in the dropped range).
+
+Reasoning text and token usage are stored locally per assistant message; by
+default reasoning is also sent back on later rounds (``keep_reasoning``),
+but usage never reaches the wire.
 """
 
 from __future__ import annotations
@@ -17,21 +22,35 @@ from __future__ import annotations
 import base64
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, NamedTuple, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
 
 from .gitwork import TurnCheckpoint
 from .images import IMAGE_TOKEN_RE, ImageAttachment, ImageRef, token_text
 
-# Prefix of the summary user message compaction leaves behind. Identifying
-# it by content (not identity) keeps working across a session save/load.
-SUMMARY_PREFIX = "[earlier conversation, summarized]"
+# Every state a tool result can be in. ``parse_error`` means the model's
+# arguments were invalid (it should retry with valid ones); ``interrupted``
+# is the synthetic result an orphaned tool call gets after a cancel.
+ToolStatus = Literal["ok", "error", "parse_error", "interrupted"]
 
-def is_summary(message: "Message") -> bool:
-    """True for the summary user message a compaction leaves behind."""
-    return message.kind == "summary"
+
+class ToolResult(NamedTuple):
+    """One tool call's outcome: a status and the single text both the model
+    and the UI see. A failing call keeps its real output in ``content`` (a
+    failing test run must reach the model, not just its exit code)."""
+
+    status: ToolStatus = "ok"
+    content: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+# The marker a compaction's summary message starts with (a rendering detail;
+# identification is the ``is_summary`` flag).
+SUMMARY_PREFIX = "[earlier conversation, summarized]"
 
 
 class TextPart(BaseModel):
@@ -58,7 +77,7 @@ MessagePart = TextPart | ImagePart
 
 
 def build_parts(
-    text: str, images: list[ImageAttachment] | None,
+    text: str, images: list["ImageAttachment | ImageRef"] | None,
     store: Any = None,
 ) -> list[MessagePart]:
     """Build ordered text/image parts from a user message.
@@ -66,9 +85,11 @@ def build_parts(
     The text carries one ``[🖼 name W×H #id]`` token per attachment; parts are
     emitted in token order so ``compare [img1] with [img2]`` keeps its
     meaning. A token without a matching attachment stays text, and an
-    attachment without a token is appended at the end. ``store`` (an object
-    with ``save(ImageAttachment) -> ImageRef``) writes the bytes to the blob
-    store; without one the parts carry transient ``data`` instead.
+    attachment without a token is appended at the end. ``images`` items are
+    either :class:`ImageRef` (bytes already in the store) or
+    :class:`ImageAttachment`; ``store`` (an object with
+    ``save(ImageAttachment) -> ImageRef``) writes attachment bytes to the
+    blob store; without one the parts carry transient ``data`` instead.
     """
     if not images:
         return [TextPart(text=text)] if text else []
@@ -76,7 +97,10 @@ def build_parts(
     used: set[int] = set()
     parts: list[MessagePart] = []
 
-    def add_image(image: ImageAttachment) -> None:
+    def add_image(image: "ImageAttachment | ImageRef") -> None:
+        if isinstance(image, ImageRef):
+            parts.append(ImagePart(ref=image))
+            return
         ref = store.save(image) if store is not None else image.to_ref()
         parts.append(ImagePart(
             ref=ref, data=None if store is not None else image.data(),
@@ -106,8 +130,14 @@ def build_parts(
 def image_refs(message: "Message") -> list[ImageRef]:
     """The image references carried by a message, in text order."""
     return [
-        part.ref for part in message.parts or () if isinstance(part, ImagePart)
+        part.ref for part in getattr(message, "parts", None) or ()
+        if isinstance(part, ImagePart)
     ]
+
+
+def is_summary(message: "Message") -> bool:
+    """True for the summary user message a compaction leaves behind."""
+    return message.role == "user" and message.is_summary
 
 
 class ToolCall(BaseModel):
@@ -135,23 +165,38 @@ class ToolCall(BaseModel):
 
 
 class Usage(BaseModel):
-    """Token usage for a turn. ``approximate`` marks locally estimated counts.
+    """Token usage for one round.
 
     A pydantic model (not a dataclass) so the very same object crosses the
-    wire in snapshots and persists losslessly."""
+    wire in snapshots and persists losslessly. ``cached_tokens`` /
+    ``reasoning_tokens`` account for prefix-cache hits and thinking-channel
+    spend when the provider reports them."""
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
     approximate: bool = False
+
+    def context_tokens(self, keep_reasoning: bool = True) -> int:
+        """The context size this round implies (input side).
+
+        Reasoning tokens count only when they are actually re-sent: with
+        ``keep_reasoning`` off the next request drops them, so counting
+        them would overestimate the context and trigger compaction early."""
+        output = self.output_tokens
+        if not keep_reasoning and self.reasoning_tokens:
+            output = max(0, output - self.reasoning_tokens)
+        return self.input_tokens + output
 
 
 class Timing(BaseModel):
     """When a message happened and (for a turn's last answer) how long it took.
 
-    One sub-model instead of six fields scattered on ``Message``. Stamps are
-    wall-clock UTC ISO 8601; ``summary`` is the derived turn timing line
-    ("total | running idle") stamped only on the turn's last assistant
-    message so every client and every reload shows the same one."""
+    One sub-model instead of six fields scattered on each message. Stamps are
+    wall-clock UTC ISO 8601; ``reasoning_seconds`` is the derived thinking
+    duration stamped only on the turn's last assistant message so every
+    client and every reload shows the same one."""
 
     send: str | None = None
     start: str | None = None
@@ -159,96 +204,135 @@ class Timing(BaseModel):
     reasoning_seconds: float | None = None
 
 
-class Message(BaseModel):
-    """One conversation message, mirroring the API's message object."""
+class BaseMessage(BaseModel):
+    """Fields every message carries."""
 
-    role: Literal["user", "assistant", "system", "tool"]
-    content: str = ""
-    # "summary" marks the handoff message compaction appends; "interrupted"
-    # marks a partial assistant message saved when a turn was cancelled.
-    kind: Literal["normal", "summary", "interrupted"] = "normal"
-    # Compaction epoch: the conversation shows only messages whose epoch
-    # equals the current one (plus later appends). Undo-compaction flips the
-    # epoch back instead of restoring a second copy of the history.
-    epoch: int = 0
     # Stable id (uuid4), persisted. Click-to-undo addresses messages by
     # id, not object identity.
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    # Timestamps and the derived timing line. Never sent to the provider.
+    # Timestamps. Never sent to the provider.
     timing: Timing = Field(default_factory=Timing)
-    # Local-only: reasoning-channel text for assistant messages.
-    reasoning: str | None = None
-    # Local-only: token usage reported for the round that produced this
-    # message (assistant messages only; never sent over the wire).
-    usage: Usage | None = None
-    # Tool result outcome, persisted explicitly instead of encoded in the
-    # content prefix, so the TUI can rebuild the call's status faithfully.
-    ok: bool = True
-    parse_error: bool = False
-    name: str | None = None
-    tool_call_id: str | None = None
-    tool_calls: list[ToolCall] | None = None
-    # Ordered text/image segments of a user message. Images are stored by
-    # content hash (see ImageRef); the provider wire format is assembled in
-    # to_wire, so persistence and snapshots carry no base64 payloads.
-    parts: list[TextPart | ImagePart] | None = None
+
+
+class UserMessage(BaseMessage):
+    """A user turn opener or steering message. Text and images live in
+    ``parts`` — the single source, in order; ``content`` is the joined
+    text, derived."""
+
+    role: Literal["user"] = "user"
+    parts: list[TextPart | ImagePart] = Field(default_factory=list)
+    # True for the handoff message compaction appends.
+    is_summary: bool = False
+
+    @property
+    def content(self) -> str:
+        """The joined text of the message's text parts (derived, never stored)."""
+        return "".join(
+            part.text for part in self.parts if isinstance(part, TextPart)
+        )
 
     def to_wire(
         self, include_reasoning: bool = False,
-        image_loader: Callable[[str], bytes | None] | None = None,
+        image_loader: "Callable[[ImageRef], str | None] | None" = None,
     ) -> dict[str, Any]:
-        message: dict[str, Any] = {"role": self.role}
+        image_parts = [p for p in self.parts if isinstance(p, ImagePart)]
+        if not image_parts:
+            return {"role": "user", "content": self.content}
+        # Multipart content, in the order the text/image parts were
+        # recorded. The image data-URL comes from the loader (the session
+        # blob store's cache); ``part.data`` is the transient fallback for
+        # callers without a store.
+        content: list[dict[str, Any]] = []
+        for part in self.parts:
+            if isinstance(part, TextPart):
+                if part.text:
+                    content.append({"type": "text", "text": part.text})
+                continue
+            url = image_loader(part.ref) if image_loader is not None else None
+            if url is None and part.data is not None:
+                encoded = base64.b64encode(part.data).decode("ascii")
+                url = f"data:{part.ref.mime};base64,{encoded}"
+            if url is None:
+                # The blob is gone: keep the message valid rather than
+                # silently dropping the attachment entirely.
+                content.append({"type": "text", "text": token_text(part.ref)})
+                continue
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        return {"role": "user", "content": content}
+
+
+class AssistantMessage(BaseMessage):
+    """One model response: the final text, the reasoning channel, and any
+    tool calls it made. ``interrupted`` marks a partial message saved when
+    a turn was cancelled."""
+
+    role: Literal["assistant"] = "assistant"
+    content: str = ""
+    # Local-only: reasoning-channel text for assistant messages.
+    reasoning: str | None = None
+    # Local-only: token usage reported for the round that produced this
+    # message (never sent over the wire).
+    usage: Usage | None = None
+    tool_calls: list[ToolCall] | None = None
+    interrupted: bool = False
+
+    def to_wire(
+        self, include_reasoning: bool = False,
+        image_loader: "Callable[[ImageRef], str | None] | None" = None,
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": "assistant"}
         # Per spec, an assistant message that only calls tools should omit
         # content entirely — some providers reject an empty string there.
-        if self.content or self.role != "assistant" or not self.tool_calls:
+        if self.content or not self.tool_calls:
             message["content"] = self.content
-        image_parts = [p for p in self.parts or () if isinstance(p, ImagePart)]
-        if self.role == "user" and image_parts:
-            # Multipart content, in the order the text/image parts were
-            # recorded. The bytes are resolved from the session blob store
-            # (or carried transiently when there is no store).
-            content: list[dict[str, Any]] = []
-            for part in self.parts or ():
-                if isinstance(part, TextPart):
-                    if part.text:
-                        content.append({"type": "text", "text": part.text})
-                    continue
-                data = part.data
-                if data is None and image_loader is not None:
-                    data = image_loader(part.ref.id)
-                if data is None:
-                    # The blob is gone: keep the message valid rather than
-                    # silently dropping the attachment entirely.
-                    content.append({"type": "text", "text": token_text(part.ref)})
-                    continue
-                encoded = base64.b64encode(data).decode("ascii")
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{part.ref.mime};base64,{encoded}"},
-                })
-            message["content"] = content
-        if include_reasoning and self.role == "assistant" and self.reasoning is not None:
+        if include_reasoning and self.reasoning:
             # DeepSeek-style field name; providers that don't know it ignore it.
             message["reasoning_content"] = self.reasoning
-        if self.name is not None:
-            message["name"] = self.name
-        if self.tool_call_id is not None:
-            message["tool_call_id"] = self.tool_call_id
         if self.tool_calls is not None:
             message["tool_calls"] = [call.to_wire() for call in self.tool_calls]
         return message
 
 
-class Turn(BaseModel):
-    """One tracked user turn: the user message that opened it and the git
-    trees on either side of its edits. ``after_tree is None`` means open."""
+class ToolMessage(BaseMessage):
+    """One tool result, addressed by ``tool_call_id``. ``content`` is the
+    single text both the model and the UI see — a failing call keeps its
+    real output there."""
 
-    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    user_message_id: str
-    before_tree: str | None = None
-    after_tree: str | None = None
-    # /accept locks a turn: its files can no longer be reverted by /undo.
-    locked: bool = False
+    role: Literal["tool"] = "tool"
+    tool_call_id: str
+    content: str = ""
+    status: ToolStatus = "ok"
+
+    def to_wire(
+        self, include_reasoning: bool = False,
+        image_loader: "Callable[[ImageRef], str | None] | None" = None,
+    ) -> dict[str, Any]:
+        return {"role": "tool", "tool_call_id": self.tool_call_id,
+                "content": self.content}
+
+
+Message = Annotated[
+    Union[UserMessage, AssistantMessage, ToolMessage],
+    Field(discriminator="role"),
+]
+
+
+def user_message(
+    text: str,
+    images: list[ImageAttachment] | None = None,
+    store: Any = None,
+    **kwargs: Any,
+) -> UserMessage:
+    """A user message with its text/image parts in order."""
+    return UserMessage(
+        parts=build_parts(text, images, store) if images else (
+            [TextPart(text=text)] if text else []
+        ),
+        **kwargs,
+    )
+
+
+MESSAGE_ADAPTER = TypeAdapter(Message)
 
 
 @dataclass(slots=True)
@@ -261,46 +345,111 @@ class RollbackPlan:
 
     user_text: str  # the turn's user message (input box / resend)
     revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
-    keep: list[Message]  # what the conversation becomes
+    # The conversation becomes ``messages[:drop_from]``. Rolling back past a
+    # compaction's summary truncates the summary away automatically.
+    drop_from: int
     images: list[ImageRef] | None = None
-    # Epoch to restore (undoing a compaction flips it back instead of
-    # restoring a second copy of the history).
-    epoch: int = 0
-    # True for a compaction-only undo: no messages are dropped, the turn
-    # stays intact, no files are reverted, and the input box is not touched.
-    compaction_only: bool = False
+    # True for a compaction undo: no messages but the summary are dropped,
+    # the turn stays intact, no files are reverted.
+    compaction: bool = False
 
 
-@dataclass(slots=True)
-class Conversation:
+class Conversation(BaseModel):
     """Ordered message history; the single source of truth for the chat.
 
-    ``messages`` is append-only across compaction: old epochs stay in the
-    list and are simply hidden by ``visible_messages`` until an undo flips
-    ``epoch`` back. ``turns`` owns the per-turn git checkpoints, so a user
-    message carries no turn state of its own."""
+    ``messages`` is append-only across compaction: a compaction appends a
+    summary user message and everything before it drops out of the visible
+    slice (but stays for the human transcript) until the summary is popped.
 
-    messages: list[Message] = field(default_factory=list)
-    turns: list[Turn] = field(default_factory=list)
-    epoch: int = 0
+    Turn checkpoints live in ``turns``, keyed by the opening user message's
+    id — messages are truly immutable and append-only is sound (a turn end,
+    an accept or a rollback mutates only this side table, never a persisted
+    message row). A message id without an entry is a steering message, a
+    summary, or a legacy message from before tracking."""
+
+    messages: list[Message] = Field(default_factory=list)
+    turns: dict[str, TurnCheckpoint] = Field(default_factory=dict)
+
+    _visible_cache: "tuple[int, int, int] | None" = PrivateAttr(default=None)
 
     def add(self, message: Message) -> Message:
-        message.epoch = self.epoch
         self.messages.append(message)
+        self._invalidate_visible()
         return message
 
+    def _invalidate_visible(self) -> None:
+        self._visible_cache = None
+
+    def visible_index(self) -> int:
+        """First index of the visible slice: the last summary message (the
+        model sees the summary plus everything after it).
+
+        Cached against the identity and length of the message list — both
+        change on every append and truncation, and messages are immutable,
+        so a hit is always valid."""
+        cache = self._visible_cache
+        if cache is not None and cache[0] == id(self.messages) \
+                and cache[1] == len(self.messages):
+            return cache[2]
+        index = 0
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].role == "user" and self.messages[i].is_summary:
+                index = i
+                break
+        self._visible_cache = (id(self.messages), len(self.messages), index)
+        return index
+
     def visible_messages(self) -> list[Message]:
-        return [m for m in self.messages if m.epoch == self.epoch]
+        return self.messages[self.visible_index():]
+
+    def history_messages(self) -> list[Message]:
+        """Everything the visible slice hides (compacted-away transcript)."""
+        return self.messages[:self.visible_index()]
 
     @property
-    def open_turn(self) -> Turn | None:
-        """The still-open turn (its after_tree not yet recorded), or None."""
-        return next((t for t in reversed(self.turns) if t.after_tree is None), None)
+    def open_turn(self) -> TurnCheckpoint | None:
+        """The still-open turn's checkpoint (``closed`` not yet set), or
+        None.
 
-    def begin_turn(self, user_message: Message, before_tree: str | None) -> Turn:
-        turn = Turn(user_message_id=user_message.id, before_tree=before_tree)
-        self.turns.append(turn)
-        return turn
+        ``turns`` is insertion-ordered and entries are added in message
+        order, so the last unclosed entry is the open turn — no walk over
+        the whole message list."""
+        for turn in reversed(list(self.turns.values())):
+            if not turn.closed:
+                return turn
+        return None
+
+    def close_crashed_turns(self) -> list[TurnCheckpoint]:
+        """Close every turn left open by a crash (a loaded session can never
+        have a running turn).
+
+        Tracked turns (``before_tree`` set) with no after tree get the
+        before tree as a placeholder — "no edits attributed" — and are
+        returned so the caller can stamp the real workspace tree over it
+        and mark it seen. Untracked turns (``before_tree`` None) are just
+        closed: the host's tree-based repair never saw them, and a turn
+        left open forever makes ``open_turn`` and ``open_turn_before``
+        return stale results."""
+        repaired: list[TurnCheckpoint] = []
+        for turn in self.turns.values():
+            if turn.closed:
+                continue
+            turn.closed = True
+            if turn.before_tree is not None and turn.after_tree is None:
+                turn.after_tree = turn.before_tree
+                repaired.append(turn)
+        return repaired
+
+    def begin_turn(self, user_message: UserMessage, before_tree: str | None) -> None:
+        """Attach a fresh checkpoint to the turn-opening user message.
+
+        Always called — with ``before_tree=None`` when there is no git
+        tracking or the snapshot failed — so every real turn has an entry
+        and a rollback plan never has to guess from "the last user
+        message" (which could be steering)."""
+        self.turns[user_message.id] = TurnCheckpoint(
+            before_tree=before_tree, after_tree=None,
+        )
 
     # -- rollback planning ------------------------------------------------
 
@@ -311,29 +460,35 @@ class Conversation:
         """Plan the rollback of the last user turn, or None if there is
         nothing to undo (no user message, or no response to it yet).
 
-        If the most recent thing that happened is a compaction (a summary in
-        the visible history, no real user turn after it), /undo //retry undo
-        the compaction itself first by flipping the epoch back; the turn that
-        triggered it stays intact and no files are touched."""
-        visible = self.visible_messages()
-        if self.epoch > 0 and visible and is_summary(visible[-1]):
+        If the most recent thing that happened is a compaction (a summary is
+        the last message), /undo //retry undo the compaction itself first by
+        popping the summary; the turn that triggered it stays intact and no
+        files are touched."""
+        if self.messages and is_summary(self.messages[-1]):
             return RollbackPlan(
-                user_text="", revert_turns=[], keep=list(self.messages),
-                epoch=self.epoch - 1, compaction_only=True,
+                user_text="", revert_turns=[],
+                drop_from=len(self.messages) - 1, compaction=True,
             )
-        turn = self.turns[-1] if self.turns else None
-        message = self.message_by_id(turn.user_message_id) if turn else None
-        if message is None:
-            # Legacy session without a tracked turn: fall back to the last
+        turn_message = next(
+            (m for m in reversed(self.messages)
+             if m.role == "user" and m.id in self.turns),
+            None,
+        )
+        if turn_message is None:
+            # Legacy message without a tracked turn: fall back to the last
             # real user message that has a response after it.
-            message = next(
+            visible = self.visible_messages()
+            turn_message = next(
                 (m for m in reversed(visible)
-                 if m.role == "user" and not is_summary(m) and m is not visible[-1]),
+                 if m.role == "user" and not is_summary(m)
+                 and m is not visible[-1]),
                 None,
             )
-        if message is None or (visible and message is visible[-1]):
+        if turn_message is None or (
+            self.messages and turn_message is self.messages[-1]
+        ):
             return None  # the turn produced no response yet
-        return self.rollback_plan_to(message)
+        return self.rollback_plan_to(turn_message)
 
     def rollback_plan_to(self, message: Message) -> RollbackPlan | None:
         """Plan a rollback to an arbitrary earlier user message
@@ -341,7 +496,7 @@ class Conversation:
         the workspace to the checkpoint taken when it was sent.
 
         Searches the full append-only history, so messages the last compaction
-        summarized away are found too (the epoch simply drops back to theirs).
+        summarized away are found too (truncating past the summary drops it).
         Returns None when the message is not a user turn in this conversation.
         """
         if message.role != "user" or is_summary(message):
@@ -351,68 +506,104 @@ class Conversation:
         )
         if index is None:
             return None
-        dropped_ids = {m.id for m in self.messages[index:]}
-        # Revert only closed, unlocked turns that are being dropped; their
-        # file edits can still be undone.
+        # Revert only closed turns that are being dropped and actually
+        # changed files; their file edits can still be undone.
         revert = [
-            TurnCheckpoint(t.before_tree, t.after_tree)
-            for t in reversed(self.turns)
-            if t.user_message_id in dropped_ids and not t.locked
-            and t.before_tree and t.after_tree
+            self.turns[message.id] for message in reversed(self.messages[index:])
+            if (turn := self.turns.get(message.id)) is not None
+            and turn.before_tree and turn.after_tree
+            and turn.before_tree != turn.after_tree
         ]
         return RollbackPlan(
-            user_text=message.content, revert_turns=revert[::-1],
-            keep=list(self.messages[:index]), epoch=message.epoch,
+            user_text=message.content, revert_turns=revert[::-1], drop_from=index,
             images=image_refs(message) or None,
         )
 
     def apply_rollback(self, plan: RollbackPlan) -> None:
         """Truncate the conversation to the plan. File edits are reversed
-        separately, so a conflict can abort before the conversation changes."""
-        self.messages = list(plan.keep)
-        self.epoch = plan.epoch
-        kept = {m.id for m in self.messages}
-        self.turns = [t for t in self.turns if t.user_message_id in kept]
+        separately, so a conflict can abort before the conversation changes.
+
+        The dropped turns' checkpoints are pruned too: turns are keyed by
+        message id, and a pruned id must never resurrect."""
+        self.messages = self.messages[:plan.drop_from]
+        self._invalidate_visible()
+        keep = {m.id for m in self.messages}
+        self.turns = {
+            message_id: turn for message_id, turn in self.turns.items()
+            if message_id in keep
+        }
 
     def lock_turns(self, tree: str) -> None:
         """Point every turn's checkpoints at ``tree`` (an accepted/rejected
-        baseline) and mark the closed ones locked. The open turn keeps
-        ``after_tree = None`` so finish_turn still records its end."""
+        baseline). A turn whose before/after trees are equal can no longer be
+        reverted — reverting it is a no-op — which is what "locked" means.
+        The open turn keeps ``after_tree = None`` so finish_turn still
+        records its end."""
         open_turn = self.open_turn
-        for turn in self.turns:
+        for turn in self.turns.values():
             turn.before_tree = tree
             if turn is not open_turn:
                 turn.after_tree = tree
-                turn.locked = True
 
-    def repair_orphaned_tool_calls(self, now: str | None = None) -> bool:
+    def turn_checkpoints(self) -> list[TurnCheckpoint]:
+        """The reversible turns since the baseline, oldest first."""
+        return [
+            turn for message in self.messages
+            if (turn := self.turns.get(message.id)) is not None
+            and turn.before_tree and turn.after_tree
+            and turn.before_tree != turn.after_tree
+        ]
+
+    def known_trees(self) -> list[str]:
+        """Every after-tree the conversation ever recorded (locked turns
+        included): the workspace states the session has accounted for."""
+        return [
+            turn.after_tree for message in self.messages
+            if (turn := self.turns.get(message.id)) is not None
+            and turn.after_tree
+        ]
+
+    def repair_orphaned_tool_calls(self, now: str | None = None) -> "int | None":
         """Give any assistant tool_call without a matching tool message a
-        synthetic interrupted result (``kind="interrupted"``, ``ok=False``),
-        so the next API request is valid. Runs after a cancel and on a
-        session load. Returns True when anything was added."""
-        visible = self.visible_messages()
+        synthetic interrupted result, so the next API request is valid. Runs
+        after a cancel and on a session load.
+
+        Returns the lowest insertion index, or None when nothing was added —
+        the caller uses it to move a tail-only persistence watermark back
+        (the insert shifts rows that a tail-only write would not rewrite)."""
         answered = {
-            m.tool_call_id for m in visible
+            m.tool_call_id for m in self.messages
             if m.role == "tool" and m.tool_call_id
         }
-        changed = False
-        for message in visible:
+        lowest: int | None = None
+        # Insert each synthetic result right after the assistant message
+        # that owns the call: appending at the end of the history would
+        # leave the tool message non-adjacent to its assistant message
+        # (a session saved mid-tool-loop and then steered), which some
+        # providers reject.
+        for index in range(len(self.messages) - 1, -1, -1):
+            message = self.messages[index]
             if message.role != "assistant" or not message.tool_calls:
                 continue
-            for call in message.tool_calls:
-                if call.call_id not in answered:
-                    self.add(Message(
-                        role="tool", tool_call_id=call.call_id,
-                        content="interrupted", kind="interrupted", ok=False,
-                        end_time=now,
-                    ))
-                    answered.add(call.call_id)
-                    changed = True
-        return changed
+            missing = [c for c in message.tool_calls if c.call_id not in answered]
+            if not missing:
+                continue
+            # One tool message per missing call, all directly after the
+            # owning assistant message.
+            for offset, call in enumerate(missing, start=1):
+                answered.add(call.call_id)
+                self.messages.insert(index + offset, ToolMessage(
+                    tool_call_id=call.call_id,
+                    content="interrupted", status="interrupted",
+                    timing=Timing(end=now),
+                ))
+            self._invalidate_visible()
+            lowest = index if lowest is None else min(lowest, index)
+        return lowest
 
     def to_wire(
         self, keep_reasoning: bool = False, system: str | None = None,
-        image_loader: Callable[[str], bytes | None] | None = None,
+        image_loader: Callable[[ImageRef], str | None] | None = None,
     ) -> list[dict[str, Any]]:
         # Orphaned tool calls (turn interrupted mid-execution, session saved
         # mid-turn) are answered synthetically by Session._repair_tool_calls,
@@ -421,10 +612,18 @@ class Conversation:
         messages = []
         if system is not None:
             messages.append({"role": "system", "content": system})
-        messages.extend(
-            message.to_wire(
-                include_reasoning=keep_reasoning, image_loader=image_loader,
+        for message in self.visible_messages():
+            if (
+                message.role == "assistant" and message.interrupted
+                and not message.content and not message.tool_calls
+            ):
+                # A reasoning-only partial: an empty assistant content string
+                # is rejected by some providers, and the reasoning alone is
+                # not worth a message slot on the wire.
+                continue
+            messages.append(
+                message.to_wire(
+                    include_reasoning=keep_reasoning, image_loader=image_loader,
+                )
             )
-            for message in self.visible_messages()
-        )
         return messages

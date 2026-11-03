@@ -10,18 +10,28 @@ from textual.pilot import Pilot
 
 from xarness import protocol
 from xarness.clientlib import ClientError
-from xarness.conversation import Timing
+from xarness.conversation import (
+    AssistantMessage, TextPart, Timing, ToolMessage, UserMessage,
+)
 from xarness.protocol import (
+    Activity,
     CommandResult,
     ConfigInfo,
     DiffInfo,
     Event,
+    SessionConfigView,
     SessionSummary,
     Snapshot,
     StatusPayload,
 )
 from xarness.tui import flow as tflow
 from xarness.tui.transcript import ToolStatus
+
+
+def _model_info() -> dict:
+    """Full ModelInfo fields (ConfigInfo.models is typed now)."""
+    return {"cot_strength": "medium", "max_context": 128_000,
+            "supports_vision": False, "auto_compact": True}
 
 
 class FakeClient:
@@ -55,7 +65,7 @@ class FakeClient:
     async def command(self, name: str, command) -> CommandResult:
         self.commands.append((name, command))
         return self.command_results.get(
-            command.type, CommandResult(cmd_id="t", ok=True, payload=protocol.RollbackResult(user_text="put back")),
+            command.type, CommandResult(cmd_id="t", ok=True, user_text="put back"),
         )
 
     async def sessions(self, **kwargs):
@@ -63,7 +73,8 @@ class FakeClient:
 
     async def config(self):
         return protocol.ConfigInfo(
-            models=[{"name": "glm-flash", "display_name": "GLM Flash"}],
+            models=[dict(_model_info(), name="glm-flash",
+                         display_name="GLM Flash")],
             sandboxes=[{"name": "default"}],
             presets=["default"], themes=[],
             default_model="glm-flash",
@@ -111,20 +122,18 @@ def make_snapshot(state: str = "idle") -> Snapshot:
     return Snapshot(
         messages=[],
         status=StatusPayload(
-            state=state,  # type: ignore[arg-type]
-            session_name="s1", workspace="/tmp/ws", mode="write",
-            model_name="m", model_display_name="m", model_id="m",
+            config=SessionConfigView(
+                session_name="s1", workspace="/tmp/ws", mode="write",
+                model_name="m", model_display_name="m", model_id="m",
+            ),
+            activity=Activity(state=state),  # type: ignore[arg-type]
         ),
     )
 
 
 def running_status_event() -> Event:
     return protocol.StatusChanged(
-        status=StatusPayload(
-            state="running",  # type: ignore[arg-type]
-            session_name="s1", workspace="/tmp/ws", mode="write",
-            model_name="m", model_display_name="m", model_id="m",
-        )
+        activity=Activity(state="running"),  # type: ignore[arg-type]
     )
 
 
@@ -204,8 +213,11 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [type(e.item).__name__ for e in app._flow_model.entries
                  if type(e.item).__name__ == "UserItem"], [])
-            client.queue.put_nowait(protocol.UserMessageAdded(
-                text="hello", message_id="m1", send_time="2026-01-01T00:00:00+00:00",
+            client.queue.put_nowait(protocol.MessageAdded(
+                message=UserMessage(
+                    parts=[TextPart(text="hello")], id="m1",
+                    timing=Timing(send="2026-01-01T00:00:00+00:00"),
+                ),
             ))
             await pilot.pause()
             users = [e for e in app._flow_model.entries
@@ -224,7 +236,7 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            client.queue.put_nowait(protocol.StatusChanged(status=StatusPayload(
+            client.queue.put_nowait(protocol.StatusChanged(activity=Activity(
                 state="running",  # type: ignore[arg-type]
                 session_name="s1", workspace="/tmp/ws", mode="write",
                 model_name="m", model_display_name="m", model_id="m",
@@ -345,9 +357,8 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause()
             # Empty Enter with queued messages flushes them now.
-            app.status = app.status.model_copy(update={
-                "queued": [QueuedMessage(text="steer")],
-            })
+            assert app._activity is not None
+            app._activity.queued = [QueuedMessage(text="steer")]
             app._refresh_steer_bar()
             await pilot.press("enter")
             await pilot.pause()
@@ -382,12 +393,10 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            status = running_status_event().status.model_copy(
+            activity = running_status_event().activity.model_copy(
                 update={"clients_attached": 2},
             )
-            client.queue.put_nowait(__import__(
-                "xarness.protocol", fromlist=["StatusChanged"],
-            ).StatusChanged(status=status))
+            client.queue.put_nowait(protocol.StatusChanged(activity=activity))
             await pilot.pause()
             await pilot.press("ctrl+c")
             await pilot.pause()
@@ -490,8 +499,8 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             q.put_nowait(protocol.ToolCallStarted(call_id="c1", name="read_file"))
             q.put_nowait(protocol.ToolCallArgumentsDone(
                 call_id="c1", name="read_file", arguments_json="{}"))
-            q.put_nowait(protocol.TurnComplete(has_tool_calls=True))
-            q.put_nowait(protocol.ToolFinished(call_id="c1", ok=True, output="ok"))
+            q.put_nowait(protocol.RoundComplete(has_tool_calls=True))
+            q.put_nowait(protocol.ToolFinished(call_id="c1", status="ok", content="ok"))
             await pilot.pause(); await pilot.pause()
             thinking = items(tflow.ThinkingItem)
             self.assertEqual(len(thinking), 1)
@@ -506,7 +515,7 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(thinking[1].item.reasoning, "think two")
             assistants = items(tflow.AssistantItem)
             self.assertEqual(len(assistants), 2, "round 2 answer needs its own entry")
-            q.put_nowait(protocol.TurnComplete())
+            q.put_nowait(protocol.RoundComplete())
             await pilot.pause()
 
         app_client = FakeClient(make_snapshot(state="running"))
@@ -526,14 +535,15 @@ class DriftPromptStateTest(unittest.IsolatedAsyncioTestCase):
                        session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.status = StatusPayload(
+            app._config = SessionConfigView(session_name="s1")
+            app._activity = Activity(
                 state="idle",
                 pending_drift=protocol.PendingDrift(
                     workspace="/tmp/ws", last_known="aaa", current="bbb",
                     files=["a.txt"]),
             )
             await app._handle_event(protocol.DriftResolved(accepted=False))
-            self.assertIsNone(app.status.pending_drift)
+            self.assertIsNone(app._activity.pending_drift)
 
 
 class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
@@ -708,7 +718,7 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
                 arguments_json='{"path": "a.py", "edits": []}',
             ))
             client.queue.put_nowait(protocol.ToolFinished(
-                call_id="e1", ok=True, output=output,
+                call_id="e1", status="ok", content=output,
             ))
             await pilot.pause()
             await pilot.pause()
@@ -774,7 +784,15 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 str(option_list.get_option_at_index(i).prompt)
                 for i in range(option_list.option_count)
             ]
-            self.assertEqual(len(prompts), 5)
+            self.assertEqual(len(prompts), 6)
+            # The live sessions (with a state word) and the saved sessions
+            # of this workspace are separated by one blank row of padding,
+            # which the list marks disabled so the cursor skips it.
+            blank = [i for i, p in enumerate(prompts) if not p.strip()]
+            self.assertEqual(len(blank), 1, "missing the one-row section gap")
+            self.assertEqual(blank[0], 3, "gap belongs after the live rows")
+            spacer = option_list.get_option_at_index(blank[0])
+            self.assertTrue(spacer.disabled, "the gap must not be selectable")
             # Only loaded sessions get a state word; saved-one shows none.
             from xarness.tui.list_picker import STATE_WIDTH as _STATE_WIDTH
             for state, name in (("waiting", "waiting-one"),
@@ -793,8 +811,49 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                          "idle-one", "saved-one"):
                 self.assertTrue(
                     any(name in p for p in prompts), f"{name} missing from rows")
-            # Every row shows an age column.
-            self.assertTrue(all("m" in p or "h" in p or "d" in p for p in prompts))
+            # Every session row shows an age column (the gap row does not).
+            rows = [p for i, p in enumerate(prompts) if i not in blank]
+            self.assertTrue(all("m" in p or "h" in p or "d" in p for p in rows))
+
+    async def test_gap_hidden_while_filtering_and_never_highlighted(self) -> None:
+        """The blank gap row is padding only: typing hides it and the cursor
+        steps over it."""
+        from textual.app import App, ComposeResult
+        from textual.widgets import Input, Label, OptionList
+
+        from xarness.tui.list_picker import ListPicker, session_options
+
+        class Host(App):
+            def compose(self) -> ComposeResult:
+                yield Label("")
+
+        app = Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(ListPicker(
+                session_options(self._summaries(), None),
+                title="Open session", filterable=True,
+            ))
+            await pilot.pause()
+            option_list = app.screen.query_one("#picker-list", OptionList)
+            self.assertEqual(option_list.option_count, 6)
+            self.assertEqual(option_list.highlighted, 0)
+            # waiting-one -> running-one -> compacting-one -> (gap) -> idle-one
+            for _ in range(3):
+                await pilot.press("down")
+                await pilot.pause()
+            self.assertEqual(
+                option_list.get_option_at_index(option_list.highlighted).id,
+                "idle-one",
+            )
+            # Typing narrows the list and drops the gap row.
+            app.screen.query_one("#picker-search", Input).value = "saved"
+            await pilot.pause()
+            self.assertEqual(option_list.option_count, 1)
+            self.assertEqual(
+                option_list.get_option_at_index(option_list.highlighted).id,
+                "saved-one",
+            )
 
     async def test_update_options_keeps_filter_and_highlight(self) -> None:
         """The live /sessions refresh replaces rows without moving the
@@ -951,8 +1010,12 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             object.__setattr__(
                 snap, "status",
                 StatusPayload(
-                    state="idle", session_name="other", workspace="/other/ws",
-                    mode="write", model_name="m", model_display_name="m", model_id="m",
+                    config=SessionConfigView(
+                        session_name="other", workspace="/other/ws",
+                        mode="write", model_name="m", model_display_name="m",
+                        model_id="m",
+                    ),
+                    activity=Activity(state="idle"),
                 ),
             )
             client.snapshot_data = snap
@@ -970,7 +1033,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, client, app)
 
     async def test_finished_suffix_clears_when_the_next_turn_starts(self) -> None:
-        from xarness.protocol import ProcessingStarted, TurnFinished
+        from xarness.protocol import ProcessingStarted
         from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
@@ -983,9 +1046,13 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             object.__setattr__(
                 snap, "status",
                 StatusPayload(
-                    state="idle", session_name="other",
-                    workspace="/workspace/projects/xarness",
-                    mode="write", model_name="m", model_display_name="m", model_id="m",
+                    config=SessionConfigView(
+                        session_name="other",
+                        workspace="/workspace/projects/xarness",
+                        mode="write", model_name="m", model_display_name="m",
+                        model_id="m",
+                    ),
+                    activity=Activity(state="idle"),
                 ),
             )
             client.snapshot_data = snap
@@ -993,7 +1060,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(written[-1], "xarness xarness")
 
-            await app._handle_event(TurnFinished(elapsed=1.0))
+            await app._handle_event(protocol.TurnEnded(outcome="finished", elapsed=1.0))
             self.assertEqual(written[-1], "xarness xarness - finished")
 
             # A new round/turn clears the stale suffix.
@@ -1019,7 +1086,7 @@ class TerminalTitlePathTest(unittest.IsolatedAsyncioTestCase):
 
 
 class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
-    """An interrupt ends the turn without a TurnComplete for this client:
+    """An interrupt ends the turn without a RoundComplete for this client:
     the Thinking shimmer (or a half-streamed tool's writing shimmer) must
     settle when the explicit TurnEnded arrives, not shimmer forever."""
 
@@ -1103,7 +1170,7 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             q = client.queue
             q.put_nowait(protocol.ProcessingStarted())
             q.put_nowait(protocol.ContentDelta(text="hi"))
-            q.put_nowait(protocol.TurnComplete(has_tool_calls=True))
+            q.put_nowait(protocol.RoundComplete(has_tool_calls=True))
             await pilot.pause()
             # Tools are about to run: no provider request is in flight.
             self.assertEqual(app._phase, "idle")
@@ -1120,7 +1187,7 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._phase, "streaming")
             self.assertFalse([e for e in app._flow_model.entries
                               if isinstance(e.item, tflow.PendingItem) and e.alive])
-            q.put_nowait(protocol.TurnComplete(has_tool_calls=False))
+            q.put_nowait(protocol.RoundComplete(has_tool_calls=False))
             await pilot.pause()
             self.assertEqual(app._phase, "idle")
 
@@ -1161,7 +1228,11 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
 
 
 def _msg(role: str, mid: str, content: str) -> protocol.Message:
-    return protocol.Message(role=role, id=mid, content=content)
+    return (
+        UserMessage(parts=[TextPart(text=content)], id=mid)
+        if role == "user"
+        else AssistantMessage(content=content, id=mid)
+    )
 
 
 class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
@@ -1185,8 +1256,8 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             # A live turn adds a message the snapshot never contained.
-            client.queue.put_nowait(protocol.UserMessageAdded(
-                text="live", message_id="u3"))
+            client.queue.put_nowait(protocol.MessageAdded(
+                message=UserMessage(parts=[TextPart(text="live")], id="u3")))
             await pilot.pause()
             users = [e.item.message_id for e in app._flow_model.entries
                      if isinstance(e.item, tflow.UserItem)]
@@ -1195,7 +1266,7 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
             # Undo-from-here on "second" (u2): u2, a2 and u3 are gone.
             trimmed = make_snapshot()
             object.__setattr__(trimmed, "messages", messages[:2])
-            client.queue.put_nowait(protocol.HistoryReplaced(snapshot=trimmed))
+            client.queue.put_nowait(protocol.HistoryReplaced(snapshot=trimmed, reason="rollback"))
             await pilot.pause()
             users = [e.item.message_id for e in app._flow_model.entries
                      if isinstance(e.item, tflow.UserItem)]
@@ -1277,7 +1348,7 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
             app._submit("hello", None)
             await pilot.pause()
             await pilot.pause()
-            client.queue.put_nowait(protocol.StatusChanged(status=StatusPayload(
+            client.queue.put_nowait(protocol.StatusChanged(activity=Activity(
                 state="idle", session_name="s-new", workspace="/tmp/ws",
                 mode="write", model_name="glm-flash",
                 model_display_name="GLM Flash", model_id="glm-flash",
@@ -1302,9 +1373,11 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
         async def config():
             return protocol.ConfigInfo(
                 models=[
-                    {"name": "glm-flash", "display_name": "GLM Flash"},
-                    {"name": "other", "display_name": "Other Model",
-                     "cot_strength": "high", "max_context": 200_000},
+                    dict(_model_info(), name="glm-flash",
+                         display_name="GLM Flash"),
+                    dict(_model_info(), name="other",
+                         display_name="Other Model", cot_strength="high",
+                         max_context=200_000),
                 ],
                 sandboxes=[{"name": "default"}],
                 presets=["default"], themes=[],
@@ -1346,22 +1419,19 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
     def _snapshot_with_history(self) -> Snapshot:
         snap = make_snapshot()
         snap.messages = [
-            protocol.Message(
-                role="user", id="u1", content="do it",
+            UserMessage(
+                parts=[TextPart(text="do it")], id="u1",
                 timing=Timing(send="2025-01-01T00:00:00+00:00"),
             ),
-            protocol.Message(
-                role="assistant", id="a2", content="",
-                reasoning="step one\nstep two",
+            AssistantMessage(
+                content="", reasoning="step one\nstep two",
                 timing=Timing(reasoning_seconds=4.0),
                 tool_calls=[{"call_id": "c1", "name": "read_file",
                              "arguments_json": "{}"}],
             ),
-            protocol.Message(
-                role="tool", id="t1", tool_call_id="c1", content="file body",
-            ),
-            protocol.Message(
-                role="assistant", id="a1", content="Done.",
+            ToolMessage(id="t1", tool_call_id="c1", content="file body"),
+            AssistantMessage(
+                content="Done.",
                 timing=Timing(
                     start="2025-01-01T00:00:01+00:00",
                     end="2025-01-01T00:00:05+00:00",
@@ -1379,14 +1449,14 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
 
         snap = make_snapshot()
         snap.history = [
-            protocol.Message(role="user", id="u0", content="first question"),
-            protocol.Message(
-                role="user", id="s0", kind="summary",
-                content=f"{SUMMARY_PREFIX}\n\nthe handoff",
+            UserMessage(parts=[TextPart(text="first question")], id="u0"),
+            UserMessage(
+                parts=[TextPart(text=f"{SUMMARY_PREFIX}\n\nthe handoff")],
+                id="s0", is_summary=True,
             ),
         ]
         snap.messages = [
-            protocol.Message(role="assistant", id="a0", content="after"),
+            AssistantMessage(content="after", id="a0"),
         ]
         app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
         async with app.run_test() as pilot:
@@ -1434,11 +1504,9 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _big_snapshot(count: int = 1200) -> Snapshot:
-        from xarness.conversation import Message as Msg
         snap = make_snapshot()
         snap.messages = [
-            Msg(role="user" if i % 2 == 0 else "assistant",
-                content=f"body {i}", id=f"m{i}")
+            _msg("user" if i % 2 == 0 else "assistant", f"m{i}", f"body {i}")
             for i in range(count)
         ]
         return snap
@@ -1658,7 +1726,7 @@ class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
             await app._run_undo()
             await pilot.pause()
             self.assertEqual(app.query_one("#chat-input", ChatInput).text, "put back")
-            self.assertIn("undo", [command.type for _, command in client.commands])
+            self.assertIn("rollback", [command.type for _, command in client.commands])
 
 
 class RelativeTimeFormatTest(unittest.TestCase):

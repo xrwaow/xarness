@@ -40,10 +40,33 @@ import shlex
 import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
+
 _GIT_TIMEOUT = 30.0
+
+# One lock per persistent snapshot index: concurrent snapshots (diff loop,
+# finish_turn, drift detection, /accept) must not run `git add -A` on the
+# same index file at once, or git fails with index.lock. Locks are created
+# lazily per running loop (tests spin up many short-lived loops).
+_index_locks: dict[tuple[int, str], "tuple[asyncio.AbstractEventLoop, asyncio.Lock]"] = {}
+
+
+def _index_lock(index: Path) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), str(index))
+    entry = _index_locks.get(key)
+    if entry is None or entry[0].is_closed():
+        # Rebuild (and prune) entries whose loop is gone — tests spin up
+        # many short-lived loops, and a dict keyed by loop id would only
+        # ever grow.
+        if entry is not None and entry[0].is_closed():
+            for stale in [k for k, v in _index_locks.items() if v[0].is_closed()]:
+                del _index_locks[stale]
+        entry = _index_locks[key] = (loop, asyncio.Lock())
+    return entry[1]
 
 
 class GitWorktreeError(Exception):
@@ -69,14 +92,18 @@ class RepoInfo:
     external: bool = False
 
 
-@dataclass(slots=True)
-class GitInfo:
-    """Per-session git state; persisted in the session JSON as the ``git`` block."""
+class GitInfo(BaseModel):
+    """Per-session git state; persisted in the session JSON as the ``git``
+    block. A pydantic model, so it round-trips through the session file and
+    snapshots without a hand-written block converter."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     session_id: str
-    # Repo root the session tracks. The agent works in ``agent_workspace``
-    # (the subtree when scoped) — the user's real directory.
-    workspace: Path
+    # Repo root the session tracks (renamed from ``workspace``: a Session's
+    # ``workspace`` is the agent dir, and the two got confused). The agent
+    # works in ``agent_workspace`` (the subtree when scoped).
+    repo_root: Path
     git_dir: Path
     # Repo-root-relative posix subdirectory the session is scoped to ("" =
     # the whole repo). Set when the user's --workspace sits inside a bigger
@@ -97,6 +124,18 @@ class GitInfo:
     ignored_paths: tuple[str, ...] = ()
     external: bool = False
 
+    def mark_seen(self, tree: str) -> None:
+        """Record ``tree`` as the workspace state the session has accounted
+        for (turn end, accept, keep-tracking, rollback). The one writer of
+        ``last_seen_tree``."""
+        self.last_seen_tree = tree
+
+    def reset_to(self, tree: str) -> None:
+        """Rebaseline: the workspace is back at ``tree`` (accept/reject), so
+        that is now both the accounted state and the diff base."""
+        self.baseline_tree = tree
+        self.last_seen_tree = tree
+
     @property
     def index_path(self) -> Path:
         """Persistent snapshot index for this session.
@@ -106,7 +145,7 @@ class GitInfo:
         (and, because previously snapshotted paths are then *tracked* in it,
         it also makes the session-start ignore pinning real: a mid-session
         .gitignore edit no longer changes what is snapshotted)."""
-        return _index_path(self.workspace, self.session_id)
+        return _index_path(self.repo_root, self.session_id)
 
     def git_env(self, **extra: str) -> dict[str, str]:
         """Env for a git subprocess: external mode addresses the store via
@@ -114,7 +153,7 @@ class GitInfo:
         env = {**os.environ}
         if self.external:
             env["GIT_DIR"] = str(self.git_dir)
-            env["GIT_WORK_TREE"] = str(self.workspace)
+            env["GIT_WORK_TREE"] = str(self.repo_root)
         env.update(extra)
         return env
 
@@ -122,40 +161,25 @@ class GitInfo:
     def agent_workspace(self) -> Path:
         """Directory the agent works in: the scoped subtree of the repo, or
         the repo root for a whole-repo session."""
-        return self.workspace / self.subtree if self.subtree else self.workspace
+        return self.repo_root / self.subtree if self.subtree else self.repo_root
 
-    def to_block(self) -> dict:
-        """JSON-safe dict for the session file (paths as strings)."""
-        return {
-            k: list(v) if isinstance(v, tuple) else (str(v) if isinstance(v, Path) else v)
-            for k, v in asdict(self).items()
-        }
-
-    @classmethod
-    def from_block(cls, block: dict) -> GitInfo:
-        return cls(
-            session_id=block["session_id"],
-            workspace=Path(block["workspace"]),
-            git_dir=Path(block["git_dir"]),
-            subtree=block.get("subtree", ""),
-            baseline_tree=block.get("baseline_tree", ""),
-            last_seen_tree=block.get("last_seen_tree", ""),
-            ignored_paths=tuple(block.get("ignored_paths", ())),
-            external=block.get("external", False),
-        )
-
-
-@dataclass(slots=True)
-class TurnCheckpoint:
+class TurnCheckpoint(BaseModel):
     """One turn's before/after workspace trees.
 
     ``before_tree`` is the state when the turn's user message was sent,
     ``after_tree`` the state once the turn's edits finished. Reversing the
     turn means applying ``before_tree - after_tree`` to the live workspace.
+
+    A pydantic model (it persists inside the session's state row), keyed by
+    the opening user message's id — the messages themselves stay immutable.
     """
 
-    before_tree: str
-    after_tree: str
+    before_tree: str | None = None
+    after_tree: str | None = None
+    # False until the turn's finally ran ``finish_turn``. Untracked turns
+    # (no git info, or the snapshot failed) close with no trees, so they
+    # never look open forever.
+    closed: bool = False
 
 
 # ----------------------------------------------------------------------
@@ -308,6 +332,9 @@ _UNTRACKED_EXTS: tuple[str, ...] = (
 # Files larger than this are excluded from tracking (snapshots/diffs/undo).
 _MAX_TRACKED_SIZE = 1024 * 1024
 
+# The all-zero sha diff-tree reports for a path deleted between two trees.
+_DELETED_SHA = "0" * 40
+
 # Directory names whose exclusion must survive the directory not existing yet:
 # a pinned build tree appears on the first build, while the exclude pathspecs
 # are built at snapshot time, before it exists.
@@ -365,36 +392,104 @@ def _oversized_paths(
 
 
 async def _oversized_in_tree(
-    root: Path, tree: str, env: dict[str, str], limit: int = _MAX_TRACKED_SIZE,
-) -> list[str]:
-    """Paths in ``tree`` whose blob is over ``limit`` bytes.
+    root: Path, tree: str, env: dict[str, str],
+    previous: str | None = None, limit: int = _MAX_TRACKED_SIZE,
+) -> list[tuple[str, str, str | None]]:
+    """Oversized entries in ``tree``, over ``limit`` bytes.
 
-    Sizes come from the tree itself, so this costs one git call and no file
-    reads — cheap enough for every snapshot. The session-start pinning in
-    :func:`_oversized_paths` still catches files that were already big (so
-    they are never written to the object store); this catches the ones that
-    grew past the limit mid-session."""
-    rc, out, _ = await _run_git(["ls-tree", "-r", "-l", "-z", tree], cwd=root, env=env)
+    Each entry is ``(path, mode, previous_blob_sha)``: the mode and blob of
+    the same path in ``previous`` (None when the path is new there), which
+    is what lets the caller put a grown file *back* to the state it had
+    before it ballooned — see :func:`snapshot_tree`.
+
+    Sizes come from the tree itself, so this costs no file reads. With
+    ``previous`` (the prior snapshot's tree) only the changed blobs are
+    stat'ed — ``diff-tree`` finds them, ``cat-file --batch-check`` sizes
+    them — so the per-snapshot cost scales with the edit, not the tree.
+    Without it the whole tree is listed once (session start). The
+    session-start pinning in :func:`_oversized_paths` still catches files
+    that were already big (so they are never written to the object store);
+    this catches the ones that grew past the limit mid-session."""
+    by_sha: dict[str, list[tuple[str, str, str | None]]] = {}
+    if previous == tree:
+        # Nothing changed since the previous snapshot, so nothing can have
+        # grown past the limit: skip the whole ls-tree/cat-file pass (this
+        # is the common case for the diff loop and read-only run_bash).
+        return []
+    if previous is not None:
+        # --raw carries both blob shas per entry (NUL-separated, one meta
+        # record plus one path record), so a path containing a newline cannot
+        # corrupt the stream: no path ever feeds the batch-check input.
+        rc, out, _ = await _run_git(
+            ["diff-tree", "-r", "--raw", "--no-renames", "-z", previous, tree],
+            cwd=root, env=env,
+        )
+        if rc != 0:
+            return []
+        fields = out.split("\0")
+        for i in range(0, len(fields) - 1, 2):
+            meta = fields[i]
+            path = fields[i + 1]
+            if not meta.startswith(":"):
+                continue
+            parts = meta[1:].split()
+            if len(parts) >= 4 and parts[3] != _DELETED_SHA:
+                old_sha = None if parts[2] == _DELETED_SHA else parts[2]
+                by_sha.setdefault(parts[3], []).append(
+                    (path, parts[0], old_sha)
+                )
+    else:
+        rc, out, _ = await _run_git(
+            ["ls-tree", "-r", "-z", tree], cwd=root, env=env,
+        )
+        if rc != 0:
+            return []
+        for entry in out.split("\0"):
+            parts = entry.split() if entry else []
+            if len(parts) >= 3 and parts[1] == "blob":
+                # ls-tree -z separates path from metadata with a TAB; the
+                # split() above keeps the metadata fields intact.
+                by_sha.setdefault(parts[2], []).append(
+                    (entry.split("\t", 1)[1], parts[0], None)
+                )
+    if not by_sha:
+        return []
+    # batch-check prints newline-separated lines keyed by the input sha.
+    rc, out, _ = await _run_git(
+        ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+         "--buffer"],
+        cwd=root, env=env,
+        input_bytes="".join(f"{sha}\n" for sha in by_sha).encode(),
+    )
     if rc != 0:
         return []
-    oversized: list[str] = []
-    for entry in out.split("\0"):
-        meta, _, path = entry.partition("\t")
-        parts = meta.split()
-        if len(parts) < 4 or parts[1] != "blob":
+    oversized: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[1] != "blob":
             continue
-        try:
-            size = int(parts[3])
-        except ValueError:
-            continue
-        if size > limit:
-            oversized.append(path)
-    return oversized
+        size = _safe_size(parts[2])
+        if size is not None and size > limit:
+            for path, mode, old_sha in by_sha.get(parts[0], ()):
+                if path not in seen:
+                    seen.add(path)
+                    oversized.append((path, mode, old_sha))
+    return sorted(oversized)
+
+
+def _safe_size(text: str) -> int | None:
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 async def snapshot_tree(
     root: Path, subtree: str = "", exclude: Iterable[str] = (),
     env_base: dict[str, str] | None = None, index: Path | None = None,
+    previous: str | None = None,
+    oversized_out: list[str] | None = None,
 ) -> str:
     """Tree sha capturing the workspace's *current* state.
 
@@ -412,6 +507,11 @@ async def snapshot_tree(
     With ``subtree`` (repo-root relative), only that subtree is captured;
     paths stay repo-root relative. ``env_base`` carries GIT_DIR/
     GIT_WORK_TREE for external snapshot stores.
+
+    ``oversized_out``, when given, collects the repo-root-relative paths
+    that grew past the size limit and were left out of the snapshot — the
+    caller adds them to the session's ignore list so the next ``git add``
+    does not re-hash the same huge blob all over again.
     """
     root = Path(root).resolve()
 
@@ -426,7 +526,7 @@ async def snapshot_tree(
         else:
             yield str(index)
 
-    with _reusable_index() as index_file:
+    async def _capture(index_file: str) -> str:
         env = {**(env_base if env_base is not None else os.environ), "GIT_INDEX_FILE": index_file}
         args = ["add", "-A"]
         pathspecs: list[str] = []
@@ -457,13 +557,34 @@ async def snapshot_tree(
         if rc != 0:
             raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
         tree = out.strip()
-        if oversized := await _oversized_in_tree(root, tree, env):
-            # Files that grew past the size limit mid-session: drop them from
-            # the snapshot rather than tracking (and diffing, and reverting) a
-            # multi-hundred-megabyte artifact every turn.
-            payload = b"\0".join(p.encode() for p in oversized)
+        oversized = await _oversized_in_tree(root, tree, env, previous)
+        if oversized and oversized_out is not None:
+            oversized_out.extend(path for path, _, _ in oversized)
+        if oversized:
+            # Files that grew past the size limit mid-session: keep them out
+            # of the snapshot rather than tracking (and diffing, and
+            # reverting) a multi-hundred-megabyte artifact every turn.
+            #
+            # They are *rewound* to their previous snapshot entry, not
+            # deleted: plain ``git rm --cached`` would make /diff report a
+            # deletion the agent never made, and pin the path as ignored with
+            # the baseline still holding it. A path that is new since
+            # ``previous`` is un-indexed instead (mode 0).
+            #
+            # ``update-index --index-info`` takes NUL-terminated
+            # ``<mode> <sha> <stage>\t<path>`` records, so paths are never
+            # parsed as pathspecs — no globbing (``x[1].txt`` must not match
+            # ``x1.txt``), no quoting, and newlines in a name are harmless.
+            # (``git rm`` has no ``-z``/``--stdin`` at all; only
+            # ``checkout-index`` does.)
+            records = [
+                (f"{mode} {old_sha} 0\t{path}" if old_sha is not None
+                 else f"0 {_DELETED_SHA} 0\t{path}")
+                for path, mode, old_sha in oversized
+            ]
+            payload = b"".join(r.encode() + b"\0" for r in records)
             rc, _, err = await _run_git(
-                ["rm", "--cached", "--force", "-z", "--stdin"],
+                ["update-index", "--add", "-z", "--index-info"],
                 cwd=root, env=env, input_bytes=payload,
             )
             if rc != 0:
@@ -475,6 +596,16 @@ async def snapshot_tree(
                 raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
             tree = out.strip()
         return tree
+
+    with _reusable_index() as index_file:
+        if index is None:
+            # A throwaway temp index cannot collide with anyone.
+            return await _capture(index_file)
+        # A persistent index is shared by every snapshot of the session:
+        # serialize the add/write-tree sequence, or concurrent callers
+        # (diff loop, finish_turn, drift check, /accept) race on index.lock.
+        async with _index_lock(Path(index_file)):
+            return await _capture(index_file)
 
 
 async def setup_tracking(
@@ -542,7 +673,7 @@ async def setup_tracking(
     )
     info = GitInfo(
         session_id=session_id,
-        workspace=repo.root,
+        repo_root=repo.root,
         git_dir=repo.git_common_dir,
         subtree=subtree,
         baseline_tree=baseline,
@@ -560,11 +691,27 @@ async def setup_tracking(
 
 async def snapshot_state(info: GitInfo) -> str:
     """:func:`snapshot_tree` for a session's workspace, with its pinned
-    ignore exclusions applied."""
-    return await snapshot_tree(
-        info.workspace, info.subtree, exclude=info.ignored_paths,
+    ignore exclusions applied.
+
+    Files that grew past the size limit are dropped from the snapshot AND
+    added to the session's ignore list: otherwise the next ``git add -A``
+    re-adds them, re-hashing (and re-writing) the same huge blob every
+    snapshot."""
+    oversized: list[str] = []
+    tree = await snapshot_tree(
+        info.repo_root, info.subtree, exclude=info.ignored_paths,
         env_base=info.git_env(), index=info.index_path,
+        previous=info.last_seen_tree or None, oversized_out=oversized,
     )
+    if oversized:
+        # ignored_paths is an immutable tuple (it feeds argv pathspecs and
+        # round-trips through pydantic); rebuild it. A plain AttributeError
+        # here would kill finish_turn in _run_turn's finally and skip
+        # TurnEnded, so the caller's own error handling never sees it.
+        known = set(info.ignored_paths)
+        info.ignored_paths = (*info.ignored_paths,
+                              *(p for p in oversized if p not in known))
+    return tree
 
 
 async def accept_changes(info: GitInfo) -> str:
@@ -594,7 +741,7 @@ async def revert_to_tree(info: GitInfo, tree: str, current: str | None = None) -
     already has it (e.g. :func:`revert_turns`); passing it skips a redundant
     re-snapshot. Only reverts files — anything run_bash did outside the
     workspace (installs, background jobs, network calls) is not undone."""
-    root = info.workspace
+    root = info.repo_root
     if current is None:
         current = await snapshot_state(info)
     if current == tree:
@@ -659,7 +806,7 @@ async def _wrap_commit(info: GitInfo, tree: str, parent: str | None = None) -> s
     args = ["commit-tree", tree, "-m", "checkpoint"]
     if parent:
         args += ["-p", parent]
-    rc, out, err = await _run_git(args, cwd=info.workspace, env=env)
+    rc, out, err = await _run_git(args, cwd=info.repo_root, env=env)
     if rc != 0:
         raise GitWorktreeError(f"could not wrap checkpoint: {err.strip()}")
     return out.strip()
@@ -745,7 +892,7 @@ async def _revert_turn_tree(
     empty string) when ``conflict`` is set."""
     if before_tree == after_tree:
         return None, current_tree
-    root = info.workspace
+    root = info.repo_root
     base = await _wrap_commit(info, after_tree)     # state right after the turn
     theirs = await _wrap_commit(info, before_tree)  # target: state before the turn
     ours = await _wrap_commit(info, current_tree)   # live now, incl. manual edits
@@ -854,7 +1001,7 @@ async def _diff_tree_pair(info: GitInfo, base_tree: str, other_tree: str, *extra
     is passed explicitly so rename detection works regardless of the user's
     diff.renames config. With a scoped subtree the diff is limited to it and
     its paths are reported relative to it (git --relative)."""
-    root = info.workspace
+    root = info.repo_root
     args = ["diff", "-M"]
     if info.subtree:
         args.append("--relative")
@@ -1078,7 +1225,7 @@ def git_shim_script() -> str:
 
     def form_branch(sub: str, forms: frozenset[str], bare_ok: bool) -> str:
         pat = "|".join(sorted(forms))
-        bare = f'\n        if [ -z "$rest" ]; then exec "$real" "$@"; fi' if bare_ok else ""
+        bare = '\n        if [ -z "$rest" ]; then exec "$real" "$@"; fi' if bare_ok else ""
         return (
             f"        {sub}){bare}\n"
             f"        case $rest in {pat}) exec \"$real\" \"$@\" ;; *) blocked ;; esac ;;"

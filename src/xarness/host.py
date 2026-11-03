@@ -28,18 +28,26 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from . import __version__, protocol, session_store
+from . import __version__, gitwork, protocol, session_store
 from .config import (
-    DEFAULT_CONFIG_PATH, ConfigError, SandboxSettings,
-    SectionedConfig, ensure_config, load_sectioned, resolve_api_key,
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    SandboxSettings,
+    SectionedConfig,
+    ensure_config,
+    load_sectioned,
+    resolve_api_key,
     save_preferences,
 )
-from . import gitwork
+from .diffview import build_diff_info
 from .gitwork import GitInfo, GitWorktreeError
-from .protocol import SessionSummary, ServerInfo, ServerStats
+from .protocol import ServerInfo, ServerStats, SessionSummary
 from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable
-from .session import Session, SessionError, SessionParts
+from .errors import RefError, SessionError
+from .session import Session, SessionParts
+from .session_store import change_workspace_ref
 from .util import utcnow_iso as _utcnow
 
 HOST_DIR = Path("~/.local/share/xarness").expanduser()
@@ -49,6 +57,16 @@ LOCK_PATH = HOST_DIR / "host.lock"
 # How long the host lingers with no active session before exiting
 # (auto-started hosts only; a foreground --server host is persistent).
 GRACE_SECONDS = 5.0
+# How long a fully idle session stays hosted before eviction. Evicting on
+# every idle makes the next turn pay a full load (state read + tracking
+# rebind + sandbox build) and kills the persistent shell; a short TTL keeps
+# warm sessions cheap while still releasing resources. Override with
+# XARNESS_IDLE_TTL_SECONDS (0 evicts immediately, as tests expect).
+IDLE_TTL_SECONDS = 120.0
+
+
+def _idle_ttl() -> float:
+    return float(os.environ.get("XARNESS_IDLE_TTL_SECONDS", IDLE_TTL_SECONDS))
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
@@ -81,6 +99,8 @@ class Host:
         self._shutdown_event = asyncio.Event()
         # Pending call_later handle for the non-persistent grace shutdown.
         self._grace_handle: asyncio.TimerHandle | None = None
+        # Pending idle-eviction timers, by session name.
+        self._idle_handles: dict[str, asyncio.TimerHandle] = {}
 
     # ------------------------------------------------------------------
     # session construction (config + workspace + git + sandbox)
@@ -111,7 +131,7 @@ class Host:
         *,
         session_name: str,
         saved_sandbox_name: str | None = None,
-        saved_sandbox_settings: dict | None = None,
+        saved_sandbox_settings: "SandboxSettings | None" = None,
         saved_git_info: GitInfo | None = None,
     ) -> SessionParts:
         """Everything Session needs, from the sectioned config.
@@ -150,21 +170,20 @@ class Host:
             sandbox_key, settings = sectioned.resolve_sandbox(sandbox_name)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
+        # The deprecated sandbox-level tool_output_limit fallback comes from
+        # the freshly resolved profile: a saved session's settings exclude
+        # the field (it must not round-trip), so reading it there would be
+        # None on every reload.
+        profile_tool_limit = settings.tool_output_limit
         # An existing session keeps the sandbox state it was saved with
         # (its /sandbox and /filter choices), not a fresh resolution.
+        # Workspace refs are NEVER baked into the settings: they are per
+        # workspace, passed separately, and merged when the sandbox config
+        # is built (Session owns the merge).
+        workspace_refs = session_store.load_workspace_refs(str(ws))
         if saved_sandbox_settings is not None:
             settings = SandboxSettings.model_validate(saved_sandbox_settings)
             sandbox_key = saved_sandbox_name or sandbox_key
-        else:
-            # References are per workspace: seed a new session with the
-            # paths every session in this directory should see.
-            workspace_refs = session_store.load_workspace_refs(str(ws))
-            if workspace_refs:
-                settings = settings.model_copy(update={
-                    "auto_include_refs": [
-                        *settings.auto_include_refs, *workspace_refs,
-                    ],
-                })
         # Tri-state CLI overrides (--network/--gpu): the flag wins over the
         # sandbox profile when given.
         if request.network is not None or request.gpu is not None:
@@ -197,6 +216,7 @@ class Host:
         try:
             sandbox = SandboxRuntime.make(
                 ws, settings, git_info, name=sandbox_key,
+                extra_refs=workspace_refs,
             )
         except SandboxUnavailable:
             # Tools disabled, chat works.
@@ -210,8 +230,14 @@ class Host:
             config_path=self.config_path,
             sandbox=sandbox,
             git_info=git_info,
-            auto_compact=profile.auto_compact,
-            tool_output_limit=settings.tool_output_limit,
+            # The deprecated sandbox-level key is a fallback for the root,
+            # read from the freshly resolved profile (see above).
+            tool_output_limit=(
+                sectioned.tool_output_limit
+                if sectioned.tool_output_limit is not None
+                else profile_tool_limit
+            ),
+            workspace_refs=workspace_refs,
         )
 
     # ------------------------------------------------------------------
@@ -222,13 +248,13 @@ class Host:
     ) -> Session:
         name = session_store.new_session_name()
         parts = await self._build_parts(request, session_name=name)
-        session = Session(**parts.session_kwargs(name), idle_callback=self._on_session_idle)
+        session = Session(
+            **parts.session_kwargs(name),
+            no_save=request.no_session,
+            idle_callback=self._on_session_idle,
+        )
         self.sessions[name] = session
-        if request.no_session:
-            # The client asked for an unsaved conversation: nothing is ever
-            # written to the session store (Session._persist no-ops).
-            session.no_save = True
-        else:
+        if not request.no_session:
             # Durable from creation: the session shows up as saved in /sessions
             # and survives a host crash before the first turn.
             session._persist()
@@ -253,10 +279,10 @@ class Host:
             return await self._load_session_locked(name)
 
     async def _load_session_locked(self, name: str) -> Session:
-        if not session_store.session_path(name).exists():
+        if session_store.load_meta(name) is None:
             raise SessionError(f"no saved session named {name!r}")
         try:
-            state = session_store.load_state(name)
+            state = await asyncio.to_thread(session_store.load_state, name)
         except (OSError, ValueError, KeyError) as exc:
             raise SessionError(f"could not read the saved session: {exc}") from exc
         if not state.workspace:
@@ -270,13 +296,7 @@ class Host:
         # like drift and /undo would lose its turn trees). Parse it BEFORE
         # building the session, so _build_parts can skip a fresh (expensive)
         # workspace snapshot.
-        saved_block = state.git if isinstance(state.git, dict) else None
-        saved_git_info: GitInfo | None = None
-        if saved_block:
-            try:
-                saved_git_info = GitInfo.from_block(saved_block)
-            except (KeyError, TypeError, ValueError):
-                saved_git_info = None
+        saved_git_info: GitInfo | None = state.git
         parts = await self._build_parts(
             protocol.CreateSessionRequest(
                 workspace=state.workspace, model=state.profile,
@@ -290,22 +310,31 @@ class Host:
             name, parts=parts, state=state,
             idle_callback=self._on_session_idle,
         )
-        self.sessions[name] = session
         # A turn left open by a host crash or a quit mid-turn never got its
         # after-tree (finish_turn never ran). Record the workspace's current
         # state as that turn's after-tree — what finish_turn would have
         # written had the process survived — so a plain reopen doesn't
-        # surface the session's own unaccepted edits as "drift". The turn
-        # must be the last one (nothing streamed after it).
-        if session.git_info is not None:
-            turns = session.conversation.turns
-            if turns and turns[-1].after_tree is None and turns[-1].before_tree:
-                try:
-                    turns[-1].after_tree = await gitwork.snapshot_state(session.git_info)
-                    session.git_info.last_seen_tree = turns[-1].after_tree
-                    session._persist()
-                except GitWorktreeError:
-                    pass
+        # surface the session's own unaccepted edits as "drift".
+        # BEFORE publishing the session: an attach during this await would
+        # otherwise run drift detection against the stale last_seen_tree
+        # and flag the crashed turn's own edits as user drift.
+        if session.git_info is not None and session._crash_repaired:
+            # A turn left open by a host crash or a quit mid-turn never got
+            # its after-tree (Session.load closed it with the before tree as
+            # a placeholder). Record the workspace's current state as that
+            # turn's after-tree — what finish_turn would have written had
+            # the process survived — and mark it seen so the turn's own
+            # edits are not reported as drift.
+            try:
+                tree = await gitwork.snapshot_state(session.git_info)
+                session.git_info.mark_seen(tree)
+                for turn in session._crash_repaired:
+                    turn.after_tree = tree
+                session._persist()
+            except GitWorktreeError:
+                pass
+        session._crash_repaired = []
+        self.sessions[name] = session
         # Drift is NOT computed here: it is detected lazily when the first
         # client attaches (Session.prompt_resume_drift). A drifted workspace
         # with nobody attached must not report "waiting" nor keep the host
@@ -339,12 +368,22 @@ class Host:
         subscribers, close it down. The saved file is kept."""
         if self.sessions.get(session.name) is not session:
             return
+        handle = self._idle_handles.pop(session.name, None)
+        if handle is not None:
+            handle.cancel()
         self.sessions.pop(session.name, None)
         await session.shutdown(notice=notice)
 
-    def list_sessions(
+    async def list_sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
+        stats: bool = False,
     ) -> list[SessionSummary]:
+        """One listing of active and saved sessions.
+
+        ``stats`` adds the unaccepted (pending) diff totals for the hosted
+        sessions. Saved sessions get no totals: computing them from the
+        persisted git block is expensive and often stale. Best-effort — a
+        session whose diff cannot be computed lists with zeroed totals."""
         summaries: list[SessionSummary] = []
         for session in self.sessions.values():
             if workspace is not None and str(session.workspace) != workspace:
@@ -357,109 +396,116 @@ class Host:
                     continue
                 if workspace is not None and meta.get("workspace") != workspace:
                     continue
-                summaries.append(session_store.saved_summary(name, meta))
+                summaries.append(self.saved_summary(name, meta))
         if active is True:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
-        return summaries
-
-    async def list_sessions_with_stats(
-        self, *, active: bool | None = None, workspace: str | None = None,
-    ) -> list[SessionSummary]:
-        """``list_sessions`` plus unaccepted (pending) diff totals for the
-        hosted sessions. Saved sessions get no totals: computing them from
-        the persisted git block is expensive and often stale. Best-effort —
-        a session whose diff cannot be computed lists with zeroed totals.
-        """
-        summaries = self.list_sessions(active=active, workspace=workspace)
-        for summary in summaries:
-            session = self.sessions.get(summary.name)
-            if session is None or session.git_info is None:
-                continue
-            try:
-                stat = await gitwork.diff_stat(session.git_info)
-            except Exception:  # noqa: BLE001, S112 - stats must not break listing
-                continue
-            summary.additions = stat.additions
-            summary.deletions = stat.deletions
+        if stats:
+            for summary in summaries:
+                session = self.sessions.get(summary.name)
+                if session is None or session.git_info is None:
+                    continue
+                try:
+                    stat = await gitwork.diff_stat(session.git_info)
+                except Exception:
+                    continue
+                summary.additions = stat.additions
+                summary.deletions = stat.deletions
         return summaries
 
     # ------------------------------------------------------------------
     # read-only views of saved sessions
 
-    def _saved_state(self, name: str) -> session_store.SessionState:
-        """Load a saved session without hosting it (no sandbox, no git scan)."""
-        if not session_store.session_path(name).exists():
+    async def _saved_state(self, name: str) -> session_store.StoredSession:
+        """Load a saved session without hosting it (no sandbox, no git scan).
+
+        The SQLite read and the whole-history parse run in a thread: they
+        block for O(history) and must not stall the event loop."""
+        if session_store.load_meta(name) is None:
             raise SessionError(f"no saved session named {name!r}")
         try:
-            return session_store.load_state(name)
+            return await asyncio.to_thread(session_store.load_state, name)
         except (OSError, ValueError, KeyError) as exc:
             raise SessionError(f"could not read the saved session: {exc}") from exc
 
     def _saved_status(
-        self, name: str, state: session_store.SessionState,
+        self, name: str, stored: session_store.StoredSession,
     ) -> protocol.StatusPayload:
         """Best-effort status for a saved session: config metadata, but no
         sandbox construction and no workspace scan."""
         profile = None
-        profile_name = state.profile
+        profile_name = stored.profile
         try:
             profile_name, profile = load_sectioned(self.config_path).resolve_model(
-                state.profile,
+                stored.profile,
             )
         except ConfigError:
             pass
-        settings = None
-        if state.sandbox_settings is not None:
-            try:
-                settings = SandboxSettings.model_validate(state.sandbox_settings)
-            except ValueError:
-                settings = None
+        settings = stored.sandbox_settings
         refs: list[protocol.RefInfo] = []
-        if settings is not None and state.workspace:
+        if settings is not None and stored.workspace:
+            # Settings are profile-only: the workspace refs live beside the
+            # sessions and ride into the config via extra_refs.
             external = SandboxConfig.resolve_auto_refs(
-                Path(state.workspace), settings.auto_include_refs,
+                Path(stored.workspace),
+                [*settings.auto_include_refs,
+                 *session_store.load_workspace_refs(stored.workspace)],
             )
             refs = [
                 protocol.RefInfo(path=str(ref.host), mount=ref.mount)
                 for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
             ]
         return protocol.StatusPayload(
-            state="idle",
-            session_name=name,
-            workspace=state.workspace,
-            mode=state.mode or "write",
-            model_name=profile_name or "",
-            model_display_name=(
-                (profile.display_name or profile.model_id) if profile else ""
+            config=protocol.SessionConfigView(
+                session_name=name,
+                workspace=stored.workspace,
+                mode=stored.mode or "write",
+                model_name=profile_name or "",
+                model_display_name=(
+                    (profile.display_name or profile.model_id) if profile else ""
+                ),
+                model_id=profile.model_id if profile else "",
+                cot_strength=profile.cot_strength.value if profile else "medium",
+                max_context=profile.max_context if profile else 128_000,
+                supports_vision=profile.supports_vision if profile else False,
+                sandbox_name=stored.sandbox_name,
+                use_container=settings.use_container if settings else True,
+                enable_tracking=stored.git is not None,
+                filter_list=list(settings.filter_list) if settings else [],
+                refs=refs,
             ),
-            model_id=profile.model_id if profile else "",
-            cot_strength=profile.cot_strength.value if profile else "medium",
-            max_context=profile.max_context if profile else 128_000,
-            supports_vision=profile.supports_vision if profile else False,
-            sandbox_name=state.sandbox_name,
-            use_container=settings.use_container if settings else True,
-            enable_tracking=state.git is not None,
-            filter_list=list(settings.filter_list) if settings else [],
-            refs=refs,
-            total_in=state.total_in,
-            total_out=state.total_out,
-            last_in=state.last_in,
-            last_out=state.last_out,
-            context_used=state.last_in + state.last_out,
+            activity=protocol.Activity(
+                state="idle",
+                usage_total=stored.usage_total,
+                last_usage=stored.last_usage,
+            ),
         )
 
-    def saved_snapshot(self, name: str) -> protocol.Snapshot:
+    async def saved_snapshot(self, name: str) -> protocol.Snapshot:
         """Snapshot of a saved session read straight from the store."""
-        state = self._saved_state(name)
-        visible = state.conversation.visible_messages()
-        visible_ids = {id(m) for m in visible}
+        stored = await self._saved_state(name)
+        conversation = stored.conversation
         return protocol.Snapshot(
-            messages=list(visible),
-            history=[
-                m for m in state.conversation.messages if id(m) not in visible_ids
-            ],
-            status=self._saved_status(name, state),
+            messages=list(conversation.visible_messages()),
+            history=conversation.history_messages(),
+            status=self._saved_status(name, stored),
+        )
+
+    def saved_summary(
+        self, name: str, meta: dict[str, Any] | None = None,
+    ) -> SessionSummary:
+        """The list row for a session that is only on disk."""
+        if meta is None:
+            meta = session_store.load_meta(name)
+        if meta is None:
+            return SessionSummary(name=name, state="saved")
+        return SessionSummary(
+            name=name, workspace=meta.get("workspace"), state="saved",
+            active=False, model=meta.get("profile"),
+            sandbox=meta.get("sandbox_name"),
+            last_user_message_at=meta.get("last_user_message_at"),
+            message_count=meta.get("message_count", 0),
+            tracking=bool(meta.get("tracking")),
         )
 
     @staticmethod
@@ -483,30 +529,29 @@ class Host:
         self, update: protocol.WorkspaceRefUpdate,
     ) -> list[protocol.RefInfo]:
         """Add/remove one workspace ref and push the canonical list to every
-        hosted session in that workspace."""
+        hosted session in that workspace. The add/remove logic is the
+        workspace store's (:func:`change_workspace_ref`), shared with the
+        session's /ref command."""
         ws = Path(update.workspace).expanduser().resolve()
-        raw = update.path.strip()
-        if not raw:
-            raise SessionError("references need a path")
-        host = Path(raw).expanduser()
-        host = (host if host.is_absolute() else ws / host).resolve()
-        specs = session_store.load_workspace_refs(str(ws))
-        if update.add:
-            if not host.exists():
-                raise SessionError(f"no such path: {raw}")
-            if str(host) not in specs:
-                specs.append(str(host))
-        else:
-            kept = [ref for ref in specs if str(Path(ref).expanduser().resolve()) != host]
-            if len(kept) == len(specs):
-                raise SessionError(f"no such reference: {raw}")
-            specs = kept
         try:
-            session_store.save_workspace_refs(str(ws), specs)
+            specs, _host = change_workspace_ref(ws, update.path, update.add)
+        except RefError as exc:
+            raise SessionError(str(exc)) from exc
         except OSError as exc:
             raise SessionError(f"could not save references: {exc}") from exc
         for session in self.sessions.values():
             if session.workspace.resolve() == ws:
+                if session.state != "idle":
+                    # Rebinding the sandbox mid-turn can close the shell
+                    # under a running command; the session picks the new
+                    # list up from the workspace store on its next reload,
+                    # and the user can run /ref to rebind live.
+                    session._emit_notice(
+                        "references changed for this workspace while a turn "
+                        "is running — run /refs to rebind them live",
+                        "warn",
+                    )
+                    continue
                 await session.apply_ref_specs(specs)
         return self._workspace_ref_infos(ws, specs)
 
@@ -515,44 +560,13 @@ class Host:
     ) -> protocol.DiffInfo:
         """Diff for a saved session, using only the persisted git block and
         turn checkpoints — no hosted session and no sandbox."""
-        state = self._saved_state(name)
-        block = state.git if isinstance(state.git, dict) else None
-        if not block:
+        stored = await self._saved_state(name)
+        info = stored.git
+        if info is None:
             return protocol.DiffInfo(tracking=False)
-        try:
-            info = GitInfo.from_block(block)
-        except (KeyError, TypeError, ValueError):
-            return protocol.DiffInfo(tracking=False)
-        turns = [
-            gitwork.TurnCheckpoint(t.before_tree, t.after_tree)
-            for t in state.conversation.turns
-            if not t.locked and t.before_tree and t.after_tree
-        ]
-        try:
-            current = await gitwork.snapshot_state(info) if path is not None else None
-            stat = await gitwork.attributed_diff_stat(info, turns, current=current)
-        except GitWorktreeError:
-            return protocol.DiffInfo(tracking=False)
-        files = [
-            protocol.DiffFileInfo(
-                path=f.path, additions=f.additions, deletions=f.deletions,
-                is_new=f.is_new, source=f.source or "agent",
-            )
-            for f in stat.files
-            if path is None or f.path == path
-        ]
-        result = protocol.DiffInfo(
-            files=files,
-            additions=sum(f.additions for f in files),
-            deletions=sum(f.deletions for f in files),
-            tracking=True,
+        return await build_diff_info(
+            info, stored.conversation.turn_checkpoints(), path,
         )
-        if path is not None:
-            try:
-                result.text = await gitwork.git_diff(info, path, current=current)
-            except GitWorktreeError as exc:
-                raise SessionError(f"diff failed: {exc}") from exc
-        return result
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(
@@ -566,13 +580,9 @@ class Host:
 
     def stats(self) -> ServerStats:
         sessions = [s.summary() for s in self.sessions.values()]
-        by_state: dict[str, int] = {}
-        for summary in sessions:
-            by_state[summary.state] = by_state.get(summary.state, 0) + 1
         return ServerStats(
             host=self.server_info(),
             started_at=self._started_at_wall,
-            sessions_by_state=by_state,
             clients_attached=sum(s.clients_attached for s in sessions),
             total_input_tokens=sum(
                 s.controller.usage_total.input_tokens for s in self.sessions.values()
@@ -597,23 +607,21 @@ class Host:
         except ConfigError:
             sectioned = SectionedConfig()
         models = [
-            {
-                "name": name,
-                "display_name": p.display_name or p.model_id,
-                "cot_strength": p.cot_strength.value,
-                "max_context": p.max_context,
-                "supports_vision": p.supports_vision,
-                "auto_compact": p.auto_compact,
-            }
+            protocol.ModelInfo(
+                name=name,
+                display_name=p.display_name or p.model_id,
+                cot_strength=p.cot_strength.value,
+                max_context=p.max_context,
+                supports_vision=p.supports_vision,
+                auto_compact=p.auto_compact,
+            )
             for name, p in sectioned.models.items()
         ]
-        sandboxes = [{"name": name} for name in sectioned.sandboxes]
+        sandboxes = [protocol.SandboxInfo(name=name) for name in sectioned.sandboxes]
         presets = list(sectioned.presets)
-        from .theme import THEMES
         default_model = sectioned.default_preset_model()
         return protocol.ConfigInfo(
             models=models, sandboxes=sandboxes, presets=presets,
-            themes=list(THEMES),
             default_model=default_model,
             default_model_display_name=(
                 sectioned.models[default_model].display_name
@@ -678,6 +686,9 @@ class Host:
                 await asyncio.wait_for(server_task, timeout=5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 server_task.cancel()
+            for handle in self._idle_handles.values():
+                handle.cancel()
+            self._idle_handles.clear()
             for session in list(self.sessions.values()):
                 await session.stop()
             if self.unix_socket.exists():
@@ -691,10 +702,31 @@ class Host:
         session._persist()
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._release_session(session))
-            self._arm_grace()
         except RuntimeError:
-            pass
+            return
+        # Evict after a TTL, not immediately: a warm idle session makes the
+        # next turn cheap (no state reload, no sandbox rebuild, the
+        # persistent shell keeps its cwd). A session that goes active again
+        # before the TTL is simply skipped when the timer fires.
+        old = self._idle_handles.pop(session.name, None)
+        if old is not None:
+            old.cancel()
+        self._idle_handles[session.name] = loop.call_later(
+            _idle_ttl(), self._idle_expired, session.name,
+        )
+        self._arm_grace()
+
+    def _idle_expired(self, name: str) -> None:
+        self._idle_handles.pop(name, None)
+        session = self.sessions.get(name)
+        if session is None or session.is_active:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._release_session(session))
+        self._arm_grace()
 
     def _arm_grace(self) -> None:
         """(Re)schedule the shutdown check GRACE_SECONDS out. A
@@ -714,9 +746,11 @@ class Host:
     def _grace_expired(self) -> None:
         if self._shutdown_event.is_set():
             return
-        if any(s.is_active for s in self.sessions.values()):
-            # Still active (or active again): re-check after another grace
-            # period — the next idle notification re-arms the timer too.
+        if any(s.is_active for s in self.sessions.values()) or self._idle_handles:
+            # Still active (or active again), or a warm idle session is
+            # inside its TTL: re-check after another grace period — the
+            # next idle notification re-arms the timer too. Shutting down
+            # here would kill a session the TTL was meant to keep warm.
             self._arm_grace()
             return
         self._shutdown_event.set()
@@ -741,6 +775,7 @@ class Host:
 
 async def _start_unix_server(host: Host):
     import uvicorn
+
     from .api import create_app
     app = create_app(host)
     if host.unix_socket.exists():
@@ -897,9 +932,10 @@ def run_foreground() -> None:
 def _format_stats(stats: ServerStats) -> str:
     """The one-line session/client/token summary shared by the foreground
     stats printer and the periodic live-stats loop."""
-    states = ", ".join(
-        f"{k}={v}" for k, v in sorted(stats.sessions_by_state.items())
-    ) or "none"
+    by_state: dict[str, int] = {}
+    for summary in stats.sessions:
+        by_state[summary.state] = by_state.get(summary.state, 0) + 1
+    states = ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())) or "none"
     return (
         f"sessions: {len(stats.sessions)} ({states}), "
         f"clients: {stats.clients_attached}, "
@@ -917,7 +953,7 @@ def _print_live_stats() -> None:
             base_url="http://localhost", timeout=5.0,
         ) as http:
             stats = ServerStats.model_validate(http.get("/v1/server/stats").json())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"error: could not read the live host's stats: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
     print(

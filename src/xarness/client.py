@@ -19,12 +19,12 @@ from .protocol import (
     ContentDelta,
     ProcessingStarted,
     ReasoningDelta,
+    RoundComplete,
     StreamError,
     StreamEvent,
     ToolCallArgumentsDelta,
     ToolCallArgumentsDone,
     ToolCallStarted,
-    TurnComplete,
     Usage,
 )
 
@@ -167,7 +167,7 @@ class ChatClient:
         """Yield stream events for one round.
 
         Always starts with :class:`ProcessingStarted`; ends with either
-        :class:`TurnComplete` (``has_tool_calls`` set if any were made, usage
+        :class:`RoundComplete` (``has_tool_calls`` set if any were made, usage
         included when the provider returned it) or :class:`StreamError`.
         """
         url = self._profile.base_url.rstrip("/") + "/chat/completions"
@@ -227,7 +227,7 @@ class ChatClient:
 
         for event in tool_calls.finish():
             yield event
-        yield TurnComplete(usage=usage, has_tool_calls=tool_calls.has_calls)
+        yield RoundComplete(usage=usage, has_tool_calls=tool_calls.has_calls)
 
 
 def _delta_events(chunk: dict[str, Any], tool_calls: _ToolCallAccumulator) -> list[StreamEvent]:
@@ -257,4 +257,10 @@ def _usage_from_chunk(chunk: dict[str, Any]) -> Usage | None:
         return None
     input_tokens = raw.get("prompt_tokens", raw.get("input_tokens")) or 0
     output_tokens = raw.get("completion_tokens", raw.get("output_tokens")) or 0
-    return Usage(input_tokens=int(input_tokens), output_tokens=int(output_tokens))
+    prompt_details = raw.get("prompt_tokens_details") or {}
+    completion_details = raw.get("completion_tokens_details") or {}
+    return Usage(
+        input_tokens=int(input_tokens), output_tokens=int(output_tokens),
+        cached_tokens=int(prompt_details.get("cached_tokens") or 0),
+        reasoning_tokens=int(completion_details.get("reasoning_tokens") or 0),
+    )

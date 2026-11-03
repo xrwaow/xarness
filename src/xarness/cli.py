@@ -16,7 +16,10 @@ from pathlib import Path
 
 from . import __version__
 from .config import (
-    DEFAULT_CONFIG_PATH, ConfigError, ensure_config, load_sectioned,
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    ensure_config,
+    load_sectioned,
 )
 
 

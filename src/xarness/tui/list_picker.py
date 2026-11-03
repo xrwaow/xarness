@@ -62,6 +62,11 @@ MINUS_FIELD = 4
 # row so long names cannot squeeze the title out.
 DIR_MAX_WIDTH = SESSION_ROW_WIDTH // 4
 
+# Id of the blank one-line gap between the two /sessions sections (live
+# sessions with a state word, then this workspace's saved sessions). It is
+# disabled, so the cursor never stops on it, and the search box drops it.
+SPACER_ID = "\0spacer"
+
 
 @dataclass(frozen=True)
 class _RowLayout:
@@ -136,7 +141,8 @@ def session_options(
 
     Each row is one Text: name, dimmed age, innermost workspace directory,
     unaccepted +/- totals, right-aligned state word. Both sections are
-    newest-user-message first.
+    newest-user-message first, separated by one blank row of padding when
+    both are non-empty.
     """
     resolved = Path(workspace).resolve() if workspace else None
     active = sorted(
@@ -164,13 +170,45 @@ def session_options(
             f"-{summary.deletions}" if tracked and summary.deletions else "",
         ))
     layout = _RowLayout.fit(directory for _, _, directory, _, _ in rows_data)
-    return [
-        Option(
+
+    def row(entry) -> Option:
+        summary, age, directory, plus, minus = entry
+        return Option(
             _session_row(summary, age, directory, plus, minus, layout),
             id=summary.name,
         )
-        for summary, age, directory, plus, minus in rows_data
-    ]
+
+    live = rows_data[:len(active)]
+    saved_rows = rows_data[len(active):]
+    options = [row(entry) for entry in live]
+    if live and saved_rows:
+        # One blank row of padding between the live sessions (the rows that
+        # carry a state word) and the saved sessions of this workspace.
+        options.append(_spacer())
+    options.extend(row(entry) for entry in saved_rows)
+    return options
+
+
+def _spacer() -> Option:
+    """A blank, unselectable row: visible padding, never a choice."""
+    return Option(Text(" "), id=SPACER_ID, disabled=True)
+
+
+def _next_enabled(options: Sequence[Option], start: int, step: int) -> int | None:
+    """First enabled index at ``start + step, start + 2*step, …`` (wrapping)."""
+    count = len(options)
+    for offset in range(1, count + 1):
+        index = (start + step * offset) % count
+        if not options[index].disabled:
+            return index
+    return None
+
+
+def _matches(option: Option, query: str) -> bool:
+    """Filter test; the blank gap row only shows while nothing is typed."""
+    if option.id == SPACER_ID:
+        return not query
+    return query in str(option.prompt).lower()
 
 
 def _session_row(
@@ -267,7 +305,7 @@ class ListPicker(ModalScreen[str | None]):
         query = query.lower()
         matches = [
             option for option in self._options
-            if query in str(option.prompt).lower()
+            if _matches(option, query)
         ]
         option_list = self.query_one("#picker-list", OptionList)
         # Keep the cursor on the same entry across a live refresh or a
@@ -282,10 +320,11 @@ class ListPicker(ModalScreen[str | None]):
         if not matches:
             option_list.highlighted = None
             return
+        # Stay on the highlighted row across a keystroke/refresh; otherwise
+        # land on the first real row (the spacer is never highlightable).
         option_list.highlighted = next(
-            (i for i, option in enumerate(matches)
-             if option.id == highlighted_id),
-            0,
+            (i for i, option in enumerate(matches) if option.id == highlighted_id),
+            _next_enabled(matches, -1, 1),
         )
 
     def _query(self) -> str:
@@ -320,11 +359,16 @@ class ListPicker(ModalScreen[str | None]):
         option_list = self.query_one("#picker-list", OptionList)
         if option_list.option_count == 0:
             return
-        current = option_list.highlighted or 0
-        option_list.highlighted = (
-            (current - 1) % option_list.option_count if event.key == "up"
-            else (current + 1) % option_list.option_count
+        step = -1 if event.key == "up" else 1
+        current = option_list.highlighted
+        # Skip the blank spacer between the sections: it is not a choice.
+        target = _next_enabled(
+            list(option_list.options),
+            0 if current is None else current,
+            step,
         )
+        if target is not None:
+            option_list.highlighted = target
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._refilter(event.value)

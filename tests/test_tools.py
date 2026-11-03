@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from xarness.sandbox import SandboxConfig
+from xarness.sandbox import SandboxConfig, bind_ref
 from xarness.tools import (
     Tool,
     ToolRegistry,
@@ -15,20 +15,30 @@ from xarness.tools import (
     _truncate_output,
     build_registry,
 )
+from pydantic import BaseModel
 
 
-async def _ok(args: dict) -> ToolResult:
-    return ToolResult(ok=True, output=f"ran with {sorted(args)}")
+class _EmptyArgs(BaseModel):
+    pass
 
 
-async def _boom(args: dict) -> ToolResult:
+class _TwoArgs(BaseModel):
+    a: int = 0
+    b: int = 0
+
+
+async def _ok(args: _TwoArgs) -> ToolResult:
+    return ToolResult(content=f"ran with a={args.a} b={args.b}")
+
+
+async def _boom(args: _EmptyArgs) -> ToolResult:
     raise RuntimeError("kaboom")
 
 
 def _registry() -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register(Tool(name="ok_tool", description="", parameters_schema={}, handler=_ok))
-    registry.register(Tool(name="boom_tool", description="", parameters_schema={}, handler=_boom))
+    registry.register(Tool(name="ok_tool", description="", args_model=_TwoArgs, handler=_ok))
+    registry.register(Tool(name="boom_tool", description="", args_model=_EmptyArgs, handler=_boom))
     return registry
 
 
@@ -48,7 +58,7 @@ def test_schema_matches_openai_tools_format() -> None:
         Tool(
             name="my_tool",
             description="does things",
-            parameters_schema={"type": "object", "properties": {}},
+            args_model=_EmptyArgs,
             handler=_ok,
         )
     )
@@ -68,7 +78,7 @@ def test_schema_matches_openai_tools_format() -> None:
 def test_call_success_parses_arguments() -> None:
     result = asyncio.run(ToolRegistry.call(_registry(), "ok_tool", '{"b": 1, "a": 2}'))
     assert result.ok
-    assert result.output == "ran with ['a', 'b']"
+    assert result.content == "ran with a=2 b=1"
 
 
 def test_empty_arguments_become_empty_dict() -> None:
@@ -79,27 +89,27 @@ def test_empty_arguments_become_empty_dict() -> None:
 def test_invalid_json_is_a_parse_error() -> None:
     result = asyncio.run(ToolRegistry.call(_registry(), "ok_tool", '{"a": '))
     assert not result.ok
-    assert result.parse_error is True
-    assert "invalid arguments JSON" in result.error
+    assert result.status == "parse_error"
+    assert "invalid arguments JSON" in result.content
 
 
 def test_non_object_arguments_are_a_parse_error() -> None:
     result = asyncio.run(ToolRegistry.call(_registry(), "ok_tool", "[1, 2]"))
     assert not result.ok
-    assert result.parse_error is True
+    assert result.status == "parse_error"
 
 
 def test_unknown_tool_fails_without_raising() -> None:
     result = asyncio.run(ToolRegistry.call(_registry(), "nope", "{}"))
     assert not result.ok
-    assert result.parse_error is False
-    assert "unknown tool" in result.error
+    assert result.status != "parse_error"
+    assert "unknown tool" in result.content
 
 
 def test_handler_exception_is_contained() -> None:
     result = asyncio.run(ToolRegistry.call(_registry(), "boom_tool", "{}"))
     assert not result.ok
-    assert "RuntimeError: kaboom" in result.error
+    assert "RuntimeError: kaboom" in result.content
 
 
 def test_plan_registry_is_read_only(tmp_path) -> None:
@@ -121,10 +131,10 @@ def _descriptions(registry: ToolRegistry) -> dict[str, str]:
     }
 
 
-def test_refs_are_described_at_their_canonical_path(tmp_path) -> None:
-    """Refs are ordinary absolute paths to the tools; the file tool describes
-    them (run_bash leaves that to the system prompt). Neither is advertised
-    when no refs exist."""
+def test_refs_do_not_vary_the_tool_descriptions(tmp_path) -> None:
+    """Tool descriptions are stable regardless of refs (a stable schema keeps
+    the provider's prompt cache warm); refs are described in the system
+    prompt instead."""
     sandbox = _sandbox(tmp_path)
     notes = tmp_path / "notes.md"
     notes.write_text("x")
@@ -135,12 +145,10 @@ def test_refs_are_described_at_their_canonical_path(tmp_path) -> None:
     assert "/tmp/refs" not in before["run_bash"]
     assert "git in the shell is read-only" not in before["run_bash"]
 
-    sandbox.add_ref(notes, alias="notes")
+    bind_ref(sandbox.workspace, sandbox.external_refs, notes, alias="notes")
     after = _descriptions(build_registry(
         sandbox, SimpleNamespace(config=sandbox), mode="write"))
-    assert "/tmp/refs/<alias>" in after["read_file"]
-    assert "/tmp/refs" not in after["run_bash"]
-    assert ".refs/" not in after["read_file"]
+    assert after == before
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +161,7 @@ def test_read_small_file_returns_full_contents(tmp_path) -> None:
         _registry_for(tmp_path).call("read_file", '{"path": "a.txt"}')
     )
     assert result.ok
-    assert result.output == "one\ntwo\n"
+    assert result.content == "one\ntwo\n"
 
 
 def test_read_accepts_absolute_container_path(tmp_path) -> None:
@@ -164,7 +172,7 @@ def test_read_accepts_absolute_container_path(tmp_path) -> None:
         "read_file", '{"path": "/workspace/a.txt"}'
     ))
     assert result.ok
-    assert result.output == "one\ntwo\n"
+    assert result.content == "one\ntwo\n"
 
 
 def test_read_absolute_path_outline_keeps_path_intact(tmp_path) -> None:
@@ -173,7 +181,7 @@ def test_read_absolute_path_outline_keeps_path_intact(tmp_path) -> None:
         "read_file", '{"path": "/workspace/big.py"}'
     ))
     assert result.ok
-    assert "# File outline for /workspace/big.py" in result.output
+    assert "# File outline for /workspace/big.py" in result.content
 
 
 def _big_python_file(tmp_path) -> None:
@@ -204,20 +212,20 @@ def test_read_large_python_file_returns_outline(tmp_path) -> None:
         _registry_for(tmp_path).call("read_file", '{"path": "big.py"}')
     )
     assert result.ok
-    assert result.output.startswith(
+    assert result.content.startswith(
         "File outline retrieved. This file is too large to read all at once"
     )
-    assert "Do NOT retry this call without line numbers" in result.output
+    assert "Do NOT retry this call without line numbers" in result.content
     # The outline names the path the caller passed, never the host path.
-    assert "# File outline for big.py" in result.output
-    assert str(tmp_path) not in result.output
+    assert "# File outline for big.py" in result.content
+    assert str(tmp_path) not in result.content
     # Ranges are 1-based, include the whole body, exclude decorators, and
     # methods are indented under their class.
-    assert "class Big [L4-11]" in result.output
-    assert " def method [L7-8]" in result.output
-    assert " async def amethod [L10-11]" in result.output
-    assert "def top [L13-14]" in result.output
-    assert result.output.rstrip().endswith("use start_line: 100 and end_line: 150.")
+    assert "class Big [L4-11]" in result.content
+    assert " def method [L7-8]" in result.content
+    assert " async def amethod [L10-11]" in result.content
+    assert "def top [L13-14]" in result.content
+    assert result.content.rstrip().endswith("use start_line: 100 and end_line: 150.")
 
 
 def test_read_large_file_with_range_returns_requested_lines(tmp_path) -> None:
@@ -226,8 +234,8 @@ def test_read_large_file_with_range_returns_requested_lines(tmp_path) -> None:
         "read_file", '{"path": "big.py", "start_line": 4, "end_line": 5}'
     ))
     assert result.ok
-    assert result.output.startswith('class Big:\n    """doc"""\n')
-    assert "[showing lines 4-5 of " in result.output
+    assert result.content.startswith('class Big:\n    """doc"""\n')
+    assert "[showing lines 4-5 of " in result.content
 
 
 def test_read_range_defaults_end_to_eof(tmp_path) -> None:
@@ -236,7 +244,7 @@ def test_read_range_defaults_end_to_eof(tmp_path) -> None:
         "read_file", '{"path": "a.txt", "start_line": 2}'
     ))
     assert result.ok
-    assert result.output == "two\nthree\n"
+    assert result.content == "two\nthree\n"
 
 
 def test_read_non_python_large_file_falls_back_to_preview(tmp_path) -> None:
@@ -247,9 +255,67 @@ def test_read_non_python_large_file_falls_back_to_preview(tmp_path) -> None:
         _registry_for(tmp_path).call("read_file", '{"path": "big.txt"}')
     )
     assert result.ok
-    assert "start_line/end_line" in result.output
-    assert "line 1\n" in result.output
-    assert "line 201" not in result.output
+    assert "start_line/end_line" in result.content
+    assert "line 1\n" in result.content
+    assert "line 201" not in result.content
+
+
+NUMBERED_1000 = "".join(f"line {i}\n" for i in range(1, 1001))
+
+
+def _capped_read(tmp_path, text: str, limit: int, **args) -> ToolResult:
+    """read_file with the registry's output cap forced to ``limit``."""
+    (tmp_path / "a.txt").write_text(text)
+    registry = _registry_for(tmp_path)
+    registry.max_output_chars = limit
+    return asyncio.run(registry.call(
+        "read_file", json.dumps({"path": "a.txt", **args})
+    ))
+
+
+def _shown(result: ToolResult) -> tuple[list[str], str]:
+    """(body lines, footer) of a read_file result."""
+    body, _, footer = result.content.partition("\n[showing lines ")
+    return body.splitlines(), footer
+
+
+def test_read_range_is_contiguous_under_the_output_cap(tmp_path) -> None:
+    """The cap must not splice a range (head + "[... elided ...]" + tail)
+    while the footer keeps claiming every requested line."""
+    result = _capped_read(tmp_path, NUMBERED_1000, 2000, end_line=1000)
+    assert result.ok and "chars elided" not in result.content
+    shown, footer = _shown(result)
+    assert shown == [f"line {i}" for i in range(1, len(shown) + 1)]  # no gaps
+    assert footer.startswith(f"1-{len(shown)} of 1000; output limit reached")
+    assert f"continue from line {len(shown) + 1}]" in footer
+    assert len(result.content) <= 2000
+
+
+def test_read_resumes_where_a_capped_range_ended(tmp_path) -> None:
+    first = _capped_read(tmp_path, NUMBERED_1000, 600, start_line=100)
+    shown, footer = _shown(first)
+    last = 100 + len(shown) - 1
+    assert footer.startswith(f"100-{last} of 1000; output limit reached")
+    rest = _capped_read(tmp_path, NUMBERED_1000, 600, start_line=last + 1)
+    assert rest.content.splitlines()[0] == f"line {last + 1}"
+
+
+def test_read_full_file_is_contiguous_under_the_output_cap(tmp_path) -> None:
+    text = "".join(f"line {i} {'x' * 40}\n" for i in range(1, 301))
+    result = _capped_read(tmp_path, text, 1000)
+    shown, footer = _shown(result)
+    assert shown == [f"line {i} {'x' * 40}" for i in range(1, len(shown) + 1)]
+    assert footer.startswith(f"1-{len(shown)} of 300; output limit reached")
+    assert len(result.content) <= 1000
+
+
+def test_read_under_the_cap_is_unchanged(tmp_path) -> None:
+    text = "".join(f"line {i}\n" for i in range(1, 101))
+    ranged = _capped_read(tmp_path, text, 32768, start_line=10, end_line=20)
+    assert ranged.content == "".join(
+        f"line {i}\n" for i in range(10, 21)
+    ) + "\n[showing lines 10-20 of 100]"
+    assert _capped_read(tmp_path, text, 32768).content == text
 
 
 def test_read_rejects_inverted_range(tmp_path) -> None:
@@ -258,7 +324,7 @@ def test_read_rejects_inverted_range(tmp_path) -> None:
         "read_file", '{"path": "a.txt", "start_line": 2, "end_line": 1}'
     ))
     assert not result.ok
-    assert result.parse_error is True
+    assert result.status == "parse_error"
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +339,13 @@ def test_read_counts_lines_without_trailing_newline(tmp_path) -> None:
     )
     assert result.ok
     # Full read: no truncation annotation, and the last line is included.
-    assert result.output == "one\ntwo\nthree"
+    assert result.content == "one\ntwo\nthree"
 
     ranged = asyncio.run(_registry_for(tmp_path).call(
         "read_file", '{"path": "a.txt", "start_line": 2, "end_line": 2}'
     ))
     assert ranged.ok
-    assert "[showing lines 2-2 of 3" in ranged.output
+    assert "[showing lines 2-2 of 3" in ranged.content
 
 
 def test_read_outline_threshold_ignores_missing_trailing_newline(tmp_path) -> None:
@@ -292,15 +358,15 @@ def test_read_outline_threshold_ignores_missing_trailing_newline(tmp_path) -> No
         _registry_for(tmp_path).call("read_file", '{"path": "big.py"}')
     )
     assert result.ok
-    assert result.output.startswith("File outline retrieved.")
-    assert "def top [L500-501]" in result.output
+    assert result.content.startswith("File outline retrieved.")
+    assert "def top [L500-501]" in result.content
 
 
 def test_write_file_creates_missing_parent_directories(tmp_path) -> None:
     result = asyncio.run(_registry_for(tmp_path).call(
         "write_file", '{"path": "a/b/c.txt", "content": "hi\\n"}'
     ))
-    assert result.ok, result.error
+    assert result.ok, result.content
     assert (tmp_path / "a" / "b" / "c.txt").read_text() == "hi\n"
 
 
@@ -309,7 +375,7 @@ def test_write_file_reports_bytes_not_characters(tmp_path) -> None:
         "write_file", json.dumps({"path": "u.txt", "content": "héllo"})
     ))
     assert result.ok
-    assert "(6 bytes)" in result.output
+    assert "(6 bytes)" in result.content
 
 
 def test_write_tools_reject_the_read_only_refs_area(tmp_path) -> None:
@@ -320,7 +386,7 @@ def test_write_tools_reject_the_read_only_refs_area(tmp_path) -> None:
             "write_file", json.dumps({"path": path, "content": "no"})
         ))
         assert not result.ok, path
-        assert "read-only" in result.error, path
+        assert "read-only" in result.content, path
 
 
 def test_string_integers_are_coerced(tmp_path) -> None:
@@ -328,14 +394,14 @@ def test_string_integers_are_coerced(tmp_path) -> None:
     result = asyncio.run(_registry_for(tmp_path).call(
         "read_file", '{"path": "a.txt", "start_line": "2"}'
     ))
-    assert result.ok, result.error
-    assert result.output == "two\nthree\n"
+    assert result.ok, result.content
+    assert result.content == "two\nthree\n"
 
 
 def test_missing_required_argument_is_a_parse_error(tmp_path) -> None:
     result = asyncio.run(_registry_for(tmp_path).call("read_file", "{}"))
-    assert not result.ok and result.parse_error
-    assert "missing required argument 'path'" in result.error
+    assert result.status == "parse_error"
+    assert "path: Field required" in result.content
 
 
 def test_read_start_past_eof_names_the_length(tmp_path) -> None:
@@ -344,7 +410,7 @@ def test_read_start_past_eof_names_the_length(tmp_path) -> None:
         "read_file", '{"path": "a.txt", "start_line": 9}'
     ))
     assert not result.ok
-    assert "2 lines" in result.error
+    assert "2 lines" in result.content
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +423,12 @@ def test_write_file_creates_then_overwrites(tmp_path) -> None:
         "write_file", '{"path": "new.txt", "content": "hello\\n"}'
     ))
     assert first.ok
-    assert first.output.startswith("created ")
+    assert first.content.startswith("created ")
     second = asyncio.run(registry.call(
         "write_file", '{"path": "new.txt", "content": "bye\\n"}'
     ))
     assert second.ok
-    assert second.output.startswith("overwrote ")
+    assert second.content.startswith("overwrote ")
     assert (tmp_path / "new.txt").read_text() == "bye\n"
 
 
@@ -371,7 +437,7 @@ def test_write_file_rejects_refs(tmp_path) -> None:
         "write_file", '{"path": "/tmp/refs/x", "content": "nope"}'
     ))
     assert not result.ok
-    assert "read-only" in result.error
+    assert "read-only" in result.content
 
 
 def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
@@ -383,16 +449,16 @@ def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     assert result.ok
     assert (tmp_path / "f.txt").read_text() == "alpha\nBETA\nalpha\n"
     # The result carries the changed code, not just an acknowledgement.
-    assert result.output.startswith("applied edit to f.txt")
-    assert "-beta" in result.output
-    assert "+BETA" in result.output
+    assert result.content.startswith("applied edit to f.txt")
+    assert "-beta" in result.content
+    assert "+BETA" in result.content
 
 
 def test_edit_file_newline_only_change_is_reported(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha")
     args = {"path": "f.txt", "edits": [{"old_string": "alpha", "new_string": "alpha\n"}]}
     result = asyncio.run(_registry_for(tmp_path).call("edit_file", json.dumps(args)))
-    assert result.ok and "(no textual change)" not in result.output
+    assert result.ok and "(no textual change)" not in result.content
     assert (tmp_path / "f.txt").read_text() == "alpha\n"
 
 
@@ -409,7 +475,7 @@ def test_edit_file_rejects_bare_top_level_pair(tmp_path) -> None:
         "edit_file", '{"path": "f.txt", "old_string": "beta", "new_string": "BETA"}'
     ))
     assert not result.ok
-    assert "edits" in result.error
+    assert "edits" in result.content
 
 
 def test_edit_file_applies_multiple_edits_in_one_call(tmp_path) -> None:
@@ -423,13 +489,13 @@ def test_edit_file_applies_multiple_edits_in_one_call(tmp_path) -> None:
     ))
     assert result.ok
     assert (tmp_path / "f.txt").read_text() == "ALPHA\nbeta\nGAMMA\n"
-    assert result.output.startswith("applied 2 edits to f.txt")
-    assert "diff --git a/f.txt b/f.txt" in result.output
+    assert result.content.startswith("applied 2 edits to f.txt")
+    assert "diff --git a/f.txt b/f.txt" in result.content
     for line in ("-alpha", "+ALPHA", "-gamma", "+GAMMA"):
-        assert line in result.output
+        assert line in result.content
     # The diff must be line-structured: the TUI parser keys off "---",
     # "+++" and "@@" starting their own lines.
-    lines = result.output.splitlines()
+    lines = result.content.splitlines()
     assert "--- a/f.txt" in lines
     assert "+++ b/f.txt" in lines
     assert any(line.startswith("@@") for line in lines)
@@ -459,11 +525,11 @@ def test_edit_file_is_atomic_on_a_failed_batch(tmp_path) -> None:
         ]}),
     ))
     assert not result.ok
-    assert "edit 2" in result.error
-    assert "not found" in result.error
+    assert "edit 2" in result.content
+    assert "not found" in result.content
     # Nothing was written: a failed batch never leaves a half-edited file.
     assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\n"
-    assert "ALPHA" not in result.output
+    assert "ALPHA" not in result.content
 
 
 def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
@@ -476,9 +542,9 @@ def test_edit_file_reports_which_edit_was_ambiguous(tmp_path) -> None:
         ]}),
     ))
     assert not result.ok
-    assert "edit 2" in result.error
-    assert "not unique" in result.error
-    assert "replace_all" in result.error
+    assert "edit 2" in result.content
+    assert "not unique" in result.content
+    assert "replace_all" in result.content
     # Atomic: the ambiguous edit means edit 1 is not applied either.
     assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\nalpha\n"
 
@@ -501,8 +567,8 @@ def test_edit_file_rejects_empty_edits_list(tmp_path) -> None:
         "edit_file", '{"path": "f.txt", "edits": []}'
     ))
     assert not result.ok
-    assert result.parse_error is True
-    assert "non-empty list" in result.error
+    assert result.status == "parse_error"
+    assert "non-empty list" in result.content
 
 
 def test_edit_file_rejects_malformed_edit_item(tmp_path) -> None:
@@ -511,8 +577,8 @@ def test_edit_file_rejects_malformed_edit_item(tmp_path) -> None:
         "edit_file", '{"path": "f.txt", "edits": [{"new_string": "x"}]}'
     ))
     assert not result.ok
-    assert result.parse_error is True
-    assert "old_string" in result.error
+    assert result.status == "parse_error"
+    assert "old_string" in result.content
     assert (tmp_path / "f.txt").read_text() == "alpha\n"
 
 
@@ -523,7 +589,7 @@ def test_edit_file_rejects_ambiguous_match(tmp_path) -> None:
         '{"path": "f.txt", "edits": [{"old_string": "alpha", "new_string": "BETA"}]}',
     ))
     assert not result.ok
-    assert "not unique" in result.error
+    assert "not unique" in result.content
 
 
 def test_edit_file_requires_old_string(tmp_path) -> None:
@@ -533,5 +599,5 @@ def test_edit_file_requires_old_string(tmp_path) -> None:
         '{"path": "f.txt", "edits": [{"new_string": "BETA"}]}',
     ))
     assert not result.ok
-    assert result.parse_error is True
-    assert "old_string" in result.error
+    assert result.status == "parse_error"
+    assert "old_string" in result.content
