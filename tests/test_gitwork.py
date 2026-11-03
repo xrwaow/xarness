@@ -13,11 +13,16 @@ from unittest import mock
 
 from xarness import gitwork
 from xarness.gitwork import (
-    GitInfo, TurnCheckpoint, accept_changes, attributed_diff_stat, check_blocked_git,
-    detect_repo, diff_stat, git_diff, revert_to_tree, revert_turn,
+    GitInfo, TurnCheckpoint, accept_changes, attributed_diff_stat,
+    detect_repo, diff_stat, git_diff, revert_to_tree, revert_turns,
     snapshot_state,
     setup_tracking, snapshot_tree, tree_diff_stat,
 )
+
+
+def _turn(before: str, after: str) -> TurnCheckpoint:
+    """The one checkpoint a single-turn revert needs."""
+    return TurnCheckpoint(before_tree=before, after_tree=after)
 
 
 def _git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
@@ -70,7 +75,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
             info, notes = await setup_tracking(workspace, "sess1")
 
         assert info is not None
-        assert info.workspace == workspace.resolve()
+        assert info.repo_root == workspace.resolve()
         assert info.external
         with self.assertRaises(ValueError):
             info.git_dir.relative_to(workspace.resolve())  # store is outside
@@ -101,7 +106,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (workspace / "new.txt").write_text("created\n")
         after = await snapshot_state(info)
 
-        conflict = await revert_turn(info, before, after)
+        conflict = await revert_turns(info, [_turn(before, after)])
 
         assert conflict is None
         assert (workspace / "doc.txt").read_text() == "base\n"
@@ -460,7 +465,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert repo not in info.index_path.parents  # never inside the repo
 
     # ------------------------------------------------------------------
-    # revert_turn: reverse one turn's diff, preserving later edits
+    # revert_turns: reverse a turn's diff, preserving later edits
 
     async def test_revert_turn_reverses_only_the_turns_diff(self):
         """A turn's edits are reversed; an unrelated file changed after the
@@ -474,7 +479,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after = await snapshot_state(info)
         (repo / "unrelated.txt").write_text("manual edit\n")  # after the turn
 
-        conflict = await revert_turn(info, before, after)
+        conflict = await revert_turns(info, [_turn(before, after)])
 
         assert conflict is None
         assert (repo / "app.py").read_text() == "line1\nline2\n"
@@ -492,7 +497,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after = await snapshot_state(info)
         (repo / "app.py").write_text("manual change\n")  # overlapping manual edit
 
-        conflict = await revert_turn(info, before, after)
+        conflict = await revert_turns(info, [_turn(before, after)])
 
         assert conflict is not None
         # A readable summary, not raw merge-tree output (tree oids, stage
@@ -510,26 +515,24 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         tree = await snapshot_state(info)
         (repo / "manual.txt").write_text("manual\n")
 
-        result = await revert_turn(info, tree, tree)
+        result = await revert_turns(info, [_turn(tree, tree)])
 
         assert result is None
         assert (repo / "manual.txt").read_text() == "manual\n"
 
-    async def test_revert_turn_noop_makes_no_git_calls(self):
-        """The no-edit early return skips the whole merge machinery — no
-        commit wrapping, no merge-tree, no revert."""
+    async def test_revert_turn_noop_skips_the_merge(self):
+        """A no-edit turn (before == after) needs no commit wrapping and no
+        merge-tree: only the one snapshot to find the live state."""
         repo = self.make_repo()
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
         tree = await snapshot_state(info)
 
-        with mock.patch.object(gitwork, "_wrap_commit", new=mock.AsyncMock()) as wrap, \
-                mock.patch.object(gitwork, "_run_git", new=mock.AsyncMock()) as run:
-            result = await revert_turn(info, tree, tree)
+        with mock.patch.object(gitwork, "_wrap_commit", new=mock.AsyncMock()) as wrap:
+            result = await revert_turns(info, [_turn(tree, tree)])
 
         assert result is None
         wrap.assert_not_called()
-        run.assert_not_called()
 
     async def test_tree_diff_stat_cache_returns_fresh_rows(self):
         """Repeated diffs of the same immutable tree pair are cached, but each
@@ -562,7 +565,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after2 = await snapshot_state(info)
 
         conflict = await gitwork.revert_turns(info, [
-            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+            _turn(before1, after1), _turn(before2, after2),
         ])
 
         assert conflict is None
@@ -582,7 +585,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "one.txt").write_text("manual\n")  # makes the older revert conflict
 
         conflict = await gitwork.revert_turns(info, [
-            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+            _turn(before1, after1), _turn(before2, after2),
         ])
 
         assert conflict is not None
@@ -602,7 +605,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after = await snapshot_state(info)
         (repo / "manual.txt").write_text("manual\n")  # drift after the turn
 
-        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        stat = await attributed_diff_stat(info, [_turn(before, after)])
         by_path = {f.path: f for f in stat.files}
         assert by_path["agent.txt"].source == "agent"
         assert by_path["manual.txt"].source == "drift"
@@ -632,9 +635,9 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
 
         # Once the turn finishes, normal attribution resumes.
         after = await snapshot_state(info)
-        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        stat = await attributed_diff_stat(info, [_turn(before, after)])
         (repo / "stray.txt").write_text("outside\n")
-        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        stat = await attributed_diff_stat(info, [_turn(before, after)])
         assert {f.path: f for f in stat.files}["stray.txt"].source == "drift"
 
     async def test_attributed_diff_keeps_drift_after_a_later_turn(self):
@@ -653,7 +656,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "agent.txt").write_text("agent\n")
         after = await snapshot_state(info)
 
-        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        stat = await attributed_diff_stat(info, [_turn(before, after)])
         by_path = {f.path: f for f in stat.files}
         assert by_path["drift.txt"].source == "drift"
         assert by_path["agent.txt"].source == "agent"
@@ -674,7 +677,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after2 = await snapshot_state(info)
 
         stat = await attributed_diff_stat(info, [
-            TurnCheckpoint(before1, after1), TurnCheckpoint(before2, after2),
+            _turn(before1, after1), _turn(before2, after2),
         ])
         by_path = {f.path: f for f in stat.files}
         assert by_path["mid.txt"].source == "drift"
@@ -693,7 +696,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         after = await snapshot_state(info)
         (repo / "app.py").write_text("agent\nmanual\n")
 
-        stat = await attributed_diff_stat(info, [TurnCheckpoint(before, after)])
+        stat = await attributed_diff_stat(info, [_turn(before, after)])
         by_path = {f.path: f for f in stat.files}
         assert by_path["app.py"].source == "agent"
 
@@ -766,15 +769,15 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
     # session-block round trip
 
     async def test_git_info_block_round_trip(self):
+        """The persisted block (a JSON model dump) restores field for field."""
         repo = self.make_repo()
         info, _ = await setup_tracking(repo, "sess1")
         assert info is not None
-        block = info.to_block()
+        block = info.model_dump(mode="json")
         assert all(
-            isinstance(v, (str, int, list)) for v in block.values()
+            isinstance(v, (str, int, list, type(None))) for v in block.values()
         )
-        restored = GitInfo.from_block(block)
-        assert restored == info
+        assert GitInfo.model_validate(block) == info
 
     async def test_git_info_rejects_legacy_worktree_block(self):
         """GitInfo is a plain pydantic model now; the legacy worktree block
@@ -791,79 +794,135 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
             })
 
     # ------------------------------------------------------------------
-    # run_bash git-command filter (unchanged behavior)
+    # the generated git shim (the read-only policy at execution time)
 
-    def guard(self, cmd: str) -> str | None:
-        return check_blocked_git(cmd)
+    def shim(self) -> Path:
+        """Write git_shim_script() into a temp bin dir and return that dir."""
+        if not hasattr(self, "_shim_dir"):
+            shim_dir = self.base / "shim"
+            shim_dir.mkdir()
+            script = shim_dir / "git"
+            script.write_text(gitwork.git_shim_script())
+            script.chmod(0o755)
+            self._shim_dir = shim_dir
+        return self._shim_dir
 
-    def test_blocks_any_git_mutation(self):
-        assert self.guard("git checkout other-branch") is not None
-        assert self.guard("git switch main") is not None
-        assert self.guard("git checkout -b new") is not None
-        assert self.guard("git checkout -- file.txt") is not None
-        assert self.guard("git branch feature") is not None
-        assert self.guard("git branch -D agent/x") is not None
-        assert self.guard("git tag v1") is not None
-        assert self.guard("git tag -d v1") is not None
-        assert self.guard("git reset --hard") is not None
-        assert self.guard("git reset HEAD~1") is not None
-        assert self.guard("git rebase main") is not None
-        assert self.guard("git worktree add ../wt") is not None
-        assert self.guard("git update-ref refs/heads/main HEAD~1") is not None
-        assert self.guard("git symbolic-ref HEAD refs/heads/other") is not None
-        assert self.guard("git stash") is not None
-        assert self.guard("git clean -fd") is not None
-        assert self.guard("git merge main") is not None
-        assert self.guard("git push") is not None
-        assert self.guard("git pull") is not None
-        assert self.guard("git commit --amend") is not None
-        assert self.guard("git config user.email a@b.c") is not None
-        assert self.guard("git config user.email") is not None
+    def run_shim(self, command: str, cwd: Path, *,
+                 path: str | None = None) -> subprocess.CompletedProcess:
+        """Run ``command`` through ``/bin/sh`` with the shim first on PATH."""
+        env = {
+            **os.environ,
+            "PATH": path or f"{self.shim()}:{os.environ['PATH']}",
+        }
+        return subprocess.run(
+            ["/bin/sh", "-c", command], cwd=cwd, capture_output=True,
+            text=True, env=env, check=False,
+        )
 
-    def test_allows_readonly_git(self):
-        assert self.guard("git status") is None
-        assert self.guard("git diff HEAD") is None
-        assert self.guard("git log --oneline") is None
-        assert self.guard("git blame file.txt") is None
-        assert self.guard("git show HEAD") is None
-        assert self.guard("git rev-parse HEAD") is None
-        assert self.guard("git config --get user.name") is None
-        assert self.guard("git config --list") is None
+    def test_shim_blocks_mutations_in_place(self):
+        """A blocked git call fails where it stands: statements around it
+        still run, and the message says the command did not run."""
+        repo = self.make_repo()
+        result = self.run_shim(
+            "echo before; git reset --hard; echo after", repo)
+        assert result.returncode == 0  # the last statement's status
+        assert "before" in result.stdout and "after" in result.stdout
+        assert "blocked, read-only here" in result.stderr
 
-    def test_blocks_through_shell_operators_and_env_prefixes(self):
-        assert self.guard("echo hi && git status") is None
-        assert self.guard("FOO=1 git log") is None
-        assert self.guard("sh -c 'git status'") is None
-        assert self.guard("(git status)") is None
-        assert self.guard("echo hi && git reset --hard") is not None
-        assert self.guard("FOO=1 git reset --hard") is not None
-        assert self.guard("sh -c 'git reset --hard'") is not None
-        assert self.guard("(git commit -m x)") is not None
+    def test_shim_stops_at_and(self):
+        """``&&`` stops at the block, exactly as a failing command should."""
+        repo = self.make_repo()
+        result = self.run_shim(
+            "echo before && git add -A && echo after", repo)
+        assert result.returncode != 0
+        assert "before" in result.stdout
+        assert "after" not in result.stdout + result.stderr
+        assert "blocked, read-only here" in result.stderr
 
-    def test_list_forms_of_branch_tag_stash_remote_are_reads(self):
-        for cmd in (
-            "git branch", "git branch --show-current", "git branch -a",
-            "git branch --list 'feat*'", "git tag", "git tag -l 'v1*'",
-            "git stash list", "git stash show", "git remote -v",
-            "git remote show origin", "git reflog", "git reflog show",
-            "git check-ignore dist/",
+    def test_shim_blocks_every_mutation(self):
+        repo = self.make_repo()
+        for command in (
+            "git checkout other-branch",
+            "git switch main",
+            "git checkout -b new",
+            "git checkout -- app.py",
+            "git branch feature",
+            "git branch -D agent/x",
+            "git tag v1",
+            "git tag -d v1",
+            "git reset --hard",
+            "git reset HEAD~1",
+            "git rebase main",
+            "git worktree add ../wt",
+            "git update-ref refs/heads/main HEAD~1",
+            "git symbolic-ref HEAD refs/heads/other",
+            "git stash",
+            "git clean -fd",
+            "git merge main",
+            "git push",
+            "git pull",
+            "git commit --amend",
+            "git config user.email a@b.c",
+            "git config user.email",
         ):
-            assert self.guard(cmd) is None, cmd
-        for cmd in (
-            "git branch feature", "git tag v1", "git stash", "git stash pop",
-            "git remote add origin url", "git reflog expire --all",
-            "git reflog delete HEAD@{0}",
+            assert "blocked, read-only here" in self.run_shim(
+                command, repo).stderr, command
+        # None of that mutated the repo.
+        assert _git(repo, "symbolic-ref", "--short", "HEAD").strip() == "main"
+        assert _git(repo, "status", "--porcelain").strip() == ""
+
+    def test_shim_allows_read_only_inspection(self):
+        repo = self.make_repo()
+        for command in (
+            "git status",
+            "git status --short",
+            "git diff HEAD",
+            "git log --oneline",
+            "git blame app.py",
+            "git show HEAD",
+            "git rev-parse HEAD",
+            "git config --get user.name",
+            "git config --list",
+            "git branch",
+            "git branch --show-current",
+            "git branch -a",
+            "git tag",
+            "git tag -l 'v1*'",
+            "git stash list",
+            "git stash show",
+            "git remote -v",
+            "git reflog",
+            "git reflog show",
+            "git check-ignore pkg/",
+            "git -C . status",
+            "git --no-pager log --oneline",
         ):
-            assert self.guard(cmd) is not None, cmd
+            result = self.run_shim(command, repo)
+            assert "blocked" not in result.stderr, (command, result.stderr)
 
-    def test_heredoc_bodies_are_data_not_commands(self):
-        script = "cat > run.sh <<'EOF'\ngit init .\ngit commit -qm x\nEOF\nbash run.sh"
-        assert self.guard(script) is None
-        # A real command after the heredoc is still checked.
-        assert self.guard("cat > x <<EOF\nhi\nEOF\ngit reset --hard") is not None
+    def test_shim_reads_through_shell_wrappers(self):
+        """An env prefix or a nested ``sh -c`` still resolves to the shim
+        (and mentioning git is not running it)."""
+        repo = self.make_repo()
+        assert "blocked" in self.run_shim(
+            "FOO=1 git reset --hard", repo).stderr
+        assert "blocked" not in self.run_shim(
+            "FOO=1 git status", repo).stderr
+        assert "blocked" not in self.run_shim(
+            "sh -c 'git status'", repo).stderr
+        assert "blocked" in self.run_shim(
+            "sh -c 'git reset --hard'", repo).stderr
+        assert "blocked" not in self.run_shim(
+            'echo "git reset --hard"', repo).stderr
+        assert "blocked" not in self.run_shim(
+            "grep -q line1 app.py", repo).stderr
 
-    def test_filter_blocks_even_without_branch_info(self):
-        assert check_blocked_git("git reset --hard") is not None
+    def test_shim_reports_a_missing_real_git(self):
+        """Only the shim on PATH: say so instead of silently doing nothing."""
+        result = self.run_shim("git status", self.make_repo(),
+                               path=str(self.shim()))
+        assert result.returncode == 127
+        assert "found no real git binary" in result.stderr
 
     # ------------------------------------------------------------------
     # pinned ignore exclusions (snapshots ignore .gitignore edits)

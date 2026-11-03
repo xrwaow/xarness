@@ -82,8 +82,9 @@ async def wait_idle(session: Session, timeout: float = 10.0) -> None:
 
 
 def _image() -> ImageAttachment:
+    import hashlib
     return ImageAttachment(
-        name="cat.png", mime="image/png",
+        id=hashlib.sha256(b"cat").hexdigest(), name="cat.png", mime="image/png",
         data_b64=base64.b64encode(b"cat").decode(), width=1, height=1,
     )
 
@@ -98,7 +99,7 @@ def test_undo_and_retry_keep_images(tmp_path) -> None:
     async def go():
         session.images.save(_image())
         await session.execute("s1", SendMessage(
-            text="look [x]", images=[_image().to_ref()],
+            text="look [x]", images=[_image()],
         ))
         await wait_idle(session)
         await session.execute("r1", Rollback(resend=True))
@@ -203,7 +204,7 @@ def test_history_replaced_keeps_live_partial_round(tmp_path) -> None:
     async def go():
         session.subscribe()
         session._set_state("running")
-        session._emit(protocol.ContentDelta(text="before"))
+        session.controller.partial_round.content = "before"
         assert session.snapshot().partial_round.content == "before"
         session._commit_history('accept')
         assert session.snapshot().partial_round.content == "before"
@@ -490,7 +491,7 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
         await finish_gate.wait()
 
     session.controller.compact = fake_compact
-    session.controller.finish_turn = fake_finish_turn
+    session._finish_turn = fake_finish_turn
 
     async def go():
         session.subscribe()
@@ -810,7 +811,9 @@ def test_only_round_content_updates_partial_round(tmp_path) -> None:
         session._emit(protocol.Notice(text="stale notice"))
         session._emit(protocol.StatusChanged(activity=session._activity()))
         assert session.snapshot().partial_round is None
-        session._emit(protocol.ContentDelta(text="live"))
+        # The controller fills the model-stream half (status/notice events
+        # never create a partial round).
+        session.controller.partial_round.content = "live"
         partial = session.snapshot().partial_round
         assert partial is not None and partial.content == "live"
 
@@ -822,12 +825,15 @@ def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
 
     async def go():
         session._set_state("running")
-        session._emit(protocol.ContentDelta(text="answer"))
-        session._emit(protocol.ToolCallStarted(call_id="c1", name="read_file"))
-        session._emit(protocol.ToolCallArgumentsDone(
-            call_id="c1", name="read_file", arguments_json='{"path": "a"}',
+        # What the controller's stream accumulates: answer text, then the
+        # call it started with its parsed arguments.
+        partial = session.controller.partial_round
+        partial.content = "answer"
+        partial.tool_calls.append(protocol.PartialToolCall(
+            call_id="c1", name="read_file", arguments='{"path": "a"}',
         ))
         session._emit(protocol.ToolOutputDelta(call_id="c1", text="body"))
+        partial.content = ""  # what the controller does on RoundComplete
         session._emit(protocol.RoundComplete())
         partial = session.snapshot().partial_round
         assert partial is not None
@@ -851,8 +857,9 @@ def test_partial_round_never_truncates_a_long_answer(tmp_path) -> None:
 
     async def go():
         session._set_state("running")
-        for _ in range(600):
-            session._emit(protocol.ContentDelta(text="x"))
+        # The live content is the controller's, verbatim: the session must
+        # never truncate or re-copy it when building the snapshot.
+        session.controller.partial_round.content = "x" * 600
         partial = session.snapshot().partial_round
         assert partial is not None and len(partial.content) == 600
 
@@ -1348,12 +1355,15 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
         await session.execute("s1", SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
-        async def fake_summarize(_wire_messages):
+        from unittest import mock
+        from xarness import compaction as compaction_mod
+
+        async def fake_summarize(_client, _wire_messages):
             return "handoff summary", None
 
-        session.controller._summarize = fake_summarize
-        await session.controller.compact()
-        assert session.controller.open_turn_before() is not None
+        with mock.patch.object(compaction_mod, "summarize", fake_summarize):
+            await session.controller.compact()
+        assert session._open_turn_before() is not None
 
         (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
         stat = await session.diff_info(None)
@@ -1399,7 +1409,7 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
         async def fail_checkpoint():
             return None
 
-        session.controller._take_checkpoint = fail_checkpoint
+        session._take_checkpoint = fail_checkpoint
         await session.execute("s2", SendMessage(text="second"))
         await asyncio.wait_for(started.wait(), 5)
 
@@ -1551,14 +1561,14 @@ def test_rollback_watermark_survives_inflight_write(tmp_path, monkeypatch) -> No
     async def go():
         session.conversation.add(user_message("hi"))
         session.conversation.add(AssistantMessage(content="hello"))
-        session._persist_from = 0
+        session.conversation._dirty_from = 0
         session._persist()
         await asyncio.wait_for(started.wait(), 5)
         # The rollback lands while the write thread is running.
-        session._persist_from = 1  # plan.drop_from
+        session.conversation._dirty_from = 1  # plan.drop_from
         release.set()
         await session._flush_persist()
-        assert session._persist_from == 1, session._persist_from
+        assert session.conversation._dirty_from == 1, session.conversation._dirty_from
 
         # A follow-up write covers the cut onward; the reload keeps both
         # messages (the truncated row was rewritten, not skipped).
@@ -1620,10 +1630,15 @@ def test_load_starts_watermark_at_end_and_closes_crashed_turns(tmp_path) -> None
         loaded = Session.load(
             "test", parts=_parts(tmp_path), state=stored,
         )
-        assert loaded._persist_from == len(loaded.conversation.messages)
+        # The watermark starts "everything persisted": the first write must
+        # not rewrite a loaded history.
+        assert loaded.conversation._dirty_from is None
         assert loaded.conversation.open_turn is None  # closed on load
         assert all(t.closed for t in loaded.conversation.turns.values())
-        assert loaded._crash_repaired == []  # untracked: nothing to stamp
+        # Untracked: the crash repair has nothing to stamp.
+        await loaded.repair_crashed_turns()
+        assert all(t.after_tree is None
+                   for t in loaded.conversation.turns.values())
 
     asyncio.run(go())
 
@@ -1682,8 +1697,8 @@ def test_persist_watermark_advances_across_writes(tmp_path, monkeypatch) -> None
     first_end = asyncio.run(go())
     assert from_seqs, "no persist happened"
     assert from_seqs[-1] >= 1, from_seqs
-    assert session._persist_from == len(session.conversation.messages)
-    assert session._persist_from >= first_end
+    # Fully written: nothing left to rewrite next time.
+    assert session.conversation._dirty_from is None
 
 
 def test_persist_failure_does_not_stall_the_turn(tmp_path, monkeypatch) -> None:
@@ -1706,6 +1721,6 @@ def test_persist_failure_does_not_stall_the_turn(tmp_path, monkeypatch) -> None:
             events.append(queue.get_nowait())
         assert session._state == "idle"
         assert any(isinstance(e, protocol.TurnEnded) for e in events)
-        assert session._persist_from == 0  # rewound: retry from scratch
+        assert session.conversation._dirty_from == 0  # rewound
 
     asyncio.run(go())

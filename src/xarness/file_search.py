@@ -29,17 +29,23 @@ _candidate_cache: OrderedDict[Path, tuple[float, list[str]]] = OrderedDict()
 
 def _git_candidates(root: Path) -> list[str] | None:
     """Workspace-relative candidate paths from git, or None when the
-    workspace is not tracked (or git is unavailable)."""
+    workspace is not tracked (or git is unavailable).
+
+    ``-z`` keeps non-ASCII names verbatim (without it git quotes and
+    octal-escapes them, and the quoted string is not a path on disk).
+    Tracked-but-deleted files are dropped: they are in the index but there
+    is nothing to open."""
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "-co", "--exclude-standard"],
-            cwd=root, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+            ["git", "ls-files", "-co", "--exclude-standard", "-z"],
+            cwd=root, capture_output=True, timeout=_GIT_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
-    return proc.stdout.splitlines()
+    paths = proc.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return [path for path in paths if path and (root / path).exists()]
 
 
 def _walk_bounded(root: Path) -> list[str]:

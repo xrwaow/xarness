@@ -28,7 +28,6 @@ from ..protocol import (
     ToolFinished,
     ToolOutputDelta,
     image_refs,
-    is_summary,
 )
 from ..protocol import (
     Message as ConversationMessage,
@@ -58,7 +57,7 @@ def turn_time_summary(messages) -> str | None:
     stores no second, preformatted copy."""
     user_index = next(
         (i for i, m in reversed(list(enumerate(messages)))
-         if m.role == "user" and m.timing.send and not is_summary(m)), None,
+         if m.role == "user" and m.timing.send and not m.is_summary), None,
     )
     turn = messages[user_index + 1:] if user_index is not None else messages
     assistants = [
@@ -97,7 +96,7 @@ def turn_time_summaries(messages) -> dict[int, str]:
     derived timing line."""
     starts = [
         i for i, m in enumerate(messages)
-        if m.role == "user" and not is_summary(m)
+        if m.role == "user" and not m.is_summary
     ]
     summaries: dict[int, str] = {}
     for n, start in enumerate(starts):
@@ -373,7 +372,7 @@ class Transcript:
         self, message, results: dict, summary: str | None = None,
     ) -> None:
         if message.role == "user":
-            if is_summary(message):
+            if message.is_summary:
                 self.items.append(DividerItem(
                     message.content.removeprefix(SUMMARY_PREFIX).strip(),
                 ))
@@ -489,7 +488,7 @@ class Transcript:
         """Fold one live event; return the items created or mutated."""
         if isinstance(event, MessageAdded):
             message = event.message
-            if message.role != "user" or is_summary(message):
+            if message.role != "user" or message.is_summary:
                 # Assistant/tool messages were already rendered from their
                 # stream events (or arrive with the next snapshot).
                 return []

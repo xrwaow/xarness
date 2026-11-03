@@ -166,10 +166,10 @@ def test_git_shim_blocks_in_place(tmp_path) -> None:
     # The blocked call fails in place; the shell keeps going and the last
     # statement's status (echo after) is the command's own.
     assert semi.ok
-    assert "before" in semi.output and "after" in semi.content
+    assert "before" in semi.content and "after" in semi.content
     assert "blocked, read-only here" in semi.content
 
-    assert "before" in amp.output and "after" not in amp.content
+    assert "before" in amp.content and "after" not in amp.content
 
     assert inspect_.ok  # inspection subcommands pass the shim
     assert mention.ok  # mentioning git is not running git

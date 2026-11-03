@@ -20,7 +20,6 @@ from ..conversation import (  # noqa: F401 - re-exported for clients
     Usage,
     UserMessage,
     image_refs,
-    is_summary,
 )
 from .commands import (  # noqa: F401
     Accept,

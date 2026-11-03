@@ -3,6 +3,7 @@ multipart wire format, session persistence, and the TUI's @-mention /
 vision gating."""
 
 import base64
+import hashlib
 import io
 import json
 import unittest
@@ -20,9 +21,24 @@ from xarness.session_store import (
     SessionImageStore, load_blob,
 )
 
+# In-memory blob store: every message with images needs one, and these tests
+# never want to touch (or do not yet have) a session directory.
+STORE = SessionImageStore("test", persist=False)
+
+
+def _attachment(
+    name: str = "cat.png", data: bytes = b"A", mime: str = "image/png",
+    width: int = 2, height: int = 2,
+) -> ImageAttachment:
+    """An attachment the way load_image_bytes builds one (hash on the bytes)."""
+    return ImageAttachment(
+        id=hashlib.sha256(data).hexdigest(), name=name, mime=mime,
+        data_b64=base64.b64encode(data).decode(), width=width, height=height,
+    )
+
 
 def _user_message(text: str, images: list[ImageAttachment]) -> Message:
-    return user_message(text, images)
+    return user_message(text, images, STORE)
 
 
 def _png(width: int, height: int, color=(255, 0, 0)) -> bytes:
@@ -46,6 +62,8 @@ class TestLoadImage(unittest.TestCase):
             self.assertEqual((att.width, att.height), (10, 10))
             self.assertEqual(att.mime, "image/png")
             self.assertEqual(att.name, Path(path).name)
+            # The id is the content hash, computed once on load.
+            self.assertEqual(att.id, hashlib.sha256(data).hexdigest())
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -79,6 +97,19 @@ class TestLoadImage(unittest.TestCase):
         finally:
             Path(path).unlink(missing_ok=True)
 
+    def test_palette_png_transparency_survives(self) -> None:
+        """A palette (P) PNG with a transparent index is re-encoded as PNG,
+        not flattened to JPEG (``"A" in getbands()`` is False for mode P)."""
+        from xarness.images import load_image_bytes
+
+        img = Image.new("P", (2, 2))
+        img.putpalette([0, 0, 0] * 256)
+        img.info["transparency"] = 0
+        buf = io.BytesIO()
+        img.save(buf, "PNG", transparency=0)
+        att = load_image_bytes(buf.getvalue(), name="pal.png")
+        self.assertEqual(att.mime, "image/png")
+
     def test_is_image_path(self) -> None:
         self.assertTrue(is_image_path("shot.PNG"))
         self.assertTrue(is_image_path("a/b.jpg"))
@@ -106,12 +137,9 @@ class TestLoadImage(unittest.TestCase):
 
 class TestWireFormat(unittest.TestCase):
     def test_user_message_with_images_emits_content_parts(self) -> None:
-        att = ImageAttachment(
-            name="shot.png", mime="image/png",
-            data_b64=base64.b64encode(_png(4, 4)).decode(), width=4, height=4,
-        )
+        att = _attachment("shot.png", _png(4, 4), width=4, height=4)
         message = _user_message("look at this", [att])
-        wire = message.to_wire()
+        wire = message.to_wire(image_loader=STORE.data_url)
         self.assertIsInstance(wire["content"], list)
         self.assertEqual(wire["content"][0], {"type": "text", "text": "look at this"})
         image_part = wire["content"][1]
@@ -123,11 +151,17 @@ class TestWireFormat(unittest.TestCase):
         self.assertEqual(user_message("hi").to_wire()["content"], "hi")
 
     def test_empty_content_with_images_still_emits_image_parts(self) -> None:
-        att = ImageAttachment(
-            name="s.jpg", mime="image/jpeg", data_b64="aGk=", width=2, height=2,
-        )
-        wire = _user_message("", [att]).to_wire()
+        att = _attachment("s.jpg", b"hi", mime="image/jpeg", width=2, height=2)
+        wire = _user_message("", [att]).to_wire(image_loader=STORE.data_url)
         self.assertEqual([p["type"] for p in wire["content"]], ["image_url"])
+
+    def test_missing_blob_degrades_to_text(self) -> None:
+        """A blob the store no longer has must not produce a broken part."""
+        att = _attachment("gone.png", b"gone")
+        message = _user_message("see", [att])
+        wire = message.to_wire(image_loader=lambda _ref: None)
+        self.assertEqual([p["type"] for p in wire["content"]], ["text", "text"])
+        self.assertIn("gone.png", wire["content"][1]["text"])
 
     def test_profile_supports_vision_defaults_false(self) -> None:
         profile = ProviderProfile(base_url="https://x.test/v1", model_id="m")
@@ -136,12 +170,12 @@ class TestWireFormat(unittest.TestCase):
 
 class TestOrderedWireFormat(unittest.TestCase):
     def test_tokens_order_the_content_blocks(self) -> None:
-        a = ImageAttachment(name="a.png", mime="image/png", data_b64="QQ==", width=2, height=2)
-        b = ImageAttachment(name="b.png", mime="image/png", data_b64="Qg==", width=3, height=3)
+        a = _attachment("a.png", b"A")
+        b = _attachment("b.png", b"B", width=3, height=3)
         message = _user_message(
             f"compare {token_text(a)} with {token_text(b)}", [a, b],
         )
-        parts = message.to_wire()["content"]
+        parts = message.to_wire(image_loader=STORE.data_url)["content"]
         self.assertEqual(
             [(p["type"], p.get("text") or p["image_url"]["url"][-4:]) for p in parts],
             [
@@ -153,18 +187,18 @@ class TestOrderedWireFormat(unittest.TestCase):
         )
 
     def test_images_without_tokens_are_appended(self) -> None:
-        a = ImageAttachment(name="a.png", mime="image/png", data_b64="QQ==", width=2, height=2)
+        a = _attachment("a.png", b"A")
         message = _user_message("look", [a])
-        parts = message.to_wire()["content"]
+        parts = message.to_wire(image_loader=STORE.data_url)["content"]
         self.assertEqual(parts[0]["type"], "text")
         self.assertEqual(parts[1]["type"], "image_url")
 
     def test_token_without_attachment_keeps_its_text(self) -> None:
-        a = ImageAttachment(name="a.png", mime="image/png", data_b64="QQ==", width=2, height=2)
+        a = _attachment("a.png", b"A")
         message = _user_message(
             f"{token_text(a)} and [🖼 gone.png 1×1 #0000]", [a],
         )
-        parts = message.to_wire()["content"]
+        parts = message.to_wire(image_loader=STORE.data_url)["content"]
         self.assertEqual(parts[0]["type"], "image_url")
         texts = [p.get("text", "") for p in parts if p["type"] == "text"]
         self.assertTrue(any("gone.png" in t for t in texts))
@@ -172,21 +206,19 @@ class TestOrderedWireFormat(unittest.TestCase):
     def test_same_name_and_size_tokens_do_not_collide(self) -> None:
         """Two different images with equal name/dimensions get distinct
         tokens, so both reach the wire instead of one turning into text."""
-        a = ImageAttachment(name="x.png", mime="image/png", data_b64="QQ==", width=2, height=2)
-        b = ImageAttachment(name="x.png", mime="image/png", data_b64="Qg==", width=2, height=2)
+        a = _attachment("x.png", b"A")
+        b = _attachment("x.png", b"B")
         self.assertNotEqual(token_text(a), token_text(b))
         text = f"{token_text(a)} vs {token_text(b)}"
-        parts = _user_message(text, [a, b]).to_wire()["content"]
+        parts = _user_message(text, [a, b]).to_wire(
+            image_loader=STORE.data_url)["content"]
         kinds = [p["type"] for p in parts]
         self.assertEqual(kinds.count("image_url"), 2, kinds)
 
 
 class TestPersistence(unittest.TestCase):
     def test_images_round_trip_through_session_json(self) -> None:
-        att = ImageAttachment(
-            name="shot.png", mime="image/png",
-            data_b64=base64.b64encode(_png(4, 4)).decode(), width=4, height=4,
-        )
+        att = _attachment("shot.png", _png(4, 4), width=4, height=4)
         message = _user_message("see attached", [att])
         raw = json.loads(json.dumps(message.model_dump(exclude_none=True)))
         loaded = MESSAGE_ADAPTER.validate_python(raw)
@@ -194,23 +226,22 @@ class TestPersistence(unittest.TestCase):
         self.assertNotIn("data_b64", json.dumps(raw))
         self.assertNotIn("data", json.dumps(raw))
         ref = loaded.parts[1].ref
-        self.assertEqual(ref.id, att.to_ref().id)
+        self.assertEqual(ref.id, att.id)
         # Bytes are resolved from the store when turning into a wire message.
-        wire = loaded.to_wire(image_loader=lambda _id: att.data())
+        wire = loaded.to_wire(image_loader=STORE.data_url)
         self.assertEqual(wire["content"][1]["type"], "image_url")
 
     def test_snapshot_carries_refs_not_bytes(self) -> None:
         from xarness.protocol import Snapshot
 
-        att = ImageAttachment(
-            name="shot.png", mime="image/png", data_b64="aGk=", width=2, height=2,
-        )
+        att = _attachment("shot.png", b"hi")
         message = _user_message("see attached", [att])
         payload = Snapshot(
             messages=[message], status={"state": "idle"},
         ).model_dump_json()
         self.assertNotIn(att.data_b64, payload)
-        self.assertIn(att.to_ref().id, payload)
+        self.assertIn(att.id, payload)
+
 
 class TestBlobStore(unittest.TestCase):
     def setUp(self) -> None:
@@ -225,10 +256,7 @@ class TestBlobStore(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _attachment(self, data: bytes = b"cat") -> ImageAttachment:
-        return ImageAttachment(
-            name="cat.png", mime="image/png",
-            data_b64=base64.b64encode(data).decode(), width=2, height=2,
-        )
+        return _attachment("cat.png", data)
 
     def test_save_is_content_addressed_and_deduped(self) -> None:
         store = SessionImageStore("s1")
@@ -255,7 +283,7 @@ class TestBlobStore(unittest.TestCase):
         self.assertNotIn("data_b64", raw)
         loaded = session_store.load_state("s1")
         ref = loaded.conversation.messages[0].parts[1].ref
-        self.assertEqual(ref.id, att.to_ref().id)
+        self.assertEqual(ref.id, att.id)
         # The provider wire still gets the image, resolved from the blob
         # (the loader returns a data URL for the ref).
         wire = loaded.conversation.to_wire(
@@ -275,11 +303,12 @@ class TestBlobStore(unittest.TestCase):
         from xarness.api import create_app
 
         data = _png(2, 2)
-        ref = SessionImageStore("s1").save(ImageAttachment(
-            name="cat.png", mime="image/png",
-            data_b64=base64.b64encode(data).decode(), width=2, height=2,
-        ))
-        app = create_app(None)  # the image route needs only the blob store
+        ref = SessionImageStore("s1").save(_attachment("cat.png", data))
+
+        class _Host:
+            sessions: dict = {}  # no live session: blobs come from disk
+
+        app = create_app(_Host())  # the image route needs only the blob store
 
         async def fetch(image_id: str) -> httpx.Response:
             transport = httpx.ASGITransport(app=app)

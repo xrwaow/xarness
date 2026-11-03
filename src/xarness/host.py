@@ -41,10 +41,9 @@ from .config import (
     resolve_api_key,
     save_preferences,
 )
-from .diffview import build_diff_info
 from .gitwork import GitInfo, GitWorktreeError
 from .protocol import ServerInfo, ServerStats, SessionSummary
-from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable
+from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable, ref_infos
 from .errors import RefError, SessionError
 from .session import Session, SessionParts
 from .session_store import change_workspace_ref
@@ -67,6 +66,11 @@ IDLE_TTL_SECONDS = 120.0
 
 def _idle_ttl() -> float:
     return float(os.environ.get("XARNESS_IDLE_TTL_SECONDS", IDLE_TTL_SECONDS))
+
+# How often the reaper wakes to evict inactive sessions and check for
+# shutdown. Small enough that an idle session leaves promptly, cheap enough
+# that the scan (one dict of sessions) never shows up in a profile.
+REAP_INTERVAL_SECONDS = 0.25
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
@@ -97,10 +101,9 @@ class Host:
         self._started_at = time.monotonic()
         self._started_at_wall = _utcnow()
         self._shutdown_event = asyncio.Event()
-        # Pending call_later handle for the non-persistent grace shutdown.
-        self._grace_handle: asyncio.TimerHandle | None = None
-        # Pending idle-eviction timers, by session name.
-        self._idle_handles: dict[str, asyncio.TimerHandle] = {}
+        # The one background loop that evicts inactive sessions and decides
+        # when a non-persistent host may exit (see _reap).
+        self._reaper: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
     # session construction (config + workspace + git + sandbox)
@@ -170,11 +173,6 @@ class Host:
             sandbox_key, settings = sectioned.resolve_sandbox(sandbox_name)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
-        # The deprecated sandbox-level tool_output_limit fallback comes from
-        # the freshly resolved profile: a saved session's settings exclude
-        # the field (it must not round-trip), so reading it there would be
-        # None on every reload.
-        profile_tool_limit = settings.tool_output_limit
         # An existing session keeps the sandbox state it was saved with
         # (its /sandbox and /filter choices), not a fresh resolution.
         # Workspace refs are NEVER baked into the settings: they are per
@@ -230,13 +228,7 @@ class Host:
             config_path=self.config_path,
             sandbox=sandbox,
             git_info=git_info,
-            # The deprecated sandbox-level key is a fallback for the root,
-            # read from the freshly resolved profile (see above).
-            tool_output_limit=(
-                sectioned.tool_output_limit
-                if sectioned.tool_output_limit is not None
-                else profile_tool_limit
-            ),
+            tool_output_limit=sectioned.tool_output_limit,
             workspace_refs=workspace_refs,
         )
 
@@ -251,7 +243,6 @@ class Host:
         session = Session(
             **parts.session_kwargs(name),
             no_save=request.no_session,
-            idle_callback=self._on_session_idle,
         )
         self.sessions[name] = session
         if not request.no_session:
@@ -306,34 +297,13 @@ class Host:
             saved_sandbox_settings=state.sandbox_settings,
             saved_git_info=saved_git_info,
         )
-        session = Session.load(
-            name, parts=parts, state=state,
-            idle_callback=self._on_session_idle,
-        )
-        # A turn left open by a host crash or a quit mid-turn never got its
-        # after-tree (finish_turn never ran). Record the workspace's current
-        # state as that turn's after-tree — what finish_turn would have
-        # written had the process survived — so a plain reopen doesn't
-        # surface the session's own unaccepted edits as "drift".
-        # BEFORE publishing the session: an attach during this await would
-        # otherwise run drift detection against the stale last_seen_tree
-        # and flag the crashed turn's own edits as user drift.
-        if session.git_info is not None and session._crash_repaired:
-            # A turn left open by a host crash or a quit mid-turn never got
-            # its after-tree (Session.load closed it with the before tree as
-            # a placeholder). Record the workspace's current state as that
-            # turn's after-tree — what finish_turn would have written had
-            # the process survived — and mark it seen so the turn's own
-            # edits are not reported as drift.
-            try:
-                tree = await gitwork.snapshot_state(session.git_info)
-                session.git_info.mark_seen(tree)
-                for turn in session._crash_repaired:
-                    turn.after_tree = tree
-                session._persist()
-            except GitWorktreeError:
-                pass
-        session._crash_repaired = []
+        session = Session.load(name, parts=parts, state=state)
+        # A turn left open by a host crash or a quit mid-turn gets the live
+        # tree as its after-tree, BEFORE publishing the session: an attach
+        # during this await would otherwise run drift detection against the
+        # stale last_seen_tree and flag the crashed turn's own edits as
+        # user drift.
+        await session.repair_crashed_turns()
         self.sessions[name] = session
         # Drift is NOT computed here: it is detected lazily when the first
         # client attaches (Session.prompt_resume_drift). A drifted workspace
@@ -368,9 +338,6 @@ class Host:
         subscribers, close it down. The saved file is kept."""
         if self.sessions.get(session.name) is not session:
             return
-        handle = self._idle_handles.pop(session.name, None)
-        if handle is not None:
-            handle.cancel()
         self.sessions.pop(session.name, None)
         await session.shutdown(notice=notice)
 
@@ -413,84 +380,6 @@ class Host:
                 summary.deletions = stat.deletions
         return summaries
 
-    # ------------------------------------------------------------------
-    # read-only views of saved sessions
-
-    async def _saved_state(self, name: str) -> session_store.StoredSession:
-        """Load a saved session without hosting it (no sandbox, no git scan).
-
-        The SQLite read and the whole-history parse run in a thread: they
-        block for O(history) and must not stall the event loop."""
-        if session_store.load_meta(name) is None:
-            raise SessionError(f"no saved session named {name!r}")
-        try:
-            return await asyncio.to_thread(session_store.load_state, name)
-        except (OSError, ValueError, KeyError) as exc:
-            raise SessionError(f"could not read the saved session: {exc}") from exc
-
-    def _saved_status(
-        self, name: str, stored: session_store.StoredSession,
-    ) -> protocol.StatusPayload:
-        """Best-effort status for a saved session: config metadata, but no
-        sandbox construction and no workspace scan."""
-        profile = None
-        profile_name = stored.profile
-        try:
-            profile_name, profile = load_sectioned(self.config_path).resolve_model(
-                stored.profile,
-            )
-        except ConfigError:
-            pass
-        settings = stored.sandbox_settings
-        refs: list[protocol.RefInfo] = []
-        if settings is not None and stored.workspace:
-            # Settings are profile-only: the workspace refs live beside the
-            # sessions and ride into the config via extra_refs.
-            external = SandboxConfig.resolve_auto_refs(
-                Path(stored.workspace),
-                [*settings.auto_include_refs,
-                 *session_store.load_workspace_refs(stored.workspace)],
-            )
-            refs = [
-                protocol.RefInfo(path=str(ref.host), mount=ref.mount)
-                for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
-            ]
-        return protocol.StatusPayload(
-            config=protocol.SessionConfigView(
-                session_name=name,
-                workspace=stored.workspace,
-                mode=stored.mode or "write",
-                model_name=profile_name or "",
-                model_display_name=(
-                    (profile.display_name or profile.model_id) if profile else ""
-                ),
-                model_id=profile.model_id if profile else "",
-                cot_strength=profile.cot_strength.value if profile else "medium",
-                max_context=profile.max_context if profile else 128_000,
-                supports_vision=profile.supports_vision if profile else False,
-                sandbox_name=stored.sandbox_name,
-                use_container=settings.use_container if settings else True,
-                enable_tracking=stored.git is not None,
-                filter_list=list(settings.filter_list) if settings else [],
-                refs=refs,
-            ),
-            activity=protocol.Activity(
-                state="idle",
-                usage_total=stored.usage_total,
-                last_usage=stored.last_usage,
-            ),
-        )
-
-    async def saved_snapshot(self, name: str) -> protocol.Snapshot:
-        """Snapshot of a saved session read straight from the store."""
-        stored = await self._saved_state(name)
-        conversation = stored.conversation
-        return protocol.Snapshot(
-            messages=list(conversation.visible_messages()),
-            history=conversation.history_messages(),
-            status=self._saved_status(name, stored),
-        )
-
     def saved_summary(
         self, name: str, meta: dict[str, Any] | None = None,
     ) -> SessionSummary:
@@ -512,11 +401,7 @@ class Host:
     def _workspace_ref_infos(
         workspace: Path, specs: list[str],
     ) -> list[protocol.RefInfo]:
-        external = SandboxConfig.resolve_auto_refs(workspace, specs)
-        return [
-            protocol.RefInfo(path=str(ref.host), mount=ref.mount)
-            for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
-        ]
+        return ref_infos(SandboxConfig.resolve_auto_refs(workspace, specs))
 
     def workspace_refs(self, workspace: str) -> list[protocol.RefInfo]:
         """Canonical workspace refs, without hosting a session."""
@@ -554,19 +439,6 @@ class Host:
                     continue
                 await session.apply_ref_specs(specs)
         return self._workspace_ref_infos(ws, specs)
-
-    async def saved_diff_info(
-        self, name: str, path: str | None,
-    ) -> protocol.DiffInfo:
-        """Diff for a saved session, using only the persisted git block and
-        turn checkpoints — no hosted session and no sandbox."""
-        stored = await self._saved_state(name)
-        info = stored.git
-        if info is None:
-            return protocol.DiffInfo(tracking=False)
-        return await build_diff_info(
-            info, stored.conversation.turn_checkpoints(), path,
-        )
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(
@@ -665,7 +537,7 @@ class Host:
         down."""
         HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
         server, server_task = await _start_unix_server(self)
-        self._arm_grace()
+        self._reaper = asyncio.get_running_loop().create_task(self._reap())
         try:
             if stats_interval is None:
                 await self._shutdown_event.wait()
@@ -679,91 +551,68 @@ class Host:
                     )
                     await asyncio.sleep(stats_interval)
         finally:
-            if self._grace_handle is not None:
-                self._grace_handle.cancel()
+            if self._reaper is not None:
+                self._reaper.cancel()
+                self._reaper = None
             server.should_exit = True
             try:
                 await asyncio.wait_for(server_task, timeout=5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 server_task.cancel()
-            for handle in self._idle_handles.values():
-                handle.cancel()
-            self._idle_handles.clear()
             for session in list(self.sessions.values()):
                 await session.stop()
             if self.unix_socket.exists():
                 self.unix_socket.unlink()
 
-    def _on_session_idle(self, session: Session) -> None:
-        if self.sessions.get(session.name) is not session:
-            return
-        if session.is_active:
-            return
-        session._persist()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        # Evict after a TTL, not immediately: a warm idle session makes the
-        # next turn cheap (no state reload, no sandbox rebuild, the
-        # persistent shell keeps its cwd). A session that goes active again
-        # before the TTL is simply skipped when the timer fires.
-        old = self._idle_handles.pop(session.name, None)
-        if old is not None:
-            old.cancel()
-        self._idle_handles[session.name] = loop.call_later(
-            _idle_ttl(), self._idle_expired, session.name,
-        )
-        self._arm_grace()
+    async def _reap(self) -> None:
+        """The host's one lifecycle loop: evict inactive sessions and, for a
+        non-persistent host, exit after GRACE_SECONDS with nothing to keep it
+        alive.
 
-    def _idle_expired(self, name: str) -> None:
-        self._idle_handles.pop(name, None)
-        session = self.sessions.get(name)
-        if session is None or session.is_active:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self._release_session(session))
-        self._arm_grace()
+        Polling instead of per-session timers keeps the whole policy in one
+        place: there is no idle callback for a session to fire, no handle to
+        re-arm, and an eviction can never cancel the task that scheduled it.
 
-    def _arm_grace(self) -> None:
-        """(Re)schedule the shutdown check GRACE_SECONDS out. A
-        non-persistent host shuts down once the grace passes with nothing
-        active — a client between connections finds the host alive because
-        every idle notification re-arms the timer."""
-        if self.persistent:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if self._grace_handle is not None:
-            self._grace_handle.cancel()
-        self._grace_handle = loop.call_later(GRACE_SECONDS, self._grace_expired)
-
-    def _grace_expired(self) -> None:
-        if self._shutdown_event.is_set():
-            return
-        if any(s.is_active for s in self.sessions.values()) or self._idle_handles:
-            # Still active (or active again), or a warm idle session is
-            # inside its TTL: re-check after another grace period — the
-            # next idle notification re-arms the timer too. Shutting down
-            # here would kill a session the TTL was meant to keep warm.
-            self._arm_grace()
-            return
-        self._shutdown_event.set()
-
-    async def _release_session(self, session: Session) -> None:
-        """Evict an inactive session: stop its loops and sandbox shell and
-        drop it from the host. The saved file is kept (it was just
-        persisted); /sessions reopens it on demand."""
-        if self.sessions.get(session.name) is not session:
-            return
-        if session.is_active:
-            return  # a client re-attached or a turn started in the meantime
-        await self._evict(session)
+        A session is evicted once it has been inactive (no turn, no ask, no
+        client) for ``_idle_ttl()`` seconds. A warm idle session is why the
+        host lingers: the next turn pays no state reload, no sandbox rebuild,
+        and keeps the persistent shell's cwd."""
+        inactive: dict[str, float] = {}
+        quiet_since: float | None = None
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=REAP_INTERVAL_SECONDS,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            ttl = _idle_ttl()
+            warm = False
+            for session in list(self.sessions.values()):
+                if session.is_active:
+                    inactive.pop(session.name, None)
+                    continue
+                since = inactive.setdefault(session.name, now)
+                if now - since < ttl:
+                    warm = True
+                    continue
+                inactive.pop(session.name, None)
+                session._persist()
+                await self._evict(session)
+            # Sessions that left the host by another path (unload, delete)
+            # must not keep their clock around.
+            for name in [n for n in inactive if n not in self.sessions]:
+                del inactive[name]
+            if warm or any(s.is_active for s in self.sessions.values()):
+                quiet_since = None
+            elif self.persistent:
+                quiet_since = None
+            elif quiet_since is None:
+                quiet_since = now
+            elif now - quiet_since >= GRACE_SECONDS:
+                self._shutdown_event.set()
 
     async def request_shutdown(self) -> None:
         self._shutdown_event.set()

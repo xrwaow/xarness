@@ -267,9 +267,18 @@ def _plain_body(call: ToolCallView) -> RenderableType:
     return _with_output(body, call.output)
 
 
+def _bash_line(args_text: str) -> str:
+    """The command as one line, shared by the live and settled labels.
+
+    Not ``splitlines()[0]``: a command that opens with a blank line or spans
+    several lines would otherwise render as a bare "Running run_bash" while
+    it executes, only naming the command after it settled."""
+    return _shorten(_command(args_text), 80)
+
+
 def _bash_settled(args_text: str) -> Text | None:
-    command = _command(args_text)
-    return _muted(" " + _shorten(command, 80)) if command else None
+    command = _bash_line(args_text)
+    return _muted(" " + command) if command else None
 
 
 def _plain_live(args_text: str) -> tuple[str, str]:
@@ -277,8 +286,7 @@ def _plain_live(args_text: str) -> tuple[str, str]:
 
 
 def _bash_live(args_text: str) -> tuple[str, str]:
-    command = _command(args_text)
-    return "run_bash", command.splitlines()[0] if command else ""
+    return "run_bash", _bash_line(args_text)
 
 
 def _write_settled(args_text: str) -> Text | None:
@@ -306,9 +314,12 @@ TOOL_VIEWS: dict[str, ToolView] = {
 
 
 def live_parts(tool_name: str, args_text: str) -> tuple[str, str]:
-    """The shimmering tool name and the static argument-derived detail."""
+    """The shimmering tool name and the static argument-derived detail.
+
+    Truncated at the same width as the settled detail, so the command a
+    running call shows does not shrink when it finishes."""
     name, detail = TOOL_VIEWS.get(tool_name, _DEFAULT)[0](args_text)
-    return name, _shorten(detail) if detail else detail
+    return name, _shorten(detail, 80) if detail else detail
 
 
 def summary_text(call: ToolCallView) -> Text:

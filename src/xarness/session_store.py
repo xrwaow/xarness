@@ -157,9 +157,14 @@ class SessionImageStore:
         self._url_cache: "OrderedDict[str, str]" = OrderedDict()
 
     def save(self, attachment: ImageAttachment) -> ImageRef:
-        ref = attachment.to_ref()
-        self.store(attachment.data())
-        return ref
+        """Store one attachment's bytes; returns its content-addressed
+        ref (the attachment already carries the id — the hash was computed
+        once, on load)."""
+        self._write(attachment.id, attachment.data())
+        return ImageRef(
+            id=attachment.id, name=attachment.name, mime=attachment.mime,
+            width=attachment.width, height=attachment.height,
+        )
 
     def load(self, image_id: str) -> bytes | None:
         if not self.persist:
@@ -182,10 +187,14 @@ class SessionImageStore:
     def store(self, data: bytes) -> str:
         """Store raw uploaded bytes under their content hash; returns the id.
 
-        The one write path for blobs — message attachments and client
-        uploads share it (and a ``no_save`` session keeps them in memory,
-        where the provider round can still reach them)."""
+        The one write path for blobs — client uploads use it (and a
+        ``no_save`` session keeps them in memory, where the provider round
+        can still reach them)."""
         image_id = hashlib.sha256(data).hexdigest()
+        self._write(image_id, data)
+        return image_id
+
+    def _write(self, image_id: str, data: bytes) -> None:
         if self.persist:
             path = _blob_path(self.name, image_id)
             if not path.exists():
@@ -199,7 +208,6 @@ class SessionImageStore:
                 os.replace(tmp, path)
         else:
             self._memory[image_id] = data
-        return image_id
 
     def data_url(self, ref: ImageRef) -> str | None:
         """``data:<mime>;base64,...`` for one stored image, cached by id."""
@@ -243,10 +251,12 @@ class StoredSession(BaseModel):
     schema_version: int = Field(alias="schema", default=SCHEMA_VERSION)
     updated_at: str = Field(default_factory=_utcnow_iso)
     conversation: Conversation = Field(default_factory=Conversation)
-    # Turn checkpoints live on Conversation.turns (keyed by the opening
-    # user message's id) — ONE home, runtime and persisted. They live in
-    # the state row (not on the messages): messages are immutable, and
-    # these mutate at every turn end / accept / rollback.
+    # Turn checkpoints, keyed by the opening user message's id. ONE home at
+    # runtime (Conversation.turns); this is the persisted shape of it, a
+    # real field so neither serialize nor load has to splice the dict in by
+    # hand. They live in the state row (not on the messages): messages are
+    # immutable, and these mutate at every turn end / accept / rollback.
+    turns: dict[str, TurnCheckpoint] = Field(default_factory=dict)
     profile: str | None = None
     workspace: str | None = None
     git: GitInfo | None = None
@@ -264,24 +274,17 @@ class StoredSession(BaseModel):
 
 def _meta_block(stored: StoredSession, tracking: bool) -> dict[str, Any]:
     """The small summary block listing and last-used lookups read: no
-    conversation parsing needed on those paths."""
-    # Scan ALL messages, not just the visible slice: after a compaction the
-    # visible history can start with the summary (no user message), and the
-    # row would sort by name instead of recency.
-    last_user = max(
-        (m.timing.send for m in stored.conversation.messages
-         if m.role == "user" and m.timing.send),
-        default=None,
-    )
+    conversation parsing needed on those paths.
+
+    ``updated_at``/``schema`` are NOT duplicated here: the sessions table
+    has a column for each, and the loaders inject them back."""
     visible = stored.conversation.visible_messages()
     return {
-        "schema": SCHEMA_VERSION,
         "profile": stored.profile,
         "workspace": stored.workspace,
-        "updated_at": stored.updated_at,
         "sandbox_name": stored.sandbox_name,
         "message_count": len(visible),
-        "last_user_message_at": last_user,
+        "last_user_message_at": stored.conversation.last_user_message_at(),
         "tracking": tracking,
     }
 
@@ -360,11 +363,17 @@ def _state_block(stored: StoredSession) -> dict[str, Any]:
     """Everything but the messages (and the redundant schema/version key).
 
     Dumping only the small fields — never the whole model — keeps a persist
-    O(state), not O(history)."""
-    return stored.model_dump(
+    O(state), not O(history). ``turns`` comes from the conversation, the one
+    runtime home (``StoredSession.turns`` is its persisted shape)."""
+    state = stored.model_dump(
         mode="json", by_alias=True, exclude_none=True,
-        exclude={"conversation", "schema_version"},
+        exclude={"conversation", "schema_version", "turns"},
     )
+    state["turns"] = {
+        message_id: turn.model_dump(mode="json", exclude_none=True)
+        for message_id, turn in stored.conversation.turns.items()
+    }
+    return state
 
 
 def serialize_state(
@@ -383,13 +392,6 @@ def serialize_state(
     messages = stored.conversation.messages
     from_seq = max(0, min(from_seq, len(messages)))
     state = _state_block(stored)
-    # Turn checkpoints: Conversation.turns is the ONE home (runtime and
-    # persisted); the conversation itself is excluded from the state block,
-    # so its turns are added here, in the state-row shape.
-    state["turns"] = {
-        message_id: turn.model_dump(mode="json", exclude_none=True)
-        for message_id, turn in stored.conversation.turns.items()
-    }
     payload = {
         "state": state,
         "messages": [
@@ -419,21 +421,21 @@ def write_state(
         for index, message in enumerate(payload["messages"])
     ]
     with connection() as db:
-        with db:
-            db.execute(
-                "DELETE FROM messages WHERE name = ? AND seq >= ?",
-                (name, from_seq),
-            )
-            db.executemany(
-                "INSERT OR REPLACE INTO messages (name, seq, data) VALUES (?, ?, ?)",
-                rows,
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(name, schema, state, meta, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (name, SCHEMA_VERSION, state_json,
-                 json.dumps(meta, separators=(",", ":")), meta["updated_at"]),
-            )
+        db.execute(
+            "DELETE FROM messages WHERE name = ? AND seq >= ?",
+            (name, from_seq),
+        )
+        db.executemany(
+            "INSERT OR REPLACE INTO messages (name, seq, data) VALUES (?, ?, ?)",
+            rows,
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(name, schema, state, meta, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (name, SCHEMA_VERSION, state_json,
+             json.dumps(meta, separators=(",", ":")),
+             payload["state"]["updated_at"]),
+        )
 
 
 def load_state(name: str) -> StoredSession:
@@ -457,32 +459,16 @@ def load_state(name: str) -> StoredSession:
             "SELECT data FROM messages WHERE name = ? ORDER BY seq", (name,)
         ).fetchall()
     raw_state = json.loads(state_json)
-    # Turn checkpoints: Conversation.turns is the ONE home — lift the state
-    # row's copy straight into it (extra="ignore" would drop the key).
-    state_turns = raw_state.pop("turns", {}) or {}
-    stored = StoredSession(
-        schema=SCHEMA_VERSION,
-        **raw_state,
-    )
-    for message_id, turn in state_turns.items():
-        stored.conversation.turns.setdefault(
-            message_id, TurnCheckpoint.model_validate(turn),
-        )
+    stored = StoredSession(schema=SCHEMA_VERSION, **raw_state)
+    # Conversation.turns is the ONE runtime home; the state row is its
+    # persisted shape (a real StoredSession field).
+    stored.conversation.turns = stored.turns
     messages: list[Message] = []
     for (data,) in rows:
-        raw = json.loads(data)
-        # Pre-schema-4 messages carried their turn checkpoint inline; lift it
-        # out before validation (messages are immutable now) instead of
-        # silently dropping it.
-        turn = raw.pop("turn", None) if isinstance(raw, dict) else None
-        message = MESSAGE_ADAPTER.validate_python(raw)
-        if turn is not None and message.role == "user":
-            stored.conversation.turns.setdefault(message.id, TurnCheckpoint.model_validate(turn))
-        messages.append(message)
+        messages.append(MESSAGE_ADAPTER.validate_python(json.loads(data)))
     stored.conversation.messages = messages
-    # A fresh list object: drop any visible-index cache (keyed on the old
-    # list's identity) from validation.
-    stored.conversation._invalidate_visible()
+    # The list was replaced wholesale: recompute the derived visible index.
+    stored.conversation._recompute_visible()
     return stored
 
 
@@ -493,16 +479,11 @@ def load_meta(name: str) -> dict[str, Any] | None:
     try:
         with connection() as db:
             row = db.execute(
-                "SELECT meta FROM sessions WHERE name = ?", (name,)
+                "SELECT meta, updated_at FROM sessions WHERE name = ?", (name,)
             ).fetchone()
     except sqlite3.Error:
         return None
-    if row is None:
-        return None
-    try:
-        return json.loads(row[0])
-    except json.JSONDecodeError:
-        return None
+    return _meta_row(row)
 
 
 def load_metas() -> dict[str, dict[str, Any]]:
@@ -513,29 +494,44 @@ def load_metas() -> dict[str, dict[str, Any]]:
         return {}
     try:
         with connection() as db:
-            rows = db.execute("SELECT name, meta FROM sessions").fetchall()
+            rows = db.execute("SELECT name, meta, updated_at FROM sessions").fetchall()
     except sqlite3.Error:
         return {}
     metas: dict[str, dict[str, Any]] = {}
-    for name, meta_json in rows:
+    for name, meta_json, updated_at in rows:
         try:
-            metas[name] = json.loads(meta_json)
+            meta = json.loads(meta_json)
         except json.JSONDecodeError:
             continue
+        meta["updated_at"] = updated_at
+        metas[name] = meta
     return metas
+
+
+def _meta_row(row: "tuple[str, str] | None") -> dict[str, Any] | None:
+    """Decode one (meta JSON, updated_at column) row, injecting the column
+    value the meta block deliberately does not duplicate."""
+    if row is None:
+        return None
+    meta_json, updated_at = row
+    try:
+        meta = json.loads(meta_json)
+    except json.JSONDecodeError:
+        return None
+    meta["updated_at"] = updated_at
+    return meta
 
 
 def delete_session(name: str) -> bool:
     existed = False
     if _db_path().exists():
         with connection() as db:
-            with db:
-                cursor = db.execute(
-                    "DELETE FROM messages WHERE name = ?", (name,))
-                existed = cursor.rowcount > 0
-                cursor = db.execute(
-                    "DELETE FROM sessions WHERE name = ?", (name,))
-                existed = existed or cursor.rowcount > 0
+            cursor = db.execute(
+                "DELETE FROM messages WHERE name = ?", (name,))
+            existed = cursor.rowcount > 0
+            cursor = db.execute(
+                "DELETE FROM sessions WHERE name = ?", (name,))
+            existed = existed or cursor.rowcount > 0
     directory = session_dir(name)
     if directory.is_dir():
         shutil.rmtree(directory)

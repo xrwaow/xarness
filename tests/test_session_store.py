@@ -180,15 +180,15 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
     controller2 = ChatController(PROFILE, "k", client=FakeClient())
     controller2.conversation = resumed
 
-    plan = controller2.rollback_plan()
+    plan = controller2.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "hi"
-    controller2.apply_rollback(plan)
+    controller2.conversation.apply_rollback(plan)
     assert controller2.conversation.messages == []
     assert controller2.usage_total == Usage(input_tokens=0, output_tokens=0)
 
 
 async def _send(controller: ChatController, text: str) -> None:
-    async for _ in controller.begin_turn(text):
+    async for _ in controller.begin_turn(text, None, None):
         pass
 
 
@@ -229,7 +229,12 @@ def test_saved_sessions_carry_a_schema_version(tmp_path, monkeypatch) -> None:
     conversation = Conversation()
     conversation.add(user_message("hi"))
     _save("s", session_store.StoredSession(conversation=conversation))
-    assert session_store.load_meta("s")["schema"] == session_store.SCHEMA_VERSION
+    # The version lives in its own column (not duplicated in meta).
+    with session_store.connection() as db:
+        (schema,) = db.execute(
+            "SELECT schema FROM sessions WHERE name = 's'").fetchone()
+    assert schema == session_store.SCHEMA_VERSION
+    assert session_store.load_state("s").schema_version == session_store.SCHEMA_VERSION
 
 
 def test_tool_calls_persist_in_internal_shape(tmp_path, monkeypatch) -> None:
@@ -353,27 +358,6 @@ def test_turns_persist_in_the_state_row_not_the_messages(tmp_path, monkeypatch) 
     turn = loaded.conversation.turns[user.id]
     assert turn.before_tree == "abc"
     assert turn.closed is False
-
-
-def test_legacy_inline_turn_is_lifted_out_of_the_message(tmp_path, monkeypatch) -> None:
-    """A pre-refactor message row carried its checkpoint inline; loading
-    moves it into the conversation instead of dropping it."""
-    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
-    conversation = Conversation()
-    user = conversation.add(user_message("hi"))
-    conversation.add(AssistantMessage(content="a"))
-    stored = session_store.StoredSession(profile="m", conversation=conversation)
-    session_store.write_state("s", *session_store.serialize_state(stored))
-    from xarness.gitwork import TurnCheckpoint
-    legacy = TurnCheckpoint(before_tree="x", after_tree="y").model_dump(mode="json")
-    with session_store.connection() as db:
-        db.execute("UPDATE messages SET data = ? WHERE name = 's' AND seq = 0",
-                   (json.dumps({**json.loads(db.execute(
-                       "SELECT data FROM messages WHERE name = 's' AND seq = 0"
-                   ).fetchone()[0]), "turn": legacy}),))
-    loaded = session_store.load_state("s")
-    assert loaded.conversation.turns[user.id].before_tree == "x"
-    assert "turn" not in loaded.conversation.messages[0].model_dump()
 
 
 def test_change_workspace_ref_adds_and_removes(tmp_path, monkeypatch) -> None:

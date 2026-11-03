@@ -26,7 +26,7 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -49,21 +49,22 @@ from .conversation import (
     RollbackPlan,
     ToolCall,
 )
-from .diffview import build_diff_info
 from .gitwork import (
     GitInfo,
     GitWorktreeError,
     RevertConflict,
     TurnCheckpoint,
     accept_changes,
-    check_blocked_git,
+    attributed_diff_stat,
     diff_stat,
+    git_diff,
     revert_to_tree,
+    revert_turns,
     snapshot_state,
     tree_diff_stat,
 )
 from .images import ImageRef
-from .prompts import prompt_facts, system_prompt_for
+from .prompts import system_prompt
 from .protocol import (
     Command,
     CommandResult,
@@ -80,6 +81,7 @@ from .sandbox import (
     SandboxRuntime,
     SandboxSession,
     SandboxUnavailable,
+    ref_infos,
 )
 from .session_store import RefError, StoredSession, change_workspace_ref
 from .tools import DEFAULT_TIMEOUT, build_registry
@@ -118,10 +120,6 @@ class _QueuedSteer:
 
 
 LOG = logging.getLogger(__name__)
-
-# Sentinel for "cached value not computed yet" (distinct from None, which
-# is a real "no user message yet" answer).
-_UNSET = object()
 
 
 def _ok(**fields: Any) -> CommandResult:
@@ -188,7 +186,6 @@ class Session:
         config_path: Path | None = None,
         no_save: bool = False,
         workspace_refs: list[str] | None = None,
-        idle_callback: "Callable[[Session], None] | None" = None,
     ) -> None:
         self.name = name
         self.workspace = workspace
@@ -203,7 +200,6 @@ class Session:
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_user,
-            git_guard=self._make_git_guard(),
             default_timeout=self._tool_timeout(),
         )
         if tool_output_limit is not None:
@@ -212,7 +208,6 @@ class Session:
             profile, api_key, tool_registry=self.tool_registry,
             client=client,
         )
-        self.controller.git_info = git_info
         self.controller.on_user_message = self._on_user_message
         self._refresh_system_prompt()
         if conversation is not None:
@@ -237,10 +232,6 @@ class Session:
         # Set when a turn finishes with no subscriber attached; surfaced to
         # the next client that attaches ("finished while you were away").
         self._finished_while_away = False
-        # Host-provided hook: called whenever the session may have gone
-        # fully inactive (idle, no subscribers, no pending ask) so the host
-        # can persist and release it.
-        self.idle_callback: Callable[["Session"], None] | None = idle_callback
         # Resume drift is detected lazily, when the first client attaches —
         # never at load time (a drifted workspace with nobody attached must
         # not hold the host open or report "waiting").
@@ -258,23 +249,15 @@ class Session:
         # common case; a full rewrite happens after anything mutated the
         # already-persisted prefix (truncate, turn stamping, accept).
         self._persist_dirty = False
-        # Watermark: the first message index not known to be on disk (None
-        # until the first write succeeds).
-        self._persist_from: int | None = None
         self._persist_task: asyncio.Task[None] | None = None
         self._diff_task: asyncio.Task[None] | None = None
         self._diff_dirty = False
         # Turns closed by Session.load because a crash left them open; the
         # host stamps the real workspace tree over their placeholder.
         self._crash_repaired: list[TurnCheckpoint] = []
-        # Cached latest user send_time (see last_user_message_at); _UNSET
-        # until first needed, invalidated when the history changes shape.
-        self._last_user_at: str | None = _UNSET
 
         # Fan-out.
         self._subscribers: list[asyncio.Queue[Event]] = []
-        # Live round state sent in snapshots (so attach needs no replay log).
-        self._partial_round = protocol.PartialRound()
 
         # Command serialization (FIFO) + dedupe of client retries.
         self._cmd_lock = asyncio.Lock()
@@ -290,31 +273,22 @@ class Session:
         name: str,
         *,
         parts: SessionParts,
-        state: "StoredSession | None" = None,
-        idle_callback: "Callable[[Session], None] | None" = None,
+        state: "StoredSession",
     ) -> "Session":
         """Host a saved session: load its conversation and rebind tracking.
 
-        ``state`` must carry an already-loaded StoredSession when called
-        off-loop (the host loads it in a worker thread first); the direct
-        read here is a convenience for sync callers and blocks.
-        """
-        if state is None:
-            state = session_store.load_state(name)
+        ``state`` is the already-loaded StoredSession (the host loads it in a
+        worker thread, off the event loop)."""
         session = cls(
             **parts.session_kwargs(name),
             conversation=state.conversation,
             mode=state.mode or "write",
-            idle_callback=idle_callback,
         )
         # Restore the persisted token counters so the client's footer shows
         # real in/out/ctx immediately instead of 0 until the next round.
         session.controller.usage_total = state.usage_total
         session.controller.last_usage = state.last_usage
         session._finished_while_away = state.finished_while_away
-        # Everything in the state row is on disk: the watermark starts at the
-        # end, so the next persist only writes the tail.
-        session._persist_from = len(session.conversation.messages)
         # A loaded session can never have a running turn: a crash (or a
         # kill) left any open ones behind. Close them all — a turn left
         # "open" forever makes open_turn()/open_turn_before() return stale
@@ -323,10 +297,36 @@ class Session:
         # snapshot) stamps the real workspace tree over it via
         # _crash_repaired and marks it seen.
         session._crash_repaired = session.conversation.close_crashed_turns()
+        # The loaded history is on disk by definition: the first write must
+        # not rewrite it.
+        session.conversation.mark_clean()
         # A session saved mid-turn can carry tool calls with no result; give
         # them synthetic answers so the next request is valid.
         session._repair_tool_calls()
         return session
+
+    async def repair_crashed_turns(self) -> None:
+        """Stamp the workspace's current tree onto turns a crash left open.
+
+        A turn interrupted by a host crash or a quit mid-turn never got its
+        after-tree (``finish_turn`` never ran); :meth:`load` closed it with
+        the before tree as a placeholder. Record the live tree — what
+        ``finish_turn`` would have written had the process survived — and
+        mark it seen, so a plain reopen does not surface the session's own
+        unaccepted edits as "drift". Nothing to do without tracking or when
+        no turn was open."""
+        repaired = self._crash_repaired
+        self._crash_repaired = []
+        if self.git_info is None or not repaired:
+            return
+        try:
+            tree = await snapshot_state(self.git_info)
+        except GitWorktreeError:
+            return
+        self.git_info.mark_seen(tree)
+        for turn in repaired:
+            turn.after_tree = tree
+        self._persist()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -421,60 +421,34 @@ class Session:
     # fan-out
 
     def _emit(self, event: Event) -> Event:
-        """Fold live round state into the snapshot and push the event."""
+        """Fold live tool-exec state into the snapshot and push the event."""
         self._track_partial(event)
         for queue in self._subscribers:
             queue.put_nowait(event)
         return event
 
     def _reset_partial(self) -> None:
-        self._partial_round = protocol.PartialRound()
+        self.controller.reset_partial()
 
     def _track_partial(self, event: Event) -> None:
-        """Maintain the compact live-round state clients need on attach.
+        """Fold the tool-execution events the session itself emits into the
+        live round state (the controller owns the model-stream half).
 
-        This replaces replaying a potentially unbounded event log: the
-        snapshot carries the complete partial answer, never a truncated one.
-        """
-        partial = self._partial_round
-        if isinstance(event, protocol.ReasoningDelta):
-            partial.reasoning += event.text
-        elif isinstance(event, protocol.ContentDelta):
-            partial.content += event.text
-        elif isinstance(event, protocol.RoundComplete):
-            # The assistant message is in the history now; only any tool
-            # calls still executing remain live.
-            partial.reasoning = ""
-            partial.content = ""
-        elif isinstance(event, protocol.ToolCallStarted):
-            partial.tool_calls.append(protocol.PartialToolCall(
-                call_id=event.call_id, name=event.name,
-            ))
-        elif isinstance(event, protocol.ToolCallArgumentsDelta):
-            call = self._partial_call(event.call_id)
-            if call is not None:
-                call.arguments += event.text
-        elif isinstance(event, protocol.ToolCallArgumentsDone):
-            call = self._partial_call(event.call_id)
-            if call is not None:
-                call.arguments = event.arguments_json
-        elif isinstance(event, protocol.ToolOutputDelta):
-            call = self._partial_call(event.call_id)
+        This is what lets an attach mid-tool-call render the call and its
+        output so far without replaying an unbounded event log."""
+        partial = self.controller.partial_round
+        if isinstance(event, protocol.ToolOutputDelta):
+            call = partial.find_call(event.call_id)
             if call is not None:
                 call.content += event.text
         elif isinstance(event, protocol.ToolFinished):
-            call = self._partial_call(event.call_id)
+            call = partial.find_call(event.call_id)
             if call is not None:
                 call.status = event.status
                 call.content = event.content
-        elif isinstance(event, protocol.StreamError):
-            self._reset_partial()
 
     def _partial_call(self, call_id: str) -> protocol.PartialToolCall | None:
-        return next(
-            (c for c in self._partial_round.tool_calls if c.call_id == call_id),
-            None,
-        )
+        return self.controller.partial_round.find_call(call_id)
 
     def subscribe(self) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
@@ -491,17 +465,7 @@ class Session:
     def unsubscribe(self, queue: asyncio.Queue[Event]) -> None:
         if queue in self._subscribers:
             self._subscribers.remove(queue)
-        self._notify_idle()
 
-    def _notify_idle(self) -> None:
-        """Tell the host the session may have gone fully inactive (the host
-        decides; see Host._on_session_idle). Best-effort, never raises."""
-        if self.idle_callback is None:
-            return
-        try:
-            self.idle_callback(self)
-        except Exception:
-            pass
 
     @property
     def clients_attached(self) -> int:
@@ -564,33 +528,12 @@ class Session:
             # still shows everything that happened before the handoff.
             history=conversation.history_messages(),
             status=self.status(),
-            partial_round=(
-                self._partial_round
-                if (self._partial_round.reasoning
-                    or self._partial_round.content
-                    or self._partial_round.tool_calls)
-                else None
-            ),
+            partial_round=self.controller.partial_round or None,
         )
 
     def last_user_message_at(self) -> str | None:
-        """Latest user send_time (derived, never stored separately).
-
-        All messages, not just the visible slice: after a compaction with no
-        new user message the visible slice starts at the summary, and the
-        session would sort by name instead of recency.
-
-        Cached: summary() runs on every listing of every hosted session,
-        and a full scan per call is O(history) for O(1) information. The
-        cache is dropped whenever the history changes shape (a new user
-        message, a rollback)."""
-        if self._last_user_at is _UNSET:
-            times = [
-                m.timing.send for m in self.conversation.messages
-                if m.role == "user" and m.timing.send
-            ]
-            self._last_user_at = max(times) if times else None
-        return self._last_user_at
+        """Latest user send_time (see Conversation.last_user_message_at)."""
+        return self.conversation.last_user_message_at()
 
     # ------------------------------------------------------------------
     # commands: serialized by the per-session lock
@@ -732,11 +675,9 @@ class Session:
     # state
 
     def _set_state(self, state: State) -> None:
-        """Flip the state and push it. Does NOT notify the host of idleness:
-        the idle notification can trigger eviction (unload -> stop() ->
-        cancel this task), so callers notify explicitly at a point where
-        cancellation can no longer skip their cleanup — the very end of
-        _run_turn's finally, after the turn's cleanup awaits."""
+        """Flip the state and push it. Purely local: the host's reaper polls
+        for inactivity, so nothing here can trigger an eviction and there is
+        no callback ordering to respect."""
         if self._state == state:
             return
         self._state = state
@@ -843,13 +784,20 @@ class Session:
         # at "running" forever).
         await asyncio.sleep(0)
 
-    def _cmd_cancel(self) -> CommandResult:
-        if self._state == "idle":
-            return _ok(cancelled=False)
+    def _cancel_work(self) -> None:
+        """Cancel the running turn and/or compaction (if any).
+
+        Their cleanup is what starts the next queued message (or leaves the
+        session idle), so both cancel paths are just this."""
         if self._turn_task is not None:
             self._turn_task.cancel()
         if self._compact_task is not None:
             self._compact_task.cancel()
+
+    def _cmd_cancel(self) -> CommandResult:
+        if self._state == "idle":
+            return _ok(cancelled=False)
+        self._cancel_work()
         return _ok(cancelled=True)
 
     def _cmd_answer_ask(self, command: protocol.AnswerAsk) -> CommandResult:
@@ -864,7 +812,6 @@ class Session:
         self._emit(protocol.AskResolved(
             ask_id=command.ask_id, answers=command.answers,
         ))
-        self._notify_idle()
         return _ok()
 
     async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
@@ -901,7 +848,6 @@ class Session:
                 "keeping tracking against the last known state — the drift "
                 "shows up in /diff"
             )
-        self._notify_idle()
         return _ok()
 
     def _cmd_discard_queued(self) -> CommandResult:
@@ -916,10 +862,7 @@ class Session:
         compaction; the cleanup starts the queued message immediately."""
         if self._state == "idle" or not self._queued:
             return _ok(flushed=False)
-        if self._turn_task is not None:
-            self._turn_task.cancel()
-        if self._compact_task is not None:
-            self._compact_task.cancel()
+        self._cancel_work()
         return _ok(flushed=True)
 
     async def _cmd_rollback(self, command: protocol.Rollback) -> CommandResult:
@@ -931,10 +874,10 @@ class Session:
             message = self.conversation.message_by_id(command.message_id)
             if message is None:
                 raise SessionError("no user message with that id in this session")
-            plan = self.controller.rollback_plan_to(message)
+            plan = self.conversation.rollback_plan_to(message)
             scope = "messages from here on"
         else:
-            plan = self.controller.rollback_plan()
+            plan = self.conversation.rollback_plan()
             scope = "last turn"
         if plan is None:
             self._emit_notice(f"nothing to {label}")
@@ -949,7 +892,7 @@ class Session:
         if not plan.compaction:
             label = "retry" if resend else "undo"
             try:
-                await self.controller.revert_changes(plan.revert_turns)
+                await self._revert_changes(plan.revert_turns)
             except RevertConflict as exc:
                 raise SessionError(
                     f"/{label} conflict: the turn's changes overlap edits made "
@@ -963,15 +906,9 @@ class Session:
                     self.git_info.mark_seen(await snapshot_state(self.git_info))
                 except GitWorktreeError:
                     pass
-        self.controller.apply_rollback(plan)
-        self._last_user_at = _UNSET  # the newest user message may be gone
-        # The truncation invalidated rows on disk from the cut onward: move
-        # the persist watermark back so the next write replaces them. When
-        # nothing has been written yet (watermark None), leave it None: the
-        # next write starts at seq 0 and covers everything anyway — setting
-        # drop_from here would make rows below the cut never be written.
-        if self._persist_from is not None:
-            self._persist_from = min(self._persist_from, plan.drop_from)
+        self.conversation.apply_rollback(plan)
+        # The truncation invalidated rows on disk from the cut onward; the
+        # conversation lowered its persist watermark itself.
         if plan.compaction:
             note = "reverted"
         elif self.git_info is None:
@@ -1005,13 +942,11 @@ class Session:
         except asyncio.CancelledError:
             self._set_state("idle")
             await self._start_queued()
-            self._notify_idle()
             raise
         except Exception as exc:
             self._set_state("idle")
             self._emit_notice(f"compaction failed: {exc}", "error")
             await self._start_queued()
-            self._notify_idle()
             return
         self._set_state("idle")
         if result is None:
@@ -1025,7 +960,6 @@ class Session:
                 after_tokens=result.after_tokens,
             )
         await self._start_queued()
-        self._notify_idle()
 
     async def _start_queued(self) -> bool:
         """Start the oldest queued message unless the session is closed."""
@@ -1152,12 +1086,11 @@ class Session:
 
     def _validate_ref(self, path: str, add: bool) -> str:
         """Shared validation for /ref and PATCH: the normalized path (or
-        SessionError). Existence is checked only when adding."""
+        SessionError). Existence is checked by change_workspace_ref, the one
+        place that also applies the change."""
         raw = path.strip()
         if not raw or self.sandbox.settings is None:
             raise SessionError("references need a path and a sandbox")
-        if add and not self._ref_path(raw).exists():
-            raise SessionError(f"no such path: {raw}")
         return raw
 
     def _validate_filter(self, path: str, add: bool) -> str:
@@ -1220,15 +1153,12 @@ class Session:
 
     def _ref_infos(self) -> list[protocol.RefInfo]:
         """The refs currently bound, for the client's status payload."""
-        external = (
-            self.sandbox.config.external_refs
-            if self.sandbox.config is not None
-            else SandboxConfig.resolve_auto_refs(self.workspace, self._ref_specs())
+        specs = self._ref_specs()
+        if self.sandbox.config is not None:
+            return ref_infos(self.sandbox.config.external_refs)
+        return ref_infos(
+            SandboxConfig.resolve_auto_refs(self.workspace, specs)
         )
-        return [
-            protocol.RefInfo(path=str(ref.host), mount=ref.mount)
-            for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
-        ]
 
     async def _cmd_ref(self, path: str, add: bool) -> CommandResult:
         """Add/remove an external reference path for this workspace.
@@ -1344,7 +1274,6 @@ class Session:
         the only way any client learns about it (no local echo)."""
         if message.timing.send is None:
             message.timing.send = _utcnow()
-        self._last_user_at = message.timing.send  # newest by construction
         self._emit(protocol.MessageAdded(message=message))
 
     async def _run_turn(self, text: str, images: list[ImageRef] | None) -> None:
@@ -1362,7 +1291,9 @@ class Session:
             # crossed right at the previous turn's end, where compacting
             # would only produce a handoff the model answers redundantly.
             await self._maybe_auto_compact()
-            stream = self.controller.begin_turn(text, images)
+            stream = self.controller.begin_turn(
+                text, images, await self._take_checkpoint(),
+            )
             saw_stream_error = False
             while True:
                 async for event in stream:
@@ -1437,7 +1368,7 @@ class Session:
         finally:
             # Record where the turn left the workspace so /undo //retry can
             # reverse exactly this turn's diff later (interruptions included).
-            await self.controller.finish_turn()
+            await self._finish_turn()
             self._persist()
             await self._flush_persist()
             # The turn is over: its content lives in the history now.
@@ -1458,11 +1389,8 @@ class Session:
                 self._persist()
 
             # A queued message sent at the exact end of the turn (or a
-            # "send queued now" cancel) starts immediately. The idle
-            # notification is LAST: it can trigger eviction (which cancels
-            # this task), so nothing may follow it in this finally.
-            if not await self._start_queued():
-                self._notify_idle()
+            # "send queued now" cancel) starts immediately.
+            await self._start_queued()
 
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
@@ -1517,17 +1445,9 @@ class Session:
 
     def _repair_tool_calls(self) -> None:
         """Answer orphaned tool calls so the next API request is valid;
-        persist when anything changed.
-
-        The synthetic result is INSERTED at the orphan's position, so a
-        mid-history repair shifts rows a tail-only write would not rewrite:
-        move the watermark back to the lowest insertion index first."""
-        low = self.conversation.repair_orphaned_tool_calls(now=_utcnow())
-        if low is None:
-            return
-        if self._persist_from is not None:
-            self._persist_from = min(self._persist_from, low)
-        self._persist()
+        persist when anything changed."""
+        if self.conversation.repair_orphaned_tool_calls(now=_utcnow()):
+            self._persist()
 
     # ------------------------------------------------------------------
     # ask tool
@@ -1554,27 +1474,59 @@ class Session:
     # ------------------------------------------------------------------
     # git tracking
 
-    def _make_git_guard(self) -> Callable[[str], str | None]:
-        if self.sandbox.allow_git_write:
-            # The git guard is off entirely: the agent manages git itself;
-            # tracking guarantees no longer hold.
-            return lambda command: None
-        if self.sandbox.git_shim_active:
-            # In-container mode: the PATH shim blocks bad git subcommands at
-            # execution time, statement by statement (see gitwork.py). The
-            # string scanner would only veto whole commands the shim now
-            # handles better.
-            return lambda command: None
+    async def _take_checkpoint(self) -> str | None:
+        """Snapshot the workspace's current state as a tree and return the
+        sha. None when there is no git tracking or the checkpoint failed."""
+        if self.git_info is None:
+            return None
+        try:
+            return await snapshot_state(self.git_info)
+        except GitWorktreeError:
+            return None
 
-        def guard(command: str) -> str | None:
-            info = self.git_info
-            if info is None:
-                return None
-            return check_blocked_git(command)
-        return guard
+    async def _finish_turn(self) -> None:
+        """Record the workspace state after the turn's edits as the open
+        turn's after tree, so /undo can reverse exactly this turn's diff
+        later, and mark the turn closed. No-op without an open turn; a
+        failed snapshot closes the turn without an after tree (its edits
+        just become unrevertable, like untracked turns')."""
+        turn = self.conversation.open_turn
+        if turn is None:
+            return
+        if self.git_info is not None and turn.before_tree:
+            try:
+                turn.after_tree = await snapshot_state(self.git_info)
+            except GitWorktreeError:
+                turn.after_tree = None
+            else:
+                # The turn's end state is now the workspace the session
+                # knows about; resume drift must measure from here, not from
+                # the previous turn.
+                self.git_info.mark_seen(turn.after_tree)
+        turn.closed = True
+
+    def _open_turn_before(self) -> str | None:
+        """The still-open turn's before tree, or None."""
+        turn = self.conversation.open_turn
+        return turn.before_tree if turn is not None else None
 
     def turn_checkpoints(self) -> list[TurnCheckpoint]:
-        return self.controller.turn_checkpoints()
+        """The reversible turns since the baseline, oldest first."""
+        return self.conversation.turn_checkpoints()
+
+    async def _revert_changes(self, turns: list[TurnCheckpoint]) -> None:
+        """Reverse the given turns' file edits (newest first) onto the live
+        workspace.
+
+        Raises :class:`RevertConflict` when a turn's changes overlap
+        unresolvably with edits made since (the workspace is left untouched),
+        or :class:`GitWorktreeError` on another git failure. No tracking, or
+        an empty turn list, is a clean no-op."""
+        if self.git_info is None or not turns:
+            return
+        conflict = await revert_turns(self.git_info, turns)
+        if conflict is not None:
+            raise RevertConflict(conflict)
 
     async def detect_resume_drift(self) -> "protocol.PendingDrift | None":
         """The drift prompt (last known tree, current tree, changed paths)
@@ -1605,7 +1557,7 @@ class Session:
             # reconnected mid-turn). Its in-flight edits are not drift: only
             # report a change if something outside the turn's own
             # before→current diff also moved.
-            open_before = self.controller.open_turn_before()
+            open_before = self._open_turn_before()
             if open_before is not None:
                 since_open = {
                     f.path for f in (
@@ -1657,11 +1609,11 @@ class Session:
     def _refresh_system_prompt(self) -> None:
         """Derive the mode-aware system prompt for the next request. It is
         never persisted in the conversation."""
-        self.controller.system_prompt = system_prompt_for(prompt_facts(
+        self.controller.system_prompt = system_prompt(
             self.sandbox.config, self.mode,
             tracked=self.git_info is not None,
             git_write=self.sandbox.allow_git_write,
-        ))
+        )
 
     def _tool_timeout(self) -> float:
         """The profile's tool timeout (the one-shot tools default to it; a
@@ -1676,7 +1628,6 @@ class Session:
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_user,
-            git_guard=self._make_git_guard(),
             default_timeout=self._tool_timeout(),
         )
         self.tool_registry.max_output_chars = limit
@@ -1695,34 +1646,26 @@ class Session:
             return
         self._persist_dirty = True
         if self._persist_task is None or self._persist_task.done():
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # No loop (sync callers): write inline.
-                self._persist_dirty = False
-                payload, meta = self._persist_state()
-                session_store.write_state(self.name, payload, meta)
-                self._persist_from = (
-                    payload["from_seq"] + len(payload["messages"])
-                )
-                return
-            self._persist_task = loop.create_task(self._persist_loop())
+            self._persist_task = asyncio.get_running_loop().create_task(
+                self._persist_loop()
+            )
 
     def _persist_state(self) -> tuple[Any, dict[str, Any]]:
         """Serialize into write instructions; runs on the event loop (pydantic
         dumps copy, so the writer thread only ever touches plain data).
 
-        The watermark (``_persist_from``) is the first message index not yet
-        safely on disk. Messages are immutable, so a normal persist only
-        sends the tail; a rollback moves the watermark back to the cut.
+        The conversation owns the watermark (the first message index not yet
+        safely on disk). Messages are immutable, so a normal persist only
+        sends the tail; a rollback or a tool-call repair lowers it.
 
-        The watermark is advanced OPTIMISTICALLY here, at serialize time:
+        ``take_dirty_from`` resets it OPTIMISTICALLY here, at serialize time:
         this is fully synchronous (no awaits), so the captured ``from_seq``
-        and the optimistic value describe the same list state. If the write
-        fails, the loop resets the watermark back to ``from_seq`` so the
-        next persist rewrites from there."""
+        and the reset describe the same list state. If the write fails, the
+        loop restores the watermark to ``from_seq`` so the next persist
+        rewrites from there."""
         stored = StoredSession(
             conversation=self.conversation,
+            turns=self.conversation.turns,
             mode=self.mode,
             profile=self.profile_name,
             workspace=str(self.workspace),
@@ -1733,9 +1676,8 @@ class Session:
             last_usage=self.controller.last_usage,
             finished_while_away=self._finished_while_away,
         )
-        from_seq = self._persist_from or 0
+        from_seq = self.conversation.take_dirty_from()
         payload, meta = session_store.serialize_state(stored, from_seq)
-        self._persist_from = len(self.conversation.messages)  # optimistic
         return payload, meta
 
     async def _persist_loop(self) -> None:
@@ -1755,11 +1697,7 @@ class Session:
                 # persist failure must not skip _set_state("idle")/
                 # TurnEnded in _run_turn's finally.
                 LOG.exception("persist failed for session %s", self.name)
-                self._persist_from = min(
-                    self._persist_from if self._persist_from is not None
-                    else payload["from_seq"],
-                    payload["from_seq"],
-                )
+                self.conversation._mark_dirty(payload["from_seq"])
                 return
 
     async def _flush_persist(self) -> None:
@@ -1783,25 +1721,10 @@ class Session:
             return False
         # The summary message a compaction appends carries no usage (the
         # summarization round's usage is folded into the totals instead), so
-        # right after a compaction there is no usage-bearing visible message
-        # and this returns False — no loop guard needed.
-        visible = self.conversation.visible_messages()
-        # Only AssistantMessage carries usage; UserMessage/ToolMessage don't
-        # have the field at all.
-        last_usage_message_index = next(
-            (i for i in range(len(visible) - 1, -1, -1)
-             if getattr(visible[i], "usage", None)), -1,
-        )
-        last_usage_message = visible[last_usage_message_index] if last_usage_message_index >= 0 else None
-        last_usage = getattr(last_usage_message, "usage", None) if last_usage_message else None
-        used = (last_usage.context_tokens(self.profile.keep_reasoning)
-                if last_usage else 0) + (
-            # Messages appended after the last usage-bearing round (tool
-            # results, steering) are not in that round's input; estimate
-            # them, or the threshold check undershoots a long tool loop.
-            sum(len(m.content or "") for m in visible[last_usage_message_index + 1:])
-            // compaction.CHARS_PER_TOKEN
-            if last_usage_message is not None else 0
+        # right after a compaction the estimate is 0 and this returns False —
+        # no loop guard needed.
+        used = compaction.context_tokens(
+            self.conversation.visible_messages(), self.profile.keep_reasoning,
         )
         if used < self.profile.auto_compact_threshold * self.profile.max_context:
             return False
@@ -1839,6 +1762,37 @@ class Session:
         info = self.git_info
         if info is None:
             return protocol.DiffInfo(tracking=False)
-        open_before = self.controller.open_turn_before()
-        return await build_diff_info(info, self.turn_checkpoints(), path,
-                                     open_before=open_before)
+        try:
+            # A per-file click-through needs both the stat rows and the
+            # text; snapshot the workspace once and share the sha between
+            # them.
+            current = await snapshot_state(info) if path is not None else None
+            stat = await attributed_diff_stat(
+                info, self.turn_checkpoints(),
+                open_before=self._open_turn_before(), current=current,
+            )
+            files = [
+                protocol.DiffFileInfo(
+                    path=f.path, additions=f.additions, deletions=f.deletions,
+                    is_new=f.is_new, source=f.source or "agent",
+                )
+                for f in stat.files
+                if path is None or f.path == path
+            ]
+        except GitWorktreeError as exc:
+            # Git failures raise instead of reporting tracking=False: a
+            # transient index.lock (concurrent snapshots) must not make
+            # clients believe tracking disappeared.
+            raise SessionError(f"diff failed: {exc}") from exc
+        result = protocol.DiffInfo(
+            files=files,
+            additions=sum(f.additions for f in files),
+            deletions=sum(f.deletions for f in files),
+            tracking=True,
+        )
+        if path is not None:
+            try:
+                result.text = await git_diff(info, path, current=current)
+            except GitWorktreeError as exc:
+                raise SessionError(f"diff failed: {exc}") from exc
+        return result

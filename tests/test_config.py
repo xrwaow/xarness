@@ -225,8 +225,8 @@ def test_sandbox_settings_defaults() -> None:
 
 def test_tool_output_limit_is_top_level(tmp_path: Path, caplog) -> None:
     """The output cap is a tool-registry concern, not a sandbox one: it
-    lives at the config's top level. A sandbox-level key still validates
-    (deprecated) and acts as the fallback when the root omits it."""
+    lives at the config's top level only. A stale sandbox-level key is
+    ignored (with a warning) instead of failing validation."""
     path = write(tmp_path, {"tool_output_limit": 4096})
     config = load_sectioned(path)
     assert config.tool_output_limit == 4096
@@ -235,16 +235,16 @@ def test_tool_output_limit_is_top_level(tmp_path: Path, caplog) -> None:
         _, settings = load_sectioned(write(tmp_path, {
             "sandboxes": {"default": {"tool_output_limit": 8192}},
         })).resolve_sandbox("default")
-    assert settings.tool_output_limit == 8192
+    assert not hasattr(settings, "tool_output_limit")
     assert any("tool_output_limit" in r.message for r in caplog.records)
-    # ...and the root key wins when both are present.
+    # The sandbox key neither round-trips nor shadows the root value.
     sectioned = load_sectioned(write(tmp_path, {
         "tool_output_limit": 4096,
         "sandboxes": {"default": {"tool_output_limit": 8192}},
     }))
     _, settings = sectioned.resolve_sandbox("default")
     assert sectioned.tool_output_limit == 4096
-    assert settings.tool_output_limit == 8192
+    assert "tool_output_limit" not in settings.model_dump()
 
 
 def test_sandbox_inheritance_over_default(tmp_path: Path) -> None:

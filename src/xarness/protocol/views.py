@@ -254,11 +254,23 @@ class PartialToolCall(BaseModel):
 class PartialRound(BaseModel):
     """The live round an attaching client must render on top of the
     snapshot messages: reasoning/content not yet persisted, plus any tool
-    calls whose results are not in the history yet."""
+    calls whose results are not in the history yet.
+
+    ONE accumulator: the controller fills the model-stream half (reasoning,
+    answer, tool-call arguments) and the session folds in the tool-exec
+    events it emits itself."""
 
     reasoning: str = ""
     content: str = ""
     tool_calls: list[PartialToolCall] = Field(default_factory=list)
+
+    def find_call(self, call_id: str) -> PartialToolCall | None:
+        return next(
+            (call for call in self.tool_calls if call.call_id == call_id), None,
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.reasoning or self.content or self.tool_calls)
 
 
 class Snapshot(BaseModel):

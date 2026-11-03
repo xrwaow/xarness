@@ -75,7 +75,6 @@ from ..protocol import (
     SwitchModel,
     ToolCallStarted,
     TurnEnded,
-    is_summary,
 )
 from ..util import format_duration as _format_duration
 from . import flow as tflow
@@ -590,7 +589,7 @@ class AgentApp(App[None]):
             )
             prefix = "auto-compacted" if event.automatic else "compacted"
             summary = next(
-                (m.content for m in event.snapshot.messages if is_summary(m)),
+                (m.content for m in event.snapshot.messages if m.is_summary),
                 "",
             )
             return f"{prefix}: {counts}\n{summary}"
@@ -922,13 +921,16 @@ class AgentApp(App[None]):
                 refs.append(image)
                 continue
             data = image.data()
-            ref = image.to_ref()
             try:
-                await self.client.upload_image(self.session_name, data, ref.id)
+                await self.client.upload_image(self.session_name, data, image.id)
             except ClientError as exc:
                 self._error(f"could not upload {image.name}: {exc}")
                 continue
-            refs.append(ref)
+            # Send the ref shape only: the bytes are on the host now.
+            refs.append(ImageRef(
+                id=image.id, name=image.name, mime=image.mime,
+                width=image.width, height=image.height,
+            ))
         await self._send_command(SendMessage(text=text, images=refs or None))
 
     # ------------------------------------------------------------------

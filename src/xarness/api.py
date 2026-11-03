@@ -119,13 +119,10 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Snapshot of a session (messages, status, live round)",
     )
     async def get_session(name: str) -> Snapshot:
-        session = host.sessions.get(name)
-        if session is not None:
-            return session.snapshot()
-        try:
-            return await host.saved_snapshot(name)
-        except SessionError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        """The session's snapshot. A saved-but-released session is re-hosted
+        on demand (cheap: constructing a Session starts no shell); the
+        reaper evicts it again once nothing is attached."""
+        return (await _session_or_load(host, name)).snapshot()
 
     @router.get(
         "/sessions/{name}/events",
@@ -166,13 +163,10 @@ def sessions_router(host: Host) -> APIRouter:
         response_class=Response,
     )
     async def get_image(name: str, image_id: str) -> Response:
-        session = host.sessions.get(name) if host is not None else None
-        if session is not None:
-            # The session's own store first: a no_save session keeps blobs
-            # in memory only, where the disk lookup below would 404.
-            data = session.images.load(image_id)
-        else:
-            data = None
+        session = host.sessions.get(name)
+        # The session's own store first: a no_save session keeps blobs in
+        # memory only, where the disk lookup below would 404.
+        data = session.images.load(image_id) if session is not None else None
         if data is None:
             data = session_store.load_blob(name, image_id)
         if data is None:
@@ -188,15 +182,12 @@ def sessions_router(host: Host) -> APIRouter:
         session = await _session_or_load(host, name)
         # Cap the body BEFORE reading it: an unbounded upload would let one
         # request balloon the host's memory.
-        length = request.headers.get("content-length")
-        try:
-            if length and int(length) > MAX_IMAGE_UPLOAD:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"image too large: {length} bytes (limit {MAX_IMAGE_UPLOAD})",
-                )
-        except ValueError:
-            pass
+        length = request.headers.get("content-length") or ""
+        if length.isdigit() and int(length) > MAX_IMAGE_UPLOAD:
+            raise HTTPException(
+                status_code=413,
+                detail=f"image too large: {length} bytes (limit {MAX_IMAGE_UPLOAD})",
+            )
         data = await request.body()
         if not data:
             raise HTTPException(status_code=400, detail="empty image body")
@@ -234,14 +225,8 @@ def sessions_router(host: Host) -> APIRouter:
         summary="Pending changes: summary and per-file diffs",
     )
     async def diff(name: str, path: str | None = None) -> protocol.DiffInfo:
-        session = host.sessions.get(name)
-        if session is not None:
-            return await session.diff_info(path)
-        if session_store.load_meta(name) is None:
-            raise HTTPException(
-                status_code=404, detail=f"no saved session named {name!r}",
-            )
-        return await host.saved_diff_info(name, path)
+        session = await _session_or_load(host, name)
+        return await session.diff_info(path)
 
     @router.post(
         "/sessions/{name}/close",

@@ -15,7 +15,7 @@ prompt (which would change the cached prefix).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,18 +45,21 @@ class CompactionResult:
     after_tokens: int
 
 
-def context_tokens(messages: Sequence[Message]) -> int:
+def context_tokens(
+    messages: Sequence[Message], keep_reasoning: bool = True,
+) -> int:
     """Rough context size of ``messages``, in tokens.
 
     The last real usage (the provider counted the whole prompt it saw) is
     authoritative; messages appended after that round — tool results,
-    steering — are estimated from their characters."""
+    steering — are estimated from their characters. ``keep_reasoning``
+    matches the request that will follow: with reasoning off, those tokens
+    are not re-sent and must not count toward the threshold."""
+    estimated_from = len(messages) - 1
     total = 0
-    estimated_from = len(messages)
     for index in range(len(messages) - 1, -1, -1):
-        usage = getattr(messages[index], "usage", None)
-        if usage is not None:
-            total += usage.input_tokens + usage.output_tokens
+        if (usage := getattr(messages[index], "usage", None)) is not None:
+            total = usage.context_tokens(keep_reasoning)
             estimated_from = index
             break
     return total + sum(
@@ -93,9 +96,6 @@ async def summarize(
 
 async def compact(
     conversation: Conversation, client: StreamClient,
-    summarizer: Callable[
-        [Sequence[dict[str, Any]]], Awaitable[tuple[str, Usage | None]]
-    ] | None = None,
     *,
     system: str | None = None,
     keep_reasoning: bool = False,
@@ -117,16 +117,13 @@ async def compact(
     visible = conversation.visible_messages()
     if not visible:
         return None
-    before_tokens = context_tokens(visible)
+    before_tokens = context_tokens(visible, keep_reasoning)
     wire_messages = conversation.to_wire(
         keep_reasoning=keep_reasoning, system=system,
         image_loader=image_loader,
     )
     wire_messages.append({"role": "user", "content": COMPACTION_PROMPT})
-    if summarizer is None:
-        summary, usage = await summarize(client, wire_messages)
-    else:
-        summary, usage = await summarizer(wire_messages)
+    summary, usage = await summarize(client, wire_messages)
     conversation.add(user_message(
         f"{SUMMARY_PREFIX}\n\n{summary}", is_summary=True,
     ))

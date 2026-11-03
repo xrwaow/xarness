@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -14,6 +15,7 @@ from xarness.conversation import (
 )
 from xarness.gitwork import TurnCheckpoint
 from xarness.images import ImageAttachment, token_text
+from xarness.session_store import SessionImageStore
 from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
@@ -63,7 +65,7 @@ def _save(name: str, stored) -> None:
 
 
 async def collect(controller: ChatController, text: str) -> list[Any]:
-    return [event async for event in controller.begin_turn(text)]
+    return [event async for event in controller.begin_turn(text, None, None)]
 
 
 def test_turn_builds_conversation_and_wire_messages() -> None:
@@ -403,28 +405,28 @@ def test_undo_across_compaction_after_later_turn() -> None:
     ]
 
     # First /undo: removes turn 4, back to the end of turn 3 (post-compaction).
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "fourth"
     assert plan.compaction is False
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.role for m in controller.conversation.visible_messages()] == [
         "user", "user", "assistant",
     ]
     
     # Second /undo: removes turn 3 — the first turn after the compaction.
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "third"
     assert plan.compaction is False
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.role for m in controller.conversation.visible_messages()] == ["user"]
 
     # Third /undo: undoes the compaction itself — the full pre-compaction
     # history comes back, turns 1 and 2 still intact.
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None and plan.compaction
     assert plan.user_text == ""
     assert plan.revert_turns == []  # compaction only: no files reverted
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.role for m in controller.conversation.visible_messages()] == [
         "user", "assistant", "user", "assistant",
     ]
@@ -434,19 +436,19 @@ def test_undo_across_compaction_after_later_turn() -> None:
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
 
     # Fourth /undo: removes turn 2 normally.
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "second"
     assert plan.compaction is False
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.content for m in controller.conversation.visible_messages()] == ["first", "one"]
     assert controller.conversation.messages[1].role == "assistant"
     # Totals unchanged: nothing new was spent, and undo never subtracts.
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
 
     # A further /undo walks back the pre-compaction turns normally.
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "first"
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert controller.conversation.visible_messages() == []
     # Totals are monotonic: everything ever spent stays counted.
     assert controller.usage_total == Usage(input_tokens=122, output_tokens=15)
@@ -484,22 +486,22 @@ def test_resumed_compacted_session_undoes_across_compaction(tmp_path) -> None:
     controller2 = ChatController(PROFILE, "key", client=client)
     controller2.conversation = resumed_conversation
     # First /undo: removes turn 3 — the first turn after the compaction.
-    plan = controller2.rollback_plan()
+    plan = controller2.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "third"
-    controller2.apply_rollback(plan)
+    controller2.conversation.apply_rollback(plan)
     # Second /undo: undoes the compaction itself — full pre-compaction
     # history restored, turns 1 and 2 intact.
-    plan = controller2.rollback_plan()
+    plan = controller2.conversation.rollback_plan()
     assert plan is not None and plan.compaction
-    controller2.apply_rollback(plan)
+    controller2.conversation.apply_rollback(plan)
     assert [m.role for m in controller2.conversation.visible_messages()] == [
         "user", "assistant", "user", "assistant",
     ]
     assert controller2.conversation.messages[2].content == "second"
     # Third /undo removes turn 2 normally.
-    plan = controller2.rollback_plan()
+    plan = controller2.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "second"
-    controller2.apply_rollback(plan)
+    controller2.conversation.apply_rollback(plan)
     assert [m.role for m in controller2.conversation.visible_messages()] == ["user", "assistant"]
     assert controller2.conversation.messages[1].content == "one"
 
@@ -513,12 +515,12 @@ def test_rollback_plan_drops_the_turn_for_undo_and_retry() -> None:
     client.script = [ContentDelta(text="two"), RoundComplete(usage=Usage(input_tokens=9, output_tokens=4))]
     asyncio.run(collect(controller, "second"))
 
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None
     assert plan.user_text == "second"
     assert [m.content for m in [m for m in controller.conversation.messages[:plan.drop_from]]] == ["first", "one"]
 
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.content for m in controller.conversation.messages] == [
         "first", "one",
     ]
@@ -539,11 +541,11 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     controller.conversation.add(AssistantMessage(content="b", usage=Usage(input_tokens=9, output_tokens=4)))
     controller.usage_total = Usage(input_tokens=14, output_tokens=7)
 
-    plan = controller.rollback_plan()
+    plan = controller.conversation.rollback_plan()
     assert plan is not None
     assert plan.user_text == "last"
     assert plan.revert_turns == [TurnCheckpoint(before_tree="abc123", after_tree="def456")]
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert [m.content for m in controller.conversation.visible_messages()] == ["old", "a"]
     # Totals are monotonic: the undone turn's spend stays counted.
     assert controller.usage_total == Usage(input_tokens=14, output_tokens=7)
@@ -551,9 +553,9 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
 
 def test_rollback_is_a_noop_without_a_finished_turn() -> None:
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    assert controller.rollback_plan() is None  # empty conversation
+    assert controller.conversation.rollback_plan() is None  # empty conversation
     asyncio.run(collect(controller, "only a user message"))
-    assert controller.rollback_plan() is None  # no response yet
+    assert controller.conversation.rollback_plan() is None  # no response yet
 
 
 def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
@@ -568,12 +570,12 @@ def test_rollback_plan_to_an_arbitrary_earlier_turn() -> None:
     asyncio.run(collect(controller, "third"))
 
     first_user = controller.conversation.messages[0]
-    plan = controller.rollback_plan_to(first_user)
+    plan = controller.conversation.rollback_plan_to(first_user)
     assert plan is not None
     assert plan.user_text == "first"
     assert [m for m in controller.conversation.messages[:plan.drop_from]] == []
 
-    controller.apply_rollback(plan)
+    controller.conversation.apply_rollback(plan)
     assert controller.conversation.messages == []
     # Totals are monotonic: all three turns' spend stays counted.
     assert controller.usage_total == Usage(input_tokens=21, output_tokens=9)
@@ -585,10 +587,10 @@ def test_rollback_plan_to_rejects_non_turns_allows_the_latest() -> None:
     controller.conversation.add(AssistantMessage(content="one"))
     controller.conversation.add(user_message("pending"))
     messages = controller.conversation.messages
-    assert controller.rollback_plan_to(messages[1]) is None  # not a user turn
+    assert controller.conversation.rollback_plan_to(messages[1]) is None  # not a user turn
     # The latest user message is still undoable: nothing to drop or revert,
     # but the plan puts its text back in the input.
-    plan = controller.rollback_plan_to(messages[2])
+    plan = controller.conversation.rollback_plan_to(messages[2])
     assert plan is not None
     assert plan.user_text == "pending"
     assert [m for m in controller.conversation.messages[:plan.drop_from]] == messages[:2]
@@ -599,7 +601,8 @@ def test_save_interrupted_round_keeps_partial_answer() -> None:
     """An interrupted round is saved with the text and reasoning it managed
     to stream before the cancellation."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = PartialRound(["thinking "], ["partial answer"])
+    controller.partial_round = PartialRound(
+        reasoning="thinking ", content="partial answer")
     assert controller.save_interrupted_round() is True
     message = controller.conversation.messages[-1]
     assert message.role == "assistant"
@@ -614,7 +617,7 @@ def test_save_interrupted_round_keeps_reasoning_only() -> None:
     partial CoT: it belongs in the history and is sent with it (the same
     keep_reasoning rule as any assistant message's reasoning)."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = PartialRound(["just thinking"], [])
+    controller.partial_round = PartialRound(reasoning="just thinking")
     assert controller.save_interrupted_round() is True
     (message,) = controller.conversation.messages
     assert message.role == "assistant"
@@ -635,7 +638,7 @@ def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:
     """Half-streamed tool calls are dropped: they have no result to pair with,
     and an orphaned tool call would be rejected on the next request."""
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
-    controller._partial_round = PartialRound([], [])
+    controller.partial_round = PartialRound()
     assert controller.save_interrupted_round() is False
     assert controller.conversation.messages == []
 
@@ -645,27 +648,30 @@ async def _drain(stream: AsyncIterator[Any]) -> list[Any]:
 
 
 def _image(name: str = "cat.png") -> ImageAttachment:
+    data_b64 = base64.b64encode(name.encode()).decode()
     return ImageAttachment(
-        name=name, mime="image/png",
-        data_b64=base64.b64encode(name.encode()).decode(),
-        width=1, height=1,
+        id=hashlib.sha256(name.encode()).hexdigest(), name=name,
+        mime="image/png", data_b64=data_b64, width=1, height=1,
     )
+
+
+STORE = SessionImageStore("test", persist=False)
 
 
 def test_rollback_plan_keeps_images() -> None:
     controller = ChatController(PROFILE, "key", client=FakeClient([]))
     image = _image()
-    controller.conversation.add(user_message("look", [image]))
+    controller.conversation.add(user_message("look", [image], STORE))
     controller.conversation.add(AssistantMessage(content="ok"))
-    plan = controller.rollback_plan()
-    assert plan is not None and plan.images == [image.to_ref()]
+    plan = controller.conversation.rollback_plan()
+    assert plan is not None and [i.id for i in plan.images] == [image.id]
 
 
 def test_image_token_maps_by_text_not_ordinal() -> None:
     image = _image()
     text = f"[🖼 stale 1×1 #0000] mid {token_text(image)} end"
-    msg = user_message(text, [image])
-    parts = msg.to_wire()["content"]
+    msg = user_message(text, [image], STORE)
+    parts = msg.to_wire(image_loader=STORE.data_url)["content"]
     image_at = next(i for i, p in enumerate(parts) if p["type"] == "image_url")
     before = "".join(p["text"] for p in parts[:image_at] if p["type"] == "text")
     assert "stale" in before and "cat.png" not in before

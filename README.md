@@ -53,7 +53,7 @@ Everything the model can reach:
 | `/etc/resolv.conf`, `/etc/ssl` | read-only | DNS/TLS when network access is on |
 | `/proc`, `/dev`, `/tmp` | fresh/empty | isolated procfs, empty devtmpfs, tmpfs |
 | workspace → `/workspace` | read-write, or read-only in plan mode | your real directory, edited in place |
-| `.git` directory (same host path) | read-only | `git status`/`diff`/`log` work in the container; the harness does all git writes on the host |
+| `.git` directory of your repo (or, without one, the private snapshot store at `/.xarness-snapshot-store`) | read-only | `git status`/`diff`/`log` work in the container; the harness does all git writes on the host |
 | `uv.lock` | read-only | `uv` may read it to build the project env, never rewrite it |
 | `.venv` | read-write | the project env the agent should use (see below) — your worktree's `.venv` is shadowed by it |
 | shared caches (`uv`, `pip`, `cargo`, `npm`) | read-write | offline installs from warm host caches; `~/.cargo`, `~/.rustup`, `~/.local` are bound read-only so PATH tools still resolve |
@@ -88,20 +88,29 @@ commands cannot change files either.
 fingerprinted; when a setting changes at runtime (`/mode`),
 the persistent shell restarts with the new mounts on its next command.
 Network and GPU access are fixed at launch: `xarness --no-network --no-gpu`
-runs the sandbox fully offline and without device access (both default to
-the sandbox profile's settings, which default to `true`).
+runs the sandbox fully offline and without device access (each defaults to
+the sandbox profile's setting — `allow_network: true`, `gpu_access: false`).
 
-**Git guard.** On top of the mounts, `run_bash` vetoes ref-identity
-git commands: `checkout <ref>`, `switch`, `worktree`, `rebase`,
-`reset --hard`, `branch -d/-m/-C`, `tag -d/-f`, `update-ref`, and
-`symbolic-ref` are rejected ("your branch and refs are the user's"), while
-read-only git (`status`, `diff`, `log`, `show`, `blame`) and `git add`/
-`commit` still work. This is a best-effort UX safety net, not a security
-boundary — the boundary is the mount namespace. All snapshots, diffs, and
-reverts run host-side through throwaway indexes: the user's index, HEAD, and
-refs are never written from inside the sandbox, and what counts as "ignored"
-for change tracking is pinned at session start, so editing ignore files in
-the container cannot shift what `/diff` tracks.
+**Git guard.** When change tracking is active and `allow_git_write` is off
+(and only then), a small generated `git` shim is installed first on `PATH`
+—inside the container, and on the host `PATH` for unsandboxed sessions. It
+is an allow-list: inspection subcommands pass (`status`, `diff`, `log`,
+`show`, `blame`, `rev-parse`, `ls-files`, `cat-file`, `merge-base`,
+`for-each-ref`, `config --get/--list`, the list forms of
+`branch`/`tag`/`stash`/`remote`/`reflog`, and similar read-only ones), and
+everything else is blocked — notably anything writing the index, refs, or
+worktree: `checkout`, `switch`, `worktree`, `rebase`, `reset`,
+`branch`/`tag` mutations, `stash`, `clean`, `merge`, `push`/`pull`, `add`,
+`commit`, `update-ref`, `symbolic-ref`. A blocked call fails in place
+(statements around it still run; `&&` stops there) instead of vetoing the
+whole command string up front. Like the string scanner it replaced, this
+is a best-effort accident guardrail, not a security boundary — the
+boundary is the read-only `.git` mount / the mount namespace. All
+snapshots, diffs, and reverts run host-side through throwaway indexes: the
+user's index, HEAD, and refs are never written from inside the sandbox,
+and what counts as "ignored" for change tracking is pinned at session
+start, so editing ignore files in the container cannot shift what `/diff`
+tracks.
 
 Expose external files to the agent with `/refs add <path>` (or the
 `auto_include_refs` sandbox setting); the model addresses them as
@@ -112,17 +121,20 @@ mount and mark it writable.
 ## Change tracking and undo
 
 The agent edits your files directly — there is no separate worktree and no
-accept/reject step. Instead, every session snapshots your workspace state
-into a git tree object at startup (via a throwaway index: your index, HEAD,
-and refs are never touched), and every turn records two more: the state
-*before* the turn and the state *after* its edits finished.
+per-change accept gate before edits land. Instead, every session snapshots
+your workspace state into a git tree object at startup (via a throwaway
+index: your index, HEAD, and refs are never touched), and every turn
+records two more: the state *before* the turn and the state *after* its
+edits finished.
 
 No setup is required: if the workspace isn't a git repo (or has no commits
-yet), xarness runs `git init` itself so tracking works. Your files are never
-modified by this, and no commits are ever created — snapshots are plain tree
-objects (and an unreferenced commit wrapper for the 3-way merge below). Opt
-out with `--no-init-repo` (the agent still edits the directory directly;
-there is just no /diff or /undo for file changes).
+yet), xarness keeps a private snapshot store under its own state directory
+and drives git against it with an explicit `GIT_DIR` — no `.git` is created
+in your workspace, and your files are never modified. No commits are ever
+created either: snapshots are plain tree objects (plus an unreferenced
+commit wrapper for the 3-way merge below). Opt out with `--no-init-repo`,
+which disables change tracking entirely (the agent still edits the
+directory directly; there is just no /diff or /undo for file changes).
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
@@ -180,18 +192,20 @@ reports it and changes nothing rather than picking a side.
 **Only file edits are reversed.** Non-file side effects of `run_bash` —
 package installs, background jobs, network calls, anything outside the
 workspace — are *not* undone. `/undo` puts the removed message back into the
-input box; `/retry` resends it immediately. Both also roll back the turn's
-token usage from the session totals, and work across a compaction (the
-pre-compaction history is restored). Without git tracking (no repo,
-`--no-init-repo`, or setup failure) they still remove the messages and fix
-the token counts, but tell you the file edits could not be reverted. With no
-turn to reverse, `/undo` is a no-op on the filesystem.
+input box; `/retry` resends it immediately. Session token totals stay
+cumulative: an undone turn's spend really happened, so it stays counted.
+Both commands work across a compaction (the pre-compaction history is
+restored). Without git tracking (`--no-init-repo` or a setup failure) they
+still remove the messages and fix the token counts, but tell you the file
+edits could not be reverted. With no turn to reverse, `/undo` is a no-op on
+the filesystem.
 
 ## Sessions
 
-Conversations autosave under `~/.local/share/xarness/sessions/` (disable with
-`--no-session`). Resume with `/sessions` in the TUI, or attach/load by name
-at startup:
+Conversations autosave in `~/.local/share/xarness/sessions/sessions.db`
+(SQLite: one state row plus one row per message; image blobs live under
+`sessions/<name>/blobs/`) — disable with `--no-session`. Resume with
+`/sessions` in the TUI, or attach/load by name at startup:
 
 ```sh
 xarness --session my-session   # attach to an active session or load a saved one
@@ -199,12 +213,13 @@ xarness --sessions             # print active sessions and exit
 ```
 
 Resuming reconnects to the session's change tracking (the persisted baseline
-snapshot); sessions created by older builds with worktree isolation resume
-with fresh tracking instead. If the workspace changed outside the session
-while it was closed, resuming shows what drifted and asks whether to accept
-it as the new baseline or keep tracking against the last known state — it
-never silently reverts or accepts. `/delete` removes the saved session file
-and starts a fresh chat, and never touches your workspace files.
+snapshot). A session saved by an older schema is refused with a "start a new
+session" error rather than half-migrated. If the workspace changed outside
+the session while it was closed, resuming shows what drifted and asks
+whether to accept it as the new baseline or keep tracking against the last
+known state — it never silently reverts or accepts. `/delete` removes the
+saved session (its row and image blobs) and starts a fresh chat, and never
+touches your workspace files.
 
 ## Install
 
@@ -227,8 +242,7 @@ On first run xarness autogenerates a starter config at
 defaults) — edit it to point at your provider. If an existing config omits
 optional values, xarness notes which defaults apply at startup.
 
-Config is JSON at `~/.config/xarness/config.json` (override with
-`--config`). The layout is sectioned:
+Config is JSON at `~/.config/xarness/config.json`. The layout is sectioned:
 
 ```json
 {
@@ -278,11 +292,15 @@ Config is JSON at `~/.config/xarness/config.json` (override with
     (default `0.9`).
   - `provider` — optional OpenRouter provider routing, sent verbatim as the
     request's `provider` field.
+- `tool_output_limit` — cap on the text of every tool result sent back to
+  the model (default 32768; at least 256). It is a tool-registry setting: a
+  `tool_output_limit` inside a sandbox profile is ignored (with a warning)
+  and never round-trips into saved session settings.
 - `sandboxes` — named sandbox profiles. `default` is the base; other
   profiles inherit from it and list only overrides. Fields include
   `allow_network`, `gpu_access`, `allow_git_write`, `use_container`,
-  `enable_tracking`, `auto_include_refs`, `filter_list`, `tool_output_limit`
-  (default 32768; at least 256), and `default_timeout`.
+  `enable_tracking`, `auto_include_refs`, `filter_list`, and
+  `default_timeout`.
 - `presets` — named `{model, sandbox}` pairs; `defaults.preset` chooses one.
 - `ui.theme` — startup color theme (`ayu-darker`, `one-light`); `/theme`
   switches it live.
@@ -317,7 +335,7 @@ xarness --server                     # run the host in the foreground
 | `/theme` | Choose a color theme |
 | `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `/tmp/refs/<alias>` — the same path tool calls and the shell use (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
 | `/new` | Start a new chat |
-| `/delete` | Remove the saved session file and start a fresh chat, leaving your workspace files untouched |
+| `/delete` | Remove the saved session and start a fresh chat, leaving your workspace files untouched |
 | `/undo` | Drop the last turn (only its own file edits reversed, message back in the input). Click an earlier message and confirm `↩ undo to here` to drop several turns at once. If the last thing that happened was a compaction, the first `/undo` restores the pre-compaction history instead (turn and files untouched); the next `/undo` removes the turn |
 | `/retry` | Drop the last turn (file edits reverted) and resend its message |
 | `/diff`, `/accept`, `/reject` | See "Change tracking and undo" above |
@@ -357,7 +375,7 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   indicator stays in the scrollback; `Ctrl+T` or a click expands it inline.
   Reasoning text is kept in the conversation history regardless of visibility.
 - **Scrolling**: the log follows new output only while you are at the bottom.
-  Scroll up mid-answer and it stays where you put it (nothing yanks it back
+  Scroll up mid-answer and it stays where you put it (nothing yanks it back);
   scroll back to the bottom and it resumes following. Expanding a tool call
   whose output is a diff renders it with the theme's diff colors; expanding
   `write_file` shows the written content as a syntax-highlighted code block.
@@ -378,20 +396,20 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 ```
 src/xarness/
   cli.py          argument parsing, boots the TUI, change-tracking setup
-  config.py       pydantic config models, YAML loading, profile selection
+  config.py       pydantic config models, JSON loading, profile selection
   client.py       async httpx SSE client, reasoning-effort mapping
   compaction.py   context handoff: token estimates + summarizer round
-  controller.py   conversation state + event enrichment (no UI imports)
+  controller.py   one-round runner: stream events, wire history, usage totals
   host.py         session host: FastAPI over a unix socket, lifecycle, config resolution
   api.py          HTTP/SSE endpoints used by the TUI and other clients
   clientlib.py    async client used by the TUI (host spawn + API calls)
   conversation.py plain message history, wire-format faithful
-  prompts.py      system prompts (general + plan/write mode clauses)
+  prompts.py      the one system-prompt renderer (mode + environment facts)
   tools.py        tool registry: read/write/edit, run_bash, ask_user
   sandbox.py      bubblewrap sandbox: one-shot file tools + persistent shell
-  session_store.py  save/load conversations as JSON, keyed by session name
+  session_store.py  SQLite persistence: state row, message rows, image blobs
   file_search.py  bounded filename search backing @-mention autocomplete
-  gitwork.py      tree-snapshot checkpoints, diff computation, git filter
+  gitwork.py      tree-snapshot checkpoints, diff computation, read-only git shim
   theme.py        the color palettes
   tui/            Textual app, widgets, screens (picker/resume/confirm), stylesheet
 ```

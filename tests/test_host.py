@@ -137,14 +137,14 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
                 session_id="test", repo_root=tmp_path, git_dir=tmp_path / ".git",
                 baseline_tree="t" * 40,
             )
-            from xarness import diffview as diffview_mod
+            from xarness import session as session_mod
             monkey = pytest.MonkeyPatch()
             async def fake_snapshot(info):
                 return "t" * 40
 
-            monkey.setattr(diffview_mod, "attributed_diff_stat", fake_stat)
-            monkey.setattr(diffview_mod, "git_diff", fake_text)
-            monkey.setattr(diffview_mod, "snapshot_state", fake_snapshot)
+            monkey.setattr(session_mod, "attributed_diff_stat", fake_stat)
+            monkey.setattr(session_mod, "git_diff", fake_text)
+            monkey.setattr(session_mod, "snapshot_state", fake_snapshot)
             try:
                 async with _unix_http(host.unix_socket) as http:
                     whole_resp = await http.get(f"/v1/sessions/{name}/diff")
@@ -165,9 +165,10 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
     assert per_file["files"][0]["path"] == "a.txt"
 
 
-def test_saved_session_reads_do_not_host_or_build_a_sandbox(tmp_path, monkeypatch) -> None:
-    """GET /sessions/{name} and /diff must serve an unloaded session from
-    the store: no Session object, no sandbox construction."""
+def test_saved_session_reads_load_and_host_the_session(tmp_path) -> None:
+    """GET /sessions/{name} and /diff use the one load path: an unloaded
+    session is hosted on demand (its state and saved tracking reused), and
+    the reaper releases it again when it goes idle."""
 
     async def go():
         host = make_host(tmp_path)
@@ -177,10 +178,6 @@ def test_saved_session_reads_do_not_host_or_build_a_sandbox(tmp_path, monkeypatc
             await host.unload_session(name)
             assert name not in host.sessions
 
-            def boom(*args, **kwargs):
-                raise AssertionError("saved read built a sandbox")
-
-            monkeypatch.setattr("xarness.sandbox.SandboxRuntime.make", boom)
             async with _unix_http(host.unix_socket) as http:
                 snap_resp = await http.get(f"/v1/sessions/{name}")
                 diff_resp = await http.get(f"/v1/sessions/{name}/diff")
@@ -189,9 +186,9 @@ def test_saved_session_reads_do_not_host_or_build_a_sandbox(tmp_path, monkeypatc
                 snap = snap_resp.json()
                 assert snap["status"]["session_name"] == name
                 assert snap["status"]["state"] == "idle"
+                # Same saved git block: the baseline survived the reload.
                 assert diff_resp.json()["tracking"] is True
-            # Still saved-only: neither GET re-hosted the session.
-            assert name not in host.sessions
+            assert name in host.sessions
         finally:
             await host.request_shutdown()
             await asyncio.wait_for(task, timeout=5)
@@ -410,8 +407,11 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
 
         loaded = await host.load_session(name)
         assert loaded.git_info is not None
-        turns = loaded.turn_checkpoints()
-        assert turns and turns[-1].after_tree  # finalized on load
+        # The crashed turn is closed and stamped with the live tree (no
+        # edits since the crash, so it has nothing to revert).
+        (turn,) = loaded.conversation.turns.values()
+        assert turn.closed and turn.after_tree
+        assert loaded.turn_checkpoints() == []
         # Nothing changed since: no drift.
         assert await loaded.detect_resume_drift() is None
     asyncio.run(go())
@@ -430,16 +430,22 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
         session._persist()
         await host.unload_session(name)
 
-        # Corrupt the saved git block: loading must fall back to fresh
+        # Drop the saved git block: loading must fall back to fresh
         # tracking instead of failing.
-        path = session_store.session_path(name)
-        data = json.loads(path.read_text())
-        data["git"] = {"bogus": True}
-        path.write_text(json.dumps(data))
+        with session_store.connection() as db:
+            (state_json,) = db.execute(
+                "SELECT state FROM sessions WHERE name = ?", (name,),
+            ).fetchone()
+            state = json.loads(state_json)
+            state.pop("git", None)
+            db.execute(
+                "UPDATE sessions SET state = ? WHERE name = ?",
+                (json.dumps(state), name),
+            )
 
         loaded = await host.load_session(name)
         assert loaded.git_info is not None
-        assert loaded.git_info.workspace == (tmp_path / "ws").resolve()
+        assert loaded.git_info.repo_root == (tmp_path / "ws").resolve()
         assert loaded.git_info.baseline_tree  # a real tree sha
     asyncio.run(go())
 
@@ -649,7 +655,7 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         assert loaded.sandbox.settings is not None
         assert loaded.sandbox.settings.allow_git_write is True
         assert loaded.git_info is not None
-        assert loaded.git_info.workspace == (tmp_path / "ws").resolve()
+        assert loaded.git_info.repo_root == (tmp_path / "ws").resolve()
         # The SAVED git block won: the baseline is the session's own, not a
         # fresh snapshot of the (possibly changed) workspace.
         assert loaded.git_info.baseline_tree == saved_tree
@@ -660,10 +666,12 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
     asyncio.run(go())
 
 
-def test_host_stays_alive_while_a_client_is_attached(tmp_path) -> None:
+def test_host_stays_alive_while_a_client_is_attached(tmp_path, monkeypatch) -> None:
     """An open event stream counts as active: the host must not exit during
     the grace window while a client is attached to a session, even with no
     turn running."""
+    monkeypatch.setenv("XARNESS_IDLE_TTL_SECONDS", "0")
+
     async def go():
         host = make_host(tmp_path)
         task = await _serve(host)
@@ -825,10 +833,17 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> 
             assert session.summary().active
             # The client closes the stream.
             session.unsubscribe(queue)
-            await asyncio.sleep(0.1)  # let the release task run
+
+            async def released() -> None:
+                for _ in range(100):
+                    if name not in host.sessions:
+                        return
+                    await asyncio.sleep(0.05)
+
+            await released()
             assert name not in host.sessions, "idle session must be released"
             # It is saved, and /sessions lists it as saved (not active).
-            assert name in session_store.list_sessions()
+            assert name in session_store.load_metas()
             summaries = await host.list_sessions()
             row = next(s for s in summaries if s.name == name)
             assert row.active is False
@@ -1024,7 +1039,7 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
 
             # With git info the pending diff totals land on the row.
             async def fake_diff_stat(info):
-                return DiffStat(additions=7, deletions=2, tracking=True)
+                return DiffStat(additions=7, deletions=2)
 
             monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
             session.git_info = GitInfo(

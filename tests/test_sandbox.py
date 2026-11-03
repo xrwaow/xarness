@@ -22,6 +22,7 @@ from xarness.sandbox import (
     SANDBOX_CARGO_TARGET_DIR,
     SandboxConfig,
     SandboxResult,
+    SandboxRuntime,
     SandboxSession,
     SandboxUnavailable,
     _etc_skeleton,
@@ -125,8 +126,8 @@ class SandboxSessionProtocolTest(unittest.TestCase):
         self.addCleanup(argv.stop)
 
     def _run_all(self, *commands: str, timeout: float = 5.0) -> list[SandboxResult]:
-        config = SandboxConfig(workspace=self.workspace, timeout_seconds=timeout)
-        session = SandboxSession(config)
+        config = SandboxConfig(workspace=self.workspace)
+        session = SandboxSession(config, default_timeout=timeout)
 
         async def drive() -> list[SandboxResult]:
             results: list[SandboxResult] = []
@@ -651,7 +652,7 @@ class ContainerMountsTest(SandboxArgvTest):
         # And irrelevant fields do NOT change it (fresh config).
         config2 = self.config(**base)
         key2 = config2.mount_key
-        config2.timeout_seconds = 999
+        config2.git_dir = Path("/elsewhere/.git")  # not a mount input
         self.assertEqual(config2.mount_key, key2)
 
 
@@ -807,10 +808,12 @@ class ConfigFlagsTest(SandboxArgvTest):
 
     # -- default_timeout ------------------------------------------------
 
-    def test_default_timeout_flows_into_config(self):
-        settings = SandboxSettings(default_timeout=0.5)
-        config = SandboxConfig.from_settings(self.workspace, settings)
-        self.assertEqual(config.timeout_seconds, 0.5)
+    def test_default_timeout_flows_into_the_shell(self):
+        settings = SandboxSettings(
+            default_timeout=0.5, use_container=False)
+        runtime = SandboxRuntime.make(self.workspace, settings, None)
+        assert runtime.shell is not None
+        self.assertEqual(runtime.shell.default_timeout, 0.5)
         # The validator requires > 0.
         with self.assertRaises(Exception):
             SandboxSettings(default_timeout=0)
@@ -837,7 +840,6 @@ class ConfigFlagsTest(SandboxArgvTest):
             gpu_access=settings.gpu_access,
             use_container=settings.use_container,
             filter_list=list(settings.filter_list),
-            timeout_seconds=settings.default_timeout,
             external_refs=SandboxConfig.resolve_auto_refs(
                 workspace, settings.auto_include_refs),
             git_dir=git_dir,
@@ -1173,9 +1175,9 @@ class ContainerExecTest(unittest.TestCase):
     # 7. default_timeout used when no per-command timeout is given
 
     def test_default_timeout_applies(self):
-        config = self.session_config(timeout_seconds=0.5)
+        config = self.session_config()
         async def drive():
-            session = SandboxSession(config)
+            session = SandboxSession(config, default_timeout=0.5)
             try:
                 return await session.run("sleep 5")
             finally:

@@ -54,19 +54,25 @@ class ClientError(Exception):
     one place that still needs the raw httpx error and reads it directly."""
 
 
-async def _wrap_http(coro):
-    """Await an HTTP request, folding transport errors into ClientError."""
-    try:
-        return await coro
-    except httpx.HTTPError as exc:
-        raise ClientError(str(exc) or type(exc).__name__) from exc
-
-
 class XarnessClient:
     """Typed client for one host."""
 
     def __init__(self, http: httpx.AsyncClient) -> None:
         self._http = http
+
+    async def _send(
+        self, request: httpx.Request, *, stream: bool,
+    ) -> httpx.Response:
+        """Send one built request, folding transport errors into ClientError.
+
+        ``stream`` skips the wrap: the SSE reader owns its reconnect loop
+        and needs the raw httpx error."""
+        try:
+            return await self._http.send(request, stream=stream)
+        except httpx.HTTPError as exc:
+            if stream:
+                raise
+            raise ClientError(str(exc) or type(exc).__name__) from exc
 
     async def _request(
         self, method: str, path: str, *, stream: bool = False, **kwargs: Any,
@@ -85,7 +91,11 @@ class XarnessClient:
             return await self._http.send(request, stream=stream)
         except httpx.ConnectError:
             await ensure_host()
-            return await self._http.send(request, stream=stream)
+            return await self._send(request, stream=stream)
+        except httpx.HTTPError as exc:
+            if stream:
+                raise
+            raise ClientError(str(exc) or type(exc).__name__) from exc
 
     @classmethod
     async def connect_unix(
@@ -136,15 +146,16 @@ class XarnessClient:
     # meta
 
     async def health(self) -> ServerInfo:
-        return ServerInfo.model_validate(await self._get("/v1/health"))
+        return await self._get("/v1/health", model=ServerInfo)
 
     async def config(self) -> protocol.ConfigInfo:
-        return protocol.ConfigInfo.model_validate(await self._get("/v1/config"))
+        return await self._get("/v1/config", model=protocol.ConfigInfo)
 
     async def set_default_profile(self, name: str) -> protocol.ConfigInfo:
         """Ask the host to persist the default model for future sessions."""
-        return protocol.ConfigInfo.model_validate(
-            await self._put("/v1/config/defaults", {"default_profile": name})
+        return await self._put(
+            "/v1/config/defaults", {"default_profile": name},
+            model=protocol.ConfigInfo,
         )
 
     async def search_files(self, workspace: str, q: str) -> list[str]:
@@ -153,22 +164,17 @@ class XarnessClient:
         ))
 
     async def workspace_refs(self, workspace: str) -> list[protocol.RefInfo]:
-        return [
-            protocol.RefInfo.model_validate(item)
-            for item in await self._get(
-                "/v1/workspaces/refs", params={"workspace": workspace},
-            )
-        ]
+        return await self._get(
+            "/v1/workspaces/refs", params={"workspace": workspace},
+            model=protocol.RefInfo, many=True,
+        )
 
     async def update_workspace_refs(
         self, workspace: str, path: str, add: bool,
     ) -> list[protocol.RefInfo]:
-        return [
-            protocol.RefInfo.model_validate(item)
-            for item in await self._post("/v1/workspaces/refs", {
-                "workspace": workspace, "path": path, "add": add,
-            })
-        ]
+        return await self._post("/v1/workspaces/refs", {
+            "workspace": workspace, "path": path, "add": add,
+        }, model=protocol.RefInfo, many=True)
 
     # ------------------------------------------------------------------
     # sessions
@@ -184,60 +190,52 @@ class XarnessClient:
             params["workspace"] = workspace
         if stats:
             params["stats"] = "true"
-        return [
-            SessionSummary.model_validate(s)
-            for s in await self._get("/v1/sessions", params=params)
-        ]
+        return await self._get(
+            "/v1/sessions", params=params, model=SessionSummary, many=True,
+        )
 
     async def create_session(
         self, request: protocol.CreateSessionRequest,
     ) -> SessionSummary:
-        return SessionSummary.model_validate(
-            await self._post(
-                "/v1/sessions", request.model_dump(exclude_none=True),
-            )
+        return await self._post(
+            "/v1/sessions", request.model_dump(exclude_none=True),
+            model=SessionSummary,
         )
 
     async def load_session(self, name: str) -> SessionSummary:
-        return SessionSummary.model_validate(
-            await self._post(f"/v1/sessions/{name}/load", {})
+        return await self._post(
+            f"/v1/sessions/{name}/load", {}, model=SessionSummary,
         )
 
     async def diff(self, name: str, path: str | None = None) -> protocol.DiffInfo:
         params = {"path": path} if path else None
-        return protocol.DiffInfo.model_validate(
-            await self._get(f"/v1/sessions/{name}/diff", params=params)
+        return await self._get(
+            f"/v1/sessions/{name}/diff", params=params,
+            model=protocol.DiffInfo,
         )
 
     async def upload_image(self, name: str, data: bytes, image_id: str) -> None:
-        response = await _wrap_http(
-            self._request(
-                "PUT",
-                f"/v1/sessions/{name}/images/{image_id}",
-                content=data,
-                headers={"Content-Type": "application/octet-stream"},
-            )
+        response = await self._request(
+            "PUT",
+            f"/v1/sessions/{name}/images/{image_id}",
+            content=data,
+            headers={"Content-Type": "application/octet-stream"},
         )
         if response.status_code >= 400:
-            try:
-                detail = response.json().get("detail", response.text)
-            except Exception:
-                detail = response.text
             raise ClientError(
-                f"image upload failed: HTTP {response.status_code}: {detail}"
-            ) from None
+                f"image upload failed: HTTP {response.status_code}: "
+                f"{self._error_detail(response)}"
+            )
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:
-        return protocol.DeleteResult.model_validate(
-            self._json(
-                await _wrap_http(self._request("DELETE", f"/v1/sessions/{name}"))
-            )
+        return await self._request_json(
+            "DELETE", f"/v1/sessions/{name}", model=protocol.DeleteResult,
         )
 
     async def close_session(self, name: str) -> protocol.CloseResult:
         """Stop hosting the session: cancel + unload; the saved file stays."""
-        return protocol.CloseResult.model_validate(
-            await self._post(f"/v1/sessions/{name}/close", {})
+        return await self._post(
+            f"/v1/sessions/{name}/close", {}, model=protocol.CloseResult,
         )
 
     # ------------------------------------------------------------------
@@ -246,10 +244,10 @@ class XarnessClient:
     async def command(self, name: str, command: Command) -> CommandResult:
         """Send one command; the reply goes only to this client."""
         envelope = CommandEnvelope(cmd_id=uuid.uuid4().hex, command=command)
-        result = CommandResult.model_validate(self._json(await self._request(
-            "POST", f"/v1/sessions/{name}/commands",
-            json=envelope.model_dump(),
-        )))
+        result = await self._post(
+            f"/v1/sessions/{name}/commands", envelope.model_dump(),
+            model=CommandResult,
+        )
         if not result.ok:
             raise ClientError(result.error or "command failed")
         return result
@@ -293,23 +291,54 @@ class XarnessClient:
     # ------------------------------------------------------------------
     # plumbing
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._json(await _wrap_http(self._request("GET", path, params=params)))
+    async def _get(
+        self, path: str, params: dict[str, Any] | None = None, *,
+        model: type[Any] | None = None, many: bool = False,
+    ) -> Any:
+        return await self._request_json(
+            "GET", path, params=params, model=model, many=many,
+        )
 
-    async def _post(self, path: str, body: dict[str, Any]) -> Any:
-        return self._json(await _wrap_http(self._request("POST", path, json=body)))
+    async def _post(
+        self, path: str, body: dict[str, Any], *,
+        model: type[Any] | None = None, many: bool = False,
+    ) -> Any:
+        return await self._request_json(
+            "POST", path, json=body, model=model, many=many,
+        )
 
-    async def _put(self, path: str, body: dict[str, Any]) -> Any:
-        return self._json(await _wrap_http(self._request("PUT", path, json=body)))
+    async def _put(
+        self, path: str, body: dict[str, Any], *,
+        model: type[Any] | None = None, many: bool = False,
+    ) -> Any:
+        return await self._request_json(
+            "PUT", path, json=body, model=model, many=many,
+        )
+
+    async def _request_json(
+        self, method: str, path: str, *,
+        model: type[Any] | None = None, many: bool = False, **kwargs: Any,
+    ) -> Any:
+        """One typed request: send, check the status, optionally validate."""
+        data = self._json(await self._request(method, path, **kwargs))
+        if model is None:
+            return data
+        return [model.model_validate(item) for item in data] if many \
+            else model.model_validate(data)
 
     @staticmethod
-    def _json(response: httpx.Response) -> Any:
+    def _error_detail(response: httpx.Response) -> str:
+        """The API's ``detail`` for an error response, else the raw body."""
+        try:
+            return str(response.json().get("detail", response.text))
+        except Exception:
+            return response.text
+
+    @classmethod
+    def _json(cls, response: httpx.Response) -> Any:
         if response.status_code >= 400:
-            try:
-                detail = response.json().get("detail", response.text)
-            except Exception:
-                detail = response.text
-            raise ClientError(f"HTTP {response.status_code}: {detail}")
+            raise ClientError(
+                f"HTTP {response.status_code}: {cls._error_detail(response)}")
         return response.json()
 
 

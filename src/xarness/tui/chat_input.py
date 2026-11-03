@@ -19,7 +19,7 @@ from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import TextArea
-from textual.widgets.text_area import Selection, TextAreaTheme
+from textual.widgets.text_area import Location, Selection, TextAreaTheme
 
 from .. import images, theme
 from ..images import ImageAttachment, ImageError, token_text
@@ -98,16 +98,31 @@ class ChatInput(TextArea):
         fed by tree-sitter); with no language set we own that map. Ranges
         are byte offsets into the line (the renderer maps them back to
         codepoints), which matters because 🖼 is multi-byte. Tokens never
-        span lines, so per-line scanning is enough."""
+        span lines, so per-line scanning is enough.
+
+        A token inside the selection gets ``image-token-selected`` instead:
+        highlights are painted over the selection, so the chip must change
+        color itself to show that it is selected."""
+        selection = self.selection
+        selecting = selection.start != selection.end
+        top, bottom = sorted(selection)
         self._highlights.clear()
         for row in range(self.document.line_count):
             line = self.document.get_line(row)
+            if selecting and top[0] <= row <= bottom[0]:
+                # This row's selection span in codepoint columns, the same
+                # conversion the renderer applies before painting highlights.
+                sel_start = top[1] if row == top[0] else 0
+                sel_end = bottom[1] if row == bottom[0] else len(line)
+            else:
+                sel_start = sel_end = -1
             for match in images.IMAGE_TOKEN_RE.finditer(line):
+                selected = sel_start <= match.start() and match.end() <= sel_end
                 self._highlights[row].append(
                     (
                         len(line[: match.start()].encode("utf-8")),
                         len(line[: match.end()].encode("utf-8")),
-                        "image-token",
+                        "image-token-selected" if selected else "image-token",
                     )
                 )
 
@@ -132,6 +147,12 @@ class ChatInput(TextArea):
                 # Image attachment tokens ([🖼 name W×H]) get a dimmed chip
                 # look, matching .user-image-chip in the transcript.
                 "image-token": Style(bgcolor=theme.PALETTE["border"], color=theme.PALETTE["muted"]),
+                # Same chip over a selection: Textual paints highlights after
+                # the selection style, so the chip would hide that its text is
+                # selected — swap to the selection's background instead.
+                "image-token-selected": Style(
+                    bgcolor=theme.PALETTE["highlight"], color=theme.PALETTE["muted"],
+                ),
             },
         )
         self.register_theme(no_line_highlight)
@@ -139,6 +160,14 @@ class ChatInput(TextArea):
         # through the builtin to force the new colors to be applied.
         self.theme = "css"
         self.theme = "xarness-input"
+
+    def _watch_selection(
+        self, previous_selection: Selection, selection: Selection,
+    ) -> None:
+        super()._watch_selection(previous_selection, selection)
+        # Highlights sit on top of the selection, so they must be re-picked
+        # whenever the selection moves across a token.
+        self._refresh_token_highlights()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         self._check_triggers()
@@ -266,6 +295,48 @@ class ChatInput(TextArea):
         ]
 
     # -- atomic image tokens -------------------------------------------
+
+    def _token_edge(self, direction: int) -> Location | None:
+        """Where the cursor should land for a one-step move in ``direction``
+        when that step crosses an image token, else None.
+
+        A token behaves as one character: stepping left from anywhere at or
+        inside its right side lands on its start; stepping right from
+        anywhere at or inside its left side lands past its end."""
+        offset = self.document.get_index_from_location(self.cursor_location)
+        for match in images.IMAGE_TOKEN_RE.finditer(self.text):
+            start, end = match.span()
+            hit = start < offset <= end if direction < 0 else start <= offset < end
+            if not hit:
+                continue
+            edge = start if direction < 0 else end
+            return self.document.get_location_from_index(edge)
+        return None
+
+    def action_cursor_left(self, select: bool = False) -> None:
+        if not self._has_cursor:
+            self.scroll_left()
+            return
+        target = (
+            self.get_cursor_left_location()
+            if select or self.selection.is_empty
+            else min(*self.selection)
+        )
+        self.move_cursor(self._token_edge(-1) or target, select=select)
+
+    def action_cursor_right(self, select: bool = False) -> None:
+        if not self._has_cursor:
+            self.scroll_right()
+            return
+        if self.suggestion:
+            self.insert(self.suggestion)
+            return
+        target = (
+            self.get_cursor_right_location()
+            if select or self.selection.is_empty
+            else max(*self.selection)
+        )
+        self.move_cursor(self._token_edge(1) or target, select=select)
 
     def _delete_token_at_cursor(self, direction: int) -> bool:
         """Backspace/Delete at an image token's edge: remove the whole token

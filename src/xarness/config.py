@@ -18,6 +18,7 @@ needed).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -207,11 +208,6 @@ class SandboxSettings(BaseModel):
     # conversation-only; no auto-init of a repo.
     enable_tracking: bool = True
 
-    # Deprecated (moved to the config root); honoured as a fallback when
-    # the root does not set one. Excluded from dumps: it must not leak into
-    # saved session settings or round-trip as a live field.
-    tool_output_limit: int | None = Field(default=None, ge=256, exclude=True)
-
     @field_validator("filter_list")
     @classmethod
     def _validate_filter_list(cls, value: list[str]) -> list[str]:
@@ -234,17 +230,17 @@ class SandboxSettings(BaseModel):
     @classmethod
     def _deprecate_tool_output_limit(cls, data: Any) -> Any:
         """``tool_output_limit`` used to live on sandbox profiles; it moved
-        to the config root. Accept it here (deprecation warning) instead of
-        failing every pre-existing config with extra="forbid" — and honour
-        it as a fallback when the root does not set one."""
+        to the config root. Ignore it here instead of failing every
+        pre-existing config with extra="forbid"."""
         if isinstance(data, dict) and "tool_output_limit" in data:
             # A DeprecationWarning is hidden by Python's default filters —
             # log instead, so the user actually sees it.
             LOG.warning(
                 "tool_output_limit belongs at the top level of the config "
                 "file, not inside a sandbox profile; the sandbox-level key "
-                "still works as a fallback"
+                "is ignored"
             )
+            data = {k: v for k, v in data.items() if k != "tool_output_limit"}
         return data
 
     def merged_over(self, base: "SandboxSettings") -> "SandboxSettings":
@@ -363,23 +359,17 @@ def _read(path: Path) -> dict[str, Any]:
     return data
 
 
-_SECTIONED_CACHE: dict[tuple[str, int], SectionedConfig] = {}
-# SectionedConfig is immutable in practice (callers only read it); cache by
-# (path, mtime_ns) so per-request loads (config_info, sandbox resolution,
-# workspace last-used) don't re-read and re-validate the file.
+_SECTIONED_CACHE_SIZE = 1
 
 
-def load_sectioned(path: Path) -> SectionedConfig:
-    """Load and validate the config file (cached on path + mtime)."""
-    path = Path(path)
-    try:
-        key = (str(path), path.stat().st_mtime_ns)
-    except OSError:
-        key = None
-    if key is not None:
-        cached = _SECTIONED_CACHE.get(key)
-        if cached is not None:
-            return cached
+@functools.lru_cache(maxsize=_SECTIONED_CACHE_SIZE)
+def _load_cached(path: str, mtime_ns: int) -> SectionedConfig:
+    """Parse+validate one config file, cached on (path, mtime). ``mtime_ns``
+    is only the cache key; the file is re-read whenever it changes."""
+    return _parse_sectioned(Path(path))
+
+
+def _parse_sectioned(path: Path) -> SectionedConfig:
     data = _read(path)
     # Unknown top-level keys (e.g. 'server') are ignored: forward
     # compatibility with newer configs.
@@ -388,10 +378,17 @@ def load_sectioned(path: Path) -> SectionedConfig:
     except ValidationError as exc:
         raise _format_validation_error(path, exc) from None
     sectioned.sandboxes.setdefault("default", SandboxSettings())
-    if key is not None:
-        _SECTIONED_CACHE.clear()  # keep at most the newest entry per file
-        _SECTIONED_CACHE[key] = sectioned
     return sectioned
+
+
+def load_sectioned(path: Path) -> SectionedConfig:
+    """Load and validate the config file (cached on path + mtime)."""
+    path = Path(path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return _parse_sectioned(path)
+    return _load_cached(str(path), mtime_ns)
 
 
 def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> list[str]:

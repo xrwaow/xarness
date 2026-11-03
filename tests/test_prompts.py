@@ -1,12 +1,11 @@
 """Tests for the rendered system prompt.
 
-``system_prompt_for`` is the only place the model's instructions are built.
-It should carry environment facts the model cannot discover on its own —
-mode, sandbox, git/undo, network, toolchains — and nothing else: mechanics
-belong in the tool descriptions, and behavioural policy belongs to the
-model. A prompt that claims something false (edit tools in plan mode,
-`.refs` in unsandboxed mode, `.venv` in a Rust project) is worse than a
-shorter one.
+``system_prompt`` is the only place the model's instructions are built. It
+should carry environment facts the model cannot discover on its own — mode,
+sandbox, git/undo, network, toolchains — and nothing else: mechanics belong in
+the tool descriptions, and behavioural policy belongs to the model. A prompt
+that claims something false (edit tools in plan mode, `.refs` in unsandboxed
+mode, `.venv` in a Rust project) is worse than a shorter one.
 """
 
 from __future__ import annotations
@@ -15,18 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from xarness.prompts import (
-    CONTAINER_HEADER,
-    NETWORK_OFF,
-    NETWORK_ON,
-    prompt_facts,
-    system_prompt_for,
-)
+from xarness.prompts import system_prompt
 from xarness.sandbox import SandboxConfig, bind_ref
-
-
-def _facts(config: SandboxConfig | None, mode: str = "write", **kw):
-    return prompt_facts(config, mode, **kw)
 
 
 @pytest.fixture
@@ -45,11 +34,9 @@ def python_project(tmp_path: Path) -> SandboxConfig:
     return SandboxConfig(workspace=tmp_path, allow_network=False)
 
 
-def test_base_comes_first_and_mode_clause_matches(sandbox):
-    plan = system_prompt_for(_facts(sandbox, "plan"))
-    write = system_prompt_for(_facts(sandbox, "write"))
-    for prompt in (plan, write):
-        assert prompt.startswith(CONTAINER_HEADER)
+def test_mode_clause_matches(sandbox):
+    plan = system_prompt(sandbox, "plan")
+    write = system_prompt(sandbox, "write")
     assert "Mode: PLAN (read-only)" in plan
     assert "Mode: WRITE (read/write)" in write
     assert "Mode: PLAN" not in write and "Mode: WRITE" not in plan
@@ -57,24 +44,24 @@ def test_base_comes_first_and_mode_clause_matches(sandbox):
 
 
 def test_plan_mode_does_not_describe_write_tools(sandbox):
-    prompt = system_prompt_for(_facts(sandbox, "plan"))
+    prompt = system_prompt(sandbox, "plan")
     assert "edit_file" not in prompt
     assert "write_file" not in prompt
-    # No shell in unsandboxed plan mode → no shell section either.
-    host_prompt = system_prompt_for(
-        _facts(SandboxConfig(workspace=sandbox.workspace, use_container=False), "plan"))
+    # No shell in unsandboxed plan mode → no git-in-the-shell claim either.
+    host_prompt = system_prompt(
+        SandboxConfig(workspace=sandbox.workspace, use_container=False), "plan")
     assert "run_bash" not in host_prompt
 
 
-def test_read_mode_omits_write_only_facts(sandbox):
-    prompt = system_prompt_for(_facts(sandbox, "plan", tracked=True))
+def test_plan_mode_omits_write_only_facts(sandbox):
+    prompt = system_prompt(sandbox, "plan", tracked=True)
     assert "snapshotted" not in prompt
     assert "git in the shell" not in prompt
 
 
 def test_prompt_has_no_methodology_or_style(sandbox):
     """How to work is the model's call; only environment facts belong here."""
-    prompt = system_prompt_for(_facts(sandbox, "write"))
+    prompt = system_prompt(sandbox, "write")
     for policy in (
         "all-or-nothing",
         "Batch every change",
@@ -91,9 +78,9 @@ def test_prompt_has_no_methodology_or_style(sandbox):
 
 def test_unsandboxed_prompt_has_no_container_claims(sandbox):
     host = SandboxConfig(workspace=sandbox.workspace, use_container=False)
-    prompt = system_prompt_for(_facts(host, "write"))
+    prompt = system_prompt(host, "write")
     assert "/workspace" not in prompt
-    assert ".refs" not in prompt
+    assert "/tmp/refs" not in prompt
     assert "tmpfs" not in prompt
     assert "No container" in prompt
     # The real workspace path is named instead.
@@ -101,7 +88,7 @@ def test_unsandboxed_prompt_has_no_container_claims(sandbox):
 
 
 def test_container_prompt_names_workspace_and_ephemeral_tmp(sandbox):
-    prompt = system_prompt_for(_facts(sandbox, "write"))
+    prompt = system_prompt(sandbox, "write")
     assert "/workspace" in prompt
     assert "tmpfs" in prompt
 
@@ -114,37 +101,37 @@ def test_refs_mentioned_only_when_mounted(sandbox, tmp_path):
     ref.write_text("x")
     host = SandboxConfig(workspace=sandbox.workspace)
     bind_ref(host.workspace, host.external_refs, ref, alias="notes")
-    with_refs = system_prompt_for(_facts(host, "write", tracked=True))
+    with_refs = system_prompt(host, "write", tracked=True)
     assert "/tmp/refs" in with_refs
     assert "/diff" not in with_refs and "/undo" not in with_refs
     # Untracked / git-write sessions and ref-less sessions still omit them.
-    bare = system_prompt_for(_facts(sandbox, "write", git_write=True))
+    bare = system_prompt(sandbox, "write", git_write=True)
     assert "/tmp/refs" not in bare
     assert "/diff" not in bare and "/undo" not in bare
-    assert ".refs" not in bare
 
 
 def test_network_claim_follows_the_sandbox(sandbox, offline):
-    online = system_prompt_for(_facts(sandbox))
-    assert NETWORK_ON in online
-    assert NETWORK_OFF not in online
+    online = system_prompt(sandbox, "write")
+    assert "Network access is available" in online
+    assert "no network" not in online
     assert "UV_OFFLINE" not in online
 
-    off = system_prompt_for(_facts(offline))
-    assert NETWORK_OFF in off
+    off = system_prompt(offline, "write")
+    assert "no network" in off
     assert "UV_OFFLINE" in off
-    assert NETWORK_ON not in off
+    assert "Network access is available" not in off
 
 
 def test_python_clause_only_for_python_projects(tmp_path, python_project):
-    py = system_prompt_for(_facts(python_project))
+    py = system_prompt(python_project, "write")
     assert "`.venv`" in py
     assert "uv run --frozen" in py
     assert "uv.lock" in py
     # A directory with no project files gets no toolchain claim.
     plain = tmp_path / "plain"
     plain.mkdir()
-    other = system_prompt_for(_facts(SandboxConfig(workspace=plain, allow_network=True)))
+    other = system_prompt(
+        SandboxConfig(workspace=plain, allow_network=True), "write")
     assert ".venv" not in other
     assert "uv run" not in other
 
@@ -152,7 +139,7 @@ def test_python_clause_only_for_python_projects(tmp_path, python_project):
 def test_cargo_project_gets_cargo_facts_without_test_instructions(tmp_path):
     (tmp_path / "Cargo.toml").write_text("")
     config = SandboxConfig(workspace=tmp_path, allow_network=True)
-    prompt = system_prompt_for(_facts(config))
+    prompt = system_prompt(config, "write")
     assert "target-sandbox" in prompt
     assert "cargo test" not in prompt
     assert ".venv" not in prompt
@@ -160,23 +147,23 @@ def test_cargo_project_gets_cargo_facts_without_test_instructions(tmp_path):
 
 
 def test_tracking_clause_is_opt_out(sandbox):
-    with_tracking = system_prompt_for(_facts(sandbox, tracked=True))
-    without = system_prompt_for(_facts(sandbox, tracked=False))
+    with_tracking = system_prompt(sandbox, "write", tracked=True)
+    without = system_prompt(sandbox, "write", tracked=False)
     assert "review and undo" in with_tracking
     assert "except gitignored files" in with_tracking
     assert "review and undo" not in without
 
 
 def test_git_policy_follows_allow_git_write(sandbox):
-    readonly = system_prompt_for(_facts(sandbox, tracked=True))
+    readonly = system_prompt(sandbox, "write", tracked=True)
     assert "git in the shell is read-only" in readonly
-    writable = system_prompt_for(_facts(sandbox, git_write=True))
+    writable = system_prompt(sandbox, "write", git_write=True)
     assert "git is read-write in the shell" in writable
     assert "inspection only" not in writable
 
 
 def test_no_sandbox_means_no_environment_claims():
-    prompt = system_prompt_for(_facts(None))
+    prompt = system_prompt(None, "write")
     assert "Environment" not in prompt
     assert "Sandbox" not in prompt
     assert ".venv" not in prompt
@@ -187,5 +174,5 @@ def test_no_sandbox_means_no_environment_claims():
 def test_same_facts_render_byte_identically(sandbox):
     """The prompt is part of the cached prefix: the same session must render
     the same bytes (no set iteration, no timestamps)."""
-    facts = _facts(sandbox, tracked=True)
-    assert system_prompt_for(facts) == system_prompt_for(facts)
+    assert system_prompt(sandbox, "write", tracked=True) == system_prompt(
+        sandbox, "write", tracked=True)

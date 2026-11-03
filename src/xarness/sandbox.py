@@ -60,6 +60,20 @@ def is_refs_path(path: str) -> bool:
     return norm == REFS_ANCHOR or norm.startswith(REFS_ANCHOR + "/")
 
 
+def ref_infos(external: dict[str, "ContainerRef"]) -> list:
+    """Client-facing ``protocol.RefInfo`` rows for a resolved ref map.
+
+    One helper for every caller (session status, workspace refs): the rows
+    are always sorted by host path, so a listing never reshuffles.
+    """
+    from .protocol import RefInfo  # local: keep the sandbox import-light
+
+    return [
+        RefInfo(path=str(ref.host), mount=ref.mount)
+        for _, ref in sorted(external.items(), key=lambda item: str(item[1].host))
+    ]
+
+
 def bind_ref(
     workspace: Path,
     refs: dict[str, ContainerRef],
@@ -367,11 +381,12 @@ class SandboxConfig:
     # this mode (see tools.build_registry): there is no read-only mount to
     # enforce it with.
     use_container: bool = True
-    # Install the read-only git shim (gitwork.git_shim_script) first on the
-    # container's PATH: blocked subcommands fail in place at execution time
-    # instead of the whole command string being vetoed before it runs. Set
-    # by from_settings when git tracking is active and allow_git_write is
-    # off; unsandboxed sessions keep the string-scanning guard instead.
+    # Install the read-only git shim (gitwork.git_shim_script) first on
+    # PATH: blocked subcommands fail in place at execution time instead of
+    # the whole command string being vetoed before it runs. Set by
+    # from_settings when git tracking is active and allow_git_write is off;
+    # unsandboxed sessions prepend the same shim to the host PATH (see
+    # SandboxSession._ensure_started).
     # Part of mount_key, so enabling it restarts the persistent shell.
     git_shim: bool = False
     # Workspace-root-relative paths excluded from the container's mounts
@@ -983,6 +998,13 @@ class SandboxSession:
         # an inherited value); unsandboxed mode has no bwrap, so hand it to
         # the shell's own environment.
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if not self._config.use_container and self._config.git_shim:
+            # Unsandboxed mode has no container PATH to rewrite from the
+            # inside, so prepend the same read-only git shim here: both modes
+            # then enforce one policy, at execution time.
+            shim_dir = sandbox_cache_root() / GIT_SHIM_DIR
+            _write_git_shim(shim_dir)
+            env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
             env=env,
@@ -1161,13 +1183,6 @@ class SandboxRuntime:
     @property
     def allow_git_write(self) -> bool:
         return self.settings.allow_git_write if self.settings is not None else False
-
-    @property
-    def git_shim_active(self) -> bool:
-        """True when the container enforces read-only git via the PATH shim
-        (so the string-scanning guard must stay off — it would veto whole
-        commands the shim now handles statement by statement)."""
-        return self.config.git_shim if self.config is not None else False
 
     def set_mode(self, mode: str) -> None:
         if self.config is not None:

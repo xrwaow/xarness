@@ -21,13 +21,12 @@ All git operations here run as plain subprocesses against host paths in the
 harness process; only the agent's *tools* run sandboxed inside the
 workspace.
 
-Also home to ``check_blocked_git`` — the best-effort filter that keeps the
-agent's shell tool from mutating the repo (only read-only inspection
-subcommands and ``git config --get/--list`` pass; add, commit, checkout,
-branch, tag, reset, switch, rebase, push, config writes, … are blocked).
-It is a UX safety net, not
-a security boundary: the user's history is theirs; the agent edits files,
-not refs.
+Also home to the generated ``git`` shim (:func:`git_shim_script`), the
+best-effort filter that keeps the agent's shell tool from mutating the repo
+(only read-only inspection subcommands and ``git config --get/--list``
+pass; add, commit, checkout, branch, tag, reset, switch, rebase, push,
+config writes, … are blocked). It is a UX safety net, not a security
+boundary: the user's history is theirs; the agent edits files, not refs.
 """
 
 from __future__ import annotations
@@ -36,7 +35,6 @@ import asyncio
 import hashlib
 import os
 import re
-import shlex
 import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -854,35 +852,6 @@ def _conflict_summary(out: str) -> str:
     return f"conflicting files: {listed}"
 
 
-async def revert_turn(info: GitInfo, before_tree: str, after_tree: str) -> str | None:
-    """Reverse one turn's edits onto the current live state via 3-way merge.
-
-    ``before_tree`` is the workspace before the turn, ``after_tree`` the
-    state the turn produced. The merge base is ``after_tree`` (what the turn
-    left behind), "ours" is the live workspace now (including any manual
-    edits made since), and "theirs" is ``before_tree`` (the target). The
-    merge therefore applies the *reverse* of the turn's own diff on top of
-    the live state, leaving unrelated changes made since the turn untouched.
-
-    Returns a short conflict description if the turn's changes overlap
-    unresolvably with edits made since; None on a clean revert. On conflict
-    the workspace is left exactly as it was — nothing is partially applied.
-    """
-    if before_tree == after_tree:
-        return None  # the turn made no edits — nothing to reverse
-
-    current_tree = await snapshot_state(info)
-    conflict, result_tree = await _revert_turn_tree(
-        info, before_tree, after_tree, current_tree
-    )
-    if conflict is not None:
-        return conflict
-    # Safe: reverting to the merge RESULT, not a raw historical snapshot. The
-    # current tree is passed through so revert_to_tree needn't re-snapshot.
-    await revert_to_tree(info, result_tree, current_tree)
-    return None
-
-
 async def _revert_turn_tree(
     info: GitInfo, before_tree: str, after_tree: str, current_tree: str,
 ) -> tuple[str | None, str]:
@@ -1134,7 +1103,6 @@ class DiffStat:
     files: list[DiffFile] = field(default_factory=list)
     additions: int = 0
     deletions: int = 0
-    tracking: bool = False
 
 
 def _diff_info(files: list[DiffFile]) -> DiffStat:
@@ -1149,15 +1117,6 @@ def _diff_info(files: list[DiffFile]) -> DiffStat:
 # ----------------------------------------------------------------------
 # shell-command filter — best-effort UX safety net
 
-
-_BLOCK_REASON = (
-    "blocked: git in this shell is read-only — inspection commands (status, "
-    "log, diff, show, blame, grep, ls-files, rev-parse, …), config reads "
-    "(git config --get/--list) and the list forms of branch/tag/stash/remote "
-    "(e.g. `git branch --show-current`, `git stash list`, `git remote -v`) "
-    "are available. Anything that stages, commits or rewrites refs/config "
-    "is not. Continue editing files normally."
-)
 
 # Deny by default: only these inspection subcommands pass. Everything else
 # (add, commit, checkout, reset, switch, rebase, clean, push, update-ref, …)
@@ -1195,25 +1154,21 @@ _GIT_VALUE_FLAGS = {
     "-C", "-c", "--git-dir", "--work-tree", "--namespace",
     "--super-prefix", "--exec-path",
 }
-_SHELL_SPLIT_RE = re.compile(r"&&|\|\||[;|&\n]")
-_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
-_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def git_shim_script() -> str:
     """A POSIX-sh ``git`` wrapper that enforces the read-only policy at
     execution time.
 
-    Installed first on the sandbox's PATH, it lets statement-level git
-    through exactly where :func:`check_blocked_git` would block the whole
-    command string: ``cmd1; git commit; cmd2`` runs cmd1, prints the block
-    message in place, and still runs cmd2, while ``cmd1 && git commit &&
-    cmd2`` stops at the block as ``&&`` should. Commands that merely mention
-    the word git (``grep "git is read" …``) never invoke it, so the string
-    scanner's false positives disappear.
+    Installed first on PATH (in the container, and for unsandboxed sessions
+    on the host), it lets statement-level git through: ``cmd1; git commit;
+    cmd2`` runs cmd1, prints the block message in place, and still runs
+    cmd2, while ``cmd1 && git commit && cmd2`` stops at the block as ``&&``
+    should. Commands that merely mention the word git (``grep "git is
+    read" …``) never invoke it.
 
-    The allow-lists are generated from the same constants
-    :func:`_check_git_args` reads, so the two can't drift.
+    The allow-lists below are the only description of the policy: the shim
+    is generated from the same constants the block message names.
 
     This is an accident guardrail, not a security boundary: a determined
     bypass (``/usr/bin/git``, ``command git``) is out of scope by design —
@@ -1241,10 +1196,15 @@ def git_shim_script() -> str:
 # (/usr/bin/git, `command git`); the read-only .git mount is the real
 # boundary.
 real=
-for c in /usr/bin/git /bin/git /usr/local/bin/git; do
-    if [ -x "$c" ]; then real=$c; break; fi
-done
-if [ -z "$real" ]; then
+# Strip this shim's own directory (the first PATH entry) and ask the shell
+# for the next git on the way: works in the container and for unsandboxed
+# sessions on the host, without hardcoding install locations. A PATH with
+# no colon has nothing else on it — looking there would find this shim and
+# exec it forever.
+case $PATH in
+    *:*) real=$(PATH=${{PATH#*:}} command -v git 2>/dev/null) ;;
+esac
+if [ -z "$real" ] || [ ! -x "$real" ]; then
     echo "git: shim found no real git binary" >&2
     exit 127
 fi
@@ -1293,87 +1253,3 @@ case $sub in
     *) blocked ;;
 esac
 '''
-
-
-def _check_git_args(args: list[str]) -> str | None:
-    # Subshell spelling: "(git commit)" tokenizes as "(git", "commit)".
-    if args and args[-1].endswith(")"):
-        args = [*args[:-1], args[-1].rstrip(")")]
-    i = 0
-    while i < len(args) and args[i].startswith("-"):
-        i += 2 if args[i] in _GIT_VALUE_FLAGS else 1
-    if i >= len(args):
-        return None
-    sub, rest = args[i], args[i + 1:]
-
-    if sub in _ALLOWED_SUBCOMMANDS:
-        return None
-    if sub == "config" and any(a in _CONFIG_READ_FLAGS for a in rest):
-        return None
-    if read_forms := _READ_FORMS.get(sub):
-        if not rest and sub in _BARE_IS_READ:
-            return None
-        if rest and rest[0] in read_forms:
-            return None
-    return _BLOCK_REASON
-
-
-def _split_segments(command: str) -> list[str]:
-    """Split a shell command on operators, dropping heredoc bodies.
-
-    A heredoc body is data (a script being written, a commit message), not
-    commands to run; scanning it blocked harmless commands like
-    ``cat > run.sh <<'EOF' … EOF``."""
-    segments = _SHELL_SPLIT_RE.split(command)
-    kept: list[str] = []
-    index = 0
-    while index < len(segments):
-        segment = segments[index]
-        kept.append(segment)
-        index += 1
-        match = _HEREDOC_RE.search(segment)
-        if match is None:
-            continue
-        terminator = match.group(1)
-        while index < len(segments) and segments[index].strip() != terminator:
-            index += 1
-        index += 1  # the terminator line itself
-    return kept
-
-
-def check_blocked_git(command: str) -> str | None:
-    """Return a block reason if the shell command runs a git subcommand
-    outside the read-only allow-list, else None.
-
-    Best effort: splits on shell operators and inspects each segment's
-    command word (env assignments, subshell parens, sudo/env prefixes, and
-    ``sh -c`` recursion are handled; heredoc bodies are ignored). Anything
-    more adversarial (command substitution indirection, aliases, a git
-    binary earlier in PATH…) can route around it by design — see the module
-    docstring.
-    """
-    for segment in _split_segments(command):
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            tokens = segment.split()
-        idx = 0
-        while idx < len(tokens) and (
-            _ENV_ASSIGN_RE.match(tokens[idx]) or tokens[idx] in ("(", "{", "sudo", "env", "nohup")
-        ):
-            idx += 1
-        if idx >= len(tokens):
-            continue
-        # Subshell spelling: "(git commit)" tokenizes as "(git".
-        head = tokens[idx].lstrip("({")
-        if os.path.basename(head) == "git":
-            reason = _check_git_args(tokens[idx + 1:])
-            if reason:
-                return reason
-        elif os.path.basename(head) in ("sh", "bash", "dash", "zsh") and "-c" in tokens[idx:]:
-            inner = tokens[idx:].index("-c")
-            if idx + inner + 1 < len(tokens):
-                reason = check_blocked_git(tokens[idx + inner + 1])
-                if reason:
-                    return reason
-    return None

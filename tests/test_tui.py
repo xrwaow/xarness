@@ -3,6 +3,7 @@ client/server import boundary. The app runs against a fake clientlib
 client; the session behaviors themselves are covered in test_session.py."""
 
 import asyncio
+import json
 import unittest
 
 from textual.app import App
@@ -592,6 +593,33 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("+1 -1", detail)
         self.assertIn("b.py", detail)
 
+    def test_running_run_bash_names_the_command_whatever_its_shape(self) -> None:
+        """The live label must not depend on the command's first line being
+        non-blank: leading newlines and multi-line scripts (heredocs) still
+        have to say what is running, and agree with the settled label."""
+        from xarness.tui.tool_view import _bash_settled, live_parts
+
+        cases = {
+            "\nls -la": "ls -la",
+            "\n\n  rg foo": "rg foo",
+            "cd workspace &&\nls": "cd workspace && ls",
+            "python - <<PY\nprint(1)\nPY": "python - <<PY print(1) PY",
+        }
+        for command, expected in cases.items():
+            args = json.dumps({"command": command})
+            self.assertEqual(live_parts("run_bash", args), ("run_bash", expected))
+            self.assertEqual(_bash_settled(args).plain.strip(), expected)
+
+    def test_running_command_truncates_like_the_settled_one(self) -> None:
+        """A long command may not shrink when the call finishes: the live
+        detail keeps the settled width."""
+        from xarness.tui.tool_view import _bash_settled, live_parts
+
+        args = json.dumps({"command": "rg " + "x" * 200})
+        live = live_parts("run_bash", args)[1]
+        self.assertEqual(live, _bash_settled(args).plain.strip())
+        self.assertLessEqual(len(live), 80)
+
     async def test_streamed_arguments_render_live_details(self) -> None:
         from xarness.tui.app import AgentApp
 
@@ -603,6 +631,9 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
              '"new_string": "y\\nz"}]}', "+2 -1 b.py"),
             ("b1", "run_bash", '{"command": "grep -rn foo"}',
              "grep -rn foo"),
+            # Leading newline: the command must still name itself live.
+            ("b2", "run_bash", '{"command": "\\nla -la /workspace"}',
+             "la -la /workspace"),
         ]
         client = FakeClient(make_snapshot(state="running"))
         app = AgentApp(client, workspace=None, session_name="s1")
@@ -633,6 +664,7 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
                 flow.row_text(y) for y in range(flow.row_count))
             self.assertIn("Running write_file +3 a.py", painted)
             self.assertIn("Running run_bash grep -rn foo", painted)
+            self.assertIn("Running run_bash la -la /workspace", painted)
 
     def test_expanded_edit_file_body_shows_the_diff(self) -> None:
         """edit_file's returned unified diff must render as +/- rows — the
@@ -1739,3 +1771,108 @@ class RelativeTimeFormatTest(unittest.TestCase):
         self.assertEqual(relative_time((now - timedelta(days=2)).isoformat()), "2d")
         self.assertEqual(relative_time((now - timedelta(hours=3)).isoformat()), "3h00m")
         self.assertEqual(relative_time(None), "?")
+
+
+class ImageTokenCursorTest(unittest.IsolatedAsyncioTestCase):
+    """A pasted-image token behaves as one character in the input."""
+
+    async def _input(self, text: str, offset: int):
+        from textual.app import App, ComposeResult
+        from textual.widgets.text_area import Selection
+
+        from xarness.images import ImageRef, token_text
+        from xarness.tui.widgets import ChatInput
+
+        class Host(App):
+            def compose(self) -> ComposeResult:
+                yield ChatInput(id="chat-input")
+
+        token = token_text(ImageRef(
+            id="0" * 64, name="pic.png", mime="image/png", width=8, height=8,
+        ))
+        full = text.replace("•", token)
+        app = Host()
+        async with app.run_test() as pilot:
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.load_text(full)
+            location = chat_input.document.get_location_from_index(
+                len(full) if offset < 0 else offset,
+            )
+            chat_input.selection = Selection(location, location)
+            await pilot.pause()
+            yield chat_input
+
+    async def test_left_arrow_skips_the_token(self) -> None:
+        async for chat_input in self._input("ab •", -1):
+            chat_input.action_cursor_left()
+            # one press crosses the whole token, landing on its start
+            self.assertEqual(chat_input.cursor_location, (0, len("ab ")))
+
+    async def test_right_arrow_skips_the_token(self) -> None:
+        async for chat_input in self._input("• cd", 0):
+            chat_input.action_cursor_right()
+            # one press crosses the whole token, landing past its end
+            self.assertEqual(
+                chat_input.cursor_location,
+                chat_input.document.get_location_from_index(
+                    len(chat_input.text) - len(" cd"),
+                ),
+            )
+
+    async def test_shift_left_selects_the_whole_token(self) -> None:
+        async for chat_input in self._input("ab •", -1):
+            chat_input.action_cursor_left(select=True)
+            self.assertEqual(chat_input.selected_text.count("🖼"), 1)
+            self.assertEqual(
+                chat_input.selected_text,
+                chat_input.text[len("ab "):],
+            )
+
+    async def test_backspace_after_token_removes_it(self) -> None:
+        async for chat_input in self._input("ab •", -1):
+            chat_input.action_delete_left()
+            self.assertEqual(chat_input.text, "ab ")
+            self.assertEqual(chat_input.attachments, [])
+
+
+class ImageTokenSelectedStyleTest(unittest.IsolatedAsyncioTestCase):
+    """A selected token's chip swaps to the selected style."""
+
+    async def test_token_highlight_follows_selection(self) -> None:
+        from textual.app import App, ComposeResult
+        from textual.widgets.text_area import Selection
+
+        from xarness.images import ImageRef, token_text
+        from xarness.tui.widgets import ChatInput
+
+        token = token_text(ImageRef(
+            id="0" * 64, name="pic.png", mime="image/png", width=8, height=8,
+        ))
+        full = f"ab {token} cd"
+
+        class Host(App):
+            def compose(self) -> ComposeResult:
+                yield ChatInput()
+
+        app = Host()
+        async with app.run_test() as pilot:
+            chat_input = app.query_one(ChatInput)
+            chat_input.load_text(full)
+            await pilot.pause()
+
+            def highlight_names() -> list[str]:
+                return [
+                    name
+                    for ranges in chat_input._highlights.values()
+                    for _, _, name in ranges
+                ]
+
+            self.assertEqual(highlight_names(), ["image-token"])
+            end = chat_input.document.get_location_from_index(len(full))
+            start = chat_input.document.get_location_from_index(2)
+            chat_input.selection = Selection(start, end)
+            await pilot.pause()
+            self.assertEqual(highlight_names(), ["image-token-selected"])
+            chat_input.selection = Selection(end, end)
+            await pilot.pause()
+            self.assertEqual(highlight_names(), ["image-token"])

@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import BaseModel
 
 # Hard pixel budget per image; anything larger is downsampled once, on load.
 MAX_PIXELS = 1_000_000
@@ -59,42 +59,18 @@ class ImageRef(BaseModel):
     height: int
 
 
-class ImageAttachment(BaseModel):
+class ImageAttachment(ImageRef):
     """One image travelling from a client to the host.
 
-    ``data_b64`` is the encoded image bytes; ``width``/``height`` describe
-    the encoded image (post-downsample) so the TUI can show real dims
-    without decoding. ``SendMessage`` carries these; the host stores the
-    bytes in its blob store and keeps only an :class:`ImageRef`."""
+    An :class:`ImageRef` plus the encoded bytes: the reference (including
+    its content-hash ``id``) is computed once, on load/attach, not per
+    keystroke. The TUI puts these in an upload; the host stores the bytes
+    in its blob store and keeps only the ref."""
 
-    model_config = ConfigDict(extra="ignore")
-
-    name: str
-    mime: str
     data_b64: str
-    width: int
-    height: int
-
-    # Content-hash id, computed lazily (hashing a multi-MB payload on every
-    # keystroke would be wasteful).
-    _ref_id: str | None = PrivateAttr(default=None)
-
-    @property
-    def ref_id(self) -> str:
-        if self._ref_id is None:
-            self._ref_id = self.to_ref().id
-        return self._ref_id
 
     def data(self) -> bytes:
         return base64.b64decode(self.data_b64)
-
-    def to_ref(self) -> ImageRef:
-        """The content-addressed reference for these bytes."""
-        return ImageRef(
-            id=hashlib.sha256(self.data()).hexdigest(),
-            name=self.name, mime=self.mime,
-            width=self.width, height=self.height,
-        )
 
 
 def sniff_mime(data: bytes) -> str:
@@ -112,12 +88,12 @@ def sniff_mime(data: bytes) -> str:
     return "application/octet-stream"
 
 
-def _token_id(image: ImageRef | ImageAttachment) -> str:
+def _token_id(image: ImageRef) -> str:
     """The short content id a token carries (distinguishes same-named images)."""
-    return (image.id if isinstance(image, ImageRef) else image.ref_id)[:4]
+    return image.id[:4]
 
 
-def token_text(image: ImageRef | ImageAttachment) -> str:
+def token_text(image: ImageRef) -> str:
     """The placeholder token an attached image appears as in the text."""
     return _TOKEN_TEXT.format(
         name=image.name, width=image.width, height=image.height,
@@ -178,62 +154,52 @@ def load_image_bytes(data: bytes, name: str = "clipboard.png") -> ImageAttachmen
 
 
 def _attachment_from_pil(
-    img: Image.Image, name: str, original: bytes | None,
+    img: Image.Image, name: str, original: bytes,
 ) -> ImageAttachment:
     """Turn a loaded Pillow image into an :class:`ImageAttachment`.
 
     ``original`` is the source bytes, reused verbatim when the image was
     untouched and already PNG/JPEG (no generation loss)."""
     fmt = img.format or "PNG"
-
-    if img.width * img.height > MAX_PIXELS:
+    resized = img.width * img.height > MAX_PIXELS
+    if resized:
         scale = (MAX_PIXELS / (img.width * img.height)) ** 0.5
         img = img.resize(
             (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
             Image.LANCZOS,
         )
-        downsampled = True
-    else:
-        downsampled = False
-
-    if fmt == "GIF":
-        # Animated GIFs keep their first frame, re-encoded as PNG/JPEG below.
-        downsampled = True
-
-    if fmt not in ("PNG", "JPEG"):
-        # WebP/GIF/BMP: re-encode as a widely-accepted format. Transparency
-        # is only meaningful in PNG; JPEG needs a plain RGB image.
-        fmt = "PNG" if "A" in img.getbands() else "JPEG"
-
-    if fmt == "JPEG" and img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-
-    if not downsampled and fmt in ("PNG", "JPEG") and original is not None:
-        # Untouched within the pixel budget: send the original bytes so no
-        # generation loss sneaks in.
-        data = original
-        mime = "image/jpeg" if fmt == "JPEG" else "image/png"
-        width, height = img.width, img.height
-    else:
+    # Keep the original bytes when nothing changed and the format is one
+    # every provider accepts. GIF (an animated first frame) and the other
+    # formats are re-encoded as PNG (the only one that keeps transparency)
+    # or JPEG.
+    keep = not resized and fmt in ("PNG", "JPEG")
+    if not keep:
+        if fmt == "GIF" or fmt not in ("PNG", "JPEG"):
+            transparent = "A" in img.getbands() or (
+                fmt != "JPEG" and "transparency" in img.info
+            )
+            fmt = "PNG" if transparent else "JPEG"
+        if fmt == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
         buf = BytesIO()
         try:
             if fmt == "JPEG":
                 img.save(buf, "JPEG", quality=_JPEG_QUALITY)
-                mime = "image/jpeg"
             else:
                 img.save(buf, "PNG")
-                mime = "image/png"
         except OSError as exc:  # e.g. a mode Pillow cannot encode
             raise ImageError(f"could not encode image {name}: {exc}") from None
         data = buf.getvalue()
-        width, height = img.width, img.height
-
+    else:
+        data = original
+    mime = "image/png" if fmt == "PNG" else "image/jpeg"
     return ImageAttachment(
+        id=hashlib.sha256(data).hexdigest(),
         name=name,
         mime=mime,
         data_b64=base64.b64encode(data).decode("ascii"),
-        width=width,
-        height=height,
+        width=img.width,
+        height=img.height,
     )
 
 

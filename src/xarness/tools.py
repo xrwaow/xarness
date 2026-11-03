@@ -43,9 +43,17 @@ class Tool:
     description: str
     args_model: "type[BaseModel]"
     handler: "Callable[[BaseModel], Awaitable[ToolResult]]"
-    # The provider-facing JSON schema, computed once at registration (it is
+    # The provider-facing JSON schema, computed once at construction (it is
     # immutable; regenerating it per tool per round was pure waste).
     schema: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Derive the provider schema from the args model.
+
+        Here (not in the registry) so every Tool has one — the decorator and
+        a hand-built Tool produce the same shape."""
+        if not self.schema:
+            self.schema = ToolRegistry._schema_of(self)
 
 
 def tool(name: str, description: str, args_model: "type[BaseModel]") -> Callable:
@@ -56,12 +64,10 @@ def tool(name: str, description: str, args_model: "type[BaseModel]") -> Callable
     receives typed, defaulted fields instead of a raw dict."""
 
     def deco(handler):
-        built = Tool(
+        return Tool(
             name=name, description=description,
             args_model=args_model, handler=handler,
         )
-        built.schema = ToolRegistry._schema_of(built)
-        return built
 
     return deco
 
@@ -184,9 +190,6 @@ class ToolRegistry:
     """
 
     max_output_chars: int = DEFAULT_OUTPUT_LIMIT
-    # Default per-command timeout for one-shot sandbox runs (from the
-    # sandbox profile's default_timeout).
-    default_timeout: float = DEFAULT_TIMEOUT
     _tools: dict[str, Tool] = field(default_factory=dict)
 
     @staticmethod
@@ -240,8 +243,6 @@ class ToolRegistry:
         return schema
 
     def register(self, tool: Tool) -> None:
-        if not tool.schema:
-            tool.schema = self._schema_of(tool)
         self._tools[tool.name] = tool
 
     def tools(self) -> list[Tool]:
@@ -381,14 +382,21 @@ def _line_window(
         note = "" if last >= end else f"; output limit reached — continue from line {last + 1}"
         return "".join(lines[:kept]) + f"\n[showing lines {start}-{last} of {total}{note}]"
 
-    if limit is not None and len(render(len(lines))) > limit:
-        low, high = 0, len(lines)  # largest count that fits
-        while low < high:
-            middle = (low + high + 1) // 2
-            low, high = ((middle, high) if len(render(middle)) <= limit
-                         else (low, middle - 1))
-        return render(max(low, 1) if lines else 0)  # a lone oversized line: let _truncate_output cut it
-    return render(len(lines))
+    text = render(len(lines))
+    if limit is None or len(text) <= limit:
+        return text
+    # The longest whole-line prefix of the contents that fits the budget:
+    # cut at the last newline inside it (never mid-line), then count the
+    # lines kept.
+    contents = "".join(lines)
+    kept = contents[:contents.rfind("\n", 0, limit) + 1].count("\n")
+    if kept <= 0:
+        # A lone line longer than the whole budget: let _truncate_output cut it.
+        return render(1)
+    # The footer the cut introduces must fit too.
+    while kept > 1 and len(render(kept)) > limit:
+        kept -= 1
+    return render(kept)
 
 
 def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
@@ -686,10 +694,7 @@ def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
 # run_bash
 
 
-def _make_run_bash_tool(
-    session: SandboxSession,
-    git_guard: Callable[[str], str | None] | None = None,
-) -> Tool:
+def _make_run_bash_tool(session: SandboxSession) -> Tool:
     description = ["Run a shell command inside the sandboxed workspace, as /bin/sh."]
     description.append(
         "The shell persists across calls within this chat — cd and exported "
@@ -713,10 +718,6 @@ def _make_run_bash_tool(
             # empty `{ }`, a syntax error that kills the shell.
             return _bad("'command' is required")
         timeout = args.timeout_seconds
-        if git_guard is not None:
-            block_reason = git_guard(command)
-            if block_reason:
-                return ToolResult(status="error", content=block_reason)
         result = await session.run(command, on_output=_output_sink.get(), timeout=timeout)
         if result.timed_out:
             label = f" after {timeout}s" if timeout is not None else ""
@@ -777,7 +778,6 @@ def build_registry(
     session: SandboxSession | None,
     mode: str = "write",
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
-    git_guard: Callable[[str], str | None] | None = None,
     default_timeout: float = DEFAULT_TIMEOUT,
 ) -> ToolRegistry:
     """Build the tool set for one session.
@@ -785,14 +785,14 @@ def build_registry(
     Plan mode is read-only: read_file plus run_bash against a read-only
     workspace mount. Write mode adds the editing tools: write_file,
     edit_file. ``ask_user`` is available in both modes when ``ask_callback``
-    is given. ``git_guard`` optionally vetoes run_bash commands that would
-    rewrite the user's branch/refs (see gitwork.py).
+    is given. The read-only-git policy is enforced by the PATH shim
+    (gitwork.git_shim_script), not here.
 
     Does NOT touch ``sandbox.read_only`` — the caller owns the sandbox's mode
     (set it to ``mode != "write"`` before calling; a persistent
     SandboxSession restarts its shell to pick up the new mounts).
     """
-    registry = ToolRegistry(default_timeout=default_timeout)
+    registry = ToolRegistry()
     if ask_callback is not None:
         registry.register(_make_ask_user_tool(ask_callback))
     if sandbox is not None:
@@ -809,7 +809,7 @@ def build_registry(
         # allow_network and gpu_access are likewise ignored in that mode
         # (see SandboxConfig.use_container).
         if session is not None and (sandbox.use_container or mode != "plan"):
-            registry.register(_make_run_bash_tool(session, git_guard))  # run_bash
+            registry.register(_make_run_bash_tool(session))  # run_bash
         if mode == "write":
             registry.register(_make_write_tool(sandbox, default_timeout))  # write_file
             registry.register(_make_edit_tool(sandbox, default_timeout))  # edit_file

@@ -54,9 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-init-repo",
         action="store_true",
-        help="Don't auto-initialize a git repo when the workspace has none "
-        "(default: xarness runs `git init` itself so change tracking works "
-        "without setup; your files are never modified by this).",
+        help="Don't track changes when the workspace has no git repo "
+        "(default: xarness keeps a private snapshot store outside the "
+        "workspace, so tracking works without setup and no .git is "
+        "created; your files are never modified by this).",
     )
     parser.add_argument(
         "--no-session", action="store_true",

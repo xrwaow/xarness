@@ -19,7 +19,6 @@ but usage never reaches the wire.
 
 from __future__ import annotations
 
-import base64
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -63,33 +62,27 @@ class TextPart(BaseModel):
 class ImagePart(BaseModel):
     """One image segment, ordered where it appeared in the text.
 
-    ``ref`` is the persisted/wire shape (content hash + display metadata).
-    ``data`` is a transient fallback for callers without an image store; it
-    is excluded from every serialization, so it never reaches a session
-    file or a snapshot."""
+    ``ref`` is the persisted/wire shape (content hash + display metadata);
+    the bytes live in the session's image store."""
 
     type: Literal["image"] = "image"
     ref: ImageRef
-    data: bytes | None = Field(default=None, exclude=True)
 
 
 MessagePart = TextPart | ImagePart
 
 
 def build_parts(
-    text: str, images: list["ImageAttachment | ImageRef"] | None,
-    store: Any = None,
+    text: str, images: list["ImageRef"] | None, store: Any,
 ) -> list[MessagePart]:
     """Build ordered text/image parts from a user message.
 
     The text carries one ``[🖼 name W×H #id]`` token per attachment; parts are
     emitted in token order so ``compare [img1] with [img2]`` keeps its
     meaning. A token without a matching attachment stays text, and an
-    attachment without a token is appended at the end. ``images`` items are
-    either :class:`ImageRef` (bytes already in the store) or
-    :class:`ImageAttachment`; ``store`` (an object with
-    ``save(ImageAttachment) -> ImageRef``) writes attachment bytes to the
-    blob store; without one the parts carry transient ``data`` instead.
+    attachment without a token is appended at the end. ``store`` (an object
+    with ``save(ImageAttachment) -> ImageRef``) is mandatory: it writes
+    attachment bytes to the blob store.
     """
     if not images:
         return [TextPart(text=text)] if text else []
@@ -97,14 +90,9 @@ def build_parts(
     used: set[int] = set()
     parts: list[MessagePart] = []
 
-    def add_image(image: "ImageAttachment | ImageRef") -> None:
-        if isinstance(image, ImageRef):
-            parts.append(ImagePart(ref=image))
-            return
-        ref = store.save(image) if store is not None else image.to_ref()
-        parts.append(ImagePart(
-            ref=ref, data=None if store is not None else image.data(),
-        ))
+    def add_image(image: ImageRef) -> None:
+        parts.append(ImagePart(ref=store.save(image) if isinstance(
+            image, ImageAttachment) else image))
 
     last = 0
     for match in IMAGE_TOKEN_RE.finditer(text):
@@ -133,11 +121,6 @@ def image_refs(message: "Message") -> list[ImageRef]:
         part.ref for part in getattr(message, "parts", None) or ()
         if isinstance(part, ImagePart)
     ]
-
-
-def is_summary(message: "Message") -> bool:
-    """True for the summary user message a compaction leaves behind."""
-    return message.role == "user" and message.is_summary
 
 
 class ToolCall(BaseModel):
@@ -213,6 +196,12 @@ class BaseMessage(BaseModel):
     # Timestamps. Never sent to the provider.
     timing: Timing = Field(default_factory=Timing)
 
+    # True only for the handoff message a compaction appends. A field (not a
+    # property) so ``UserMessage`` can persist it, but excluded everywhere
+    # else: only the user role ever sets it, and every caller can read it
+    # without a ``role == "user" and ...`` guard.
+    is_summary: bool = Field(default=False, exclude=True)
+
 
 class UserMessage(BaseMessage):
     """A user turn opener or steering message. Text and images live in
@@ -221,7 +210,8 @@ class UserMessage(BaseMessage):
 
     role: Literal["user"] = "user"
     parts: list[TextPart | ImagePart] = Field(default_factory=list)
-    # True for the handoff message compaction appends.
+    # True for the handoff message compaction appends (re-shared: the base
+    # declaration excludes it, this one persists it).
     is_summary: bool = False
 
     @property
@@ -240,8 +230,7 @@ class UserMessage(BaseMessage):
             return {"role": "user", "content": self.content}
         # Multipart content, in the order the text/image parts were
         # recorded. The image data-URL comes from the loader (the session
-        # blob store's cache); ``part.data`` is the transient fallback for
-        # callers without a store.
+        # blob store's cache).
         content: list[dict[str, Any]] = []
         for part in self.parts:
             if isinstance(part, TextPart):
@@ -249,9 +238,6 @@ class UserMessage(BaseMessage):
                     content.append({"type": "text", "text": part.text})
                 continue
             url = image_loader(part.ref) if image_loader is not None else None
-            if url is None and part.data is not None:
-                encoded = base64.b64encode(part.data).decode("ascii")
-                url = f"data:{part.ref.mime};base64,{encoded}"
             if url is None:
                 # The blob is gone: keep the message valid rather than
                 # silently dropping the attachment entirely.
@@ -324,12 +310,7 @@ def user_message(
     **kwargs: Any,
 ) -> UserMessage:
     """A user message with its text/image parts in order."""
-    return UserMessage(
-        parts=build_parts(text, images, store) if images else (
-            [TextPart(text=text)] if text else []
-        ),
-        **kwargs,
-    )
+    return UserMessage(parts=build_parts(text, images, store), **kwargs)
 
 
 MESSAGE_ADAPTER = TypeAdapter(Message)
@@ -370,34 +351,57 @@ class Conversation(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     turns: dict[str, TurnCheckpoint] = Field(default_factory=dict)
 
-    _visible_cache: "tuple[int, int, int] | None" = PrivateAttr(default=None)
+    # First index of the visible slice (just at/after the last summary).
+    # Maintained by every mutator below, so no caller has to re-scan.
+    _visible_from: int = PrivateAttr(default=0)
+    # Watermark: the first message index not known to be on disk, or None
+    # when the whole history is persisted. ``Conversation`` is the only
+    # class that mutates messages, so it owns this invariant; the persist
+    # code only reads and resets it.
+    _dirty_from: int | None = PrivateAttr(default=None)
 
     def add(self, message: Message) -> Message:
+        index = len(self.messages)
+        if message.is_summary:
+            self._visible_from = index
+        self._mark_dirty(index)
         self.messages.append(message)
-        self._invalidate_visible()
         return message
 
-    def _invalidate_visible(self) -> None:
-        self._visible_cache = None
+    def _mark_dirty(self, index: int) -> None:
+        """Lower the persist watermark to ``index`` (the lowest index whose
+        row on disk is now stale)."""
+        self._dirty_from = index if self._dirty_from is None else min(
+            self._dirty_from, index)
+
+    def take_dirty_from(self) -> int:
+        """The persist watermark, reset to "everything is on disk".
+
+        Called synchronously by the persist code when it serializes: the
+        returned index and the reset describe the same list state, so a
+        failed write restores it by marking from there again. A clean
+        conversation (or a state-only write, e.g. a checkpoint rebaseline)
+        returns ``len(messages)``: nothing in the message tail changed."""
+        index = len(self.messages) if self._dirty_from is None \
+            else self._dirty_from
+        self._dirty_from = None
+        return index
+
+    def mark_clean(self) -> None:
+        """Declare the whole history on disk (a freshly loaded session)."""
+        self._dirty_from = None
+
+    def _recompute_visible(self) -> None:
+        """Recompute the visible slice's start (after a bulk rewrite)."""
+        self._visible_from = next(
+            (i for i in range(len(self.messages) - 1, -1, -1)
+             if self.messages[i].is_summary), 0,
+        )
 
     def visible_index(self) -> int:
         """First index of the visible slice: the last summary message (the
-        model sees the summary plus everything after it).
-
-        Cached against the identity and length of the message list — both
-        change on every append and truncation, and messages are immutable,
-        so a hit is always valid."""
-        cache = self._visible_cache
-        if cache is not None and cache[0] == id(self.messages) \
-                and cache[1] == len(self.messages):
-            return cache[2]
-        index = 0
-        for i in range(len(self.messages) - 1, -1, -1):
-            if self.messages[i].role == "user" and self.messages[i].is_summary:
-                index = i
-                break
-        self._visible_cache = (id(self.messages), len(self.messages), index)
-        return index
+        model sees the summary plus everything after it)."""
+        return self._visible_from
 
     def visible_messages(self) -> list[Message]:
         return self.messages[self.visible_index():]
@@ -456,6 +460,19 @@ class Conversation(BaseModel):
     def message_by_id(self, message_id: str) -> Message | None:
         return next((m for m in self.messages if m.id == message_id), None)
 
+    def last_user_message_at(self) -> str | None:
+        """Latest user send_time (derived, never stored separately).
+
+        All messages, not just the visible slice: after a compaction with no
+        new user message the visible slice starts at the summary and the
+        session would sort by name instead of recency. Messages are appended
+        in time order, so the first user message found from the end is the
+        answer — O(1) in practice."""
+        for message in reversed(self.messages):
+            if message.role == "user" and message.timing.send:
+                return message.timing.send
+        return None
+
     def rollback_plan(self) -> RollbackPlan | None:
         """Plan the rollback of the last user turn, or None if there is
         nothing to undo (no user message, or no response to it yet).
@@ -464,7 +481,7 @@ class Conversation(BaseModel):
         the last message), /undo //retry undo the compaction itself first by
         popping the summary; the turn that triggered it stays intact and no
         files are touched."""
-        if self.messages and is_summary(self.messages[-1]):
+        if self.messages and self.messages[-1].is_summary:
             return RollbackPlan(
                 user_text="", revert_turns=[],
                 drop_from=len(self.messages) - 1, compaction=True,
@@ -480,7 +497,7 @@ class Conversation(BaseModel):
             visible = self.visible_messages()
             turn_message = next(
                 (m for m in reversed(visible)
-                 if m.role == "user" and not is_summary(m)
+                 if m.role == "user" and not m.is_summary
                  and m is not visible[-1]),
                 None,
             )
@@ -499,7 +516,7 @@ class Conversation(BaseModel):
         summarized away are found too (truncating past the summary drops it).
         Returns None when the message is not a user turn in this conversation.
         """
-        if message.role != "user" or is_summary(message):
+        if message.role != "user" or message.is_summary:
             return None
         index = next(
             (i for i, m in enumerate(self.messages) if m is message), None,
@@ -526,7 +543,8 @@ class Conversation(BaseModel):
         The dropped turns' checkpoints are pruned too: turns are keyed by
         message id, and a pruned id must never resurrect."""
         self.messages = self.messages[:plan.drop_from]
-        self._invalidate_visible()
+        self._mark_dirty(min(plan.drop_from, len(self.messages)))
+        self._recompute_visible()
         keep = {m.id for m in self.messages}
         self.turns = {
             message_id: turn for message_id, turn in self.turns.items()
@@ -563,14 +581,13 @@ class Conversation(BaseModel):
             and turn.after_tree
         ]
 
-    def repair_orphaned_tool_calls(self, now: str | None = None) -> "int | None":
+    def repair_orphaned_tool_calls(self, now: str | None = None) -> bool:
         """Give any assistant tool_call without a matching tool message a
         synthetic interrupted result, so the next API request is valid. Runs
         after a cancel and on a session load.
 
-        Returns the lowest insertion index, or None when nothing was added —
-        the caller uses it to move a tail-only persistence watermark back
-        (the insert shifts rows that a tail-only write would not rewrite)."""
+        Returns True when anything was inserted — the inserted rows shift a
+        tail-only persistence watermark, which this lowers itself."""
         answered = {
             m.tool_call_id for m in self.messages
             if m.role == "tool" and m.tool_call_id
@@ -597,9 +614,11 @@ class Conversation(BaseModel):
                     content="interrupted", status="interrupted",
                     timing=Timing(end=now),
                 ))
-            self._invalidate_visible()
+            self._recompute_visible()
             lowest = index if lowest is None else min(lowest, index)
-        return lowest
+        if lowest is not None:
+            self._mark_dirty(lowest)
+        return lowest is not None
 
     def to_wire(
         self, keep_reasoning: bool = False, system: str | None = None,
