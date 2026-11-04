@@ -1761,6 +1761,111 @@ class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("rollback", [command.type for _, command in client.commands])
 
 
+class UndoAffordanceClickTest(unittest.IsolatedAsyncioTestCase):
+    """Click-to-undo is hit-tested: the whole user message box arms the
+    ``↩ undo to here`` line it shows, only that line's own text fires it, and
+    a click anywhere else closes it."""
+
+    async def _run(self, script) -> None:
+        from xarness.tui.app import AgentApp
+        from xarness.tui.flow import UserItem
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test(size=(60, 20)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+            app._flow_model.append(UserItem(text="hello there", message_id="m1"))
+            for _ in range(10):
+                await pilot.pause()
+            await script(pilot, client, app)
+
+    def _located(self, app, needle: str) -> tuple[int, int]:
+        """(x, y) of ``needle`` in the rendered log, in widget coordinates."""
+        view = app.query_one("#chat-log")
+        for y in range(view.row_count):
+            x = view.row_text(y).find(needle)
+            if x >= 0:
+                return x, y
+        raise AssertionError(f"{needle!r} not painted; rows: " + repr(
+            [view.row_text(y) for y in range(view.row_count)]))
+
+    def _armed(self, app) -> bool:
+        return app._flow_model.entries[-1].item.undo_armed
+
+    async def test_clicking_the_message_arms_the_affordance(self) -> None:
+        async def script(pilot, client, app):
+            x, y = self._located(app, "hello there")
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            self.assertTrue(self._armed(app))
+            self._located(app, "undo to here")
+
+        await self._run(script)
+
+    async def test_the_whole_message_box_is_the_click_target(self) -> None:
+        async def script(pilot, client, app):
+            x, y = self._located(app, "hello there")
+            # Every cell of the box arms it: the far right of the text row and
+            # the blank padding rows above and below the text. Clicking the
+            # message again closes it.
+            for ax, ay in ((40, y), (0, y - 1), (40, y + 1)):
+                await pilot.click("#chat-log", offset=(ax, ay))
+                await pilot.pause()
+                self.assertTrue(self._armed(app), (ax, ay))
+                await pilot.click("#chat-log", offset=(40, y))
+                await pilot.pause()
+                self.assertFalse(self._armed(app), (ax, ay))
+            self.assertNotIn("rollback", [c.type for _, c in client.commands])
+
+        await self._run(script)
+
+    async def test_only_the_undo_lines_text_fires_the_rollback(self) -> None:
+        async def script(pilot, client, app):
+            x, y = self._located(app, "hello there")
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            self.assertTrue(self._armed(app))
+            # A click elsewhere in the already-armed message just closes it.
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            self.assertNotIn("rollback", [c.type for _, c in client.commands])
+            self.assertFalse(self._armed(app))
+            # Arm again, then click the blank tail of the undo line: not the
+            # affordance's text, so that only closes it too.
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            _, uy = self._located(app, "undo to here")
+            await pilot.click("#chat-log", offset=(40, uy))
+            await pilot.pause()
+            self.assertNotIn("rollback", [c.type for _, c in client.commands])
+            self.assertFalse(self._armed(app))
+            # Arm one last time and click the affordance's own text.
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            ux, uy = self._located(app, "undo to here")
+            await pilot.click("#chat-log", offset=(ux + 2, uy))
+            await pilot.pause()
+            await pilot.pause()
+            rollbacks = [c for _, c in client.commands if c.type == "rollback"]
+            self.assertEqual(len(rollbacks), 1)
+            self.assertEqual(rollbacks[0].message_id, "m1")
+
+        await self._run(script)
+
+    async def test_clicking_outside_the_log_closes_it(self) -> None:
+        async def script(pilot, client, app):
+            x, y = self._located(app, "hello there")
+            await pilot.click("#chat-log", offset=(x, y))
+            await pilot.pause()
+            self.assertTrue(self._armed(app))
+            await pilot.click("#chat-input")
+            await pilot.pause()
+            self.assertFalse(self._armed(app))
+
+        await self._run(script)
+
+
 class RelativeTimeFormatTest(unittest.TestCase):
     def test_days_are_not_rendered_as_hours(self) -> None:
         from datetime import datetime, timedelta, timezone

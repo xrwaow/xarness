@@ -40,6 +40,9 @@ _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 # transcript; the full output is still persisted on the result message.
 MAX_LIVE_TOOL_OUTPUT = 65_536
 
+# The click-to-undo affordance drawn under a clicked user message.
+UNDO_LABEL = "↩ undo to here"
+
 
 def _parse_iso(stamp: str | None) -> datetime | None:
     if not stamp:
@@ -143,8 +146,12 @@ class TranscriptItem:
     def leading_blanks(self, prev: "TranscriptItem | None") -> int:
         return 0
 
-    def handle_click(self, app) -> bool:
-        """React to a click on this row; return True when the row changed."""
+    def handle_click(self, app, target: str | None = None) -> bool:
+        """React to a click on this row; return True when the row changed.
+
+        ``target`` says what the click actually hit, for rows that draw more
+        than one control (the user message's undo affordance); rows that are
+        a single click target ignore it."""
         return False
 
 
@@ -167,15 +174,21 @@ class UserItem(TranscriptItem):
             message_id=message.id or None,
         )
 
-    def handle_click(self, app) -> bool:
-        """Arm the undo affordance; a second click undoes to this message."""
+    def handle_click(self, app, target: str | None = None) -> bool:
+        """Click-to-undo, hit-tested by the presenter: a click on the
+        message's own text toggles the ``↩ undo to here`` line under it, and
+        only that line fires the undo — a click anywhere else on the row just
+        closes it."""
         if not self.message_id:
             return False
-        if self.undo_armed:
+        if target == "undo":
             self.undo_armed = False
             app.call_later(app._run_undo_to, self.message_id)
-        else:
-            self.undo_armed = True
+            return True
+        armed = target == "text" and not self.undo_armed
+        if armed == self.undo_armed:
+            return False
+        self.undo_armed = armed
         return True
 
     def leading_blanks(self, prev) -> int:

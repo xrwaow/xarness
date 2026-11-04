@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from rich import box
+from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Heading as RichHeading
 from rich.markdown import Markdown as RichMarkdown
@@ -57,6 +58,7 @@ from .tool_view import (
     summary_text as _tool_summary_text,
 )
 from .transcript import (
+    UNDO_LABEL,
     AssistantItem,
     DividerItem,
     LineItem,
@@ -171,12 +173,16 @@ class Presenter:
         # (len(args), live label parts) — streaming args are re-parsed only
         # when the text grows, not on every shimmer frame.
         self._args_cache: dict[int, tuple] = {}
+        # id(entry) -> (leading blanks, (undo row, its ink width) | None) of
+        # the last presented user message; clicks are hit-tested against it.
+        self._hits: dict[int, tuple] = {}
 
     def invalidate(self) -> None:
         self.epoch += 1
         self._cache.clear()
         self._chunks.clear()
         self._args_cache.clear()
+        self._hits.clear()
         push_rich_theme()
 
     def reset(self) -> None:
@@ -184,6 +190,7 @@ class Presenter:
         self._cache.clear()
         self._chunks.clear()
         self._args_cache.clear()
+        self._hits.clear()
         self._index_cache = None
 
     async def present(self, entry, width: int) -> Presentation:
@@ -235,6 +242,12 @@ class Presenter:
         # drag-selection highlight is unaffected: ChatFlowView.render_line
         # re-applies the selection span with cell styles overridden.
         strips = [s.apply_style(base_style) for s in strips]
+        if isinstance(item, UserItem):
+            # The whole box is one click target (the message, its padding,
+            # the rows above/below it) except the undo line, which only
+            # reacts on its own text. ``leading`` blanks sit between
+            # messages, outside the box.
+            self._hits[id(entry)] = (leading, _undo_span(strips))
         return Presentation(height=len(strips), strips=strips)
 
     def _previous_item(self, entry) -> object | None:
@@ -268,7 +281,7 @@ class Presenter:
                     continue  # the token itself already shows the attachment
                 rows.append(Text(token_text(image), style=p["muted"]))
             if item.undo_armed and item.message_id:
-                rows.append(Text("↩ undo to here", style=f"italic {p['accent']}"))
+                rows.append(Text(UNDO_LABEL, style=f"italic {p['accent']}"))
             # First row carries the "›" marker; wrapped lines hang-indent under
             # it. Every row gets the surface background (the old UserMessage
             # CSS: `background: $c-surface`), padded to the full view width.
@@ -285,6 +298,20 @@ class Presenter:
             return strips
 
         return _cached(self, entry, key, build)
+
+    def user_click_target(self, entry, x: int, y: int) -> str | None:
+        """What a click at ``(x, y)`` hit in a presented user message:
+        ``"undo"`` for the ``↩ undo to here`` line's own text, ``"text"``
+        for the rest of the message box, ``None`` for the gap outside it."""
+        hit = self._hits.get(id(entry))
+        if hit is None or x < 0:
+            return None
+        leading, undo = hit
+        if y < leading:
+            return None  # the spacer between messages, not the box
+        if undo is not None and y == undo[0]:
+            return "undo" if undo[1] <= x < undo[2] else None
+        return "text"
 
     # -- assistant ------------------------------------------------------------
 
@@ -624,6 +651,16 @@ def _(item: LineItem, presenter, entry, width: int) -> list[Strip]:
 @render_item.register
 def _(item: DividerItem, presenter, entry, width: int) -> list[Strip]:
     return render_strips(Text(item.text, style=theme.PALETTE["accent"]), width)
+
+
+def _undo_span(strips: list[Strip]) -> tuple[int, int, int] | None:
+    """``(row, first column, end column)`` of the ``↩ undo to here`` line."""
+    for i, strip in enumerate(strips):
+        if UNDO_LABEL in strip.text:
+            text = strip.text
+            start = cell_len(text) - cell_len(text.lstrip())
+            return i, start, cell_len(text.rstrip())
+    return None
 
 
 def _cached(presenter, entry, key, build):

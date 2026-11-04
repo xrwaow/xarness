@@ -153,11 +153,13 @@ closed.
 | `/undo` | Drop the last turn: reverse its file edits, put your message back in the input |
 | `/retry` | Reverse the last turn's file edits and resend your message |
 
-To undo further back, click any of your messages in the scrollback: a small
-`↩ undo to here` affordance appears, and clicking it drops that message and
+To undo further back, click any of your messages in the scrollback (the whole
+message is the click target): a small `↩ undo to here` affordance appears
+below it, and clicking that line (only its own text) drops the message and
 everything after it — each dropped turn's own file edits reversed, and the
-message put back in the input. Messages the last compaction summarized away
-can be clicked too (the pre-compaction history is restored first).
+message put back in the input. Clicking anywhere else closes the affordance
+without undoing. Messages the last compaction summarized away can be clicked
+too (the pre-compaction history is restored first).
 
 `/accept` is how you follow change-per-feature: let the agent build one
 feature, `/accept` it, move on to the next. Everything before the last

@@ -21,7 +21,7 @@ import httpx
 from rich.cells import cell_len
 from rich.segment import Segment
 from rich.style import Style
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal
@@ -80,7 +80,7 @@ from ..util import format_duration as _format_duration
 from . import flow as tflow
 from .confirm_screen import ConfirmScreen
 from .diff_summary import DiffSummary
-from .flow import LineItem, PendingItem
+from .flow import LineItem, PendingItem, UserItem
 from .list_picker import ListPicker, name_options, session_options
 from .refs_screen import RefsScreen
 from .transcript import Transcript
@@ -263,6 +263,19 @@ class ChatFlowView(FlowView):
                 out.append(segment)
             x += segment.cell_length
         return Strip(out, width)
+
+    def on_click(self, event: events.Click) -> None:
+        """Close an open undo affordance when the click lands on empty log
+        space (no entry under it). Clicks that do hit an entry are classified
+        by the ``Clicked`` message, which only fires the affordance on its
+        own text.
+
+        No ``super()`` call: Textual dispatches the base ``FlowView``'s own
+        ``on_click`` (the one that posts ``Clicked``) as a separate MRO
+        handler, so calling it here would post every click twice."""
+        offset = event.get_content_offset(self)
+        if offset is None or self._entry_at_screen(offset.x, offset.y) is None:
+            self.app.close_undo_affordances()
 
 
 class AgentApp(App[None]):
@@ -588,11 +601,9 @@ class AgentApp(App[None]):
                 f"(freed {max(0, event.before_tokens - event.after_tokens):,})"
             )
             prefix = "auto-compacted" if event.automatic else "compacted"
-            summary = next(
-                (m.content for m in event.snapshot.messages if m.is_summary),
-                "",
-            )
-            return f"{prefix}: {counts}\n{summary}"
+            # The handoff text itself is already rendered as a divider in the
+            # rebuilt transcript; don't repeat it in a transient notice line.
+            return f"{prefix}: {counts}"
         # rollback
         if not event.scope and not event.resend:
             text = "compaction undone: pre-compaction history restored"
@@ -1093,10 +1104,34 @@ class AgentApp(App[None]):
 
     def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
         """In-transcript clicks: expand/collapse tool calls and thinking
-        blocks, arm/trigger the user message's undo affordance."""
+        blocks, and drive the user message's click-to-undo affordance."""
         entry, item = event.entry, event.entry.item
+        if isinstance(item, UserItem):
+            target = self._presenter.user_click_target(entry, event.x, event.y)
+            if target == "text" and not item.undo_armed:
+                self.close_undo_affordances()  # one open at a time
+            if item.handle_click(self, target):
+                entry.update()
+            return
+        self.close_undo_affordances()  # any other click closes the affordance
         if item.handle_click(self):
             entry.update()
+
+    def close_undo_affordances(self) -> None:
+        """Close every open ``↩ undo to here`` affordance: clicking
+        anywhere other than the affordance's own text dismisses it."""
+        for entry in self._flow_model.entries:
+            item = entry.item
+            if isinstance(item, UserItem) and item.undo_armed:
+                item.undo_armed = False
+                entry.update()
+
+    def on_click(self, event: events.Click) -> None:
+        """A click outside the chat log dismisses an open undo affordance.
+        Clicks inside the log are classified by its ``Clicked`` message, so
+        the click that lands on the affordance itself still fires it."""
+        if not isinstance(event.widget, ChatFlowView):
+            self.close_undo_affordances()
 
     def _start_new_session(self) -> None:
         """Slash /new: leave the current session (it keeps running in the
