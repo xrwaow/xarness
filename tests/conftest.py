@@ -29,7 +29,7 @@ def skip_when_bwrap_unusable(monkeypatch):
     orig_run_in_sandbox = sandbox_mod.run_in_sandbox
 
     async def run_in_sandbox(config, command, input_bytes=None, timeout=120.0):
-        result = await orig_run_in_sandbox(config, command, input_bytes)
+        result = await orig_run_in_sandbox(config, command, input_bytes, timeout)
         if _bwrap_failed(result):
             pytest.skip("nested bwrap cannot start in this environment")
         return result
@@ -53,3 +53,18 @@ def skip_when_bwrap_unusable(monkeypatch):
         return result
 
     monkeypatch.setattr(sandbox_mod.SandboxSession, "run", session_run)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _fast_textual_pauses():
+    """Textual's Pilot sleeps in 20ms steps while waiting for idle, which
+    dominates the TUI tests. Shrinking the step keeps the same idle
+    detection (it still polls process CPU) at a fraction of the wall time."""
+    from textual import _wait
+
+    previous = _wait.SLEEP_GRANULARITY
+    _wait.SLEEP_GRANULARITY = 0.001
+    try:
+        yield
+    finally:
+        _wait.SLEEP_GRANULARITY = previous

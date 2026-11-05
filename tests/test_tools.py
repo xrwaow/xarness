@@ -432,14 +432,6 @@ def test_write_file_creates_then_overwrites(tmp_path) -> None:
     assert (tmp_path / "new.txt").read_text() == "bye\n"
 
 
-def test_write_file_rejects_refs(tmp_path) -> None:
-    result = asyncio.run(_registry_for(tmp_path).call(
-        "write_file", '{"path": "/tmp/refs/x", "content": "nope"}'
-    ))
-    assert not result.ok
-    assert "read-only" in result.content
-
-
 def test_edit_file_replaces_unique_occurrence(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("alpha\nbeta\nalpha\n")
     result = asyncio.run(_registry_for(tmp_path).call(

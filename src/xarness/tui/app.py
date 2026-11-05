@@ -99,6 +99,15 @@ INPUT_PLACEHOLDER = (
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
 
+# Shown while a session has no messages yet (notices such as /new's hint do
+# not count). Kept as lines so the view can centre it on either axis.
+WELCOME_ART = (
+    "... ...  ....   ... ..  .. ...     ....   ....   ....",
+    " '|..'  '' .||   ||' ''  ||  ||  .|...|| ||. '  ||. '",
+    "  .|.   .|' ||   ||      ||  ||  ||      . '|.. . '|..",
+    ".|  ||. '|..'|' .||.    .||. ||.  '|...' |'..|' |'..|'",
+)
+
 
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
@@ -204,6 +213,55 @@ class ChatFlowView(FlowView):
         self._pending_present.discard(entry.id)
         super()._present_entry(entry)
 
+    def _welcome_visible(self) -> bool:
+        """A new session's only rows are notices (/new's hint, startup
+        warnings); the wordmark sits over them until the first real
+        transcript item arrives."""
+        model = getattr(self, "_model", None)
+        if model is None:
+            return False
+        return not any(
+            entry.alive and not isinstance(entry.item, LineItem)
+            for entry in model.entries
+        )
+
+    def _welcome_row(self, y: int, width: int) -> Strip | None:
+        """The centred wordmark row at ``y``, or ``None`` outside its rows."""
+        height = self.content_region.height
+        if width <= 0 or height <= 0:
+            return None
+        lines = WELCOME_ART
+        block_width = max(len(line) for line in lines)
+        if len(lines) > height:
+            # Too short for the whole mark: crop it vertically as well.
+            crop = (len(lines) - height) // 2
+            lines = lines[crop:crop + height]
+            top = 0
+        else:
+            top = (height - len(lines)) // 2
+        row = y - top
+        if not 0 <= row < len(lines):
+            return None
+        line = lines[row]
+        if block_width > width:
+            # Narrow terminal: crop the block symmetrically instead of
+            # wrapping it (wrapping destroys the letter shapes).
+            crop = (block_width - width) // 2
+            line = line[crop:crop + width]
+            left = 0
+        else:
+            left = (width - block_width) // 2
+        palette = theme.PALETTE
+        bg = Style(bgcolor=palette["bg"])
+        ink = Style(color=palette["text"], bgcolor=palette["bg"])
+        parts = [Strip.blank(left, bg)]
+        if line:
+            parts.append(Strip([Segment(line, ink)], cell_len(line)))
+        right = width - left - cell_len(line)
+        if right > 0:
+            parts.append(Strip.blank(right, bg))
+        return Strip.join(parts).adjust_cell_length(width)
+
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
         # Empty/unstyled cells (blank rows of an empty or partially-filled
@@ -214,6 +272,10 @@ class ChatFlowView(FlowView):
         # win, so presenter-painted rows are untouched.
         if any(seg.style is None or seg.style.bgcolor is None for seg in strip):
             strip = strip.apply_style(Style(bgcolor=theme.PALETTE["bg"]))
+        if self._welcome_visible():
+            welcome = self._welcome_row(y, strip.cell_length)
+            if welcome is not None:
+                return welcome
         # The lib's _decorate_line applies the selection highlight with
         # Strip.apply_style, and rich's style merge lets each cell's own
         # bgcolor win — so rows whose cells carry an explicit background
@@ -1132,6 +1194,10 @@ class AgentApp(App[None]):
         self._status = None
         self._refresh_title()
         self._flow_model.clear()
+        # The reducer outlives the view: reset it too, so a new draft starts
+        # from an empty conversation rather than the old session's state.
+        self._transcript = Transcript()
+        self._entries = {}
         self._hint_entries = []
         self._refresh_bars()
         self.call_later(self.refresh_diff_summary)

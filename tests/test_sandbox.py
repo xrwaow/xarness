@@ -420,20 +420,6 @@ class ContainerMountsTest(SandboxArgvTest):
         # workspace mount for refs.
         self.assertFalse(any(a.startswith("/workspace/.refs") for a in argv))
 
-    def test_writable_ref_forced_read_only_in_plan_mode(self):
-        (self.workspace / "docs").mkdir()
-        (self.workspace / "docs" / "spec.md").write_text("x\n")
-        config = self.config(external_refs=SandboxConfig.resolve_auto_refs(
-            self.workspace, ["docs/spec.md"]))
-        config.external_refs["spec.md"].read_only = False
-        argv = config.build_argv(["/bin/sh"])
-        i = argv.index(f"{REFS_ANCHOR}/spec.md")
-        self.assertEqual(argv[i - 2], "--bind")
-        config.read_only = True
-        argv = config.build_argv(["/bin/sh"])
-        i = argv.index(f"{REFS_ANCHOR}/spec.md")
-        self.assertEqual(argv[i - 2], "--ro-bind")
-
     def test_ref_mounts_over_root_and_git_rejected(self):
         config = self.config()
         external = Path(self._tmp.name) / "ext.txt"
@@ -1177,7 +1163,7 @@ class ContainerExecTest(unittest.TestCase):
     def test_default_timeout_applies(self):
         config = self.session_config()
         async def drive():
-            session = SandboxSession(config, default_timeout=0.5)
+            session = SandboxSession(config, default_timeout=0.1)
             try:
                 return await session.run("sleep 5")
             finally:

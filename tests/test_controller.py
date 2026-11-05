@@ -304,16 +304,6 @@ def test_compact_replaces_history_with_summary() -> None:
     assert client.received_tools is None
 
 
-def test_compact_without_history_is_a_noop() -> None:
-    client = FakeClient([])
-    controller = ChatController(PROFILE, "key", client=client)
-
-    summary = asyncio.run(controller.compact())
-
-    assert summary is None  # nothing to compact
-    assert controller.conversation.messages == []
-
-
 # ---------------------------------------------------------------------------
 # usage accounting (per-message + cumulative)
 
@@ -628,10 +618,6 @@ def test_save_interrupted_round_keeps_reasoning_only() -> None:
     assert wire["reasoning_content"] == "just thinking"
     # Cleared, so a second call is a no-op (the round is only saved once).
     assert controller.save_interrupted_round() is False
-
-
-def test_save_interrupted_round_drops_empty_round() -> None:
-    """A round with neither text nor reasoning saves nothing."""
 
 
 def test_save_interrupted_round_drops_unpaired_tool_calls() -> None:

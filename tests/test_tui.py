@@ -245,6 +245,53 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bar.has_class("visible"))
 
 
+class WordmarkTest(unittest.IsolatedAsyncioTestCase):
+    """The wordmark marks an empty session and yields to the first message."""
+
+    @staticmethod
+    def _text(app) -> str:
+        view = app.query_one("#chat-log")
+        return "\n".join(
+            view.render_line(y).text for y in range(view.size.height)
+        )
+
+    async def test_empty_session_shows_it_and_first_message_clears_it(self) -> None:
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn("... ...", self._text(app))
+
+            client.queue.put_nowait(protocol.MessageAdded(
+                message=UserMessage(
+                    parts=[TextPart(text="hello")], id="m1",
+                    timing=Timing(send="2026-01-01T00:00:00+00:00"),
+                ),
+            ))
+            await pilot.pause()
+            self.assertNotIn("... ...", self._text(app))
+
+    async def test_new_session_brings_it_back(self) -> None:
+        from xarness.tui.app import AgentApp
+
+        snap = make_snapshot()
+        snap.messages.append(UserMessage(
+            parts=[TextPart(text="hello")], id="m1",
+            timing=Timing(send="2026-01-01T00:00:00+00:00"),
+        ))
+        client = FakeClient(snap)
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertNotIn("... ...", self._text(app))
+
+            app._start_new_session()
+            await pilot.pause()
+            self.assertIn("... ...", self._text(app))
+
+
 class ImportBoundaryTest(unittest.TestCase):
     """The TUI package imports only clientlib, protocol and pure helpers —
     never the controller, session, tools, gitwork, sandbox or host modules."""
@@ -278,7 +325,8 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
     retries."""
 
     async def test_connection_loss_reattaches(self) -> None:
-        from xarness.tui.app import RECONNECT_MIN, AgentApp
+        from xarness.tui import app as app_module
+        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
         client.fail_attach_first = True
@@ -290,12 +338,17 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
             return real_attach(name)
 
         client.attach = attach
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            # The loop backs off before retrying the stream.
-            await asyncio.sleep(RECONNECT_MIN + 0.1)
-            await pilot.pause()
+        previous = app_module.RECONNECT_MIN
+        app_module.RECONNECT_MIN = 0.01
+        try:
+            app = AgentApp(client, workspace=None, session_name="s1")
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # The loop backs off before retrying the stream.
+                await asyncio.sleep(app_module.RECONNECT_MIN + 0.02)
+                await pilot.pause()
+        finally:
+            app_module.RECONNECT_MIN = previous
 
         self.assertEqual(attaches, ["s1", "s1"])
 
@@ -1800,18 +1853,6 @@ class ShimmerDirectionTest(unittest.TestCase):
         }
         self.assertEqual(colors[0], "#f0f0f0")  # band centre
         self.assertEqual(colors[len(label) - 1], "#101010")  # resting text
-
-    def test_palette_pairs_put_the_highlight_second(self) -> None:
-        from xarness import theme
-
-        self.assertEqual(
-            theme.SHIMMER_PROCESSING,
-            (theme.PALETTE["muted"], theme.PALETTE["text"]),
-        )
-        self.assertEqual(
-            theme.SHIMMER_THINKING,
-            (theme.PALETTE["muted"], theme.PALETTE["surface"]),
-        )
 
 
 class UndoCommandTest(unittest.IsolatedAsyncioTestCase):

@@ -15,7 +15,7 @@ import pytest
 from xarness import host as host_mod
 from xarness import protocol, session_store
 from xarness.conversation import user_message
-from xarness.host import GRACE_SECONDS, Host
+from xarness.host import Host
 from xarness.protocol import ContentDelta, SendMessage, Snapshot, RoundComplete, Usage
 from xarness.session import SessionError
 
@@ -39,6 +39,10 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(host_mod, "HOST_DIR", tmp_path / "host")
     monkeypatch.setattr(host_mod, "SOCKET_PATH", tmp_path / "host" / "host.sock")
     monkeypatch.setattr(host_mod, "LOCK_PATH", tmp_path / "host" / "host.lock")
+    # Short lifecycle windows: these tests only care that the host waits past
+    # the grace period, not how long it is in production.
+    monkeypatch.setattr(host_mod, "GRACE_SECONDS", 0.3)
+    monkeypatch.setattr(host_mod, "REAP_INTERVAL_SECONDS", 0.02)
     monkeypatch.setenv("XARNESS_TEST_KEY", "test-key")
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
@@ -234,8 +238,8 @@ def test_grace_exit_with_no_active_session(tmp_path) -> None:
         task = await _serve(host)
         # No sessions: the host exits after the grace period.
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(task), timeout=GRACE_SECONDS * 0.5)
-        await asyncio.wait_for(task, timeout=GRACE_SECONDS + 10)
+            await asyncio.wait_for(asyncio.shield(task), timeout=host_mod.GRACE_SECONDS * 0.5)
+        await asyncio.wait_for(task, timeout=host_mod.GRACE_SECONDS + 10)
         assert not host.unix_socket.exists()
 
     asyncio.run(go())
@@ -271,7 +275,7 @@ def test_host_stays_alive_while_turn_runs(tmp_path) -> None:
             session.controller.tools = registry
             await session.execute("x", SendMessage(text="hi"))
             # The turn is running; the host must not exit during the grace window.
-            await asyncio.sleep(GRACE_SECONDS * 0.6)
+            await asyncio.sleep(host_mod.GRACE_SECONDS * 0.6)
             assert not task.done()
             release.set()
             await asyncio.wait_for(session._turn_task, timeout=5)
@@ -755,10 +759,10 @@ def test_host_stays_alive_while_a_client_is_attached(tmp_path, monkeypatch) -> N
             name = await _make_session(host, tmp_path, [[ContentDelta(text="x"), RoundComplete()]])
             session = host.sessions[name]
             session._subscribers.append(asyncio.Queue())
-            await asyncio.sleep(GRACE_SECONDS + 1)
+            await asyncio.sleep(host_mod.GRACE_SECONDS + 0.1)
             assert not task.done()
             session._subscribers.clear()
-            await asyncio.wait_for(task, timeout=GRACE_SECONDS + 10)
+            await asyncio.wait_for(task, timeout=host_mod.GRACE_SECONDS + 10)
         finally:
             if not task.done():
                 await host.request_shutdown()
