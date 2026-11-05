@@ -14,8 +14,34 @@ and no accept/reject step. Git is used purely as an undo log:
 
 Snapshots are built with a throwaway index (``GIT_INDEX_FILE`` pointing at a
 temp file): the user's index, HEAD, and refs are never touched, and no
-commits are created. The only git state written is unreachable tree/blob
-objects in the object store.
+commits are created (the one ``commit-tree`` wrapper exists only to feed
+``merge-tree`` during an undo). What *is* written is unreachable tree/blob
+objects — and which object store they land in depends on the workspace
+(see :func:`setup_tracking`):
+
+  - **the workspace is a repo**: the user's own object store, i.e. their
+    ``.git``. Nothing else in it changes, and because objects are
+    content-addressed a blob git already holds is shared rather than
+    duplicated (files over 1 MB are never tracked at all). The trade-off is
+    that the harness's data then lives in a store whose pruning schedule is
+    the user's, not ours: no ref points at these objects, so ``git gc
+    --prune=now``, ``git repack -ad`` or any aggressive prune discards
+    them — taking an open session's checkpoints with it. ``/diff`` and
+    ``/undo`` then fail against the missing baseline until the session
+    re-baselines (``/accept``, a fresh session, or the resume-drift
+    prompt). ``git fsck`` reports the objects as dangling and they never
+    travel with clone/fetch/push.
+  - **no repo** (``--no-init-repo`` not given): a private store under
+    xarness's state directory (:func:`_managed_store_dir`), addressed with
+    an explicit ``GIT_DIR`` so no ``.git`` is created in the workspace.
+    That store is xarness's own: nothing else gc's it, so its objects stay
+    put until someone prunes them deliberately.
+
+Keeping the snapshots in the user's store is a deliberate trade-off (no
+second copy of the user's files, and diffing stays a single-repo
+operation), not an oversight; making every session use a private store
+would separate the lifetimes, at the cost of a second object store per
+repo. ``docs/future.md`` has the note.
 
 All git operations here run as plain subprocesses against host paths in the
 harness process; only the agent's *tools* run sandboxed inside the
@@ -241,7 +267,11 @@ def _managed_store_dir(workspace: Path) -> Path:
     """Xarness-owned git dir for ``workspace``, outside the workspace so
     tracking a gitless directory never drops a ``.git`` into it. Keyed on
     the resolved path (snapshots are content-addressed trees, no refs, so
-    reuse is harmless)."""
+    reuse is harmless).
+
+    Only used when the workspace has no repo: a repo's sessions snapshot
+    into that repo's own object store instead (see the module docstring).
+    """
     state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     key = hashlib.sha1(str(workspace).encode()).hexdigest()[:16]
     return Path(state) / "xarness" / "repos" / key
@@ -619,6 +649,10 @@ async def setup_tracking(
     chat log / stderr. git_info is None when the workspace can't be tracked
     (no repo and init not allowed, or setup failed); the agent still edits
     the directory directly, there is just no /diff or /undo for files.
+
+    Where the snapshot objects go follows the workspace: a repo's own
+    object store when it has one (``external=False``), otherwise the
+    private managed store (``external=True``, see the module docstring).
     """
     notes: list[str] = []
     workspace = Path(workspace).resolve()
@@ -1165,7 +1199,9 @@ def git_shim_script() -> str:
     cmd2`` runs cmd1, prints the block message in place, and still runs
     cmd2, while ``cmd1 && git commit && cmd2`` stops at the block as ``&&``
     should. Commands that merely mention the word git (``grep "git is
-    read" …``) never invoke it.
+    read" …``) never invoke it. It does not *rely* on being first: the real
+    git is found by skipping this file wherever it sits on PATH (see the
+    lookup in the generated script).
 
     The allow-lists below are the only description of the policy: the shim
     is generated from the same constants the block message names.
@@ -1196,18 +1232,44 @@ def git_shim_script() -> str:
 # (/usr/bin/git, `command git`); the read-only .git mount is the real
 # boundary.
 real=
-# Strip this shim's own directory (the first PATH entry) and ask the shell
-# for the next git on the way: works in the container and for unsandboxed
-# sessions on the host, without hardcoding install locations. A PATH with
-# no colon has nothing else on it — looking there would find this shim and
-# exec it forever.
-case $PATH in
-    *:*) real=$(PATH=${{PATH#*:}} command -v git 2>/dev/null) ;;
-esac
+# Find the real git: the first executable `git` on PATH that is not this
+# script. Skip by file identity, not by dropping PATH's first entry: the
+# shim's own directory is not ours to assume — a session PATH is inherited
+# (another prepended bin dir, or a user PATH that already carries the
+# shim dir), and relaunching through PATH then resolves straight back to
+# this script, which execs itself forever: a `git` pinning a core with no
+# output.
+if [ -n "${{XARNESS_GIT_SHIM:-}}" ]; then
+    # Second entry: an earlier run already resolved the real git, and the
+    # PATH lookup handed this script back. Reuse its answer (this is also
+    # the fallback when `test -ef` below is unsupported) instead of
+    # looping.
+    if [ -x "${{XARNESS_GIT_SHIM}}" ] && ! [ "${{XARNESS_GIT_SHIM}}" -ef "$0" ] 2>/dev/null; then
+        real=${{XARNESS_GIT_SHIM}}
+    fi
+else
+    set -f  # PATH entries are literal text, never globs
+    old_ifs=$IFS
+    IFS=:
+    for dir in ${{PATH:-}}; do
+        [ -n "$dir" ] || dir=.
+        candidate=$dir/git
+        if [ -f "$candidate" ] && [ -x "$candidate" ] && ! [ "$candidate" -ef "$0" ] 2>/dev/null; then
+            real=$candidate
+            break
+        fi
+    done
+    IFS=$old_ifs
+    set +f
+fi
 if [ -z "$real" ] || [ ! -x "$real" ]; then
-    echo "git: shim found no real git binary" >&2
+    echo "git: shim found no real git binary on PATH" >&2
     exit 127
 fi
+# Tells a re-entered shim which git to defer to (see the resolution above).
+# Harmless to the real git, which ignores it.
+XARNESS_GIT_SHIM=$real
+export XARNESS_GIT_SHIM
 
 # The first non-global-flag token is the subcommand; global flags that
 # consume a value skip their value too.

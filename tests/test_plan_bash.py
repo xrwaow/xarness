@@ -8,6 +8,7 @@ bwrap (both are hard dependencies of the feature).
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -175,15 +176,84 @@ def test_git_shim_blocks_in_place(tmp_path) -> None:
     assert mention.ok  # mentioning git is not running git
 
 
-def test_git_shim_writes_into_the_sandbox_cache(tmp_path) -> None:
+def test_git_shim_writes_into_the_sandbox_cache(tmp_path, monkeypatch) -> None:
     """The shim lives in the shared sandbox cache (already bound at the
-    /cache anchor) and is on PATH ahead of the real bin dirs."""
+    /cache anchor) and is on PATH ahead of the real bin dirs — including
+    the toolchain bins, which are prepended too."""
     from xarness.sandbox import sandbox_cache_root
+    # Toolchain bin dirs must EXIST for the ordering to be exercised: the
+    # old code appended the shim after them, so on any machine with
+    # ~/.cargo/bin or ~/.local/bin the shim landed third on PATH (and the
+    # shim's own PATH-stripping lookup then found itself: see
+    # test_git_shim_skips_itself_when_not_first_on_path).
+    home = tmp_path / "home"
+    (home / ".cargo" / "bin").mkdir(parents=True)
+    (home / ".local" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XARNESS_SANDBOX_CACHE", raising=False)
     repo = _make_repo(tmp_path)
     sandbox = _tracked_sandbox(repo)
+    argv = sandbox.build_argv(["/bin/sh"])
+    # build_argv materializes the shim (its generated text changes when the
+    # policy does), so ask for it first, then check both the file and PATH.
     shim = sandbox_cache_root() / "git-shim" / "git"
     assert shim.is_file() and shim.stat().st_mode & 0o111
-    argv = sandbox.build_argv(["/bin/sh"])
     path = next(argv[i + 2] for i, a in enumerate(argv)
                 if a == "--setenv" and argv[i + 1] == "PATH")
-    assert path.startswith("/cache/git-shim:")
+    assert path.startswith("/cache/git-shim:/cache/cargo-bin:/cache/local-bin:")
+
+
+def _write_shim(directory: Path) -> Path:
+    from xarness.gitwork import git_shim_script
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "git"
+    shim.write_text(git_shim_script(), encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def test_git_shim_skips_itself_when_not_first_on_path(tmp_path) -> None:
+    """The shim must find the real git by skipping *its own file*, not by
+    dropping PATH's first entry.
+
+    A session PATH is not the shim's to assume: with anything prepended
+    ahead of the shim dir, the old lookup stripped that other entry and
+    resolved straight back to the shim, which exec'd itself forever — a
+    `git` pinning a CPU core with no output and no exit (the reason git
+    appeared to run constantly). The subprocess timeout is the assertion
+    that it terminates at all."""
+    real_dirs = [d for d in ("/usr/local/bin", "/usr/bin", "/bin")
+                 if (Path(d) / "git").is_file()]
+    if not real_dirs:
+        pytest.skip("no real git in the standard bin dirs")
+    shim_dir = tmp_path / "shim"
+    _write_shim(shim_dir)
+    ahead = tmp_path / "ahead"
+    ahead.mkdir()  # first on PATH, holds no git
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join([str(ahead), str(shim_dir), *real_dirs]),
+    }
+    env.pop("XARNESS_GIT_SHIM", None)
+    result = subprocess.run(
+        ["git", "--version"], env=env, capture_output=True, text=True,
+        timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("git version"), result.stdout
+
+
+def test_git_shim_without_a_real_git_fails_fast(tmp_path) -> None:
+    """No real git behind the shim: a clear 127, not an exec loop."""
+    shim_dir = tmp_path / "shim"
+    _write_shim(shim_dir)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    env = {**os.environ, "PATH": os.pathsep.join([str(shim_dir), str(empty)])}
+    env.pop("XARNESS_GIT_SHIM", None)
+    result = subprocess.run(
+        ["git", "--version"], env=env, capture_output=True, text=True,
+        timeout=20, check=False,
+    )
+    assert result.returncode == 127
+    assert "no real git binary" in result.stderr

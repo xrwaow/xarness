@@ -131,14 +131,41 @@ index: your index, HEAD, and refs are never touched), and every turn
 records two more: the state *before* the turn and the state *after* its
 edits finished.
 
-No setup is required: if the workspace isn't a git repo (or has no commits
-yet), xarness keeps a private snapshot store under its own state directory
-and drives git against it with an explicit `GIT_DIR` — no `.git` is created
-in your workspace, and your files are never modified. No commits are ever
-created either: snapshots are plain tree objects (plus an unreferenced
-commit wrapper for the 3-way merge below). Opt out with `--no-init-repo`,
-which disables change tracking entirely (the agent still edits the
-directory directly; there is just no /diff or /undo for file changes).
+No setup is required: if the workspace isn't a git repo, xarness keeps a
+private snapshot store under its own state directory and drives git
+against it with an explicit `GIT_DIR` — no `.git` is created in your
+workspace, and your files are never modified. (A repo with no commits yet
+still counts as a repo: snapshots are trees and need no HEAD.) No commits
+are ever created either: snapshots are plain tree objects (plus an
+unreferenced commit wrapper for the 3-way merge below). Opt out with
+`--no-init-repo`, which disables change tracking entirely (the agent still
+edits the directory directly; there is just no /diff or /undo for file
+changes).
+
+**Where snapshots live.** Snapshot objects go into the object store of the
+repo being tracked — your own `.git` — or, only when there is no repo, into
+a private store under xarness's state directory
+(`$XDG_STATE_HOME/xarness/repos/<hash>`, typically `~/.local/state/...`)
+driven with an explicit `GIT_DIR`, so no `.git` ever appears in your
+directory. Using yours means no second copy of your files: the objects are
+content-addressed, so a blob git already stores is shared, not duplicated,
+and files over 1 MB are never tracked at all (see below).
+
+That they are unreferenced is also the catch: nothing in your repo points
+at them, so your repo's own housekeeping can drop them — `git gc
+--prune=now`, `git repack -ad`, or any aggressive prune discards
+unreachable objects, and an open session's checkpoints are exactly that.
+When that happens the session can no longer measure pending changes: the
+pending-changes bar stops updating and is cleared on the next attach, with
+no message — a failed summary push is treated as transient on purpose, so a
+concurrent `index.lock` cannot make tracking look gone. `/diff` and a
+per-file click are where it surfaces, as `diff failed: …`, and `/undo`
+cannot reach past the point its history was collected. `/accept` — or a
+session started fresh in that workspace — re-baselines from the files on
+disk, which is also the choice the resume-drift prompt offers; until then
+`git diff` / `git status` in the repo still show the pending edits. The
+conversation and the files themselves are unaffected. `git fsck` lists the
+objects as dangling, and they never travel with clone/fetch/push.
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list

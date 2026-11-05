@@ -682,6 +682,14 @@ class SandboxConfig:
             argv += ["--ro-bind", str(host_rustup), f"{anchor}/rustup"]
             argv += ["--setenv", "RUSTUP_HOME", f"{anchor}/rustup"]
         path_prepend: list[str] = []
+        # The shim goes FIRST, ahead of every real bin dir (including the
+        # toolchain bins below): it must be the `git` the shell resolves.
+        # Appending it after them was a real bug — with ~/.cargo/bin or
+        # ~/.local/bin present the shim sat third on PATH, so its own
+        # PATH-stripping lookup found itself again and exec'd in a loop.
+        if self.git_shim:
+            path_prepend.append(f"{anchor}/{GIT_SHIM_DIR}")
+            _write_git_shim(sandbox_cache_root() / GIT_SHIM_DIR)
         cargo_bin = home / ".cargo" / "bin"
         if cargo_bin.is_dir():
             argv += ["--ro-bind", str(cargo_bin), f"{anchor}/cargo-bin"]
@@ -690,12 +698,6 @@ class SandboxConfig:
         if local_bin.is_dir():
             argv += ["--ro-bind", str(local_bin), f"{anchor}/local-bin"]
             path_prepend.append(f"{anchor}/local-bin")
-        if self.git_shim:
-            # First on PATH, ahead of every real bin dir: the shim is the
-            # `git` the shell resolves. The cache root is already bound at
-            # the anchor, so only the PATH entry is needed here.
-            path_prepend.append(f"{anchor}/{GIT_SHIM_DIR}")
-            _write_git_shim(sandbox_cache_root() / GIT_SHIM_DIR)
         # PATH is always set: --clearenv left none, and the inherited one
         # names host paths that do not exist in here. /usr is bound
         # wholesale, so its entries are real; the toolchain bins come from
