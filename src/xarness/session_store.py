@@ -267,9 +267,6 @@ class StoredSession(BaseModel):
     usage_total: Usage = Field(default_factory=Usage)
     last_usage: Usage = Field(default_factory=Usage)
     mode: str | None = None
-    # Set when a turn finished with no client attached (surfaces as
-    # "finished while you were away" on the next attach).
-    finished_while_away: bool = False
 
 
 def _meta_block(stored: StoredSession, tracking: bool) -> dict[str, Any]:
@@ -459,6 +456,12 @@ def load_state(name: str) -> StoredSession:
             "SELECT data FROM messages WHERE name = ? ORDER BY seq", (name,)
         ).fetchall()
     raw_state = json.loads(state_json)
+    # A state saved by an older build may carry a since-renamed key. Config
+    # files reject it with a pointed error (SandboxSettings), but a saved
+    # session cannot be hand-edited — migrate it or it stays unloadable.
+    settings = raw_state.get("sandbox_settings")
+    if isinstance(settings, dict) and "use_container" in settings:
+        settings["use_sandbox"] = settings.pop("use_container")
     stored = StoredSession(schema=SCHEMA_VERSION, **raw_state)
     # Conversation.turns is the ONE runtime home; the state row is its
     # persisted shape (a real StoredSession field).

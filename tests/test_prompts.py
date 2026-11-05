@@ -49,7 +49,7 @@ def test_plan_mode_does_not_describe_write_tools(sandbox):
     assert "write_file" not in prompt
     # No shell in unsandboxed plan mode → no git-in-the-shell claim either.
     host_prompt = system_prompt(
-        SandboxConfig(workspace=sandbox.workspace, use_container=False), "plan")
+        SandboxConfig(workspace=sandbox.workspace, use_sandbox=False), "plan")
     assert "run_bash" not in host_prompt
 
 
@@ -77,7 +77,7 @@ def test_prompt_has_no_methodology_or_style(sandbox):
 
 
 def test_unsandboxed_prompt_has_no_container_claims(sandbox):
-    host = SandboxConfig(workspace=sandbox.workspace, use_container=False)
+    host = SandboxConfig(workspace=sandbox.workspace, use_sandbox=False)
     prompt = system_prompt(host, "write")
     assert "/workspace" not in prompt
     assert "/tmp/refs" not in prompt

@@ -25,7 +25,6 @@ from .commands import (  # noqa: F401
     Accept,
     AnswerAsk,
     Cancel,
-    CloseResult,
     Command,
     CommandBase,
     CommandEnvelope,
@@ -51,7 +50,6 @@ from .events import (  # noqa: F401
     PROTOCOL_VERSION,
     AskResolved,
     CheckpointsChanged,
-    ConfigChanged,
     ContentDelta,
     DiffChanged,
     DriftResolved,
@@ -79,7 +77,6 @@ from .events import (  # noqa: F401
     TurnEnded,
 )
 from .views import (  # noqa: F401
-    Activity,
     ConfigDefaults,
     ConfigInfo,
     DiffFileInfo,
@@ -95,11 +92,10 @@ from .views import (  # noqa: F401
     SandboxInfo,
     ServerInfo,
     ServerStats,
-    SessionConfigView,
     SessionSummary,
     Snapshot,
     State,
-    StatusPayload,
+    Status,
     WorkspaceInfo,
     WorkspaceRefUpdate,
 )

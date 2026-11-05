@@ -8,9 +8,9 @@ object, with no mirrored copy to keep in sync.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import BaseModel, Field
 
 from ..conversation import (
     Message,
@@ -66,11 +66,24 @@ class WorkspaceRefUpdate(BaseModel):
     add: bool
 
 
-class SessionConfigView(BaseModel):
-    """The slow-changing half of the session's client-facing state: what
-    model/sandbox/mode/refs the session runs with. Emitted only when a
-    setting actually changes (``ConfigChanged``), never per tool or round."""
+class Status(BaseModel):
+    """Everything a client renders about a session: what it is doing right
+    now, and how it is configured.
 
+    One flat model on purpose: splitting it into a fast "activity" and a
+    slow "config" half cost two event types and a passthrough property per
+    field, to save a few hundred bytes per round on a local socket."""
+
+    # What it is doing: changes per round, per tool, per queued message.
+    state: State = "idle"
+    usage_total: Usage = Field(default_factory=Usage)
+    last_usage: Usage = Field(default_factory=Usage)
+    queued: list[QueuedMessage] = Field(default_factory=list)
+    pending_ask: PendingAsk | None = None
+    pending_drift: PendingDrift | None = None
+    clients_attached: int = 0
+
+    # How it is configured: changes on /model, /sandbox, /filter, /ref.
     session_name: str | None = None
     workspace: str | None = None
     mode: Mode = "write"
@@ -81,7 +94,7 @@ class SessionConfigView(BaseModel):
     max_context: int = 128_000
     supports_vision: bool = False
     sandbox_name: str | None = None
-    use_container: bool = True
+    use_sandbox: bool = True
     # Default False: a payload that doesn't know (e.g. the TUI's draft
     # status, which has no session yet) must not claim tracking exists.
     enable_tracking: bool = False
@@ -90,155 +103,6 @@ class SessionConfigView(BaseModel):
     refs: list[RefInfo] = Field(default_factory=list)
     # Tool names exposed to the model (for the /tools command).
     tools: list[str] = Field(default_factory=list)
-
-
-class Activity(BaseModel):
-    """The fast-changing half of the session's state: what it is doing and
-    what it needs from the user. This is what ``StatusChanged`` carries, so
-    a per-round or per-tool update never re-sends the config view."""
-
-    state: State = "idle"
-    # Cumulative session spend and the last round's spend.
-    usage_total: Usage = Field(default_factory=Usage)
-    last_usage: Usage = Field(default_factory=Usage)
-    queued: list[QueuedMessage] = Field(default_factory=list)
-    pending_ask: PendingAsk | None = None
-    pending_drift: PendingDrift | None = None
-    clients_attached: int = 0
-    # True when a turn finished while no client was attached; cleared on
-    # attach (the status event carries it once).
-    finished_while_away: bool = False
-
-
-class StatusPayload(BaseModel):
-    """Config view + activity in one object: the full state a client gets
-    on attach (and what the TUI synthesizes for a draft chat). The two
-    halves travel separately on the live stream; here they compose — and
-    serialize flat, so the attach shape is one flat object either way.
-
-    (The OpenAPI schema still shows the nested ``config``/``activity``
-    fields; the wire JSON is the flat merge — see :meth:`_flatten`. The
-    two field declarations exist for construction and typing only.)"""
-
-    config: SessionConfigView = Field(default_factory=SessionConfigView)
-    activity: Activity = Field(default_factory=lambda: Activity(state="idle"))
-
-    @model_validator(mode="before")
-    @classmethod
-    def _split_flat(cls, data: Any) -> Any:
-        """Accept the flat wire shape (and the old flat kwargs): unknown
-        nesting is not needed — every field belongs to exactly one half."""
-        if (isinstance(data, dict) and data
-                and "config" not in data and "activity" not in data):
-            return {
-                "config": {
-                    k: v for k, v in data.items()
-                    if k in SessionConfigView.model_fields
-                },
-                "activity": {
-                    k: v for k, v in data.items()
-                    if k in Activity.model_fields
-                },
-            }
-        return data
-
-    @model_serializer
-    def _flatten(self) -> dict[str, Any]:
-        return {**self.config.model_dump(), **self.activity.model_dump()}
-
-    # Flat passthroughs: view code reads status.mode / status.state / …
-    # without naming the half it lives in.
-    @property
-    def state(self) -> State:
-        return self.activity.state
-
-    @property
-    def session_name(self) -> str | None:
-        return self.config.session_name
-
-    @property
-    def workspace(self) -> str | None:
-        return self.config.workspace
-
-    @property
-    def mode(self) -> Mode:
-        return self.config.mode
-
-    @property
-    def model_name(self) -> str:
-        return self.config.model_name
-
-    @property
-    def model_display_name(self) -> str:
-        return self.config.model_display_name
-
-    @property
-    def model_id(self) -> str:
-        return self.config.model_id
-
-    @property
-    def cot_strength(self) -> str:
-        return self.config.cot_strength
-
-    @property
-    def max_context(self) -> int:
-        return self.config.max_context
-
-    @property
-    def supports_vision(self) -> bool:
-        return self.config.supports_vision
-
-    @property
-    def sandbox_name(self) -> str | None:
-        return self.config.sandbox_name
-
-    @property
-    def use_container(self) -> bool:
-        return self.config.use_container
-
-    @property
-    def enable_tracking(self) -> bool:
-        return self.config.enable_tracking
-
-    @property
-    def filter_list(self) -> list[str]:
-        return self.config.filter_list
-
-    @property
-    def refs(self) -> list[RefInfo]:
-        return self.config.refs
-
-    @property
-    def tools(self) -> list[str]:
-        return self.config.tools
-
-    @property
-    def usage_total(self) -> Usage:
-        return self.activity.usage_total
-
-    @property
-    def last_usage(self) -> Usage:
-        return self.activity.last_usage
-
-    @property
-    def queued(self) -> list[QueuedMessage]:
-        return self.activity.queued
-
-    @property
-    def pending_ask(self) -> PendingAsk | None:
-        return self.activity.pending_ask
-
-    @property
-    def pending_drift(self) -> PendingDrift | None:
-        return self.activity.pending_drift
-
-    @property
-    def clients_attached(self) -> int:
-        return self.activity.clients_attached
-
-    @property
-    def finished_while_away(self) -> bool:
-        return self.activity.finished_while_away
 
 
 class PartialToolCall(BaseModel):
@@ -282,7 +146,7 @@ class Snapshot(BaseModel):
     # so a human resuming the session sees the full transcript, with each
     # summary message rendered as the handoff divider.
     history: list[Message] = Field(default_factory=list)
-    status: StatusPayload = Field(default_factory=StatusPayload)
+    status: Status = Field(default_factory=Status)
     # Live round state; None when no round is streaming.
     partial_round: PartialRound | None = None
 

@@ -138,14 +138,6 @@ class ToolCall(BaseModel):
             "function": {"name": self.name, "arguments": self.arguments_json},
         }
 
-    @classmethod
-    def from_wire(cls, call: dict[str, Any]) -> ToolCall:
-        fn = call.get("function") or {}
-        return cls(
-            call_id=call.get("id", ""), name=fn.get("name", ""),
-            arguments_json=fn.get("arguments", ""),
-        )
-
 
 class Usage(BaseModel):
     """Token usage for one round.

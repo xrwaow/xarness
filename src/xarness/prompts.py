@@ -40,7 +40,7 @@ def system_prompt(
             "You are a coding agent working in the user's workspace.\n"
             f"Mode: {modename}\n"
         )
-    container = sandbox.use_container
+    container = sandbox.use_sandbox
     # Same rule as tools.build_registry: plan mode has no shell unless the
     # sandbox is a container (where the read-only mount enforces it).
     shell = container or mode != "plan"

@@ -200,8 +200,9 @@ class SandboxSettings(BaseModel):
     # restarts when it changes.
     filter_list: list[str] = Field(default_factory=list)
     # False = tools run as a user-level stateful bash on the host (an
-    # unsandboxed mode; the TUI shows a visible marker).
-    use_container: bool = True
+    # unsandboxed mode; the TUI shows a visible marker). Formerly named
+    # ``use_container``; the old key is rejected (see _reject_renamed_keys).
+    use_sandbox: bool = True
     # Replaces the hardcoded 120 s; a per-command timeout_seconds overrides.
     default_timeout: float = Field(default=120.0, gt=0)
     # False: no checkpoints, diff bar, accept/reject or file revert; undo is
@@ -225,6 +226,18 @@ class SandboxSettings(BaseModel):
         if not isinstance(value, list):
             return value
         return [{"path": entry} if isinstance(entry, str) else entry for entry in value]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_renamed_keys(cls, data: Any) -> Any:
+        """Fail with the new name instead of pydantic's bare
+        "extra_forbidden" when a config still uses a renamed key."""
+        if isinstance(data, dict) and "use_container" in data:
+            raise ValueError(
+                "use_container was renamed to use_sandbox; update the key in "
+                "this sandbox profile"
+            )
+        return data
 
     @model_validator(mode="before")
     @classmethod

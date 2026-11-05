@@ -33,19 +33,17 @@ from textual.worker import Worker
 from textual_flowview import Anchor, FlowModel, FlowView
 
 from .. import theme
-from ..clientlib import ClientError, XarnessClient, ensure_host
+from ..clientlib import ClientError, XarnessClient
 from ..config import DEFAULT_CONFIG_PATH, save_preferences
 from ..images import ImageAttachment, ImageRef
 from ..protocol import (
     Accept,
-    Activity,
     AnswerAsk,
     AskResolved,
     Cancel,
     CheckpointsChanged,
     Command,
     CommandResult,
-    ConfigChanged,
     ContentDelta,
     CreateSessionRequest,
     DiffChanged,
@@ -64,13 +62,12 @@ from ..protocol import (
     Rollback,
     RoundComplete,
     SendMessage,
-    SessionConfigView,
     SessionDeleted,
     SetMode,
     SetSandbox,
     Snapshot,
+    Status,
     StatusChanged,
-    StatusPayload,
     StreamError,
     SwitchModel,
     ToolCallStarted,
@@ -297,9 +294,11 @@ class AgentApp(App[None]):
         config_path: Path | None = DEFAULT_CONFIG_PATH,
         model: str | None = None,
         sandbox: str | None = None,
+        use_sandbox: bool | None = None,
         preset: str | None = None,
         network: bool | None = None,
         gpu: bool | None = None,
+        enable_tracking: bool | None = None,
         no_init_repo: bool = False,
         no_session: bool = False,
         startup_notices: list[str] | None = None,
@@ -312,17 +311,17 @@ class AgentApp(App[None]):
         self.model = model
         self.sandbox_name = sandbox
         self.preset = preset
-        # Tri-state sandbox overrides (None = not given).
+        # Tri-state sandbox overrides (None = not given on the command line).
+        self.use_sandbox = use_sandbox
         self.network = network
         self.gpu = gpu
+        self.enable_tracking = enable_tracking
         self.no_init_repo = no_init_repo
         self.no_session = no_session
         self.startup_notices = startup_notices or []
         # Latest status from the session (drives the bars); a draft has
-        # none. Split halves: the config view only changes on a settings
-        # command, the activity on every round/tool/prompt event.
-        self._config: SessionConfigView | None = None
-        self._activity: Activity | None = None
+        # none.
+        self._status: Status | None = None
         # The pure reducer owns the transcript data; the FlowModel holds one
         # widget entry per item. _entries maps id(item) -> entry so live
         # mutations repaint the right row without a second copy of state.
@@ -458,59 +457,44 @@ class AgentApp(App[None]):
     async def _pump_events(self, name: str) -> None:
         """Consume the session's event stream, reconnecting with backoff.
 
-        Every reconnect delivers a fresh Snapshot (full re-render). Never
-        crashes the app on connection loss."""
-        try:
-            async for item in self.client.attach(name):
-                if isinstance(item, Snapshot):
-                    self._config = item.status.config
-                    self._activity = item.status.activity
-                    self._set_vision(item.status.supports_vision)
-                    self._refresh_title()
-                    await self._render_history(item)
-                    self._refresh_bars()
-                    if item.status.finished_while_away:
-                        self._notice("finished while you were away")
-                        self._set_title_state("finished")
-                    await self.refresh_diff_summary()
-                    self._sync_ask()
-                    self._maybe_prompt_drift()
-                else:
-                    await self._handle_event(item)
-        except asyncio.CancelledError:
-            raise
-        except (ClientError, httpx.HTTPError) as exc:
-            self.call_later(self._recover, name, exc)
-        except Exception as exc:
-            self.call_later(self._recover, name, exc)
-
-    async def _recover(self, name: str, exc: Exception) -> None:
-        """Connection loss: the one recovery path. Respawn the host if it
-        died, then reattach; retry with backoff until it succeeds or the user
-        switches/detaches away from this session. The stream endpoint hosts a
-        saved session on demand, so there is no separate ``load_session``
-        round-trip."""
-        self._error(f"connection lost: {exc} — reconnecting")
+        Every reconnect delivers a fresh Snapshot (full re-render); the
+        client respawns a dead host on the next request. A 4xx from the
+        stream endpoint (unknown session, unsupported schema) can never
+        heal, so it is reported once instead of retried forever."""
         backoff = RECONNECT_MIN
         while self.session_name == name:
             try:
-                await ensure_host()
-                await self._attach(name)
+                async for item in self.client.attach(name):
+                    if isinstance(item, Snapshot):
+                        self._status = item.status
+                        self._set_vision(item.status.supports_vision)
+                        self._refresh_title()
+                        await self._render_history(item)
+                        self._refresh_bars()
+                        await self.refresh_diff_summary()
+                        self._sync_ask()
+                        self._maybe_prompt_drift()
+                    else:
+                        await self._handle_event(item)
                 return
-            except (ClientError, httpx.HTTPError):
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, RECONNECT_MAX)
+            except asyncio.CancelledError:
+                raise
+            except (ClientError, httpx.HTTPError) as exc:
+                if isinstance(exc, ClientError) and exc.permanent:
+                    self._error(f"cannot open {name}: {exc}")
+                    return
+                self._error(f"connection lost: {exc} — reconnecting")
+            except Exception as exc:  # unexpected: report, don't tight-loop
+                self._error(f"stream failed: {exc}")
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
 
     async def _handle_event(self, event: Event) -> None:
         """Route one live event to the widgets."""
-        if isinstance(event, ConfigChanged):
-            self._config = event.config
-            self._set_vision(event.config.supports_vision)
-            self._refresh_bars()
-            self._sync_refs_screen()
-            return
         if isinstance(event, StatusChanged):
-            self._activity = event.activity
+            self._status = event.status
+            self._set_vision(event.status.supports_vision)
             self._refresh_bars()
             self._sync_refs_screen()
             self._sync_ask()
@@ -548,8 +532,8 @@ class AgentApp(App[None]):
             # The prompt is resolved: drop the pending flag locally too, or
             # the next StatusChanged would reopen the modal for a drift that
             # no longer exists.
-            if self._activity is not None:
-                self._activity.pending_drift = None
+            if self._status is not None:
+                self._status.pending_drift = None
             return
         if isinstance(event, TurnEnded):
             # The turn is fully unwound: settle anything still live and stop
@@ -564,8 +548,7 @@ class AgentApp(App[None]):
                 self._set_default_title()
             return
         if isinstance(event, SessionDeleted):
-            # The session went away (deleted, or closed by this or another
-            # client — a Notice with the specifics precedes this event).
+            # The session went away (deleted, or released by the host).
             self._detach()
             return
         if isinstance(event, ProcessingStarted):
@@ -729,16 +712,13 @@ class AgentApp(App[None]):
         )
 
     @property
-    def view_status(self) -> StatusPayload:
+    def view_status(self) -> Status:
         """The status the UI shows: the real session status, or — for a draft
         chat — one synthesized from ``/config`` defaults plus the pre-session
         model/mode choices. Never ``None``, so view code has no fake-status
         branch and ``session_name``/``supports_vision`` need not be mirrored."""
-        if self._activity is not None:
-            return StatusPayload(
-                config=self._config or SessionConfigView(),
-                activity=self._activity,
-            )
+        if self._status is not None:
+            return self._status
         config = self._config_cache
         target = self.model or (config.default_model if config else None)
         entry = next(
@@ -755,16 +735,13 @@ class AgentApp(App[None]):
             ) or "—"
             effort = "medium"
             max_context = 128_000
-        return StatusPayload(
-            config=SessionConfigView(
-                mode=self._draft_mode,
-                model_name=target or "",
-                model_display_name=display_name,
-                cot_strength=effort,
-                max_context=max_context,
-                workspace=str(self.workspace) if self.workspace else None,
-            ),
-            activity=Activity(state="idle"),
+        return Status(
+            mode=self._draft_mode,
+            model_name=target or "",
+            model_display_name=display_name,
+            cot_strength=effort,
+            max_context=max_context,
+            workspace=str(self.workspace) if self.workspace else None,
         )
 
     @work(group="draft-status", exit_on_error=False)
@@ -894,8 +871,10 @@ class AgentApp(App[None]):
                 model=self.model,
                 sandbox=self.sandbox_name,
                 preset=self.preset,
+                use_sandbox=self.use_sandbox,
                 network=self.network,
                 gpu=self.gpu,
+                enable_tracking=self.enable_tracking,
                 no_init_repo=self.no_init_repo,
                 no_session=self.no_session,
             ))
@@ -905,8 +884,10 @@ class AgentApp(App[None]):
         self.model = None
         self.sandbox_name = None
         self.preset = None
+        self.use_sandbox = None
         self.network = None
         self.gpu = None
+        self.enable_tracking = None
         await self._attach(summary.name)
         # Carry the draft-mode toggle (Tab before any message) into the
         # freshly created session.
@@ -1023,12 +1004,12 @@ class AgentApp(App[None]):
         requires one, and blocking the pump on a modal would stall the
         event stream while the prompt is open."""
         if (
-            self._activity is None or self._activity.pending_drift is None
+            self._status is None or self._status.pending_drift is None
             or self._drift_modal_open
         ):
             return
         self._drift_modal_open = True
-        detail = self._drift_detail(self._activity.pending_drift)
+        detail = self._drift_detail(self._status.pending_drift)
         choice = await self.push_screen_wait(ConfirmScreen(
             "Workspace changed outside this session since it was last open:",
             detail=detail,
@@ -1036,7 +1017,7 @@ class AgentApp(App[None]):
             cancel_label="Keep tracking",
         ))
         self._drift_modal_open = False
-        if self._activity is None or self._activity.pending_drift is None:
+        if self._status is None or self._status.pending_drift is None:
             return  # resolved elsewhere while the modal was open
         if choice is None:
             return  # dismissed: leave the prompt pending
@@ -1148,8 +1129,7 @@ class AgentApp(App[None]):
             self._pump_worker.cancel()
             self._pump_worker = None
         self.session_name = None
-        self._config = None
-        self._activity = None
+        self._status = None
         self._refresh_title()
         self._flow_model.clear()
         self._hint_entries = []
@@ -1347,8 +1327,8 @@ class AgentApp(App[None]):
         except ClientError as exc:
             self._error(str(exc))
             return
-        if self._config is not None:
-            self._config.refs = refs
+        if self._status is not None:
+            self._status.refs = refs
             self._refresh_bars()
         if isinstance(self.screen, RefsScreen):
             self.screen.post_message(RefsScreen.RefsChanged(refs))
@@ -1541,8 +1521,7 @@ class AgentApp(App[None]):
         # The snapshot also carries the fresh status (a drift resolve clears
         # pending_drift there); adopt it so local prompts/bars don't keep
         # showing state the host already moved past.
-        self._config = event.snapshot.status.config
-        self._activity = event.snapshot.status.activity
+        self._status = event.snapshot.status
         self._refresh_bars()
         await self._render_history(event.snapshot)
         if event.reason in ("compaction", "rollback"):
@@ -1714,10 +1693,11 @@ class AgentApp(App[None]):
     async def action_copy_or_quit(self) -> None:
         """ctrl+c: copy the active selection if there is one, quit otherwise.
 
-        Quitting while a request is still running asks first: the session
-        lives in the host, so it can keep running headless — or be cancelled
-        on the way out. Idle quits immediately. (A worker: push_screen_wait
-        requires one.)"""
+        A turn lives in the host and never depends on a client watching it,
+        so quitting is only a disconnect: "Continue headless" drops the
+        stream (a later attach replays the turn, exactly like a second
+        client), and "Stop and quit" sends one interrupt first. Idle quits
+        immediately. (A worker: push_screen_wait requires one.)"""
         if self._copy_selection():
             return
         self._disarm_interrupt()
@@ -1727,12 +1707,6 @@ class AgentApp(App[None]):
             state in ("running", "compacting") or has_pending_ask
         )
         if busy:
-            # Another client has the session open: the session keeps running
-            # for them regardless, and "stop and quit" would yank it away —
-            # so don't ask, just detach and exit.
-            if self._activity is not None and self._activity.clients_attached > 1:
-                self.exit()
-                return
             choice = await self.push_screen_wait(ConfirmScreen(
                 "A request is still running. Continue it in the background?",
                 confirm_label="Continue headless",
@@ -1740,24 +1714,16 @@ class AgentApp(App[None]):
             ))
             if choice is None:
                 return  # esc: stay in the app
-            if choice:
-                # Close the event stream and exit; the session keeps
-                # running in the host.
-                self.exit()
-                return
-            # Stop and quit: cancel, wait for it to unwind, then unload the
-            # session from the host (it stays saved on disk) and exit.
-            try:
-                await asyncio.wait_for(
-                    self._send_command(Cancel()), timeout=CANCEL_TIMEOUT,
-                )
-            except (asyncio.TimeoutError, ClientError):
-                pass
-            if self.session_name is not None:
+            if not choice:
+                # Stop and quit: interrupt, wait for it to unwind (so the
+                # saved session is idle), then leave. Nothing unloads the
+                # session — the host owns its lifetime.
                 try:
-                    await self.client.close_session(self.session_name)
-                except ClientError:
-                    pass  # exiting anyway; the host grace-exits on its own
+                    await asyncio.wait_for(
+                        self._send_command(Cancel()), timeout=CANCEL_TIMEOUT,
+                    )
+                except (asyncio.TimeoutError, ClientError):
+                    pass
             self.exit()
             return
         self.exit()
@@ -1795,8 +1761,8 @@ class AgentApp(App[None]):
             diff_summary.collapse()
             return
         if (
-            self._activity is not None
-            and self._activity.state in ("running", "compacting")
+            self._status is not None
+            and self._status.state in ("running", "compacting")
         ):
             if self._interrupt_armed:
                 # Second esc within the window: actually stop the turn.

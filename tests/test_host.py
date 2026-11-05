@@ -509,6 +509,44 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_headless_turn_runs_like_any_other_and_reattach_sees_it_done(tmp_path) -> None:
+    """The model behind the quit menu: a turn is the host's, not the
+    client's. With zero subscribers it runs to completion, and the attach
+    that comes later just sees the finished transcript and an idle status —
+    no "finished while you were away" flag, no per-client special case."""
+    from xarness.clientlib import XarnessClient
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(
+                host, tmp_path, [[ContentDelta(text="headless answer"), RoundComplete()]],
+            )
+            session = host.sessions[name]
+            assert session.clients_attached == 0
+            await session.execute("x", SendMessage(text="hi"))
+            await asyncio.wait_for(session._turn_task, timeout=5)
+            assert session.state == "idle"
+
+            client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
+            try:
+                first = await asyncio.wait_for(
+                    anext(client.attach(name)), timeout=5,
+                )
+            finally:
+                await client.aclose()
+            assert isinstance(first, Snapshot)
+            assert first.status.state == "idle"
+            assert [m.role for m in first.messages] == ["user", "assistant"]
+            assert first.messages[1].content == "headless answer"
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_default_preset_resolves_model(tmp_path) -> None:
     """The default preset picks the model used when none is requested."""
     from xarness.config import load_sectioned
@@ -623,6 +661,44 @@ def test_startup_race_yields_one_host(tmp_path) -> None:
         asyncio.run(go())
     finally:
         monkey.undo()
+
+
+def test_cli_overrides_beat_the_sandbox_profile(tmp_path) -> None:
+    """--sandbox true/false, --network, --gpu and --enable_tracking are
+    tri-state overrides: a given flag wins over the profile, an absent one
+    (None) leaves the profile's value alone."""
+
+    async def go():
+        (tmp_path / "ws").mkdir()
+        host = make_host(tmp_path)
+
+        session = await host.create_session(protocol.CreateSessionRequest(
+            workspace=str(tmp_path / "ws"),
+            use_sandbox=False, network=False, gpu=True, enable_tracking=False,
+        ))
+        settings = session.sandbox.settings
+        assert settings is not None
+        assert settings.use_sandbox is False
+        assert settings.allow_network is False
+        assert settings.gpu_access is True
+        assert settings.enable_tracking is False
+        # Tracking off means no git block at all (no checkpoints/undo).
+        assert session.git_info is None
+        assert session.status().use_sandbox is False
+        assert session.status().enable_tracking is False
+
+        # No overrides: the profile's values (the config defaults) apply.
+        plain = await host.create_session(protocol.CreateSessionRequest(
+            workspace=str(tmp_path / "ws"),
+        ))
+        plain_settings = plain.sandbox.settings
+        assert plain_settings is not None
+        assert plain_settings.use_sandbox is True
+        assert plain_settings.allow_network is True
+        assert plain_settings.gpu_access is False
+        assert plain_settings.enable_tracking is True
+
+    asyncio.run(go())
 
 
 def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkeypatch) -> None:

@@ -87,9 +87,13 @@ commands cannot change files either.
 **Live adjustments.** Everything mount-affecting (plan/write mode, refs) is
 fingerprinted; when a setting changes at runtime (`/mode`),
 the persistent shell restarts with the new mounts on its next command.
-Network and GPU access are fixed at launch: `xarness --no-network --no-gpu`
-runs the sandbox fully offline and without device access (each defaults to
-the sandbox profile's setting — `allow_network: true`, `gpu_access: false`).
+Network and GPU access are fixed at launch: `xarness --network false
+--gpu false` runs the sandbox fully offline and without device access (each
+flag takes an explicit `true`/`false`; leave it out to keep the sandbox
+profile's setting — `allow_network: true`, `gpu_access: false`).
+`--enable_tracking false` turns change tracking off for the session (no
+checkpoints, diff bar or undo/revert), and `--sandbox false` runs the tools
+unsandboxed (a host shell instead of the container).
 
 **Git guard.** When change tracking is active and `allow_git_write` is off
 (and only then), a small generated `git` shim is installed first on `PATH`
@@ -212,6 +216,7 @@ Conversations autosave in `~/.local/share/xarness/sessions/sessions.db`
 ```sh
 xarness --session my-session   # attach to an active session or load a saved one
 xarness --sessions             # print active sessions and exit
+xarness --kill                 # close every active session (each stays saved)
 ```
 
 Resuming reconnects to the session's change tracking (the persisted baseline
@@ -300,7 +305,7 @@ Config is JSON at `~/.config/xarness/config.json`. The layout is sectioned:
   and never round-trips into saved session settings.
 - `sandboxes` — named sandbox profiles. `default` is the base; other
   profiles inherit from it and list only overrides. Fields include
-  `allow_network`, `gpu_access`, `allow_git_write`, `use_container`,
+  `allow_network`, `gpu_access`, `allow_git_write`, `use_sandbox`,
   `enable_tracking`, `auto_include_refs`, `filter_list`, and
   `default_timeout`.
 - `presets` — named `{model, sandbox}` pairs; `defaults.preset` chooses one.
@@ -316,13 +321,25 @@ choice back as the default preset/model.
 xarness                              # default preset
 xarness --model deepseek             # named model profile
 xarness --sandbox offline            # named sandbox profile
+xarness --sandbox true               # default profile, sandboxing on
+xarness --sandbox false              # unsandboxed (host shell, no isolation)
 xarness --preset work                # named preset
 xarness --workspace ./some-project   # sandbox root (default: cwd)
-xarness --no-network --no-gpu        # fully offline, no device access
+xarness --network false --gpu false  # fully offline, no device access
+xarness --enable_tracking false      # no checkpoints/diff bar/undo
 xarness --session my-session         # attach/load a saved session
 xarness --sessions                   # list active sessions
+xarness --kill                       # close all active sessions (stays saved)
 xarness --server                     # run the host in the foreground
 ```
+
+The boolean flags all take an explicit value (`--network true`, `--gpu
+false`, `--enable_tracking false`; `1/0`, `yes/no` and `on/off` work too)
+and default to the sandbox profile's setting when omitted. `--sandbox`
+takes either a profile name or `true`/`false`: with `true`/`false` no
+profile is named, so the usual resolution applies (preset, then the
+workspace's most recently used profile, then `default`) and only the
+container on/off state is overridden.
 
 ## Slash commands
 

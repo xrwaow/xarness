@@ -145,16 +145,20 @@ class ChatController:
         provider or transport error). Keeps the assistant text and the
         partial chain of thought that had arrived — including a
         reasoning-only segment (a cancel mid-thinking now saves the CoT,
-        instead of discarding it) — and drops any half-streamed tool call
-        (it has no result to pair with, and an orphaned tool call would be
-        rejected on the next request). Returns True when a message was
-        added; a round with neither text nor reasoning adds nothing, so a
-        turn that had not started answering leaves the history untouched.
-        """
+        instead of discarding it). Returns True when a message was added; a
+        round with neither text nor reasoning adds nothing, so a turn that
+        had not started answering leaves the history untouched.
+
+        Only the model-stream half is consumed: the tool calls stay live so
+        the session can fold the tool-execution events into them, and an
+        attach during those tools renders them. Dropping them here is what
+        made a mid-tool attach draw the history instead — an unanswered call
+        reads as "interrupted", with the round's timing stamped on top."""
         partial = self.partial_round
         content = partial.content
         reasoning = partial.reasoning or None
-        self.reset_partial()
+        partial.content = ""
+        partial.reasoning = ""
         if not content and not reasoning:
             return False
         self.conversation.add(AssistantMessage(

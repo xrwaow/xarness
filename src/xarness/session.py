@@ -74,7 +74,6 @@ from .protocol import (
     SessionSummary,
     Snapshot,
     State,
-    StatusPayload,
 )
 from .sandbox import (
     SandboxConfig,
@@ -127,17 +126,9 @@ def _ok(**fields: Any) -> CommandResult:
     return CommandResult(cmd_id="", ok=True, **fields)
 
 
-async def _cancel_and_wait(task: asyncio.Task[None] | None) -> None:
-    """Cancel a task (if any) and let it unwind, swallowing cancellation."""
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        pass
+def _alive(task: asyncio.Task[None] | None) -> bool:
+    """Whether a session still has a task doing the work it reports."""
+    return task is not None and not task.done()
 
 
 @dataclass(slots=True)
@@ -217,6 +208,11 @@ class Session:
         self._state: State = "idle"
         self._turn_task: asyncio.Task[None] | None = None
         self._compact_task: asyncio.Task[None] | None = None
+        # The turn task currently inside its end-of-turn teardown. It is
+        # NOT cancellable any more: a CancelledError delivered in the
+        # teardown would skip the state flip to idle and strand the
+        # session reporting a turn that no longer exists.
+        self._finishing_turn: asyncio.Task[None] | None = None
         # Steering queue — send_time is when the client sent it, not when it
         # is injected.
         self._queued: list[_QueuedSteer] = []
@@ -229,9 +225,6 @@ class Session:
         # own auto_include_refs; the effective list is computed when the
         # sandbox is built).
         self.workspace_refs: list[str] = list(workspace_refs or [])
-        # Set when a turn finishes with no subscriber attached; surfaced to
-        # the next client that attaches ("finished while you were away").
-        self._finished_while_away = False
         # Resume drift is detected lazily, when the first client attaches —
         # never at load time (a drifted workspace with nobody attached must
         # not hold the host open or report "waiting").
@@ -288,7 +281,6 @@ class Session:
         # real in/out/ctx immediately instead of 0 until the next round.
         session.controller.usage_total = state.usage_total
         session.controller.last_usage = state.last_usage
-        session._finished_while_away = state.finished_while_away
         # A loaded session can never have a running turn: a crash (or a
         # kill) left any open ones behind. Close them all — a turn left
         # "open" forever makes open_turn()/open_turn_before() return stale
@@ -334,10 +326,10 @@ class Session:
     async def stop(self) -> None:
         """Cancel a running turn or compaction and flush pending writes."""
         self._closed = True
-        await _cancel_and_wait(self._turn_task)
-        await _cancel_and_wait(self._compact_task)
+        await self._cancel_and_wait(self._turn_task)
+        await self._cancel_and_wait(self._compact_task)
         self._compact_task = None
-        await _cancel_and_wait(self._diff_task)
+        await self._cancel_and_wait(self._diff_task)
         self._diff_task = None
         await self._flush_persist()
         # Close the sandbox shell here (not only on host eviction) so every
@@ -394,9 +386,7 @@ class Session:
         # it only takes over an otherwise idle row, so the picker keeps
         # reporting running/compacting while the user has not resolved it.
         if self.pending_ask is not None or (
-            self.pending_drift is not None
-            and self.clients_attached
-            and state == "idle"
+            self.pending_drift is not None and state == "idle"
         ):
             state = "waiting"
         # Active derives from the same predicate the grace loop uses — a
@@ -447,17 +437,17 @@ class Session:
                 call.status = event.status
                 call.content = event.content
 
-    def _partial_call(self, call_id: str) -> protocol.PartialToolCall | None:
-        return self.controller.partial_round.find_call(call_id)
-
     def subscribe(self) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
 
         Synchronous on purpose: no await between building the snapshot and
         registering the queue, so the stream cannot move in between (no
         gap, no duplicate)."""
+        # Last line of defence before the snapshot: whatever stranded the
+        # state (see _heal_stranded), the attaching client must never be
+        # shown a live turn nobody is running.
+        self._heal_stranded()
         snapshot = self.snapshot()
-        self._finished_while_away = False
         queue: asyncio.Queue[Event] = asyncio.Queue()
         self._subscribers.append(queue)
         return snapshot, queue
@@ -474,10 +464,9 @@ class Session:
     # ------------------------------------------------------------------
     # snapshots and status
 
-    def _config_view(self) -> protocol.SessionConfigView:
-        """The slow-changing half of the status (see StatusChanged /
-        ConfigChanged): only emitted when a setting actually changes."""
-        return protocol.SessionConfigView(
+    def status(self) -> protocol.Status:
+        """The whole client-facing state: activity plus config."""
+        return protocol.Status(
             session_name=self.name,
             workspace=str(self.workspace),
             mode=self.mode,
@@ -492,15 +481,10 @@ class Session:
                 if self.sandbox.settings is not None else []
             ),
             refs=self._ref_infos(),
-            use_container=self.sandbox.use_container,
+            use_sandbox=self.sandbox.use_sandbox,
             enable_tracking=self.git_info is not None,
             supports_vision=self.profile.supports_vision,
             tools=[tool.name for tool in self.tool_registry.tools()],
-        )
-
-    def _activity(self) -> protocol.Activity:
-        """The fast-changing half of the status."""
-        return protocol.Activity(
             state=self._state,
             usage_total=self.controller.usage_total,
             last_usage=self.controller.last_usage,
@@ -511,11 +495,7 @@ class Session:
             pending_ask=self.pending_ask,
             pending_drift=self._pending_drift,
             clients_attached=self.clients_attached,
-            finished_while_away=self._finished_while_away,
         )
-
-    def status(self) -> StatusPayload:
-        return StatusPayload(config=self._config_view(), activity=self._activity())
 
     def snapshot(self) -> Snapshot:
         """Full client-facing state (synchronous; see :meth:`subscribe`).
@@ -683,13 +663,9 @@ class Session:
         self._state = state
         self._emit_status()
 
-    def _emit_status(self, config_changed: bool = False) -> None:
-        """Push the fast-changing half to every client; a settings change
-        also pushes the config view (before the activity, so a client that
-        renders the pair is never stale on the config side)."""
-        if config_changed:
-            self._emit(protocol.ConfigChanged(config=self._config_view()))
-        self._emit(protocol.StatusChanged(activity=self._activity()))
+    def _emit_status(self) -> None:
+        """Push the current status to every client."""
+        self._emit(protocol.StatusChanged(status=self.status()))
 
     def _emit_notice(self, text: str, level: str = "info") -> None:
         self._emit(protocol.Notice(text=text, level=level))  # type: ignore[arg-type]
@@ -776,23 +752,83 @@ class Session:
         # a still-"idle" state would let a back-to-back send start a second
         # turn instead of steering the first.
         self._set_state("running")
-        self._turn_task = asyncio.get_running_loop().create_task(
+        task = asyncio.get_running_loop().create_task(
             self._run_turn(text, images)
         )
+        # Safety net: if the task ever ends without reaching the teardown's
+        # state flip (an unexpected exception, a cancellation that slipped
+        # past the guards), heal the session instead of reporting a turn
+        # nobody is running any more.
+        task.add_done_callback(self._on_turn_done)
+        self._turn_task = task
         # Yield once so the turn task actually starts: a task cancelled
         # before its first step never runs its cleanup (state would stick
         # at "running" forever).
         await asyncio.sleep(0)
+
+    def _cancellable(self, task: asyncio.Task[None] | None) -> bool:
+        """Whether cancelling ``task`` is safe.
+
+        Not while it is already unwinding (a second ``CancelledError`` lands
+        in its cleanup and aborts the state flip), nor while it is in
+        ``_close_out_turn`` — which runs after a *normal* turn end and so has
+        no pending cancellation to detect."""
+        return (
+            _alive(task)
+            and task is not self._finishing_turn
+            and not task.cancelling()
+        )
+
+    async def _cancel_and_wait(self, task: asyncio.Task[None] | None) -> None:
+        """Cancel a task if it is cancellable, then let it finish unwinding."""
+        if self._cancellable(task):
+            task.cancel()
+        if _alive(task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     def _cancel_work(self) -> None:
         """Cancel the running turn and/or compaction (if any).
 
         Their cleanup is what starts the next queued message (or leaves the
         session idle), so both cancel paths are just this."""
-        if self._turn_task is not None:
-            self._turn_task.cancel()
-        if self._compact_task is not None:
-            self._compact_task.cancel()
+        for task in (self._turn_task, self._compact_task):
+            if self._cancellable(task):
+                task.cancel()
+
+    def _on_turn_done(self, task: asyncio.Task[None]) -> None:
+        """Heal a turn whose task ended without reaching the state flip."""
+        if self._turn_task is task:
+            self._turn_task = None
+            self._heal_stranded()
+
+    def _on_compact_done(self, task: asyncio.Task[None]) -> None:
+        """Same safety net for a detached compaction."""
+        if self._compact_task is task:
+            self._compact_task = None
+            self._heal_stranded()
+
+    def _heal_stranded(self) -> None:
+        """End a "running"/"compacting" state whose task is gone.
+
+        Whatever stranded it — a task killed before its teardown, a path not
+        found yet — a session must never claim a turn it is not running:
+        every attach would render a live bar that never finishes, and
+        ``is_active`` would keep the host from ever evicting it."""
+        if self._state == "running" and not _alive(self._turn_task):
+            self._turn_task = None
+            self._reset_partial()
+            self._set_state("idle")
+            self._emit(protocol.TurnEnded(outcome="failed", elapsed=0.0))
+            self._emit_notice(
+                "the turn ended unexpectedly and was reset to idle", "error",
+            )
+        elif self._state == "compacting" and not _alive(self._compact_task):
+            self._compact_task = None
+            self._set_state("idle")
+            self._emit_notice("compaction ended unexpectedly", "error")
 
     def _cmd_cancel(self) -> CommandResult:
         if self._state == "idle":
@@ -931,9 +967,9 @@ class Session:
         works, commands keep flowing); the task drains the steering queue
         when it finishes."""
         self._set_state("compacting")
-        self._compact_task = asyncio.get_running_loop().create_task(
-            self._run_compact()
-        )
+        task = asyncio.get_running_loop().create_task(self._run_compact())
+        task.add_done_callback(self._on_compact_done)
+        self._compact_task = task
         return _ok(started=True)
 
     async def _run_compact(self) -> None:
@@ -1043,7 +1079,7 @@ class Session:
     def _cmd_set_mode(self, command: protocol.SetMode) -> CommandResult:
         self.mode = command.mode
         self._rebuild_tools()
-        self._emit_status(config_changed=True)
+        self._emit_status()
         return _ok(mode=self.mode)
 
     async def _cmd_switch_model(self, command: protocol.SwitchModel) -> CommandResult:
@@ -1055,7 +1091,7 @@ class Session:
         self._persist()
         if command.persist_default:
             save_preferences(self.config_path, default_profile=command.name)
-        self._emit_status(config_changed=True)
+        self._emit_status()
         return _ok(model=command.name)
 
     async def _cmd_set_sandbox(self, command: protocol.SetSandbox) -> CommandResult:
@@ -1135,12 +1171,6 @@ class Session:
 
     # ------------------------------------------------------------------
     # External references
-
-    def _ref_path(self, entry) -> Path:
-        """Host path of one ref entry (str or RefSpec)."""
-        raw = entry if isinstance(entry, str) else entry.path
-        path = Path(raw).expanduser()
-        return (path if path.is_absolute() else self.workspace / path).resolve()
 
     def _profile_refs(self) -> list:
         """The sandbox profile's own refs (never touched by /ref)."""
@@ -1264,7 +1294,7 @@ class Session:
         self._rebuild_tools()
         if save:
             self._persist()
-        self._emit_status(config_changed=True)
+        self._emit_status()
 
     # ------------------------------------------------------------------
     # turn loop
@@ -1274,6 +1304,11 @@ class Session:
         the only way any client learns about it (no local echo)."""
         if message.timing.send is None:
             message.timing.send = _utcnow()
+        # On disk before the turn does any work: a host killed mid-turn (a
+        # crash, a stop, an eviction while the turn ran) would otherwise save
+        # a session with no trace of what the user asked for, and reopening
+        # it shows an empty transcript instead of the interrupted turn.
+        self._persist()
         self._emit(protocol.MessageAdded(message=message))
 
     async def _run_turn(self, text: str, images: list[ImageRef] | None) -> None:
@@ -1366,31 +1401,51 @@ class Session:
             self._repair_tool_calls()
             self._emit_notice(f"turn failed: {type(exc).__name__}: {exc}", "error")
         finally:
+            # Teardown must not be interrupted: the footer still says
+            # "running" until the state flip, so a Cancel can land here
+            # while the after-tree snapshot persists a big repo, and a
+            # CancelledError would skip the flip and strand "running"
+            # (see _cancellable).
+            self._finishing_turn = asyncio.current_task()
+            try:
+                await self._close_out_turn(outcome, turn_start)
+            finally:
+                self._finishing_turn = None
+
+    async def _close_out_turn(self, outcome: str, turn_start: float) -> None:
+        """End-of-turn teardown: snapshot the workspace, persist, flip to
+        idle, announce.
+
+        The snapshot and the disk write are best-effort — a failure there
+        must not lose the turn. The state flip is not: a session left
+        "running" with no task is rendered as a live turn by every later
+        attach and is never evicted."""
+        try:
             # Record where the turn left the workspace so /undo //retry can
-            # reverse exactly this turn's diff later (interruptions included).
+            # reverse exactly this turn's diff later (interruptions
+            # included).
             await self._finish_turn()
             self._persist()
             await self._flush_persist()
-            # The turn is over: its content lives in the history now.
+        except asyncio.CancelledError:
+            pass  # a cancel slipped past the guards; cleanup still wins
+        except Exception:
+            LOG.exception(
+                "could not close out the turn for session %s", self.name,
+            )
+        finally:
             self._reset_partial()
             self._set_state("idle")
-            await self._emit_diff_changed()
             # After the state flip: TurnEnded describes the end and must not
             # be buffered as a live turn event for the next attach.
             self._emit(protocol.TurnEnded(
                 outcome=outcome, elapsed=time.monotonic() - turn_start,
             ))
             self._turn_task = None
-            if not self._subscribers:
-                # Persisted (not just in memory): the host evicts an idle
-                # session right after this, and the next attach must still
-                # see "finished while you were away".
-                self._finished_while_away = True
-                self._persist()
-
-            # A queued message sent at the exact end of the turn (or a
-            # "send queued now" cancel) starts immediately.
-            await self._start_queued()
+        await self._emit_diff_changed()
+        # A queued message sent at the exact end of the turn (or a
+        # "send queued now" cancel) starts immediately.
+        await self._start_queued()
 
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
@@ -1674,7 +1729,6 @@ class Session:
             sandbox_settings=self.sandbox.settings,
             usage_total=self.controller.usage_total,
             last_usage=self.controller.last_usage,
-            finished_while_away=self._finished_while_away,
         )
         from_seq = self.conversation.take_dirty_from()
         payload, meta = session_store.serialize_state(stored, from_seq)

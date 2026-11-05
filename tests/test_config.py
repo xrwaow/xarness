@@ -213,12 +213,12 @@ def test_bad_auto_compact_threshold_rejected(tmp_path: Path, threshold: float) -
 
 def test_sandbox_settings_defaults() -> None:
     settings = SandboxSettings()
-    # On by default; `xarness --no-network` (or a sandbox profile) turns it
-    # off, and the sandbox then sets UV_OFFLINE and drops the net namespace.
+    # On by default; `xarness --network false` (or a sandbox profile) turns
+    # it off, and the sandbox then sets UV_OFFLINE and drops the net namespace.
     assert settings.allow_network is True
     assert settings.gpu_access is False
     assert settings.allow_git_write is False  # secure by default
-    assert settings.use_container is True
+    assert settings.use_sandbox is True
     assert settings.enable_tracking is True
     assert settings.auto_include_refs == []
 
@@ -245,6 +245,14 @@ def test_tool_output_limit_is_top_level(tmp_path: Path, caplog) -> None:
     _, settings = sectioned.resolve_sandbox("default")
     assert sectioned.tool_output_limit == 4096
     assert "tool_output_limit" not in settings.model_dump()
+
+
+def test_legacy_use_container_key_is_rejected_with_the_new_name(tmp_path: Path) -> None:
+    """The setting was renamed to use_sandbox; the old key fails with a
+    message naming its replacement instead of pydantic's extra_forbidden."""
+    path = write(tmp_path, {"sandboxes": {"default": {"use_container": False}}})
+    with pytest.raises(ConfigError, match="use_sandbox"):
+        load_sectioned(path)
 
 
 def test_sandbox_inheritance_over_default(tmp_path: Path) -> None:

@@ -94,9 +94,13 @@ def turn_time_summary(messages) -> str | None:
             f"{format_duration(streaming + tools)} {format_duration(other)}")
 
 
-def turn_time_summaries(messages) -> dict[int, str]:
+def turn_time_summaries(messages, results: dict) -> dict[int, str]:
     """Map each turn's final assistant message (by object identity) to its
-    derived timing line."""
+    derived timing line. ``results`` is the tool results by call id.
+
+    A turn whose last round left a tool call unanswered is not over (still
+    executing, or it died mid-tool): a timing line there would claim an end
+    the history does not have."""
     starts = [
         i for i, m in enumerate(messages)
         if m.role == "user" and not m.is_summary
@@ -105,11 +109,13 @@ def turn_time_summaries(messages) -> dict[int, str]:
     for n, start in enumerate(starts):
         end = starts[n + 1] if n + 1 < len(starts) else len(messages)
         turn = messages[start:end]
-        summary = turn_time_summary(turn)
-        if not summary:
-            continue
         last = next((m for m in reversed(turn) if m.role == "assistant"), None)
-        if last is not None:
+        if last is None:
+            continue
+        if any(call.call_id not in results for call in last.tool_calls or []):
+            continue
+        summary = turn_time_summary(turn)
+        if summary:
             summaries[id(last)] = summary
     return summaries
 
@@ -375,14 +381,20 @@ class Transcript:
             m.tool_call_id: m for m in messages
             if m.role == "tool" and m.tool_call_id
         }
-        summaries = turn_time_summaries(messages)
+        summaries = turn_time_summaries(messages, results)
+        # A call with no result in a turn that is still running is the call
+        # executing now, not a failed one.
+        live = snap.status.state == "running"
         for message in messages:
-            self._add_message(message, results, summaries.get(id(message)))
+            self._add_message(
+                message, results, summaries.get(id(message)), live=live,
+            )
         self._load_partial(getattr(snap, "partial_round", None))
         return self.items
 
     def _add_message(
-        self, message, results: dict, summary: str | None = None,
+        self, message, results: dict, summary: str | None = None, *,
+        live: bool = False,
     ) -> None:
         if message.role == "user":
             if message.is_summary:
@@ -414,6 +426,11 @@ class Transcript:
                         else ToolStatus.CALL_FAILED
                     )
                     item.output = result.content
+                elif live:
+                    # The snapshot says the turn is running, so an unanswered
+                    # call is the one in flight. Claiming "interrupted" here
+                    # is what made a reattach mid-tool look like a dead turn.
+                    item.status = ToolStatus.MAKING_CALL
                 else:
                     item.status = ToolStatus.CALL_FAILED
                     item.output = "interrupted"

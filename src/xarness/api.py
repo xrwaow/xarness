@@ -113,6 +113,14 @@ def sessions_router(host: Host) -> APIRouter:
         session = await host.load_session(name)
         return session.summary()
 
+    @router.post(
+        "/sessions/{name}/unload",
+        response_model=protocol.DeleteResult,
+        summary="Stop hosting a session (it stays saved on disk)",
+    )
+    async def unload_session(name: str) -> protocol.DeleteResult:
+        return protocol.DeleteResult(deleted=await host.unload_session(name))
+
     @router.get(
         "/sessions/{name}",
         response_model=Snapshot,
@@ -227,15 +235,6 @@ def sessions_router(host: Host) -> APIRouter:
     async def diff(name: str, path: str | None = None) -> protocol.DiffInfo:
         session = await _session_or_load(host, name)
         return await session.diff_info(path)
-
-    @router.post(
-        "/sessions/{name}/close",
-        response_model=protocol.CloseResult,
-        summary="Stop hosting a session (cancel + unload; the saved file is kept)",
-    )
-    async def close_session(name: str) -> protocol.CloseResult:
-        closed = await host.unload_session(name)
-        return protocol.CloseResult(closed=closed)
 
     @router.delete(
         "/sessions/{name}",

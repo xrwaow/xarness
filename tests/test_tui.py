@@ -15,15 +15,13 @@ from xarness.conversation import (
     AssistantMessage, TextPart, Timing, ToolMessage, UserMessage,
 )
 from xarness.protocol import (
-    Activity,
     CommandResult,
     ConfigInfo,
     DiffInfo,
     Event,
-    SessionConfigView,
     SessionSummary,
     Snapshot,
-    StatusPayload,
+    Status,
 )
 from xarness.tui import flow as tflow
 from xarness.tui.transcript import ToolStatus
@@ -44,7 +42,7 @@ class FakeClient:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.commands: list[tuple[str, Event]] = []
         self.command_results: dict[str, CommandResult] = {}
-        self.closed: list[str] = []
+        self.unloaded: list[str] = []
         self.refs: list[protocol.RefInfo] = []
         self.ref_updates: list[tuple[str, str, bool]] = []
 
@@ -111,9 +109,11 @@ class FakeClient:
     async def delete_session(self, name: str) -> CommandResult:
         return CommandResult(cmd_id="t", ok=True)
 
-    async def close_session(self, name: str) -> CommandResult:
-        self.closed.append(name)
-        return CommandResult(cmd_id="t", ok=True)
+    async def unload_session(self, name: str) -> bool:
+        # Quitting must not unload anything: a session is the host's, and the
+        # quit tests assert this stays empty.
+        self.unloaded.append(name)
+        return True
 
     async def aclose(self) -> None:
         pass
@@ -122,20 +122,16 @@ class FakeClient:
 def make_snapshot(state: str = "idle") -> Snapshot:
     return Snapshot(
         messages=[],
-        status=StatusPayload(
-            config=SessionConfigView(
-                session_name="s1", workspace="/tmp/ws", mode="write",
-                model_name="m", model_display_name="m", model_id="m",
-            ),
-            activity=Activity(state=state),  # type: ignore[arg-type]
+        status=Status(
+            state=state,  # type: ignore[arg-type]
+            session_name="s1", workspace="/tmp/ws", mode="write",
+            model_name="m", model_display_name="m", model_id="m",
         ),
     )
 
 
 def running_status_event() -> Event:
-    return protocol.StatusChanged(
-        activity=Activity(state="running"),  # type: ignore[arg-type]
-    )
+    return protocol.StatusChanged(status=Status(state="running"))
 
 
 class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
@@ -171,9 +167,9 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             cancels = [c for _, c in client.commands if c.type == "cancel"]
             self.assertEqual(len(cancels), 1)
-            # "Stop and quit" also unloads the session from the host (it
-            # stays saved on disk) — otherwise it lingers in the host's list.
-            self.assertEqual(client.closed, ["s1"])
+            # ...and nothing unloads the session: quitting is a disconnect,
+            # the host owns the session's lifetime.
+            self.assertEqual(client.unloaded, [])
             self.assertFalse(app.is_running)
 
         await self._run(make_snapshot(), script)
@@ -237,7 +233,7 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            client.queue.put_nowait(protocol.StatusChanged(activity=Activity(
+            client.queue.put_nowait(protocol.StatusChanged(status=Status(
                 state="running",  # type: ignore[arg-type]
                 session_name="s1", workspace="/tmp/ws", mode="write",
                 model_name="m", model_display_name="m", model_id="m",
@@ -276,30 +272,32 @@ class ImportBoundaryTest(unittest.TestCase):
 
 
 class ReconnectTest(unittest.IsolatedAsyncioTestCase):
-    """On connection loss the TUI respawns the host and reattaches; the
-    stream endpoint loads the saved session, with no separate round-trip."""
+    """On connection loss the TUI re-attaches: a reconnect always delivers a
+    fresh snapshot, and the client respawns a dead host on the next request
+    (``clientlib.ensure_host`` on ``ConnectError``) — so the stream loop only
+    retries."""
 
-    async def test_connection_loss_respawns_and_reattaches(self) -> None:
-        from unittest import mock
-
-        import xarness.tui.app as app_mod
-        from xarness.tui.app import AgentApp
+    async def test_connection_loss_reattaches(self) -> None:
+        from xarness.tui.app import RECONNECT_MIN, AgentApp
 
         client = FakeClient(make_snapshot())
         client.fail_attach_first = True
-        client.spawned: list[bool] = []
+        attaches: list[str] = []
+        real_attach = client.attach
 
-        async def fake_ensure_host(timeout: float = 5.0) -> None:
-            client.spawned.append(True)
+        def attach(name: str):
+            attaches.append(name)
+            return real_attach(name)
 
-        with mock.patch.object(app_mod, "ensure_host", fake_ensure_host):
-            app = AgentApp(client, workspace=None, session_name="s1")
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                await pilot.pause()
-                await pilot.pause()
+        client.attach = attach
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # The loop backs off before retrying the stream.
+            await asyncio.sleep(RECONNECT_MIN + 0.1)
+            await pilot.pause()
 
-        self.assertEqual(client.spawned, [True])
+        self.assertEqual(attaches, ["s1", "s1"])
 
 
 class _WidgetApp(App):
@@ -358,8 +356,8 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause()
             # Empty Enter with queued messages flushes them now.
-            assert app._activity is not None
-            app._activity.queued = [QueuedMessage(text="steer")]
+            assert app._status is not None
+            app._status.queued = [QueuedMessage(text="steer")]
             app._refresh_steer_bar()
             await pilot.press("enter")
             await pilot.pause()
@@ -387,23 +385,33 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat_input.text, "/filter ")
             self.assertEqual(client.commands, [])
 
-    async def test_ctrl_c_skips_headless_prompt_when_opened_elsewhere(self) -> None:
+    async def test_ctrl_c_asks_even_when_another_client_is_attached(self) -> None:
+        """Quitting is a disconnect, never an unload: the question (and
+        "Stop and quit"'s single interrupt) is the same whether one or two
+        clients are watching, so a second client's presence no longer
+        changes the menu."""
         from xarness.tui.app import AgentApp
+        from xarness.tui.confirm_screen import ConfirmScreen
 
         client = FakeClient(make_snapshot("running"))
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            activity = running_status_event().activity.model_copy(
+            status = running_status_event().status.model_copy(
                 update={"clients_attached": 2},
             )
-            client.queue.put_nowait(protocol.StatusChanged(activity=activity))
+            client.queue.put_nowait(protocol.StatusChanged(status=status))
             await pilot.pause()
             await pilot.press("ctrl+c")
             await pilot.pause()
-            # No modal shown; the app just exits (the session stays for the
-            # other attached client).
+            self.assertIsInstance(app.screen, ConfirmScreen)
+            await pilot.press("y")   # Continue headless: just detach
+            await pilot.pause()
             self.assertFalse(app.is_running)
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "cancel"], [],
+            )
+            self.assertEqual(client.unloaded, [])
 
 
 class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
@@ -536,15 +544,14 @@ class DriftPromptStateTest(unittest.IsolatedAsyncioTestCase):
                        session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._config = SessionConfigView(session_name="s1")
-            app._activity = Activity(
-                state="idle",
+            app._status = Status(
+                session_name="s1",
                 pending_drift=protocol.PendingDrift(
                     workspace="/tmp/ws", last_known="aaa", current="bbb",
                     files=["a.txt"]),
             )
             await app._handle_event(protocol.DriftResolved(accepted=False))
-            self.assertIsNone(app._activity.pending_drift)
+            self.assertIsNone(app._status.pending_drift)
 
 
 class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
@@ -1041,13 +1048,10 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             snap = make_snapshot()
             object.__setattr__(
                 snap, "status",
-                StatusPayload(
-                    config=SessionConfigView(
-                        session_name="other", workspace="/other/ws",
-                        mode="write", model_name="m", model_display_name="m",
-                        model_id="m",
-                    ),
-                    activity=Activity(state="idle"),
+                Status(
+                    session_name="other", workspace="/other/ws",
+                    mode="write", model_name="m", model_display_name="m",
+                    model_id="m",
                 ),
             )
             client.snapshot_data = snap
@@ -1077,14 +1081,11 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             snap = make_snapshot()
             object.__setattr__(
                 snap, "status",
-                StatusPayload(
-                    config=SessionConfigView(
-                        session_name="other",
-                        workspace="/workspace/projects/xarness",
-                        mode="write", model_name="m", model_display_name="m",
-                        model_id="m",
-                    ),
-                    activity=Activity(state="idle"),
+                Status(
+                    session_name="other",
+                    workspace="/workspace/projects/xarness",
+                    mode="write", model_name="m", model_display_name="m",
+                    model_id="m",
                 ),
             )
             client.snapshot_data = snap
@@ -1380,7 +1381,7 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
             app._submit("hello", None)
             await pilot.pause()
             await pilot.pause()
-            client.queue.put_nowait(protocol.StatusChanged(activity=Activity(
+            client.queue.put_nowait(protocol.StatusChanged(status=Status(
                 state="idle", session_name="s-new", workspace="/tmp/ws",
                 mode="write", model_name="glm-flash",
                 model_display_name="GLM Flash", model_id="glm-flash",
@@ -1526,6 +1527,73 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(thinking[0].done)
             self.assertIn("Thought for", all_text)
             self.assertIn("Worked for 5.0s | 4.0s 1.0s", all_text)
+
+    async def test_attach_mid_tool_shows_it_running_not_interrupted(self) -> None:
+        """A turn whose tools are still executing has no result for those
+        calls yet. Drawn from the history alone the call reads as failed
+        ("interrupted") and the round's stamp as a finished turn; the live
+        round in the snapshot must win."""
+        from xarness.tui.app import AgentApp
+
+        snap = make_snapshot("running")
+        snap.messages = [
+            UserMessage(parts=[TextPart(text="do it")], id="u1"),
+            AssistantMessage(
+                content="",
+                timing=Timing(
+                    start="2025-01-01T00:00:00+00:00",
+                    end="2025-01-01T00:00:02+00:00",
+                ),
+                tool_calls=[{"call_id": "c1", "name": "read_file",
+                             "arguments_json": "{}"}],
+            ),
+        ]
+        snap.partial_round = protocol.PartialRound(
+            tool_calls=[protocol.PartialToolCall(
+                call_id="c1", name="read_file", arguments="{}",
+            )],
+        )
+        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            flow = app.query_one("#chat-log")
+            all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
+            tools = [e.item for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.ToolItem)]
+            self.assertEqual(len(tools), 1)
+            self.assertIs(tools[0].status, ToolStatus.MAKING_CALL)
+            self.assertNotEqual(tools[0].output, "interrupted")
+            self.assertNotIn("Worked for", all_text)  # the turn is still open
+
+    async def test_unanswered_call_in_a_running_turn_is_not_interrupted(self) -> None:
+        """The host says the turn is running, so a call with no result is the
+        one in flight — even if the snapshot carries no live round for it
+        (an older host, or a gap in the bookkeeping)."""
+        from xarness.tui.app import AgentApp
+
+        snap = make_snapshot("running")
+        snap.messages = [
+            UserMessage(parts=[TextPart(text="do it")], id="u1"),
+            AssistantMessage(
+                content="",
+                timing=Timing(
+                    start="2025-01-01T00:00:00+00:00",
+                    end="2025-01-01T00:00:02+00:00",
+                ),
+                tool_calls=[{"call_id": "c1", "name": "read_file",
+                             "arguments_json": "{}"}],
+            ),
+        ]
+        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            tools = [e.item for e in app._flow_model.entries
+                     if isinstance(e.item, tflow.ToolItem)]
+            self.assertEqual(len(tools), 1)
+            self.assertIs(tools[0].status, ToolStatus.MAKING_CALL)
+            self.assertNotEqual(tools[0].output, "interrupted")
 
 
 class FlowViewTest(unittest.IsolatedAsyncioTestCase):

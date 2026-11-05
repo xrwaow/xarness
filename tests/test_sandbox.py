@@ -633,7 +633,7 @@ class ContainerMountsTest(SandboxArgvTest):
             ("read_only", dict(read_only=True)),
             ("allow_network", dict(allow_network=True)),
             ("gpu_access", dict(gpu_access=True)),
-            ("use_container", dict(use_container=False)),
+            ("use_sandbox", dict(use_sandbox=False)),
             ("filter_list", dict(filter_list=["x"])),
         ]
         for name, change in cases:
@@ -702,16 +702,16 @@ class ConfigFlagsTest(SandboxArgvTest):
             self.assertNotIn(var, argv)
             self.assertNotIn(proxies[var], argv)
 
-    # -- use_container ------------------------------------------------
+    # -- use_sandbox ------------------------------------------------
 
     def test_unsandboxed_argv_is_bare_command(self):
-        config = self.config(use_container=False)
+        config = self.config(use_sandbox=False)
         command = ["/bin/sh", "-c", "echo hi"]
         self.assertEqual(config.build_argv(command), command)
 
     def test_unsandboxed_does_not_require_bwrap(self):
         with mock.patch("shutil.which", return_value=None):
-            config = SandboxConfig(workspace=self.workspace, use_container=False)
+            config = SandboxConfig(workspace=self.workspace, use_sandbox=False)
         self.assertEqual(config.tool_path("src/app.py"),
                          str(self.workspace / "src/app.py"))
         self.assertEqual(config.tool_path("./notes.txt"),
@@ -723,7 +723,7 @@ class ConfigFlagsTest(SandboxArgvTest):
                 SandboxConfig(workspace=self.workspace)
 
     def test_isolation_settings_ignored_unsandboxed(self):
-        config = self.config(use_container=False, filter_list=["secret.txt"],
+        config = self.config(use_sandbox=False, filter_list=["secret.txt"],
                              allow_network=True, gpu_access=True)
         self.assertEqual(config.build_argv(["/bin/sh", "-c", "echo hi"]),
                          ["/bin/sh", "-c", "echo hi"])
@@ -810,7 +810,7 @@ class ConfigFlagsTest(SandboxArgvTest):
 
     def test_default_timeout_flows_into_the_shell(self):
         settings = SandboxSettings(
-            default_timeout=0.5, use_container=False)
+            default_timeout=0.5, use_sandbox=False)
         runtime = SandboxRuntime.make(self.workspace, settings, None)
         assert runtime.shell is not None
         self.assertEqual(runtime.shell.default_timeout, 0.5)
@@ -838,7 +838,7 @@ class ConfigFlagsTest(SandboxArgvTest):
             workspace=workspace,
             allow_network=settings.allow_network,
             gpu_access=settings.gpu_access,
-            use_container=settings.use_container,
+            use_sandbox=settings.use_sandbox,
             filter_list=list(settings.filter_list),
             external_refs=SandboxConfig.resolve_auto_refs(
                 workspace, settings.auto_include_refs),
@@ -868,7 +868,7 @@ class ConfigFlagsTest(SandboxArgvTest):
             SandboxSettings(gpu_access=True, filter_list=["secret.txt"],
                             auto_include_refs=["docs/spec.md"],
                             default_timeout=7.5),
-            SandboxSettings(use_container=False, allow_network=True),
+            SandboxSettings(use_sandbox=False, allow_network=True),
         ]
         for settings in matrices:
             with self.subTest(settings=settings.model_dump()):
@@ -881,7 +881,7 @@ class ConfigFlagsTest(SandboxArgvTest):
 
 
 # ----------------------------------------------------------------------
-# Unsandboxed mode (use_container=False)
+# Unsandboxed mode (use_sandbox=False)
 
 
 class UnsandboxedTest(unittest.TestCase):
@@ -898,7 +898,7 @@ class UnsandboxedTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_config_and_tool_paths(self):
-        config = SandboxConfig(workspace=self.workspace, use_container=False)
+        config = SandboxConfig(workspace=self.workspace, use_sandbox=False)
         self.assertEqual(config.tool_path("."), str(self.workspace))
         self.assertEqual(config.tool_path("src/app.py"),
                          str(self.workspace / "src/app.py"))
@@ -907,7 +907,7 @@ class UnsandboxedTest(unittest.TestCase):
     def test_refs_still_resolve_but_nothing_mounted(self):
         (self.workspace / "docs").mkdir()
         (self.workspace / "docs" / "spec.md").write_text("x\n")
-        settings = SandboxSettings(use_container=False,
+        settings = SandboxSettings(use_sandbox=False,
                                    auto_include_refs=["docs/spec.md"],
                                    gpu_access=True)
         config = SandboxConfig.from_settings(self.workspace, settings)

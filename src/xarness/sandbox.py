@@ -46,7 +46,7 @@ def has_ref_mounts(sandbox: "SandboxConfig") -> bool:
     Refs only exist inside the container; unsandboxed sessions have no refs
     area at all, so neither the tools nor the prompt should advertise one.
     """
-    return sandbox.use_container and any(
+    return sandbox.use_sandbox and any(
         ref.mount.startswith(REFS_ANCHOR + "/")
         for ref in sandbox.external_refs.values()
     )
@@ -374,13 +374,13 @@ class SandboxConfig:
     # False = tools run as a user-level stateful bash on the host (an
     # unsandboxed mode): no bwrap container, no mount isolation. Documented
     # in the config; the TUI shows a visible marker when it is off.
-    # NOTE: with use_container=False the mount-isolation settings are
+    # NOTE: with use_sandbox=False the mount-isolation settings are
     # IGNORED — filter_list (no mounts to exclude), allow_network (nothing
     # blocks network on the host) and gpu_access (all devices are already
     # reachable) have no effect. Plan mode therefore refuses run_bash in
     # this mode (see tools.build_registry): there is no read-only mount to
     # enforce it with.
-    use_container: bool = True
+    use_sandbox: bool = True
     # Install the read-only git shim (gitwork.git_shim_script) first on
     # PATH: blocked subcommands fail in place at execution time instead of
     # the whole command string being vetoed before it runs. Set by
@@ -407,7 +407,7 @@ class SandboxConfig:
     _argv_prefix_cache: tuple[tuple, list[str]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if self.use_container and shutil.which("bwrap") is None:
+        if self.use_sandbox and shutil.which("bwrap") is None:
             raise SandboxUnavailable(
                 "bwrap (bubblewrap) not found on PATH; install it "
                 "(e.g. `sudo dnf install bubblewrap` on Fedora) "
@@ -431,7 +431,7 @@ class SandboxConfig:
             self.read_only,
             self.allow_network,
             self.gpu_access,
-            self.use_container,
+            self.use_sandbox,
             self.git_shim,
             tuple(sorted(self.filter_list)),
             self.uses_project_venv(),
@@ -485,7 +485,7 @@ class SandboxConfig:
             workspace=workspace,
             allow_network=settings.allow_network,
             gpu_access=settings.gpu_access,
-            use_container=settings.use_container,
+            use_sandbox=settings.use_sandbox,
             filter_list=list(settings.filter_list),
             external_refs=cls.resolve_auto_refs(
                 workspace,
@@ -529,19 +529,19 @@ class SandboxConfig:
         """Path the agent's workspace is anchored at: the container mount,
         or the real directory in unsandboxed mode. Every use of this for
         argv building is inside a container-only branch."""
-        return _WORKSPACE if self.use_container else str(self.workspace)
+        return _WORKSPACE if self.use_sandbox else str(self.workspace)
 
     def tool_path(self, path: str) -> str:
         """Anchor a validated agent-workspace-relative path at its mount point.
         Absolute container paths (e.g. /tmp/refs/<alias>) are returned as-is.
         Commands must not rely on the process cwd.
 
-        Unsandboxed mode (use_container=False) has no container mount: paths
+        Unsandboxed mode (use_sandbox=False) has no container mount: paths
         resolve to the real workspace on the host."""
         norm = posixpath.normpath(path) if path else "."
         if posixpath.isabs(norm):
             return norm
-        if not self.use_container:
+        if not self.use_sandbox:
             return str(self.workspace / norm) if norm != "." else str(self.workspace)
         return f"{_WORKSPACE}/{norm}"
 
@@ -801,7 +801,7 @@ class SandboxConfig:
         return argv
 
     def build_argv(self, command: list[str]) -> list[str]:
-        if not self.use_container:
+        if not self.use_sandbox:
             # Unsandboxed mode: a user-level stateful shell on the host —
             # no bwrap, no mount isolation. The persistent shell starts in
             # the workspace (see SandboxSession._ensure_started).
@@ -998,7 +998,7 @@ class SandboxSession:
         # an inherited value); unsandboxed mode has no bwrap, so hand it to
         # the shell's own environment.
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-        if not self._config.use_container and self._config.git_shim:
+        if not self._config.use_sandbox and self._config.git_shim:
             # Unsandboxed mode has no container PATH to rewrite from the
             # inside, so prepend the same read-only git shim here: both modes
             # then enforce one policy, at execution time.
@@ -1012,7 +1012,7 @@ class SandboxSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             # Unsandboxed mode: the host shell starts in the workspace.
-            cwd=str(self._config.workspace) if not self._config.use_container else None,
+            cwd=str(self._config.workspace) if not self._config.use_sandbox else None,
             # readline's default 64 KiB line limit raises ValueError on
             # longer lines (minified bundles), which surfaces as a confusing
             # tool error — allow chunky single lines instead.
@@ -1177,8 +1177,8 @@ class SandboxRuntime:
         )
 
     @property
-    def use_container(self) -> bool:
-        return self.config.use_container if self.config is not None else True
+    def use_sandbox(self) -> bool:
+        return self.config.use_sandbox if self.config is not None else True
 
     @property
     def allow_git_write(self) -> bool:

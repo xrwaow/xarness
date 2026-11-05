@@ -188,7 +188,7 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
         return snapshot, events
 
     snapshot, events = asyncio.run(go())
-    statuses = [e.activity for e in events if isinstance(e, protocol.StatusChanged)]
+    statuses = [e.status for e in events if isinstance(e, protocol.StatusChanged)]
     totals = [(s.usage_total.input_tokens, s.usage_total.output_tokens) for s in statuses]
     # The per-round refreshes appear in order: after round 1 and after round 2.
     assert (100, 10) in totals and (300, 30) in totals, totals
@@ -297,6 +297,187 @@ def test_cancel_interrupts_turn(tmp_path) -> None:
     asyncio.run(go())
 
 
+def _blocking_session(tmp_path, started: asyncio.Event) -> Session:
+    """A session whose provider starts a round and then hangs, so the test
+    controls the moment the turn is still running."""
+    class BlockingClient:
+        async def stream(self, wire_messages, tools=None):
+            yield ProcessingStarted()
+            started.set()
+            await asyncio.sleep(30)
+
+    return Session(
+        name="test", workspace=tmp_path, profile=PROFILE, profile_name="test",
+        api_key="key", client=BlockingClient(),
+    )
+
+
+def _tracked_git_info(tmp_path):
+    from xarness.gitwork import GitInfo
+
+    return GitInfo(
+        repo_root=tmp_path, session_id="test", git_dir=tmp_path,
+        baseline_tree="a" * 40, last_seen_tree="a" * 40,
+    )
+
+
+def _slow_after_tree(monkeypatch, session, gate: asyncio.Event):
+    """First snapshot (turn start) is instant; the after-tree snapshot
+    blocks on ``gate``, widening the teardown window a Cancel can land in."""
+    import xarness.session as session_mod
+
+    calls = 0
+
+    async def snapshot(info):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "a" * 40
+        gate.set()
+        await asyncio.sleep(0.2)
+        return "b" * 40
+
+    monkeypatch.setattr(session_mod, "snapshot_state", snapshot)
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(session, "_emit_diff_changed", noop)
+
+
+def test_cancel_while_turn_is_finishing_does_not_strand_running(
+    tmp_path, monkeypatch,
+) -> None:
+    """The footer still says "running" during the end-of-turn snapshot, so a
+    Cancel can land in the teardown of an *already finished* turn. It used to
+    abort the state flip and leave a phantom "running" session with no task;
+    every later attach then rendered a live turn that did not exist."""
+    session = make_session([_round("done")], tmp_path)
+    session.git_info = _tracked_git_info(tmp_path)
+    gate = asyncio.Event()
+    _slow_after_tree(monkeypatch, session, gate)
+
+    async def go():
+        queue = session.subscribe()[1]
+        await session.execute("c1", SendMessage(text="hi"))
+        await asyncio.wait_for(gate.wait(), 5)
+        assert session._state == "running"  # teardown has not flipped yet
+        await session.execute("c2", Cancel())
+        await wait_idle(session)
+        assert session._turn_task is None
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(isinstance(e, protocol.TurnEnded) for e in events)
+
+    asyncio.run(go())
+
+
+def test_repeated_cancel_during_unwind_does_not_strand_running(
+    tmp_path, monkeypatch,
+) -> None:
+    """A second Cancel while the interrupted turn is still unwinding must not
+    abort its teardown (the classic phantom-running state)."""
+    started = asyncio.Event()
+    session = _blocking_session(tmp_path, started)
+    session.git_info = _tracked_git_info(tmp_path)
+    gate = asyncio.Event()
+    _slow_after_tree(monkeypatch, session, gate)
+
+    async def go():
+        session.subscribe()
+        await session.execute("c1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), 5)
+        await session.execute("c2", Cancel())
+        await asyncio.wait_for(gate.wait(), 5)
+        # The user, still seeing "running", cancels again — and again.
+        for i in range(3):
+            await session.execute(f"again-{i}", Cancel())
+        await wait_idle(session)
+        assert session._turn_task is None
+
+    asyncio.run(go())
+
+
+def test_teardown_failure_still_flips_idle(tmp_path, monkeypatch) -> None:
+    """A failing after-tree snapshot/persist must not skip the state flip:
+    the session reports idle and the turn end is still announced."""
+    session = make_session([_round("done")], tmp_path)
+    session.git_info = _tracked_git_info(tmp_path)
+
+    async def boom() -> None:
+        raise RuntimeError("snapshot store exploded")
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(session, "_finish_turn", boom)
+    monkeypatch.setattr(session, "_emit_diff_changed", noop)
+
+    async def go():
+        queue = session.subscribe()[1]
+        await session.execute("c1", SendMessage(text="hi"))
+        await wait_idle(session)
+        assert session._turn_task is None
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(isinstance(e, protocol.TurnEnded) for e in events)
+
+    asyncio.run(go())
+
+
+def test_a_turn_that_dies_before_teardown_is_healed(tmp_path, monkeypatch) -> None:
+    """Belt and braces: a task that ends without reaching the state flip is
+    healed by its done-callback, and the attach-time check heals a state
+    stranded by any other path — neither can leave a phantom "running"."""
+    session = make_session([_round("done")], tmp_path)
+
+    async def boom(outcome, turn_start) -> None:
+        raise RuntimeError("teardown skipped")
+
+    monkeypatch.setattr(session, "_close_out_turn", boom)
+
+    async def go():
+        queue = session.subscribe()[1]
+        await session.execute("c1", SendMessage(text="hi"))
+        await asyncio.sleep(0.05)
+        await wait_idle(session)
+        assert session._turn_task is None
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(isinstance(e, protocol.TurnEnded) for e in events)
+
+        # A state stranded with no task at all (any path that missed the
+        # callback) is healed by the next attach, before the snapshot.
+        session._set_state("running")
+        assert session.is_active  # a phantom turn keeps the host alive
+        snapshot, _queue = session.subscribe()
+        assert snapshot.status.state == "idle"
+        assert session.state == "idle"
+
+    asyncio.run(go())
+
+
+def test_attach_does_not_touch_a_real_running_turn(tmp_path) -> None:
+    """The attach-time check must not mistake a live turn for a stranded
+    one: the snapshot shows it running and it finishes normally."""
+    started = asyncio.Event()
+    session = _blocking_session(tmp_path, started)
+
+    async def go():
+        session.subscribe()
+        await session.execute("c1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), 5)
+        snapshot, _queue = session.subscribe()
+        assert snapshot.status.state == "running"
+        await session.execute("c2", Cancel())
+        await wait_idle(session)
+
+    asyncio.run(go())
+
+
 def test_cmd_id_dedupe(tmp_path) -> None:
     session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 
@@ -323,9 +504,9 @@ def test_ask_first_answer_wins(tmp_path) -> None:
         while not queue.empty():
             events.append(queue.get_nowait())
         asked = [e for e in events if isinstance(e, protocol.StatusChanged)
-                 and e.activity.pending_ask is not None]
+                 and e.status.pending_ask is not None]
         assert len(asked) == 1
-        ask_id = asked[0].activity.pending_ask.ask_id
+        ask_id = asked[0].status.pending_ask.ask_id
         first = await session.execute("a1", AnswerAsk(ask_id=ask_id, answers=["do it"]))
         second = await session.execute("a2", AnswerAsk(ask_id=ask_id, answers=["no"]))
         assert first.ok and not second.ok  # first answer wins
@@ -413,6 +594,25 @@ def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
         assert set(message) <= {
             "role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content",
         }
+
+
+def test_user_message_is_on_disk_while_the_turn_runs(tmp_path) -> None:
+    """A host killed mid-turn must not lose what the user asked: the
+    message is persisted when it lands, not only at turn end."""
+    started = asyncio.Event()
+    session = _blocking_session(tmp_path, started)
+
+    async def go():
+        session.subscribe()
+        await session.execute("c1", SendMessage(text="hello there"))
+        await asyncio.wait_for(started.wait(), 5)
+        await session._flush_persist()
+        assert session.state == "running"  # the turn has not finished
+        stored = session_store.load_state("test").conversation
+        assert [m.role for m in stored.messages][:1] == ["user"]
+        assert stored.messages[0].content == "hello there"
+
+    asyncio.run(go())
 
 
 def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
@@ -809,7 +1009,7 @@ def test_only_round_content_updates_partial_round(tmp_path) -> None:
     async def go():
         session._set_state("running")
         session._emit(protocol.Notice(text="stale notice"))
-        session._emit(protocol.StatusChanged(activity=session._activity()))
+        session._emit(protocol.StatusChanged(status=session.status()))
         assert session.snapshot().partial_round is None
         # The controller fills the model-stream half (status/notice events
         # never create a partial round).
@@ -848,6 +1048,31 @@ def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
         ))
         call = session.snapshot().partial_round.tool_calls[0]
         assert call.status == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_running_tool_stays_in_the_live_round(tmp_path) -> None:
+    """While a tool executes its call has no result yet, so an attaching
+    client must get it from the snapshot's live round — not from the
+    history, where the bare call reads as interrupted and the round's
+    stamp as a finished turn."""
+    registry, started, release = _blocking_edit(tmp_path)
+    session = make_session([_tool_round()], tmp_path, tools=registry)
+
+    async def go():
+        session.subscribe()
+        await session.execute("c1", SendMessage(text="go"))
+        await asyncio.wait_for(started.wait(), 5)
+        snap = session.snapshot()
+        assert snap.status.state == "running"
+        assert snap.partial_round is not None
+        assert [(c.call_id, c.status) for c in snap.partial_round.tool_calls] \
+            == [("c1", None)]
+        # Nothing to pair the call with yet: the history alone would lie.
+        assert [m.role for m in snap.messages] == ["user", "assistant"]
+        release.set()
+        await wait_idle(session)
 
     asyncio.run(go())
 

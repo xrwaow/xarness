@@ -182,24 +182,30 @@ class Host:
         if saved_sandbox_settings is not None:
             settings = SandboxSettings.model_validate(saved_sandbox_settings)
             sandbox_key = saved_sandbox_name or sandbox_key
-        # Tri-state CLI overrides (--network/--gpu): the flag wins over the
-        # sandbox profile when given.
-        if request.network is not None or request.gpu is not None:
-            settings = settings.model_copy(update={
-                **({"allow_network": request.network}
-                   if request.network is not None else {}),
-                **({"gpu_access": request.gpu}
-                   if request.gpu is not None else {}),
-            })
+        # Tri-state CLI overrides (--sandbox true/false, --network, --gpu,
+        # --enable_tracking): a given flag wins over the sandbox profile.
+        overrides = {
+            "allow_network": request.network,
+            "gpu_access": request.gpu,
+            "use_sandbox": request.use_sandbox,
+            "enable_tracking": request.enable_tracking,
+        }
+        overrides = {k: v for k, v in overrides.items() if v is not None}
+        if overrides:
+            settings = settings.model_copy(update=overrides)
         try:
             api_key = resolve_api_key(profile)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
 
-        # A loaded session already persisted its git block: reuse it instead
-        # of re-scanning/snapshotting the whole workspace just to throw the
-        # fresh result away below. That scan is the slow part of resume.
-        if saved_git_info is not None:
+        # Tracking off (profile or --enable_tracking false): no checkpoints,
+        # so skip the workspace scan instead of doing it and discarding the
+        # result. Otherwise reuse a loaded session's saved git block — that
+        # scan is the slow part of resume — and scan fresh only for a new
+        # session.
+        if not settings.enable_tracking:
+            git_info = None
+        elif saved_git_info is not None:
             git_info = saved_git_info
         else:
             try:
@@ -208,8 +214,6 @@ class Host:
                 )
             except GitWorktreeError:
                 git_info = None
-        if not settings.enable_tracking:
-            git_info = None
 
         try:
             sandbox = SandboxRuntime.make(

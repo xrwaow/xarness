@@ -177,23 +177,25 @@ class SessionUpdate(BaseModel):
     ref_add: bool | None = None
 
 
-class CloseResult(BaseModel):
-    closed: bool
-
-
 class DeleteResult(BaseModel):
     deleted: bool
 
 
 class CreateSessionRequest(BaseModel):
-    """POST /v1/sessions body."""
+    """POST /v1/sessions body.
+
+    ``sandbox`` names a sandbox profile; ``use_sandbox``/``network``/``gpu``/
+    ``enable_tracking`` are the tri-state CLI overrides (None = keep the
+    profile's value, which is also what an absent flag sends)."""
 
     workspace: str | None = None
     model: str | None = None
     sandbox: str | None = None
     preset: str | None = None
     no_init_repo: bool = False
+    use_sandbox: bool | None = None
     network: bool | None = None
     gpu: bool | None = None
+    enable_tracking: bool | None = None
     no_session: bool = False
     first_message: str | None = None

@@ -363,7 +363,7 @@ def _check_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
 def _check_write_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
     """Workspace-relative path checks shared by the writing tools: no
     absolute paths except the read-only refs area, no traversal."""
-    if sandbox.use_container and is_refs_path(path):
+    if sandbox.use_sandbox and is_refs_path(path):
         return ToolResult(status="error", content=f"'{REFS_ANCHOR}/' is read-only")
     return _check_path(sandbox, path)
 
@@ -414,7 +414,7 @@ def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
     async def read_file(args: ReadFileArgs) -> ToolResult:
         path = args.path
         if Path(path).is_absolute():
-            if not sandbox.use_container:
+            if not sandbox.use_sandbox:
                 return _bad(
                     "absolute paths only exist inside the sandbox container; "
                     "use a workspace-relative path"
@@ -802,13 +802,13 @@ def build_registry(
         # mounts, so run_bash cannot change files. Write mode drops the
         # read-only mount and adds the editing tools.
         #
-        # EXCEPT when the sandbox is unsandboxed (use_container=False):
+        # EXCEPT when the sandbox is unsandboxed (use_sandbox=False):
         # there is no read-only mount to enforce plan mode with — commands
         # would run unsandboxed on the host — so run_bash is NOT available
         # in plan mode at all (read_file still is). filter_list,
         # allow_network and gpu_access are likewise ignored in that mode
-        # (see SandboxConfig.use_container).
-        if session is not None and (sandbox.use_container or mode != "plan"):
+        # (see SandboxConfig.use_sandbox).
+        if session is not None and (sandbox.use_sandbox or mode != "plan"):
             registry.register(_make_run_bash_tool(session))  # run_bash
         if mode == "write":
             registry.register(_make_write_tool(sandbox, default_timeout))  # write_file

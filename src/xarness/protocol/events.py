@@ -14,9 +14,9 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from ..conversation import Message, ToolStatus, Usage
-from .views import Activity, DiffInfo, SessionConfigView, Snapshot
+from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 13
 
 # Error convention: REST routes fail with HTTP 4xx (400 bad request, 404
 # missing session/path); a ``command`` always returns 200 with
@@ -161,21 +161,11 @@ class MessageAdded(EventBase):
 
 
 class StatusChanged(EventBase):
-    """The session's activity changed (state, usage, queue, prompts).
-
-    Carries only the fast half; the config view travels separately
-    (:class:`ConfigChanged`) so per-round updates never re-send static data."""
+    """The session's status changed (state, usage, queue, prompts, and —
+    on settings changes — model/sandbox/mode/refs/tools)."""
 
     type: Literal["status_changed"] = "status_changed"
-    activity: Activity = Field(default_factory=lambda: Activity(state="idle"))
-
-
-class ConfigChanged(EventBase):
-    """The session's config view changed (mode, model, sandbox, filter,
-    refs, tools). Emitted only on actual settings changes."""
-
-    type: Literal["config_changed"] = "config_changed"
-    config: SessionConfigView = Field(default_factory=SessionConfigView)
+    status: Status = Field(default_factory=Status)
 
 
 class Notice(EventBase):
@@ -260,7 +250,6 @@ HostEvent = (
     | ToolFinished
     | MessageAdded
     | StatusChanged
-    | ConfigChanged
     | Notice
     | HistoryReplaced
     | CheckpointsChanged

@@ -40,8 +40,8 @@ from .protocol import (
 async def ensure_host(timeout: float = 5.0) -> None:
     """Make sure a host process is running (spawning one if needed).
 
-    Used by the TUI after a connection loss: the host may have exited while
-    nobody was attached."""
+    Used by ``_request`` after a ConnectError: the host may have exited
+    while nobody was attached."""
     from .host import connect_or_spawn
     await asyncio.to_thread(connect_or_spawn, timeout=timeout)
 
@@ -52,6 +52,21 @@ class ClientError(Exception):
     Transport failures (``httpx.HTTPError``) are wrapped into this too, so
     callers catch one exception type; the SSE reader's reconnect loop is the
     one place that still needs the raw httpx error and reads it directly."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        # The HTTP status when the error came from a response (None for
+        # transport failures); :attr:`permanent` is what callers test.
+        self.status = status
+
+    @property
+    def permanent(self) -> bool:
+        """Whether retrying is pointless: a 4xx that is not "busy, wait"."""
+        return (
+            self.status is not None
+            and 400 <= self.status < 500
+            and self.status != 429
+        )
 
 
 class XarnessClient:
@@ -100,11 +115,14 @@ class XarnessClient:
     @classmethod
     async def connect_unix(
         cls, socket_path: Path | None = None, *, spawn: bool = True,
+        check_version: bool = True,
     ) -> "XarnessClient":
         """Connect over the host's unix socket, auto-starting the host.
 
         The protocol version is checked against /health; on a mismatch with
-        no active sessions the stale host is shut down and respawned."""
+        no active sessions the stale host is shut down and respawned.
+        ``check_version=False`` skips that guard — used by ``--kill``, which
+        must reach a too-old host precisely to clear its sessions."""
         from .host import SOCKET_PATH, connect_or_spawn
         if spawn:
             # connect_or_spawn forks/waits on subprocesses — blocking work
@@ -118,7 +136,7 @@ class XarnessClient:
         )
         client = cls(http)
         info = await client.health()
-        if info.protocol_version != protocol.PROTOCOL_VERSION:
+        if check_version and info.protocol_version != protocol.PROTOCOL_VERSION:
             # An old host is still running from a previous build. With no
             # active sessions it is safe to replace it; otherwise tell the
             # user rather than killing their work.
@@ -132,7 +150,8 @@ class XarnessClient:
                 raise ClientError(
                     f"host speaks v{info.protocol_version}, this client speaks "
                     f"v{protocol.PROTOCOL_VERSION}; finish its {len(active)} active "
-                    "session(s) and restart the host"
+                    "session(s) and restart the host, or run `xarness --kill` "
+                    "to close them"
                 )
             from .host import stop_host
             await asyncio.to_thread(stop_host, info.pid, path)
@@ -232,11 +251,12 @@ class XarnessClient:
             "DELETE", f"/v1/sessions/{name}", model=protocol.DeleteResult,
         )
 
-    async def close_session(self, name: str) -> protocol.CloseResult:
-        """Stop hosting the session: cancel + unload; the saved file stays."""
-        return await self._post(
-            f"/v1/sessions/{name}/close", {}, model=protocol.CloseResult,
+    async def unload_session(self, name: str) -> bool:
+        """Stop hosting a session; its saved file is kept."""
+        result = await self._post(
+            f"/v1/sessions/{name}/unload", {}, model=protocol.DeleteResult,
         )
+        return result.deleted
 
     # ------------------------------------------------------------------
     # commands
@@ -277,7 +297,11 @@ class XarnessClient:
 
         async with _response_cm() as response:
             if response.status_code != 200:
-                raise ClientError(f"attach failed: HTTP {response.status_code}")
+                raise ClientError(
+                    f"attach failed: HTTP {response.status_code}: "
+                    f"{self._error_detail(response)}",
+                    status=response.status_code,
+                )
             async for kind, data in _read_sse(response):
                 if kind == "snapshot":
                     yield Snapshot.model_validate(data)
@@ -338,7 +362,9 @@ class XarnessClient:
     def _json(cls, response: httpx.Response) -> Any:
         if response.status_code >= 400:
             raise ClientError(
-                f"HTTP {response.status_code}: {cls._error_detail(response)}")
+                f"HTTP {response.status_code}: {cls._error_detail(response)}",
+                status=response.status_code,
+            )
         return response.json()
 
 

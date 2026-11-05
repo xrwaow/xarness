@@ -11,7 +11,7 @@ from xarness.protocol import (
     ProcessingStarted,
     ReasoningDelta,
     Snapshot,
-    StatusPayload,
+    Status,
     StreamError,
     ToolCallArgumentsDelta,
     ToolCallArgumentsDone,
@@ -24,7 +24,7 @@ from xarness.tui import transcript as tr
 
 
 def _snap(messages):
-    return Snapshot(status=StatusPayload(state="idle"), messages=messages)
+    return Snapshot(status=Status(state="idle"), messages=messages)
 
 
 def _user(text, mid="u"):
@@ -61,7 +61,7 @@ class TranscriptTest(unittest.TestCase):
         )
         new_answer = AssistantMessage(content="after", id="a2")
         snap = Snapshot(
-            status=StatusPayload(state="idle"),
+            status=Status(state="idle"),
             history=[old_user, old_answer],
             messages=[summary, new_answer],
         )
@@ -79,7 +79,7 @@ class TranscriptTest(unittest.TestCase):
         assistant = AssistantMessage(content="", tool_calls=[call], id="a1")
         result = ToolMessage(tool_call_id="c1", content="body", id="t1")
         snap = Snapshot(
-            status=StatusPayload(state="idle"),
+            status=Status(state="idle"),
             history=[_user("hi"), assistant, result],
             messages=[],
         )
