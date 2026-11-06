@@ -56,6 +56,7 @@ from ..protocol import (
     MessageAdded,
     Notice,
     ProcessingStarted,
+    QuitVerdict,
     ReasoningDelta,
     Reject,
     ResolveDrift,
@@ -1758,26 +1759,47 @@ class AgentApp(App[None]):
             return True
         return False
 
+    async def _quit_verdict(self) -> QuitVerdict | None:
+        """Ask the host whether closing now needs the continue-headless
+        choice; None when it cannot answer (host gone, timed out, older host
+        without the route). Never an error line: the app is leaving anyway."""
+        if self.session_name is None:
+            return None
+        try:
+            return await self.client.quit_verdict(self.session_name)
+        except (ClientError, httpx.HTTPError):
+            return None
+
     @work(group="quit", exclusive=True)
     async def action_copy_or_quit(self) -> None:
         """ctrl+c: copy the active selection if there is one, quit otherwise.
 
-        A turn lives in the host and never depends on a client watching it,
-        so quitting is only a disconnect: "Continue headless" drops the
-        stream (a later attach replays the turn, exactly like a second
-        client), and "Stop and quit" sends one interrupt first. Idle quits
-        immediately. (A worker: push_screen_wait requires one.)"""
+        The host decides whether quitting needs a choice: it is the only
+        side that knows if work is really in flight and whether another
+        client is still streaming the session. A turn lives in the host and
+        never depends on a client watching it, so quitting is only a
+        disconnect: "Continue headless" drops the stream (a later attach
+        replays the turn, exactly like a second client), and "Stop and
+        quit" sends one interrupt first. (A worker: push_screen_wait
+        requires one.)"""
         if self._copy_selection():
             return
         self._disarm_interrupt()
-        state = self.view_status.state
-        has_pending_ask = bool(self.view_status.pending_ask)
-        busy = self.session_name is not None and (
-            state in ("running", "compacting") or has_pending_ask
-        )
-        if busy:
+        if self.session_name is not None:
+            verdict = await self._quit_verdict()
+            # No verdict (host gone, timed out, older host without the
+            # route) quits like an idle session: the turn is the host's, so
+            # an unanswered question costs nothing but a headless run.
+            if verdict is None or not verdict.ask:
+                self.exit()
+                return
+            question = (
+                "The agent is waiting for your answer. Continue it in the "
+                "background?" if verdict.pending_ask else
+                "A request is still running. Continue it in the background?"
+            )
             choice = await self.push_screen_wait(ConfirmScreen(
-                "A request is still running. Continue it in the background?",
+                question,
                 confirm_label="Continue headless",
                 cancel_label="Stop and quit",
             ))
@@ -1793,8 +1815,6 @@ class AgentApp(App[None]):
                     )
                 except (asyncio.TimeoutError, ClientError):
                     pass
-            self.exit()
-            return
         self.exit()
 
     def action_copy_selection(self) -> None:

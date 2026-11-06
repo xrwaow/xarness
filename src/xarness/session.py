@@ -497,6 +497,23 @@ class Session:
             clients_attached=self.clients_attached,
         )
 
+    def quit_verdict(self) -> protocol.QuitVerdict:
+        """What a client about to disconnect must do (the quit menu's input).
+
+        Asking is only meaningful when the closing client is the last one
+        watching work that is still in flight: otherwise the turn keeps
+        streaming to someone else and quitting is just one viewer leaving.
+        The requester is assumed to hold one of the attached streams, so one
+        is subtracted from the count."""
+        others = max(0, self.clients_attached - 1)
+        return protocol.QuitVerdict(
+            ask=(self._state in ("running", "compacting")
+                 or self._pending_ask is not None) and others == 0,
+            state=self._state,
+            pending_ask=self._pending_ask is not None,
+            other_clients=others,
+        )
+
     def snapshot(self) -> Snapshot:
         """Full client-facing state (synchronous; see :meth:`subscribe`).
         Messages are pydantic models, so they go over the wire as-is."""

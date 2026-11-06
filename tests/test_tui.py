@@ -45,6 +45,11 @@ class FakeClient:
         self.unloaded: list[str] = []
         self.refs: list[protocol.RefInfo] = []
         self.ref_updates: list[tuple[str, str, bool]] = []
+        # The host's answer to "does closing need a choice?". Scripted per
+        # test: the policy is the host's (session.quit_verdict), never the
+        # TUI's, so the default is "nothing to ask".
+        self.quit_verdict_result = protocol.QuitVerdict(ask=False)
+        self.quit_verdict_error: Exception | None = None
 
     async def snapshot(self, name: str) -> Snapshot:
         return self.snapshot_data
@@ -115,6 +120,11 @@ class FakeClient:
         self.unloaded.append(name)
         return True
 
+    async def quit_verdict(self, name: str) -> protocol.QuitVerdict:
+        if self.quit_verdict_error is not None:
+            raise self.quit_verdict_error
+        return self.quit_verdict_result
+
     async def aclose(self) -> None:
         pass
 
@@ -145,6 +155,9 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_running_ctrl_c_shows_modal_and_continue_headless_exits(self) -> None:
         async def script(pilot: Pilot, client: FakeClient, app):
+            client.quit_verdict_result = protocol.QuitVerdict(
+                ask=True, state="running",
+            )
             client.queue.put_nowait(running_status_event())
             await pilot.pause()
             await pilot.press("ctrl+c")
@@ -154,11 +167,17 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause()
             self.assertFalse(app.is_running)
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "cancel"], [],
+            )
 
         await self._run(make_snapshot(), script)
 
     async def test_running_ctrl_c_stop_and_quit_cancels_then_exits(self) -> None:
         async def script(pilot: Pilot, client: FakeClient, app):
+            client.quit_verdict_result = protocol.QuitVerdict(
+                ask=True, state="running",
+            )
             client.queue.put_nowait(running_status_event())
             await pilot.pause()
             await pilot.press("ctrl+c")
@@ -174,8 +193,32 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
 
         await self._run(make_snapshot(), script)
 
+    async def test_pending_ask_uses_the_answer_specific_question(self) -> None:
+        async def script(pilot: Pilot, client: FakeClient, app):
+            client.quit_verdict_result = protocol.QuitVerdict(
+                ask=True, state="running", pending_ask=True,
+            )
+            client.queue.put_nowait(running_status_event())
+            await pilot.pause()
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            from textual.widgets import Label
+
+            from xarness.tui.confirm_screen import ConfirmScreen
+            self.assertIsInstance(app.screen, ConfirmScreen)
+            title = app.screen.query_one("#confirm-title", Label).render()
+            self.assertIn("waiting for your answer", str(title))
+            await pilot.press("y")
+            await pilot.pause()
+            self.assertFalse(app.is_running)
+
+        await self._run(make_snapshot(), script)
+
     async def test_running_ctrl_c_escape_stays_in_the_app(self) -> None:
         async def script(pilot: Pilot, client: FakeClient, app):
+            client.quit_verdict_result = protocol.QuitVerdict(
+                ask=True, state="running",
+            )
             client.queue.put_nowait(running_status_event())
             await pilot.pause()
             await pilot.press("ctrl+c")
@@ -194,6 +237,25 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.is_running)
             from xarness.tui.confirm_screen import ConfirmScreen
             self.assertNotIsInstance(app.screen, ConfirmScreen)
+
+        await self._run(make_snapshot(), script)
+
+    async def test_unreachable_host_quits_without_a_modal(self) -> None:
+        """No verdict (host gone, timeout, older host): quit, don't block.
+        The turn lives in the host, so an unanswered question costs nothing
+        but a headless run."""
+        async def script(pilot: Pilot, client: FakeClient, app):
+            client.quit_verdict_error = ClientError("connection refused")
+            client.queue.put_nowait(running_status_event())
+            await pilot.pause()
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            from xarness.tui.confirm_screen import ConfirmScreen
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
+            self.assertFalse(app.is_running)
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "cancel"], [],
+            )
 
         await self._run(make_snapshot(), script)
 
@@ -438,15 +500,18 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat_input.text, "/filter ")
             self.assertEqual(client.commands, [])
 
-    async def test_ctrl_c_asks_even_when_another_client_is_attached(self) -> None:
-        """Quitting is a disconnect, never an unload: the question (and
-        "Stop and quit"'s single interrupt) is the same whether one or two
-        clients are watching, so a second client's presence no longer
-        changes the menu."""
+    async def test_ctrl_c_skips_headless_prompt_when_streamed_elsewhere(self) -> None:
+        """The host reports the turn also streams to another client: this
+        quit is one viewer leaving, so there is nothing to decide — and
+        "Stop and quit" must not be offered, because the other client's
+        turn would be interrupted."""
         from xarness.tui.app import AgentApp
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client = FakeClient(make_snapshot("running"))
+        client.quit_verdict_result = protocol.QuitVerdict(
+            ask=False, state="running", other_clients=1,
+        )
         app = AgentApp(client, workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -457,9 +522,7 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("ctrl+c")
             await pilot.pause()
-            self.assertIsInstance(app.screen, ConfirmScreen)
-            await pilot.press("y")   # Continue headless: just detach
-            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
             self.assertFalse(app.is_running)
             self.assertEqual(
                 [c for _, c in client.commands if c.type == "cancel"], [],

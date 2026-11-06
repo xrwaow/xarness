@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from ..conversation import Message, ToolStatus, Usage
 from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 
 # Error convention: REST routes fail with HTTP 4xx (400 bad request, 404
 # missing session/path); a ``command`` always returns 200 with

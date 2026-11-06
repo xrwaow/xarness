@@ -88,6 +88,7 @@ from .views import (  # noqa: F401
     PendingAsk,
     PendingDrift,
     QueuedMessage,
+    QuitVerdict,
     RefInfo,
     SandboxInfo,
     ServerInfo,

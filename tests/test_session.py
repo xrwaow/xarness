@@ -478,6 +478,35 @@ def test_attach_does_not_touch_a_real_running_turn(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_quit_verdict_asks_only_for_the_last_viewer_of_work_in_flight(tmp_path) -> None:
+    """The quit menu is the host's call, not the client's: work in flight
+    AND nobody else streaming is the only case that needs an answer."""
+    session = make_session([], tmp_path)
+
+    async def go():
+        assert session.quit_verdict().ask is False      # idle, nobody watching
+        first = session.subscribe()[1]
+        second = session.subscribe()[1]
+        # Work in flight, but another client is still streaming it: quitting
+        # is just one viewer leaving.
+        session._state = "running"
+        verdict = session.quit_verdict()
+        assert verdict.ask is False and verdict.other_clients == 1
+        assert verdict.state == "running"
+        # The other client leaves: closing would now end the turn unseen.
+        session.unsubscribe(second)
+        verdict = session.quit_verdict()
+        assert verdict.ask is True and verdict.other_clients == 0
+        # A pending question counts as work in flight, even when idle.
+        session._state = "idle"
+        session._pending_ask = protocol.PendingAsk(ask_id="a1", questions=["q?"])
+        verdict = session.quit_verdict()
+        assert verdict.ask is True and verdict.pending_ask is True
+        session.unsubscribe(first)
+
+    asyncio.run(go())
+
+
 def test_cmd_id_dedupe(tmp_path) -> None:
     session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
 

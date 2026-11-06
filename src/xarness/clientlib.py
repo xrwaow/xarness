@@ -36,6 +36,10 @@ from .protocol import (
     Snapshot,
 )
 
+# The quit check is the one request that must resolve fast and never retry:
+# a wedged or dead host may delay a disconnect by at most this much.
+QUIT_TIMEOUT = 1.0
+
 
 async def ensure_host(timeout: float = 5.0) -> None:
     """Make sure a host process is running (spawning one if needed).
@@ -257,6 +261,22 @@ class XarnessClient:
             f"/v1/sessions/{name}/unload", {}, model=protocol.DeleteResult,
         )
         return result.deleted
+
+    async def quit_verdict(self, name: str) -> protocol.QuitVerdict:
+        """Ask the host whether closing this client must offer the
+        continue-headless choice.
+
+        Deliberately not :meth:`_request`: that respawns a dead host on
+        ConnectError, and quitting must never bring the host back just to ask
+        whether it is fine to leave. The short timeout is for the same reason
+        — a quit may not hang on a wedged host."""
+        try:
+            response = await self._http.get(
+                f"/v1/sessions/{name}/quit", timeout=QUIT_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            raise ClientError(str(exc) or type(exc).__name__) from exc
+        return protocol.QuitVerdict.model_validate(self._json(response))
 
     # ------------------------------------------------------------------
     # commands

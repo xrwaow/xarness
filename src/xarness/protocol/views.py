@@ -105,6 +105,25 @@ class Status(BaseModel):
     tools: list[str] = Field(default_factory=list)
 
 
+class QuitVerdict(BaseModel):
+    """GET /sessions/{name}/quit: what a client about to disconnect must do.
+
+    The host decides, not the client: it is the only side that knows whether
+    a turn is really in flight and whether anyone else is still streaming
+    the session, so every client gets the same rule from one place.
+
+    ``other_clients`` counts the event streams attached besides the one
+    asking (the querier is assumed to be streaming — only an attached client
+    has anything to detach from)."""
+
+    # True: closing now would leave the work with nobody watching, so the
+    # client must let the user choose (continue headless / stop and quit).
+    ask: bool
+    state: State = "idle"
+    pending_ask: bool = False
+    other_clients: int = 0
+
+
 class PartialToolCall(BaseModel):
     """One tool call in the round currently being generated/executed."""
 

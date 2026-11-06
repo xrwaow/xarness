@@ -141,6 +141,75 @@ def test_midstream_drop_is_not_retried() -> None:
     assert any(isinstance(e, ContentDelta) for e in events)  # tokens did arrive
 
 
+def test_quit_verdict_never_respawns_the_host() -> None:
+    """Quitting must not bring a dead host back just to ask whether it is
+    ok to leave: no respawn, no retry, and a short timeout."""
+    from xarness import clientlib
+    from xarness.protocol import QuitVerdict
+
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200, json=QuitVerdict(ask=True, state="running").model_dump(),
+        )
+
+    spawned: list[int] = []
+
+    async def fake_ensure_host(timeout: float = 5.0) -> None:
+        spawned.append(1)
+
+    async def go():
+        client = clientlib.XarnessClient(httpx.AsyncClient(
+            base_url="http://test", transport=httpx.MockTransport(handler),
+        ))
+        original = clientlib.ensure_host
+        clientlib.ensure_host = fake_ensure_host
+        try:
+            verdict = await client.quit_verdict("s1")
+        finally:
+            clientlib.ensure_host = original
+        await client.aclose()
+        return verdict
+
+    verdict = asyncio.run(go())
+    assert verdict.ask is True and verdict.state == "running"
+    assert len(calls) == 1
+    assert calls[0].url.path == "/v1/sessions/s1/quit"
+    assert spawned == []
+
+
+def test_quit_verdict_transport_error_is_a_client_error() -> None:
+    """A dead socket surfaces as ClientError (the TUI treats it as "no
+    verdict" and quits), never as a raw httpx error or a respawn."""
+    from xarness import clientlib
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no socket", request=request)
+
+    spawned: list[int] = []
+
+    async def fake_ensure_host(timeout: float = 5.0) -> None:
+        spawned.append(1)
+
+    async def go():
+        client = clientlib.XarnessClient(httpx.AsyncClient(
+            base_url="http://test", transport=httpx.MockTransport(handler),
+        ))
+        original = clientlib.ensure_host
+        clientlib.ensure_host = fake_ensure_host
+        try:
+            with pytest.raises(clientlib.ClientError):
+                await client.quit_verdict("s1")
+        finally:
+            clientlib.ensure_host = original
+        await client.aclose()
+
+    asyncio.run(go())
+    assert spawned == []
+
+
 def test_connect_error_respawns_host_and_retries() -> None:
     """A request hitting a dead socket respawns the host and retries once
     (a client idle on the draft screen outlives the host's grace exit) —

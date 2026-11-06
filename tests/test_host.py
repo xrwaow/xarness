@@ -513,6 +513,53 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_quit_verdict_route_counts_the_other_streams(tmp_path) -> None:
+    """A client about to disconnect asks the host (read-only route, no
+    command lock): alone + work in flight is the only case that needs the
+    continue-headless menu."""
+    from xarness.clientlib import XarnessClient
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [])
+            session = host.sessions[name]
+            client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
+            try:
+                stream = client.attach(name)
+                assert isinstance(
+                    await asyncio.wait_for(anext(stream), timeout=5), Snapshot,
+                )
+                assert (await client.quit_verdict(name)).ask is False  # idle
+
+                session._pending_ask = protocol.PendingAsk(
+                    ask_id="a1", questions=["pick one"],
+                )
+                alone = await client.quit_verdict(name)
+                assert alone.ask is True and alone.other_clients == 0
+                assert alone.pending_ask is True
+
+                # A second stream attaches: the prompt stays up for it, so
+                # closing the first client needs no answer.
+                second = client.attach(name)
+                assert isinstance(
+                    await asyncio.wait_for(anext(second), timeout=5), Snapshot,
+                )
+                shared = await client.quit_verdict(name)
+                assert shared.ask is False and shared.other_clients == 1
+
+                await second.aclose()
+                await stream.aclose()
+            finally:
+                await client.aclose()
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_headless_turn_runs_like_any_other_and_reattach_sees_it_done(tmp_path) -> None:
     """The model behind the quit menu: a turn is the host's, not the
     client's. With zero subscribers it runs to completion, and the attach

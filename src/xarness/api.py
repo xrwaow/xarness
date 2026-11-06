@@ -228,6 +228,19 @@ def sessions_router(host: Host) -> APIRouter:
         return await session.update_settings(body)
 
     @router.get(
+        "/sessions/{name}/quit",
+        response_model=protocol.QuitVerdict,
+        summary="Ask whether closing now needs the continue-headless choice",
+    )
+    async def quit_verdict(name: str) -> protocol.QuitVerdict:
+        """What a disconnecting client should do.
+
+        A read-only query (no command lock, no mutation): the client asks
+        before closing instead of trusting a cached status, and the policy
+        lives with the state machine it is derived from."""
+        return (await _session_or_load(host, name)).quit_verdict()
+
+    @router.get(
         "/sessions/{name}/diff",
         response_model=protocol.DiffInfo,
         summary="Pending changes: summary and per-file diffs",
