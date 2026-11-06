@@ -512,6 +512,44 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, RefsScreen)
 
 
+class SlashCommandDispatchTest(unittest.IsolatedAsyncioTestCase):
+    """A leading "/" only makes a command when it names a registered one;
+    any other input is ordinary chat text, not an unknown-command error."""
+
+    async def test_unknown_slash_text_is_sent_as_a_message(self) -> None:
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import ChatInput
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_chat_input_chat_submitted(
+                ChatInput.ChatSubmitted("/not-a-command hello"))
+            await pilot.pause()
+            await pilot.pause()
+            sends = [c for _, c in client.commands if c.type == "send_message"]
+            self.assertEqual([c.text for c in sends], ["/not-a-command hello"])
+
+    async def test_registered_slash_command_still_runs(self) -> None:
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import ChatInput
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_chat_input_chat_submitted(ChatInput.ChatSubmitted("/mode"))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(
+                [c.mode for _, c in client.commands if c.type == "set_mode"],
+                ["plan"],
+            )
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "send_message"], [])
+
+
 class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
     """The pump attaches to the session by name; reconnects always deliver
     a fresh Snapshot (which re-renders the history exactly once — the

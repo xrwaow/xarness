@@ -912,8 +912,9 @@ class AgentApp(App[None]):
         # bottom). Without this, a log scrolled up to read stays parked even
         # though the sticky anchor re-arms only at the bottom.
         self._flow_view().scroll_to_bottom(animate=False)
-        if text.startswith("/"):
-            self._handle_slash_command(text)
+        # Only a known slash command is a command: anything else that
+        # merely starts with "/" (e.g. a path or prose) is plain chat text.
+        if text.startswith("/") and self._handle_slash_command(text):
             return
         self._submit(text, event.images)
 
@@ -1106,15 +1107,17 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # Slash commands
 
-    def _handle_slash_command(self, text: str) -> None:
+    def _handle_slash_command(self, text: str) -> bool:
+        """Run a registered slash command. Returns False (handling nothing)
+        when the name is unknown, so the caller can send it as a message."""
         parts = text[1:].split(maxsplit=1)
         cmd = parts[0] if parts else ""
         arg = parts[1].strip() if len(parts) > 1 else ""
         entry = COMMANDS.get(cmd)
         if entry is None:
-            self._error(f"unknown command: /{cmd}")
-            return
+            return False
         entry.handler(self, arg)
+        return True
 
     def _switch_mode(self) -> None:
         """Toggle plan/write mode; shared by /mode and the Tab shortcut.
