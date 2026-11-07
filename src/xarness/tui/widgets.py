@@ -22,14 +22,7 @@ from textual.widgets.option_list import Option
 
 from .. import theme
 from ..theme import blend_hex
-
-
-def _fmt_tokens(count: int) -> str:
-    if count < 1_000:
-        return str(count)
-    if count < 1_000_000:
-        return f"{count / 1_000:.1f}k"
-    return f"{count / 1_000_000:.2f}M"
+from ..util import format_tokens as _fmt_tokens
 
 
 def _content_to_rich_text(content: Content) -> Text:

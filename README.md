@@ -427,8 +427,11 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   `write_file` shows the written content as a syntax-highlighted code block.
 - **Token counts**: taken from the API's `usage` field when provided
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
-  approximate local estimate is shown. The status bar keeps running session
-  totals and context headroom against `max_context`. Compaction's own
+  approximate local estimate is shown. Each turn's footer shows that turn's
+  own spend as `↑input ↓output` next to its timing line (`Worked for 5.0s
+  (4.0s | 1.0s) · ↑12.3k ↓456`; a `~` marks an estimate). The status bar keeps
+  running session totals and context headroom against `max_context`.
+  Compaction's own
   summarization round is included in the totals, and the compaction notice
   reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
   The handoff itself is shown in the transcript as a distinct padded block

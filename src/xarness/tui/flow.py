@@ -47,6 +47,7 @@ from textual_flowview import Presentation
 from .. import images, theme
 from ..images import token_text
 from ..theme import blend_hex as _lerp_hex
+from ..util import format_duration, format_tokens
 from .tool_view import (
     ToolCallView,
     body_renderable,
@@ -66,6 +67,7 @@ from .transcript import (
     ThinkingItem,
     ToolItem,
     ToolStatus,
+    TurnSummaryItem,
     UserItem,
 )
 from .widgets import highlight_code
@@ -73,7 +75,7 @@ from .widgets import highlight_code
 __all__ = [
     "AssistantItem", "DividerItem", "LineItem", "PendingItem", "Presenter",
     "shimmer_now",
-    "ThinkingItem", "ToolItem", "ToolStatus", "UserItem",
+    "ThinkingItem", "ToolItem", "ToolStatus", "TurnSummaryItem", "UserItem",
     "render_strips",
 ]
 
@@ -452,6 +454,19 @@ class Presenter:
         text = Text(f"{glyph}{item.text}", style=p[color_key])
         return render_strips(text, width)
 
+    def _footer(self, item: TurnSummaryItem, width: int) -> list[Strip]:
+        """The per-turn footer: wall time and ``↑in ↓out`` token spend."""
+        text = f"Worked for {format_duration(item.total)}"
+        if item.busy is not None and item.idle is not None:
+            text += (f" ({format_duration(item.busy)} | "
+                     f"{format_duration(item.idle)})")
+        if item.usage is not None:
+            usage = item.usage
+            approx = "~" if usage.approximate else ""
+            text += (f" · {approx}↑{format_tokens(usage.input_tokens)} "
+                     f"↓{format_tokens(usage.output_tokens)}")
+        return render_strips(Text(text, style=theme.PALETTE["muted"]), width)
+
 
 class _BorderedTableElement(RichTableElement):
     """Rich's markdown table, drawn as a real boxed table.
@@ -646,6 +661,11 @@ def _(item: PendingItem, presenter, entry, width: int) -> list[Strip]:
 @render_item.register
 def _(item: LineItem, presenter, entry, width: int) -> list[Strip]:
     return presenter._line(item, width)
+
+
+@render_item.register
+def _(item: TurnSummaryItem, presenter, entry, width: int) -> list[Strip]:
+    return presenter._footer(item, width)
 
 
 @render_item.register

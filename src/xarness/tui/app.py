@@ -74,7 +74,6 @@ from ..protocol import (
     ToolCallStarted,
     TurnEnded,
 )
-from ..util import format_duration as _format_duration
 from . import flow as tflow
 from .confirm_screen import ConfirmScreen
 from .diff_summary import DiffSummary
@@ -599,13 +598,13 @@ class AgentApp(App[None]):
                 self._status.pending_drift = None
             return
         if isinstance(event, TurnEnded):
-            # The turn is fully unwound: settle anything still live and stop
-            # the shimmer/status without inferring it from a status change.
-            self._sync_entries(self._transcript.cancel())
+            # The turn is fully unwound: the reducer settles anything still
+            # live, appends the footer for a finished turn and stops the
+            # shimmer/status without inferring it from a status change.
+            self._sync_entries(self._transcript.apply(event))
             self._phase_idle()
             self._clear_hint_lines()
             if event.outcome == "finished":
-                self._notice(f"Worked for {_format_duration(event.elapsed)}")
                 self._set_title_state("finished")
             else:
                 self._set_default_title()

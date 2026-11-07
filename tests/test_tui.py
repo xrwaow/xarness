@@ -12,7 +12,7 @@ from textual.pilot import Pilot
 from xarness import protocol
 from xarness.clientlib import ClientError
 from xarness.conversation import (
-    AssistantMessage, TextPart, Timing, ToolMessage, UserMessage,
+    AssistantMessage, TextPart, Timing, ToolMessage, UserMessage, Usage,
 )
 from xarness.protocol import (
     CommandResult,
@@ -1680,7 +1680,26 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(thinking), 1)
             self.assertTrue(thinking[0].done)
             self.assertIn("Thought for", all_text)
-            self.assertIn("Worked for 5.0s | 4.0s 1.0s", all_text)
+            self.assertIn("Worked for 5.0s (4.0s | 1.0s)", all_text)
+
+    async def test_replay_footer_shows_turn_token_counts(self) -> None:
+        """The footer carries the turn's summed ↑input ↓output spend, next
+        to the timing breakdown."""
+        from xarness.tui.app import AgentApp
+
+        snap = self._snapshot_with_history()
+        snap.messages[1].usage = Usage(
+            input_tokens=2_000, output_tokens=400)
+        snap.messages[3].usage = Usage(
+            input_tokens=1_234, output_tokens=56)
+        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            flow = app.query_one("#chat-log")
+            all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
+            self.assertIn(
+                "Worked for 5.0s (4.0s | 1.0s) · ↑3.2k ↓456", all_text)
 
     async def test_attach_mid_tool_shows_it_running_not_interrupted(self) -> None:
         """A turn whose tools are still executing has no result for those

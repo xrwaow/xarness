@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-from ..conversation import SUMMARY_PREFIX
+from ..conversation import SUMMARY_PREFIX, Usage
 from ..protocol import (
     ContentDelta,
     Level,
@@ -27,6 +27,7 @@ from ..protocol import (
     ToolCallStarted,
     ToolFinished,
     ToolOutputDelta,
+    TurnEnded,
     image_refs,
 )
 from ..protocol import (
@@ -51,73 +52,6 @@ def _parse_iso(stamp: str | None) -> datetime | None:
         return datetime.fromisoformat(stamp)
     except ValueError:
         return None
-
-
-def turn_time_summary(messages) -> str | None:
-    """The turn's timing line: total | running (streaming + tools) | idle.
-
-    Derived client-side from the persisted wall-clock stamps, so the host
-    stores no second, preformatted copy."""
-    user_index = next(
-        (i for i, m in reversed(list(enumerate(messages)))
-         if m.role == "user" and m.timing.send and not m.is_summary), None,
-    )
-    turn = messages[user_index + 1:] if user_index is not None else messages
-    assistants = [
-        m for m in turn if m.role == "assistant" and m.timing.start and m.timing.end
-    ]
-    if not assistants:
-        return None
-    end = _parse_iso(assistants[-1].timing.end)
-    start = _parse_iso(
-        messages[user_index].timing.send if user_index is not None
-        else assistants[0].timing.start
-    )
-    if end is None or start is None:
-        return None
-    total = max(0.0, (end - start).total_seconds())
-
-    def duration(message, *, reasoning: bool = False) -> float:
-        start = _parse_iso(message.timing.start)
-        end = _parse_iso(message.timing.end)
-        if start is None or end is None:
-            return 0.0
-        elapsed = max(0.0, (end - start).total_seconds())
-        if not reasoning or message.timing.reasoning_seconds is None:
-            return elapsed
-        return min(message.timing.reasoning_seconds, elapsed)
-
-    streaming = sum(duration(m, reasoning=True) for m in assistants)
-    tools = sum(duration(m) for m in turn if m.role == "tool")
-    other = max(0.0, total - streaming - tools)
-    return (f"{format_duration(total)} | "
-            f"{format_duration(streaming + tools)} {format_duration(other)}")
-
-
-def turn_time_summaries(messages, results: dict) -> dict[int, str]:
-    """Map each turn's final assistant message (by object identity) to its
-    derived timing line. ``results`` is the tool results by call id.
-
-    A turn whose last round left a tool call unanswered is not over (still
-    executing, or it died mid-tool): a timing line there would claim an end
-    the history does not have."""
-    starts = [
-        i for i, m in enumerate(messages)
-        if m.role == "user" and not m.is_summary
-    ]
-    summaries: dict[int, str] = {}
-    for n, start in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(messages)
-        turn = messages[start:end]
-        last = next((m for m in reversed(turn) if m.role == "assistant"), None)
-        if last is None:
-            continue
-        if any(call.call_id not in results for call in last.tool_calls or []):
-            continue
-        summary = turn_time_summary(turn)
-        if summary:
-            summaries[id(last)] = summary
-    return summaries
 
 
 def split_settled(text: str) -> tuple[str, str]:
@@ -198,7 +132,9 @@ class UserItem(TranscriptItem):
         return True
 
     def leading_blanks(self, prev) -> int:
-        return 0 if prev is None or isinstance(prev, LineItem) else 1
+        return 0 if prev is None or isinstance(
+            prev, (LineItem, TurnSummaryItem),
+        ) else 1
 
 
 @dataclass
@@ -261,7 +197,6 @@ class ThinkingItem(TranscriptItem):
         if not self.done:
             return "Thinking"
         if self.duration is not None:
-            from ..util import format_duration
             return f"Thought for {format_duration(self.duration)}"
         return "Thought for …"
 
@@ -339,10 +274,104 @@ class LineItem(TranscriptItem):
 
 
 @dataclass
+class TurnSummaryItem(TranscriptItem):
+    """The per-turn footer under the final answer.
+
+    Replay derives the ``busy``/``idle`` breakdown from the persisted
+    stamps; a live turn only knows the host's ``elapsed`` (the total).
+    ``usage`` sums every round the turn sent, and is None when the provider
+    reported none. One item type for both paths, so a mid-turn attach and a
+    live turn can never disagree about whether a footer exists."""
+
+    total: float
+    busy: float | None = None
+    idle: float | None = None
+    usage: Usage | None = None
+
+    def leading_blanks(self, prev) -> int:
+        return 1
+
+
+@dataclass
 class DividerItem(TranscriptItem):
     """A divider line (the compaction handoff marker)."""
 
     text: str
+
+
+def turn_summary(messages) -> TurnSummaryItem | None:
+    """Derive a turn's footer from its persisted stamps and round usage.
+
+    ``total`` is send-to-last-answer; ``busy`` is streaming + tool time and
+    ``idle`` is the rest (queueing, provider latency). Derived client-side,
+    so the host stores no second, preformatted copy."""
+    user_index = next(
+        (i for i, m in reversed(list(enumerate(messages)))
+         if m.role == "user" and m.timing.send and not m.is_summary), None,
+    )
+    turn = messages[user_index + 1:] if user_index is not None else messages
+    assistants = [
+        m for m in turn if m.role == "assistant" and m.timing.start and m.timing.end
+    ]
+    if not assistants:
+        return None
+    end = _parse_iso(assistants[-1].timing.end)
+    start = _parse_iso(
+        messages[user_index].timing.send if user_index is not None
+        else assistants[0].timing.start
+    )
+    if end is None or start is None:
+        return None
+    total = max(0.0, (end - start).total_seconds())
+
+    def duration(message, *, reasoning: bool = False) -> float:
+        start = _parse_iso(message.timing.start)
+        end = _parse_iso(message.timing.end)
+        if start is None or end is None:
+            return 0.0
+        elapsed = max(0.0, (end - start).total_seconds())
+        if not reasoning or message.timing.reasoning_seconds is None:
+            return elapsed
+        return min(message.timing.reasoning_seconds, elapsed)
+
+    streaming = sum(duration(m, reasoning=True) for m in assistants)
+    tools = sum(duration(m) for m in turn if m.role == "tool")
+    usage: Usage | None = None
+    for message in turn:
+        if message.role == "assistant" and message.usage is not None:
+            usage = message.usage if usage is None else usage + message.usage
+    return TurnSummaryItem(
+        total=total,
+        busy=streaming + tools,
+        idle=max(0.0, total - streaming - tools),
+        usage=usage,
+    )
+
+
+def turn_summaries(messages, results: dict) -> dict[int, TurnSummaryItem]:
+    """Map each turn's final assistant message (by object identity) to its
+    footer stats. ``results`` is the tool results by call id.
+
+    A turn whose last round left a tool call unanswered is not over (still
+    executing, or it died mid-tool): a footer there would claim an end the
+    history does not have."""
+    starts = [
+        i for i, m in enumerate(messages)
+        if m.role == "user" and not m.is_summary
+    ]
+    summaries: dict[int, TurnSummaryItem] = {}
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(messages)
+        turn = messages[start:end]
+        last = next((m for m in reversed(turn) if m.role == "assistant"), None)
+        if last is None:
+            continue
+        if any(call.call_id not in results for call in last.tool_calls or []):
+            continue
+        summary = turn_summary(turn)
+        if summary is not None:
+            summaries[id(last)] = summary
+    return summaries
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +391,10 @@ class Transcript:
         self.assistant: AssistantItem | None = None
         self.tool_blocks: dict[str, ToolItem] = {}
         self.cancelled = False
+        # Summed usage of the turn in flight, folded from RoundComplete
+        # events; replay starts from the rounds already in the history. The
+        # live footer reads it when the turn ends.
+        self._turn_usage: Usage | None = None
         # Emission time of the first reasoning delta in this round. The cot
         # block ends at the first answer/tool token, so that event's stamp
         # minus this one is the block's own duration (never the round's).
@@ -381,7 +414,22 @@ class Transcript:
             m.tool_call_id: m for m in messages
             if m.role == "tool" and m.tool_call_id
         }
-        summaries = turn_time_summaries(messages, results)
+        summaries = turn_summaries(messages, results)
+        # Baseline for the live turn: whatever rounds of it already landed
+        # in the history before this attach.
+        last_user = next(
+            (i for i, m in reversed(list(enumerate(messages)))
+             if m.role == "user" and not m.is_summary),
+            None,
+        )
+        self._turn_usage = None
+        start = last_user + 1 if last_user is not None else 0
+        for message in messages[start:]:
+            if message.role == "assistant" and message.usage is not None:
+                self._turn_usage = (
+                    message.usage if self._turn_usage is None
+                    else self._turn_usage + message.usage
+                )
         # A call with no result in a turn that is still running is the call
         # executing now, not a failed one.
         live = snap.status.state == "running"
@@ -393,7 +441,7 @@ class Transcript:
         return self.items
 
     def _add_message(
-        self, message, results: dict, summary: str | None = None, *,
+        self, message, results: dict, summary: TurnSummaryItem | None = None, *,
         live: bool = False,
     ) -> None:
         if message.role == "user":
@@ -436,8 +484,8 @@ class Transcript:
                     item.output = "interrupted"
                 self.tool_blocks[call.call_id] = item
                 self.items.append(item)
-            if summary:
-                self.items.append(LineItem(text=f"Worked for {summary}"))
+            if summary is not None:
+                self.items.append(summary)
 
     def _load_partial(self, partial) -> None:
         """Render the snapshot's live round on top of the persisted history.
@@ -522,10 +570,25 @@ class Transcript:
                 # Assistant/tool messages were already rendered from their
                 # stream events (or arrive with the next snapshot).
                 return []
+            # A new turn opens: its spend starts from zero.
+            self._turn_usage = None
             return [self._add(UserItem.from_message(message))]
         if isinstance(event, ProcessingStarted):
             self.start_round()
             return []
+        if isinstance(event, TurnEnded):
+            # The turn is over: settle whatever is still live and, for a
+            # completed turn, append the same footer replay derives. The
+            # reducer owns it so a live turn and a reload agree.
+            if self.cancelled:
+                return []
+            changed = self.cancel()
+            if event.outcome == "finished":
+                changed.append(self._add(TurnSummaryItem(
+                    total=event.elapsed, usage=self._turn_usage,
+                )))
+            self._turn_usage = None
+            return changed
         if self.cancelled:
             return []
         if isinstance(event, ReasoningDelta):
@@ -590,6 +653,11 @@ class Transcript:
             item.output = event.content
             return [item]
         if isinstance(event, RoundComplete):
+            if event.usage is not None:
+                self._turn_usage = (
+                    event.usage if self._turn_usage is None
+                    else self._turn_usage + event.usage
+                )
             return self.settle(event.t)
         if isinstance(event, StreamError):
             return self.settle(None)

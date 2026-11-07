@@ -19,6 +19,7 @@ from xarness.protocol import (
     ToolFinished,
     RoundComplete,
     MessageAdded,
+    TurnEnded,
 )
 from xarness.tui import transcript as tr
 
@@ -49,7 +50,8 @@ class TranscriptTest(unittest.TestCase):
         self.assertIsInstance(items[1], tr.ToolItem)
         self.assertEqual(items[1].status, tr.ToolStatus.CALL_FAILED)
         self.assertEqual(items[1].output, "body")
-        self.assertIsInstance(items[2], tr.LineItem)
+        self.assertIsInstance(items[2], tr.TurnSummaryItem)
+        self.assertIsNotNone(items[2].total)
 
     def test_load_renders_hidden_epochs_before_the_current_one(self):
         """Compaction hides old epochs from the model, not from the human:
@@ -269,6 +271,57 @@ class TranscriptTest(unittest.TestCase):
         self.assertFalse(t.cancelled)
         t.apply(ContentDelta(text="next"))
         self.assertEqual(t.assistant.live, "next")
+
+    def test_turn_footer_sums_usage_across_rounds(self):
+        """The footer's token counts are the turn's whole spend: every
+        round, not just the final answer's."""
+        from xarness.conversation import Usage
+
+        messages = [
+            user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
+            AssistantMessage(
+                content="a", id="a1", usage=Usage(
+                    input_tokens=1_234, output_tokens=56),
+                timing=Timing(
+                    start="2025-01-01T00:00:00+00:00",
+                    end="2025-01-01T00:00:01+00:00"),
+            ),
+            AssistantMessage(
+                content="b", id="a2", usage=Usage(
+                    input_tokens=2_000, output_tokens=400),
+                timing=Timing(
+                    start="2025-01-01T00:00:01+00:00",
+                    end="2025-01-01T00:00:05+00:00"),
+            ),
+        ]
+        items = tr.Transcript().load(_snap(messages))
+        footer = next(i for i in items if isinstance(i, tr.TurnSummaryItem))
+        assert footer.usage is not None
+        self.assertEqual(
+            (footer.usage.input_tokens, footer.usage.output_tokens),
+            (3_234, 456),
+        )
+
+    def test_live_and_replay_footer_match(self):
+        """A live turn appends the same footer type replay derives, with
+        the same summed usage; only the timing breakdown differs (live has
+        the host's elapsed, replay reconstructs it from stamps)."""
+        from xarness.conversation import Usage
+
+        usage = Usage(input_tokens=1_234, output_tokens=56)
+        live = tr.Transcript()
+        live.apply(MessageAdded(message=_user("hi")))
+        live.apply(ContentDelta(text="hello"))
+        live.apply(RoundComplete(usage=usage))
+        changed = live.apply(TurnEnded(outcome="finished", elapsed=5.0))
+        footers = [i for i in changed if isinstance(i, tr.TurnSummaryItem)]
+        self.assertEqual(len(footers), 1)
+        self.assertEqual(footers[0].total, 5.0)
+        self.assertEqual(footers[0].usage, usage)
+        self.assertIsNone(footers[0].busy)  # no replay breakdown live
+        # Settling a second time never duplicates the footer.
+        self.assertEqual(
+            live.apply(TurnEnded(outcome="finished", elapsed=5.0)), [])
 
     def test_finish_keeps_first_duration(self):
         item = tr.ThinkingItem(parts=["x"])

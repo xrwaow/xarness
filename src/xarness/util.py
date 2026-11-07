@@ -18,6 +18,15 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def format_tokens(count: int) -> str:
+    """Compact token count: 999 · 1.2k · 1.23M."""
+    if count < 1_000:
+        return str(count)
+    if count < 1_000_000:
+        return f"{count / 1_000:.1f}k"
+    return f"{count / 1_000_000:.2f}M"
+
+
 def utcnow_iso() -> str:
     """Wall-clock UTC timestamp (ISO 8601)."""
     return datetime.now(timezone.utc).isoformat()

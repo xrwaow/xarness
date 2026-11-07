@@ -153,6 +153,16 @@ class Usage(BaseModel):
     reasoning_tokens: int = 0
     approximate: bool = False
 
+    def __add__(self, other: "Usage") -> "Usage":
+        """Fold two rounds' usage into one total (never mutating either)."""
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            approximate=self.approximate or other.approximate,
+        )
+
     def context_tokens(self, keep_reasoning: bool = True) -> int:
         """The context size this round implies (input side).
 

@@ -303,12 +303,7 @@ class ChatController:
     def _fold_usage(self, usage: Usage) -> None:
         """Add one round's usage to the cumulative session total. Copies, so
         already-emitted status payloads keep their point-in-time values."""
-        self.usage_total = Usage(
-            input_tokens=self.usage_total.input_tokens + usage.input_tokens,
-            output_tokens=self.usage_total.output_tokens + usage.output_tokens,
-            cached_tokens=self.usage_total.cached_tokens + usage.cached_tokens,
-            reasoning_tokens=self.usage_total.reasoning_tokens + usage.reasoning_tokens,
-        )
+        self.usage_total = self.usage_total + usage
         self.last_usage = usage.model_copy()
 
     def _estimate_usage(self, content: str) -> Usage:

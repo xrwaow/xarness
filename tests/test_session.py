@@ -37,7 +37,7 @@ from xarness.session import Session
 from pydantic import BaseModel as _PydanticBase
 
 from xarness.tools import ToolRegistry, ToolResult, tool
-from xarness.tui.transcript import turn_time_summary
+from xarness.tui.transcript import turn_summary
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1", model_id="test-model", max_context=1000,
@@ -1316,9 +1316,9 @@ def test_no_save_disables_persistence(tmp_path) -> None:
     assert not session_store.session_dir("nosave").exists()
 
 
-def test_turn_time_summary_format(tmp_path) -> None:
-    """turn_time_summary derives total | running | idle from the persisted
-    stamps (running = streaming + tools)."""
+def test_turn_summary_format(tmp_path) -> None:
+    """turn_summary derives total | running | idle from the persisted stamps
+    (running = streaming + tools)."""
     from datetime import datetime, timedelta, timezone
 
     session = make_session([], tmp_path)
@@ -1344,16 +1344,15 @@ def test_turn_time_summary_format(tmp_path) -> None:
             end=(base + timedelta(seconds=8)).isoformat(),
         ),
     ))
-    summary = turn_time_summary(session.conversation.messages)
+    summary = turn_summary(session.conversation.messages)
     assert summary is not None
-    total, rest = summary.split("|")
-    running, idle = rest.split()
-    assert total.strip() == "8.0s"
-    # running = streaming (round 1: 1.7s + round 2: 3s, no reasoning)
-    #          + tools (3.0s).
-    assert running == "7.7s"
-    # total − running: the 0.3s pre-first-token latency.
-    assert idle == "0.3s"
+    assert summary.busy is not None and summary.idle is not None
+    assert round(summary.total, 1) == 8.0
+    # busy = streaming (round 1: 1.7s + round 2: 3s, no reasoning)
+    #        + tools (3.0s).
+    assert round(summary.busy, 1) == 7.7
+    # total − busy: the 0.3s pre-first-token latency.
+    assert round(summary.idle, 1) == 0.3
 
 
 def test_turn_ended_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
@@ -1383,16 +1382,53 @@ def test_turn_ended_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
 
     # Persisted stamps are enough for the client to derive the same line.
     state = session_store.load_state("test")
-    summary = turn_time_summary(state.conversation.messages)
-    assert summary is not None and "|" in summary
+    summary = turn_summary(state.conversation.messages)
+    assert summary is not None and summary.busy is not None
 
 
-def test_turn_time_summary_none_without_stamps(tmp_path) -> None:
+def test_turn_summary_none_without_stamps(tmp_path) -> None:
     """Messages without stamps (old sessions) produce no summary."""
     session = make_session([], tmp_path)
     session.conversation.add(user_message("hi"))
     session.conversation.add(AssistantMessage(content="hello"))
-    assert turn_time_summary(session.conversation.messages) is None
+    assert turn_summary(session.conversation.messages) is None
+
+
+def test_turn_summary_sums_round_usage() -> None:
+    """A turn's footer carries the summed usage of every round it sent."""
+    from xarness.tui.transcript import turn_summary, turn_summaries
+
+    messages = [
+        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
+        AssistantMessage(
+            content="a", usage=Usage(input_tokens=1_234, output_tokens=56),
+            timing=Timing(
+                start="2025-01-01T00:00:00+00:00",
+                end="2025-01-01T00:00:02+00:00"),
+        ),
+        AssistantMessage(
+            content="b", usage=Usage(input_tokens=2_000, output_tokens=400),
+            timing=Timing(
+                start="2025-01-01T00:00:02+00:00",
+                end="2025-01-01T00:00:05+00:00"),
+        ),
+    ]
+    summary = turn_summary(messages)
+    assert summary is not None and summary.usage is not None
+    assert (summary.usage.input_tokens, summary.usage.output_tokens) == (3_234, 456)
+    # Only the turn's final assistant message carries the footer.
+    assert turn_summaries(messages, {}) == {id(messages[-1]): summary}
+    # A turn with no reported usage still has timings, but no token line.
+    bare = turn_summary([
+        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
+        AssistantMessage(content="x", timing=Timing(
+            start="2025-01-01T00:00:00+00:00",
+            end="2025-01-01T00:00:01+00:00")),
+    ])
+    assert bare is not None and bare.usage is None
+    # Local estimates are flagged, never passed off as exact counts.
+    estimated = Usage(input_tokens=10, output_tokens=2, approximate=True)
+    assert (estimated + Usage(input_tokens=1, output_tokens=3)).approximate
 
 
 # ----------------------------------------------------------------------
