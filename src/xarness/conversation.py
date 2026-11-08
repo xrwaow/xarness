@@ -176,18 +176,45 @@ class Usage(BaseModel):
         return self.input_tokens + output
 
 
+class TurnStats(BaseModel):
+    """A finished turn's numbers, as the host measured them.
+
+    Stamped on the turn's last answer (``Timing.stats``) when the turn ends,
+    so a reload renders the same footer a live client got on ``TurnEnded``
+    instead of each client deriving (and disagreeing about) its own. A turn
+    that is still running carries none: that absence is the only thing a
+    client needs to know to avoid claiming an end.
+
+    A turn cut short (cancelled, failed) has ``busy``/``idle`` None: the
+    stamps only reach its last *completed* round, so a split would claim a
+    measurement nobody took to the end. Its ``total`` is the wall clock the
+    host actually spent on it."""
+
+    total: float  # send → end of the turn, wall clock
+    busy: float | None = None  # streaming + tool time (finished turns only)
+    idle: float | None = None  # the rest: queueing, provider latency
+    # The turn's whole token spend, summed over its rounds (None when the
+    # provider reported none).
+    usage: Usage | None = None
+
+
 class Timing(BaseModel):
-    """When a message happened and (for a turn's last answer) how long it took.
+    """When a message happened, and — on a turn's last answer — how long it
+    took.
 
     One sub-model instead of six fields scattered on each message. Stamps are
-    wall-clock UTC ISO 8601; ``reasoning_seconds`` is the derived thinking
-    duration stamped only on the turn's last assistant message so every
-    client and every reload shows the same one."""
+    wall-clock UTC ISO 8601. The derived numbers are written by the host on
+    the turn's last assistant message only: ``reasoning_seconds`` for that
+    answer's thinking time, and ``stats`` for the whole turn, stamped when the
+    turn ends (finished, cancelled or failed). A turn still running carries no
+    ``stats``, which is what keeps a client from drawing an end-of-turn footer
+    under a turn that has no end."""
 
     send: str | None = None
     start: str | None = None
     end: str | None = None
     reasoning_seconds: float | None = None
+    stats: TurnStats | None = None
 
 
 class BaseMessage(BaseModel):
@@ -346,10 +373,12 @@ class Conversation(BaseModel):
     slice (but stays for the human transcript) until the summary is popped.
 
     Turn checkpoints live in ``turns``, keyed by the opening user message's
-    id — messages are truly immutable and append-only is sound (a turn end,
-    an accept or a rollback mutates only this side table, never a persisted
-    message row). A message id without an entry is a steering message, a
-    summary, or a legacy message from before tracking."""
+    id — messages are append-only, and a turn end, an accept or a rollback
+    mutates only this side table. The one exception is a finished turn's
+    stats, stamped onto its last answer (see :meth:`stamp_turn_end`) so
+    clients read the numbers instead of deriving them. A message id without an
+    entry is a steering message, a summary, or a legacy message from before
+    tracking."""
 
     messages: list[Message] = Field(default_factory=list)
     turns: dict[str, TurnCheckpoint] = Field(default_factory=dict)
@@ -433,6 +462,83 @@ class Conversation(BaseModel):
             if not turn.closed:
                 return message_id
         return None
+
+    def stamp_turn_end(self, ended_at: float | None = None) -> TurnStats | None:
+        """Record a turn's numbers on its last answer.
+
+        The write-side half of the footer: the host owns both the turn's
+        boundary and its numbers, and stores them where a client already
+        looks for per-message timing (``Timing.stats``), the way
+        ``reasoning_seconds`` is stored. Every client and every reload then
+        renders the same footer without deriving one, and a turn that is
+        still running carries no stats, so no client can claim it ended.
+
+        ``ended_at`` is how long a turn that was cut short (cancelled,
+        failed) actually ran. Such a turn reports that wall clock with no
+        ``busy``/``idle`` split: its stamps only reach the last completed
+        round, so a split would claim a measurement nobody took to the end.
+        Left None for a turn that finished on its own, whose numbers come
+        from the stamps.
+
+        The turn starts at its opening user message: the last one with a
+        checkpoint, which distinguishes it from a steering message injected
+        mid-turn (those have none). Returns the stats for ``TurnEnded``, or
+        None when there is no answer to stamp (nothing streamed at all)."""
+        turn, turn_start = self._last_turn()
+        # The turn's last answer, complete or interrupted: the message a
+        # footer is drawn under, and the one a reload reads the numbers from.
+        index = next(
+            (i for i in range(len(self.messages) - 1, turn_start - 1, -1)
+             if self.messages[i].role == "assistant"),
+            None,
+        )
+        if index is None:
+            return None
+        usage: Usage | None = None
+        for message in turn:
+            if message.role == "assistant" and message.usage is not None:
+                usage = message.usage if usage is None else usage + message.usage
+        if ended_at is not None:
+            stats = TurnStats(total=max(0.0, ended_at), usage=usage)
+        else:
+            timings = turn_timings(turn)
+            if timings is None:
+                return None
+            total, busy, idle = timings
+            stats = TurnStats(
+                total=total, busy=busy, idle=idle, usage=usage,
+            )
+        self.messages[index].timing = self.messages[index].timing.model_copy(
+            update={"stats": stats},
+        )
+        # The row may already be on disk: the appended message was persisted
+        # at the previous round boundary, so the rewrite must start here.
+        self._mark_dirty(index)
+        return stats
+
+    def _last_turn(self) -> tuple[list[Message], int]:
+        """The turn in flight: its messages, and the index they start at.
+
+        It starts at its opening user message — the last one with a
+        checkpoint, which is what tells it apart from a steering message
+        injected mid-turn (those have none). Without a tracked turn (a legacy
+        message, or a test-built history) it starts at the last real user
+        message, like a client would guess."""
+        start = next(
+            (i for i in range(len(self.messages) - 1, -1, -1)
+             if self.messages[i].role == "user"
+             and not self.messages[i].is_summary
+             and self.messages[i].id in self.turns),
+            None,
+        )
+        if start is None:
+            start = next(
+                (i for i in range(len(self.messages) - 1, -1, -1)
+                 if self.messages[i].role == "user"
+                 and not self.messages[i].is_summary),
+                0,
+            )
+        return self.messages[start:], start
 
     def close_crashed_turns(self) -> list[TurnCheckpoint]:
         """Close every turn left open by a crash (a loaded session can never
@@ -646,18 +752,19 @@ class Conversation(BaseModel):
         return messages
 
 
-def turn_timings(messages: list[Message]) -> tuple[float, float, float] | None:
-    """``(total, busy, idle)`` for the last turn in ``messages``, or None
-    when it has no completed assistant round to measure.
+def turn_timings(turn: list[Message]) -> tuple[float, float, float] | None:
+    """``(total, busy, idle)`` for one turn's ``messages`` (the opening user
+    message first), or None when the turn has no completed assistant round to
+    measure.
 
     ``total`` is send-to-last-answer; ``busy`` is streaming + tool time and
-    ``idle`` is the rest (queueing, provider latency). One derivation for
-    both the host (which stamps it on ``TurnEnded``) and TUI replay."""
-    user_index = next(
-        (i for i, m in reversed(list(enumerate(messages)))
-         if m.role == "user" and m.timing.send and not m.is_summary), None,
+    ``idle`` is the rest (queueing, provider latency). Derived once by the
+    host when a turn finishes, and stamped on the turn's last answer (see
+    :meth:`Conversation.stamp_turn_end`): clients render those numbers
+    instead of each deriving its own."""
+    user = next(
+        (m for m in turn if m.role == "user" and not m.is_summary), None,
     )
-    turn = messages[user_index + 1:] if user_index is not None else messages
     assistants = [
         m for m in turn
         if m.role == "assistant" and m.timing.start and m.timing.end
@@ -666,7 +773,7 @@ def turn_timings(messages: list[Message]) -> tuple[float, float, float] | None:
         return None
     end = parse_iso(assistants[-1].timing.end)
     start = parse_iso(
-        messages[user_index].timing.send if user_index is not None
+        user.timing.send if user is not None and user.timing.send
         else assistants[0].timing.start
     )
     if end is None or start is None:

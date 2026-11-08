@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -39,6 +40,14 @@ from .protocol import (
 # The quit check is the one request that must resolve fast and never retry:
 # a wedged or dead host may delay a disconnect by at most this much.
 QUIT_TIMEOUT = 1.0
+
+
+def _session_path(name: str) -> str:
+    """Quote a session name for a URL path.
+
+    A subagent is ``<parent>/agent-N``; the slash must stay inside the
+    ``{name:path}`` route parameter instead of splitting the path."""
+    return quote(name, safe="")
 
 
 async def ensure_host(timeout: float = 5.0) -> None:
@@ -227,20 +236,20 @@ class XarnessClient:
 
     async def load_session(self, name: str) -> SessionSummary:
         return await self._post(
-            f"/v1/sessions/{name}/load", {}, model=SessionSummary,
+            f"/v1/sessions/{_session_path(name)}/load", {}, model=SessionSummary,
         )
 
     async def diff(self, name: str, path: str | None = None) -> protocol.DiffInfo:
         params = {"path": path} if path else None
         return await self._get(
-            f"/v1/sessions/{name}/diff", params=params,
+            f"/v1/sessions/{_session_path(name)}/diff", params=params,
             model=protocol.DiffInfo,
         )
 
     async def upload_image(self, name: str, data: bytes, image_id: str) -> None:
         response = await self._request(
             "PUT",
-            f"/v1/sessions/{name}/images/{image_id}",
+            f"/v1/sessions/{_session_path(name)}/images/{image_id}",
             content=data,
             headers={"Content-Type": "application/octet-stream"},
         )
@@ -252,13 +261,14 @@ class XarnessClient:
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:
         return await self._request_json(
-            "DELETE", f"/v1/sessions/{name}", model=protocol.DeleteResult,
+            "DELETE", f"/v1/sessions/{_session_path(name)}",
+            model=protocol.DeleteResult,
         )
 
     async def unload_session(self, name: str) -> bool:
         """Stop hosting a session; its saved file is kept."""
         result = await self._post(
-            f"/v1/sessions/{name}/unload", {}, model=protocol.DeleteResult,
+            f"/v1/sessions/{_session_path(name)}/unload", {}, model=protocol.DeleteResult,
         )
         return result.deleted
 
@@ -272,7 +282,7 @@ class XarnessClient:
         — a quit may not hang on a wedged host."""
         try:
             response = await self._http.get(
-                f"/v1/sessions/{name}/quit", timeout=QUIT_TIMEOUT,
+                f"/v1/sessions/{_session_path(name)}/quit", timeout=QUIT_TIMEOUT,
             )
         except httpx.HTTPError as exc:
             raise ClientError(str(exc) or type(exc).__name__) from exc
@@ -285,7 +295,7 @@ class XarnessClient:
         """Send one command; the reply goes only to this client."""
         envelope = CommandEnvelope(cmd_id=uuid.uuid4().hex, command=command)
         result = await self._post(
-            f"/v1/sessions/{name}/commands", envelope.model_dump(),
+            f"/v1/sessions/{_session_path(name)}/commands", envelope.model_dump(),
             model=CommandResult,
         )
         if not result.ok:
@@ -307,7 +317,7 @@ class XarnessClient:
         @asynccontextmanager
         async def _response_cm() -> AsyncIterator[httpx.Response]:
             response = await self._request(
-                "GET", f"/v1/sessions/{name}/events",
+                "GET", f"/v1/sessions/{_session_path(name)}/events",
                 headers=headers, stream=True,
             )
             try:

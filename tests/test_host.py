@@ -1123,6 +1123,23 @@ def test_loading_a_session_reuses_the_saved_baseline(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_subagent_names_are_parent_scoped(tmp_path, monkeypatch) -> None:
+    """Children are ``<parent>/agent-N``: the same short name can appear
+    under different parents, and a restarted host continues the count."""
+    host = make_host(tmp_path)
+    parent = "550e8400e29b41d4a716446655440000"
+    other = "6ba7b8109dad11d180b400c04fd430c8"
+    assert host._next_agent_name(parent) == f"{parent}/agent-1"
+    assert host._next_agent_name(parent) == f"{parent}/agent-2"
+    assert host._next_agent_name(other) == f"{other}/agent-1"
+
+    restarted = make_host(tmp_path)
+    monkeypatch.setattr(
+        session_store, "load_metas", lambda: {f"{parent}/agent-2": {}},
+    )
+    assert restarted._next_agent_name(parent) == f"{parent}/agent-3"
+
+
 def test_daemon_import_does_not_pull_in_textual() -> None:
     """Importing the host (the daemon) must not import the TUI stack."""
     import subprocess
@@ -1133,6 +1150,8 @@ def test_daemon_import_does_not_pull_in_textual() -> None:
         "assert 'textual' not in sys.modules, sorted(sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
 def test_session_listing_counts_a_subagents_work_as_its_parents() -> None:
     """The /sessions +/- totals follow the parent link: a child's pending
     work is part of the row for the session that spawned it."""

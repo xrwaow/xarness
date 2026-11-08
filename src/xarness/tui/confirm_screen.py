@@ -1,8 +1,8 @@
 """Generic yes/no modal for decisions the harness must not make for the user.
 
-Used by the `/accept` and `/reject` confirmations: when pending files were
-not made by this agent (or when rejecting would revert the user's own edits),
-the harness asks instead of choosing for them.
+Used by the `/reject` confirmation (and the ctrl+c quit prompt): when
+pending files would be thrown away with the user's own edits, the harness
+asks instead of choosing for them.
 
 Follows the same shape as the other modals (``ListPicker``):
 a titled surface panel centered on screen, dismissed with the app's modal

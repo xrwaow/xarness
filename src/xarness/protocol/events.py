@@ -228,15 +228,21 @@ class TurnEnded(EventBase):
     Emitted on every path — finished, cancelled, failed — so clients never
     have to infer "the turn is over" from a StatusChanged transition.
 
-    ``busy``/``idle`` come from the same persisted stamps a reload derives
-    its footer from; together they are the turn's total (None when the turn
-    left no completed round to measure, or when talking to an older host)."""
+    ``total``/``busy``/``idle``/``usage`` are the figures the host just
+    stamped on the turn's last answer (``Timing.stats``); they are exactly
+    what a reload renders, so a live footer and a replayed one agree. All of
+    them are None when there was nothing to stamp (a turn that streamed no
+    answer, or a host talking an older protocol). ``busy``/``idle`` are
+    additionally None for a turn cut short: it reports how long it ran, not a
+    split nobody measured to the end."""
 
     type: Literal["turn_ended"] = "turn_ended"
     outcome: Literal["finished", "cancelled", "failed"] = "finished"
     elapsed: float = 0.0
+    total: float | None = None
     busy: float | None = None
     idle: float | None = None
+    usage: Usage | None = None
 
 
 class SessionDeleted(EventBase):

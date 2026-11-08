@@ -174,8 +174,12 @@ class SessionSummary(BaseModel):
 
     name: str
     workspace: str | None = None
-    # "waiting" and "saved" are host-level states, not conversation states.
-    state: Literal["idle", "running", "compacting", "waiting", "saved"] = "saved"
+    # "ask", "waiting" and "saved" are host-level states, not conversation
+    # states: "ask" means the turn is blocked on the ask tool (the user owes
+    # it an answer), "waiting" that it is blocked on a tool call.
+    state: Literal[
+        "idle", "running", "compacting", "ask", "waiting", "saved",
+    ] = "saved"
     active: bool = False
     clients_attached: int = 0
     model: str | None = None

@@ -3,6 +3,8 @@ client/server import boundary. The app runs against a fake clientlib
 client; the session behaviors themselves are covered in test_session.py."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import unittest
 
@@ -12,7 +14,8 @@ from textual.pilot import Pilot
 from xarness import protocol
 from xarness.clientlib import ClientError
 from xarness.conversation import (
-    AssistantMessage, TextPart, Timing, ToolMessage, UserMessage, Usage,
+    AssistantMessage, TextPart, Timing, ToolMessage, TurnStats, UserMessage,
+    Usage,
 )
 from xarness.protocol import (
     CommandResult,
@@ -51,6 +54,7 @@ class FakeClient:
         # TUI's, so the default is "nothing to ask".
         self.quit_verdict_result = protocol.QuitVerdict(ask=False)
         self.quit_verdict_error: Exception | None = None
+        self.uploads: list[tuple[str, bytes, str]] = []
 
     async def snapshot(self, name: str) -> Snapshot:
         return self.snapshot_data
@@ -72,6 +76,9 @@ class FakeClient:
         return self.command_results.get(
             command.type, CommandResult(cmd_id="t", ok=True, user_text="put back"),
         )
+
+    async def upload_image(self, name: str, data: bytes, image_id: str) -> None:
+        self.uploads.append((name, data, image_id))
 
     async def sessions(self, **kwargs):
         self.session_calls.append(kwargs)
@@ -309,6 +316,64 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bar.has_class("visible"))
 
 
+class ImageUploadTest(unittest.IsolatedAsyncioTestCase):
+    """An attached image is uploaded before the send; ImageAttachment is an
+    ImageRef subclass, so the ref fast path must not swallow it."""
+
+    @staticmethod
+    def _attachment() -> "ImageAttachment":
+        from xarness.images import ImageAttachment
+
+        data = b"cat"
+        return ImageAttachment(
+            id=hashlib.sha256(data).hexdigest(), name="clipboard.png",
+            mime="image/png", data_b64=base64.b64encode(data).decode(),
+            width=8, height=8,
+        )
+
+    async def test_attachment_is_uploaded_and_sent_as_a_ref(self) -> None:
+        from xarness.images import ImageRef, token_text
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        attachment = self._attachment()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._submit(f"look {token_text(attachment)}", [attachment])
+            await pilot.pause()
+
+        self.assertEqual(
+            client.uploads, [("s1", b"cat", attachment.id)])
+        sends = [c for _, c in client.commands if c.type == "send_message"]
+        self.assertEqual(len(sends), 1)
+        refs = sends[0].images or []
+        self.assertEqual(len(refs), 1)
+        # The wire carries the ref shape only: no base64 payload.
+        self.assertIs(type(refs[0]), ImageRef)
+        self.assertEqual(refs[0].id, attachment.id)
+        self.assertFalse(hasattr(refs[0], "data_b64"))
+
+    async def test_a_restored_ref_is_not_uploaded_again(self) -> None:
+        from xarness.images import ImageRef, token_text
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot())
+        app = AgentApp(client, workspace=None, session_name="s1")
+        ref = ImageRef(
+            id=hashlib.sha256(b"cat").hexdigest(), name="clipboard.png",
+            mime="image/png", width=8, height=8,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._submit(f"look {token_text(ref)}", [ref])
+            await pilot.pause()
+
+        self.assertEqual(client.uploads, [])
+        sends = [c for _, c in client.commands if c.type == "send_message"]
+        self.assertEqual([i.id for i in (sends[0].images or [])], [ref.id])
+
+
 class WordmarkTest(unittest.IsolatedAsyncioTestCase):
     """The wordmark marks an empty session and yields to the first message."""
 
@@ -533,8 +598,9 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
-    """`/accept` and `/reject` ask first when the pending rows are not the
-    user's to give away (or would be thrown away with them)."""
+    """`/accept` never asks (its notice reports the foreign files); `/reject`
+    asks first when drift — the user's own edits — would be thrown away with
+    it."""
 
     def _app(self):
         from xarness.tui.app import AgentApp
@@ -549,22 +615,18 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
             for i, kind in enumerate(kinds)
         ])
 
-    async def test_accept_confirms_foreign_rows_then_accepts(self) -> None:
-        from textual.widgets import Label
-
+    async def test_accept_of_foreign_rows_posts_without_a_modal(self) -> None:
+        """Other agents' and bash rows are accepted silently: the host's
+        notice reports the breakdown, so there is nothing to confirm."""
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client, app = self._app()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._last_diff = self._diff("mine", "agent", "auto")
-            app._accept_with_confirm()
+            app._accept()
             await pilot.pause()
-            self.assertIsInstance(app.screen, ConfirmScreen)
-            title = app.screen.query_one("#confirm-title", Label).render()
-            self.assertIn("2 of 3 pending files", str(title))
-            await pilot.press("y")
-            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
             await pilot.pause()
             self.assertEqual(
                 [c.type for _, c in client.commands], ["accept"], client.commands,
@@ -577,7 +639,7 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             app._last_diff = self._diff("mine", "mine")
-            app._accept_with_confirm()
+            app._accept()
             await pilot.pause()
             self.assertNotIsInstance(app.screen, ConfirmScreen)
             await pilot.pause()
@@ -1004,8 +1066,8 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
     """Session popup rows: {title} {age} {dir} {diff}, with a right-aligned
     state word (padded to the longest state word) for loaded sessions —
-    waiting=accent, running/compacting=success, idle=muted; saved (not
-    loaded) rows show no state word at all."""
+    ask=warning, waiting=accent, running/compacting=success, idle=muted;
+    saved (not loaded) rows show no state word at all."""
 
     def _summaries(self):
         def s(name, state, active, attached=0):
@@ -1025,7 +1087,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         from xarness import theme
         from xarness.tui.list_picker import STATE_WORDS as _STATE_WORDS
         expected = {
-            "waiting": "accent", "running": "success",
+            "ask": "warning", "waiting": "accent", "running": "success",
             "compacting": "success", "idle": "muted",
         }
         for state, key in expected.items():
@@ -1033,6 +1095,72 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(key, theme.PALETTE)
         # Saved / not loaded sessions show no state word at all.
         self.assertIsNone(_STATE_WORDS.get("saved"))
+
+    def test_ask_state_gets_its_own_word(self) -> None:
+        """A session blocked on its ask tool reads "ask", not "waiting"."""
+        from xarness.tui.list_picker import (
+            STATE_WIDTH as _STATE_WIDTH,
+            SPACER_ID,
+            session_options,
+        )
+
+        entries = [
+            SessionSummary(
+                name="ask-one", state="ask", active=True,
+                last_user_message_at="2026-01-01T00:00:00+00:00",
+            ),
+        ]
+        options = [o for o in session_options(entries, None)
+                   if str(o.id) != SPACER_ID]
+        self.assertEqual(len(options), 1)
+        row = str(options[0].prompt)
+        self.assertTrue(row.endswith("ask".rjust(_STATE_WIDTH)), row)
+        self.assertNotIn("waiting", row)
+
+    def test_only_the_current_workspace_is_listed(self) -> None:
+        """Live sessions of another workspace are dropped like saved ones:
+        /sessions is about the checkout the TUI runs in."""
+        from xarness.tui.list_picker import SPACER_ID, session_options
+
+        def summary(name, workspace, state, active, at):
+            return SessionSummary(
+                name=name, workspace=workspace, state=state, active=active,
+                last_user_message_at=f"2026-01-01T{at}+00:00",
+            )
+
+        entries = [
+            summary("here-live", "/work/app", "running", True, "04:00"),
+            summary("there-live", "/work/other", "running", True, "03:00"),
+            summary("here-saved", "/work/app/.", "saved", False, "02:00"),
+            summary("there-saved", "/work/other", "saved", False, "01:00"),
+        ]
+        options = session_options(entries, "/work/app")
+        self.assertEqual(
+            [str(o.id) for o in options],
+            ["here-live", SPACER_ID, "here-saved"],
+        )
+
+    def test_titles_pad_to_the_longest_title(self) -> None:
+        """Every row's title column is the same fixed width, so the age (and
+        everything after it) starts at the same offset on every row."""
+        from xarness.tui.list_picker import session_options
+
+        names = ["short", "a-much-longer-title"]
+        entries = [
+            SessionSummary(
+                name=name, state="saved",
+                last_user_message_at="2026-01-01T00:00:00+00:00",
+            )
+            for name in names
+        ]
+        rows = [str(o.prompt) for o in session_options(entries, None)]
+        self.assertEqual(len(rows), 2)
+        title_width = max(map(len, names))
+        for row, name in zip(rows, names):
+            self.assertEqual(row[:title_width], name.ljust(title_width), row)
+        # Same age/dir/diff columns: the only difference is the padded title.
+        self.assertEqual(rows[0][title_width:], rows[1][title_width:], rows)
+        self.assertGreater(len(rows[0][title_width:].strip()), 0, rows)
 
     async def test_rows_render_title_age_and_dot(self) -> None:
         from textual.app import App, ComposeResult
@@ -1237,19 +1365,54 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             )
 
         # Recency order puts the child and the grandchild first; the picker
-        # moves each under the parent it names.
+        # moves each under the parent it names. A subagent is stored as
+        # ``<parent>/agent-N`` and only its short name is shown.
         entries = [
-            summary("child", parent="root", at="00:00:03"),
+            summary("root/agent-1", parent="root", at="00:00:03"),
             summary("other", at="00:00:02"),
             summary("root", at="00:00:04"),
-            summary("grandchild", parent="child", at="00:00:01"),
+            summary("root/agent-1/agent-1", parent="root/agent-1",
+                    at="00:00:01"),
         ]
         options = session_options(entries, None)
         assert [str(o.id) for o in options] == [
-            "root", "child", "grandchild", "other",
+            "root", "root/agent-1", "root/agent-1/agent-1", "other",
         ]
-        assert str(options[1].prompt).startswith("↳ child")
+        assert str(options[1].prompt).startswith("↳ agent-1")
+        assert str(options[2].prompt).startswith("↳ agent-1")
         assert str(options[3].prompt).startswith("other")
+
+    def test_an_active_member_promotes_its_whole_group(self) -> None:
+        """Attaching to an idle subagent keeps its parent and siblings in
+        the live section, with the hosted children above the saved ones."""
+        from xarness.tui.list_picker import SPACER_ID, session_options
+
+        def summary(
+            name: str, parent: str | None = None, state: str = "saved",
+            active: bool = False, at: str = "00:00:00",
+        ) -> SessionSummary:
+            return SessionSummary(
+                name=name, parent_id=parent, state=state, active=active,
+                last_user_message_at=f"2026-01-01T{at}+00:00",
+            )
+
+        entries = [
+            summary("root", at="00:00:04"),
+            summary("root/agent-1", parent="root", at="00:00:01"),
+            summary("root/agent-2", parent="root", state="idle", active=True,
+                    at="00:00:03"),
+            summary("old", at="00:00:02"),
+        ]
+        options = session_options(entries, None)
+        assert [str(o.id) for o in options] == [
+            "root", "root/agent-2", "root/agent-1", SPACER_ID, "old",
+        ], [str(o.id) for o in options]
+        rows = {str(o.id): str(o.prompt) for o in options}
+        assert "idle" in rows["root"]   # promoted, not loaded
+        assert "idle" in rows["root/agent-1"]
+        assert "idle" in rows["root/agent-2"]
+        assert rows["root/agent-1"].startswith("↳ agent-1")
+        assert rows["root/agent-2"].startswith("↳ agent-2")
 
     def test_idle_child_of_an_active_parent_stays_live(self) -> None:
         """A finished subagent is saved/inactive, but while its parent is
@@ -1755,9 +1918,12 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             ToolMessage(id="t1", tool_call_id="c1", content="file body"),
             AssistantMessage(
                 content="Done.",
+                # The host stamps a finished turn's numbers on its last answer;
+                # that stamp is what a footer is drawn from.
                 timing=Timing(
                     start="2025-01-01T00:00:01+00:00",
                     end="2025-01-01T00:00:05+00:00",
+                    stats=TurnStats(total=5.0, busy=4.0, idle=1.0),
                 ),
             ),
         ]
@@ -1819,15 +1985,13 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Worked for 5.0s (4.0s | 1.0s)", all_text)
 
     async def test_replay_footer_shows_turn_token_counts(self) -> None:
-        """The footer carries the turn's summed ↑input ↓output spend, next
-        to the timing breakdown."""
+        """The footer's ↑input ↓output spend is the host's turn total,
+        stamped next to the timings — the client sums nothing."""
         from xarness.tui.app import AgentApp
 
         snap = self._snapshot_with_history()
-        snap.messages[1].usage = Usage(
-            input_tokens=2_000, output_tokens=400)
-        snap.messages[3].usage = Usage(
-            input_tokens=1_234, output_tokens=56)
+        snap.messages[3].timing.stats.usage = Usage(
+            input_tokens=3_234, output_tokens=456)
         app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1836,6 +2000,24 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
             self.assertIn(
                 "Worked for 5.0s (4.0s | 1.0s) · ↑3.2k ↓456", all_text)
+
+    async def test_resumed_running_turn_shows_no_footer(self) -> None:
+        """The reported bug: continue headless, then reattach while the turn
+        still works. The host has not ended that turn, so its last answer
+        carries no stats and no \"Worked for\" line is drawn under it."""
+        from xarness.tui.app import AgentApp
+
+        snap = self._snapshot_with_history()
+        snap.status.state = "running"  # type: ignore[assignment]
+        snap.messages[-1].timing.stats = None  # not over: nothing stamped
+        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            flow = app.query_one("#chat-log")
+            all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
+            self.assertIn("Done.", all_text)
+            self.assertNotIn("Worked for", all_text)
 
     async def test_attach_mid_tool_shows_it_running_not_interrupted(self) -> None:
         """A turn whose tools are still executing has no result for those

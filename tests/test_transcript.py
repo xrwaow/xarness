@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from xarness.conversation import SUMMARY_PREFIX, Timing, ToolCall
-from xarness.conversation import AssistantMessage, ToolMessage, user_message
+from xarness.conversation import AssistantMessage, ToolMessage, TurnStats, user_message
 from xarness.protocol import (
     ContentDelta,
     ProcessingStarted,
@@ -32,15 +32,22 @@ def _user(text, mid="u"):
     return user_message(text, id=mid)
 
 
+def _stamped(start: str, end: str, **stats) -> Timing:
+    """The timing a finished turn's last answer carries: the host's numbers."""
+    figures = {"total": 5.0, "busy": 4.0, "idle": 1.0}
+    figures.update(stats)
+    return Timing(start=start, end=end, stats=TurnStats(**figures))
+
+
 class TranscriptTest(unittest.TestCase):
     def test_load_rebuilds_messages_tools_and_timing(self):
         user = user_message("hi", id="u",
                        timing=Timing(send="2025-01-01T00:00:00+00:00"))
         call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
         assistant = AssistantMessage(content="", tool_calls=[call],
-            timing=Timing(
-                start="2025-01-01T00:00:00+00:00",
-                end="2025-01-01T00:00:01+00:00",
+            timing=_stamped(
+                "2025-01-01T00:00:00+00:00",
+                "2025-01-01T00:00:01+00:00",
             ),
         )
         result = ToolMessage(tool_call_id="c1", content="body", status="error")
@@ -274,11 +281,14 @@ class TranscriptTest(unittest.TestCase):
 
     def test_turn_footer_sums_usage_across_rounds(self):
         """The footer's token counts are the turn's whole spend: every
-        round, not just the final answer's."""
-        from xarness.conversation import Usage
+        round, not just the final answer's. The host sums them when it stamps
+        the turn's end, so the client just renders them."""
+        from xarness.conversation import Conversation, Usage
 
+        opening = user_message(
+            "hi", id="u1", timing=Timing(send="2025-01-01T00:00:00+00:00"))
         messages = [
-            user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
+            opening,
             AssistantMessage(
                 content="a", id="a1", usage=Usage(
                     input_tokens=1_234, output_tokens=56),
@@ -294,7 +304,10 @@ class TranscriptTest(unittest.TestCase):
                     end="2025-01-01T00:00:05+00:00"),
             ),
         ]
-        items = tr.Transcript().load(_snap(messages))
+        conversation = Conversation(messages=messages)
+        conversation.begin_turn(opening, before_tree=None)
+        self.assertIsNotNone(conversation.stamp_turn_end())
+        items = tr.Transcript().load(_snap(conversation.messages))
         footer = next(i for i in items if isinstance(i, tr.TurnSummaryItem))
         assert footer.usage is not None
         self.assertEqual(
@@ -302,18 +315,68 @@ class TranscriptTest(unittest.TestCase):
             (3_234, 456),
         )
 
+    def test_turn_without_host_stamp_has_no_footer(self):
+        """The footer is the host's verdict that the turn is over. A round
+        that finished its tool call but was never stamped (the turn is still
+        running — e.g. a session resumed while it works headless) must not
+        claim an end, however answerable the history looks."""
+        user = user_message(
+            "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
+        call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
+        assistant = AssistantMessage(
+            content="", tool_calls=[call],
+            timing=Timing(
+                start="2025-01-01T00:00:00+00:00",
+                end="2025-01-01T00:00:01+00:00",
+            ),
+        )
+        result = ToolMessage(tool_call_id="c1", content="body", status="ok")
+        items = tr.Transcript().load(_snap([user, assistant, result]))
+        self.assertFalse(
+            [i for i in items if isinstance(i, tr.TurnSummaryItem)])
+
+    def test_cancelled_turn_reports_how_long_it_ran(self):
+        """A turn cut short has ended too: it gets a footer with the wall
+        clock it spent and no busy/idle split (the stamps only reach its last
+        completed round, so a split would lie)."""
+        user = user_message(
+            "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
+        done = AssistantMessage(
+            content="",
+            tool_calls=[ToolCall(call_id="c1", name="read_file",
+                                 arguments_json="{}")],
+            timing=Timing(
+                start="2025-01-01T00:00:00+00:00",
+                end="2025-01-01T00:00:01+00:00",
+            ),
+        )
+        result = ToolMessage(tool_call_id="c1", content="body", status="ok")
+        partial = AssistantMessage(
+            content="half", interrupted=True,
+            timing=Timing(stats=TurnStats(total=62.0)),
+        )
+        items = tr.Transcript().load(_snap([user, done, result, partial]))
+        footers = [i for i in items if isinstance(i, tr.TurnSummaryItem)]
+        self.assertEqual(len(footers), 1)
+        self.assertEqual(footers[0].total, 62.0)
+        self.assertIsNone(footers[0].busy)
+        self.assertIsNone(footers[0].idle)
+
     def test_live_and_replay_footer_match(self):
-        """A live turn appends the same footer replay derives, breakdown
-        included: the host stamps the same numbers it persisted."""
-        from xarness.conversation import Usage
+        """A live turn appends exactly the footer a reload renders: the host
+        puts the same figures on ``TurnEnded`` as it stamps on the last
+        answer."""
+        from xarness.conversation import Conversation, Usage
 
         usage = Usage(input_tokens=1_234, output_tokens=56)
         live = tr.Transcript()
         live.apply(MessageAdded(message=_user("hi")))
         live.apply(ContentDelta(text="hello"))
         live.apply(RoundComplete(usage=usage))
-        changed = live.apply(
-            TurnEnded(outcome="finished", elapsed=5.0, busy=4.0, idle=1.0))
+        changed = live.apply(TurnEnded(
+            outcome="finished", elapsed=5.0, total=5.0,
+            busy=4.0, idle=1.0, usage=usage,
+        ))
         footers = [i for i in changed if isinstance(i, tr.TurnSummaryItem)]
         self.assertEqual(len(footers), 1)
         self.assertEqual(footers[0].total, 5.0)
@@ -323,6 +386,33 @@ class TranscriptTest(unittest.TestCase):
         # Settling a second time never duplicates the footer.
         self.assertEqual(
             live.apply(TurnEnded(outcome="finished", elapsed=5.0)), [])
+
+        # The same turn as the host persists it (5s answer, 4s of it
+        # thinking) replays to the same four numbers.
+        opening = user_message(
+            "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
+        answer = AssistantMessage(
+            content="hello", usage=usage,
+            timing=Timing(
+                start="2025-01-01T00:00:00+00:00",
+                end="2025-01-01T00:00:05+00:00",
+                reasoning_seconds=4.0,
+            ),
+        )
+        conversation = Conversation(messages=[opening, answer])
+        conversation.begin_turn(opening, before_tree=None)
+        self.assertIsNotNone(conversation.stamp_turn_end())
+        replayed = [
+            i for i in tr.Transcript().load(_snap(conversation.messages))
+            if isinstance(i, tr.TurnSummaryItem)
+        ]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(
+            (replayed[0].total, replayed[0].busy, replayed[0].idle,
+             replayed[0].usage),
+            (footers[0].total, footers[0].busy, footers[0].idle,
+             footers[0].usage),
+        )
 
     def test_finish_keeps_first_duration(self):
         item = tr.ThinkingItem(parts=["x"])

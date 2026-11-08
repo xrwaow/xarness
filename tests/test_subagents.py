@@ -200,6 +200,7 @@ def test_child_session_shape(tmp_path, monkeypatch) -> None:
         await parent.execute("s1", protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child = next(s for s in host.sessions.values() if s is not parent)
+        assert child.name == f"{parent.name}/agent-1"
         assert child.parent_id == parent.name
         assert child.workspace_state is parent.workspace_state
         assert child.workspace == parent.workspace

@@ -29,8 +29,11 @@ from ..protocol import SessionSummary
 from ..util import format_duration, parse_iso
 
 # State word per session state, colored with this palette key; states not
-# listed here (saved / not loaded) get no state word.
+# listed here (saved / not loaded) get no state word. "ask" is a session
+# blocked on its ask tool: the user owes it an answer, so it gets its own
+# word (and the attention color) rather than being lumped into "waiting".
 STATE_WORDS = {
+    "ask": ("ask", "warning"),
     "waiting": ("waiting", "accent"),
     "running": ("running", "success"),
     "compacting": ("compacting", "success"),
@@ -76,8 +79,14 @@ class _RowLayout:
     dir_width: int
 
     @classmethod
-    def fit(cls, directories: Iterable[str]) -> _RowLayout:
-        """Widen the dir column to its longest value, then fit the name."""
+    def fit(
+        cls, titles: Iterable[str], directories: Iterable[str],
+    ) -> _RowLayout:
+        """Fix the title column at the longest title, then widen dir.
+
+        The title width is the max over the current rows (never more than
+        the row leaves free), so every row pads its title to the same
+        width and the columns that follow line up like a table."""
         dir_width = min(max(map(len, directories), default=0), DIR_MAX_WIDTH)
         fixed = (
             COLUMN_GAP + AGE_WIDTH
@@ -86,7 +95,9 @@ class _RowLayout:
             + DIFF_GAP + MINUS_FIELD
             + COLUMN_GAP + STATE_WIDTH
         )
-        return cls(max(NAME_MIN_WIDTH, SESSION_ROW_WIDTH - fixed), dir_width)
+        available = max(NAME_MIN_WIDTH, SESSION_ROW_WIDTH - fixed)
+        name_width = min(max(map(len, titles), default=0), available)
+        return cls(max(NAME_MIN_WIDTH, name_width), dir_width)
 
 
 def relative_time(iso: str | None) -> str:
@@ -134,58 +145,75 @@ def name_options(names: Sequence[str], current: str | None = None) -> list[Optio
 def session_options(
     entries: Sequence[SessionSummary], workspace: str | None,
 ) -> list[Option]:
-    """Global active sessions, then saved sessions of this workspace.
+    """Live groups, then saved groups — only this workspace's sessions.
+
+    ``workspace`` scopes the whole list: the picker is about the sessions
+    of the checkout the TUI runs in, so live sessions hosted for another
+    workspace are dropped along with the saved ones. ``None`` means no
+    filter (every session matches).
 
     Each row is one Text: name, dimmed age, innermost workspace directory,
     the session's own unaccepted (``mine``) +/- totals, right-aligned state
-    word. Both sections are newest-user-message first, separated by one
-    blank row of padding when both are non-empty.
+    word. A subagent is shown as ``agent-N`` immediately under its parent.
+    A whole group moves to the live section when any member is live, with
+    the active children above the idle (saved/not loaded) ones. Both
+    sections are newest-group first, separated by one blank row of padding
+    when both are non-empty.
     """
     resolved = Path(workspace).resolve() if workspace else None
-    # A subagent has no lifetime of its own once idle, but it belongs to
-    # the session that spawned it: while that parent is live, keep the
-    # child in the live section instead of dropping it below the gap.
-    active_names = {s.name for s in entries if s.active}
-    subtree_of_active = _subtree_of_active(entries, active_names)
-    active = _nested(sorted(
-        (s for s in entries
-         if s.active or s.name in subtree_of_active),
-        key=lambda s: s.last_user_message_at or "", reverse=True,
-    ))
-    saved = _nested(sorted(
-        (s for s in entries
-         if not s.active and s.name not in subtree_of_active
-         and _same_path(s.workspace or "", resolved)),
-        key=lambda s: s.last_user_message_at or "", reverse=True,
-    ))
+    entries = [
+        entry for entry in entries
+        if _same_path(entry.workspace or "", resolved)
+    ]
+    by_name = {entry.name: entry for entry in entries}
+    groups: dict[str, list[SessionSummary]] = {}
+    for entry in entries:
+        groups.setdefault(_group_root(entry, by_name), []).append(entry)
+    # A group is live when any member is hosted: attaching to an idle
+    # subagent keeps its parent and siblings above the gap with it.
+    ordered_groups = sorted(
+        groups.values(), key=_group_activity, reverse=True,
+    )
+    live_groups = [members for members in ordered_groups
+                   if any(entry.active for entry in members)]
+    saved_groups = [members for members in ordered_groups
+                    if not any(entry.active for entry in members)]
+    active = [entry for members in live_groups
+              for entry in _flatten(members)]
+    saved = [entry for members in saved_groups
+             for entry in _flatten(members)]
     # Column widths are derived from the data so every row lines up as a
-    # table: age right-aligned, workspace dir left-aligned, the session's
-    # own unaccepted (``mine``) +/- totals in fixed +/- sub-columns (blank
-    # for tracked-but-clean or untracked sessions), state word flush right.
-    # The name takes whatever width is left.
+    # table: the title is padded to the longest title of the list, the age
+    # is right-aligned, the workspace dir left-aligned, the session's own
+    # unaccepted (``mine``) +/- totals in fixed +/- sub-columns (blank for
+    # tracked-but-clean or untracked sessions), state word flush right.
     live_names = {summary.name for summary in active}
     rows_data = []
     for summary in [*active, *saved]:
         tracked = summary.tracking and (summary.additions or summary.deletions)
-        # A saved child kept live only because its parent is active is idle,
-        # not an old on-disk session: show that state.
+        # A saved child kept live only because another member of its group
+        # is active is idle, not an old on-disk session: show that state.
         state = "idle" if (summary.name in live_names
                            and summary.state == "saved") else summary.state
         rows_data.append((
             summary,
+            _title(summary),
             state,
             relative_time(summary.last_user_message_at),
             innermost_dir(summary.workspace),
             f"+{summary.additions}" if tracked and summary.additions else "",
             f"-{summary.deletions}" if tracked and summary.deletions else "",
         ))
-    layout = _RowLayout.fit(directory for _, _, _, directory, _, _ in rows_data)
+    layout = _RowLayout.fit(
+        (title for _, title, *_ in rows_data),
+        (directory for *_, directory, _, _ in rows_data),
+    )
 
     def row(entry) -> Option:
-        summary, state, age, directory, plus, minus = entry
+        summary, title, state, age, directory, plus, minus = entry
         return Option(
             _session_row(
-                summary, state, age, directory, plus, minus, layout,
+                title, state, age, directory, plus, minus, layout,
             ),
             id=summary.name,
         )
@@ -201,39 +229,45 @@ def session_options(
     return options
 
 
-def _subtree_of_active(
-    entries: Sequence[SessionSummary], active_names: set[str],
-) -> set[str]:
-    """Names of sessions whose ancestor chain reaches an active session."""
-    by_name = {entry.name: entry for entry in entries}
-    found: set[str] = set()
-    for entry in entries:
-        name, seen = entry.parent_id, {entry.name}
-        while name and name not in seen:
-            if name in active_names:
-                found.add(entry.name)
-                break
-            seen.add(name)
-            parent = by_name.get(name)
-            name = parent.parent_id if parent else None
-    return found - active_names
+def _group_root(
+    entry: SessionSummary, by_name: dict[str, SessionSummary],
+) -> str:
+    """The name of the topmost ancestor present in the listing."""
+    seen = {entry.name}
+    current = entry
+    while (
+        current.parent_id
+        and current.parent_id in by_name
+        and current.parent_id not in seen
+    ):
+        seen.add(current.parent_id)
+        current = by_name[current.parent_id]
+    return current.name
 
 
-def _nested(entries: Sequence[SessionSummary]) -> list[SessionSummary]:
-    """Put each child immediately after its parent, recursively.
+def _group_activity(members: Sequence[SessionSummary]) -> str:
+    """The group's newest user message, which orders the group as a unit."""
+    return max((entry.last_user_message_at or "" for entry in members),
+               default="")
 
-    The input order is recency; roots keep it and children follow their
-    parent (grandchildren after them). A child whose parent is not in the
-    list stays where it sorted."""
-    names = {entry.name for entry in entries}
+
+def _flatten(members: Sequence[SessionSummary]) -> list[SessionSummary]:
+    """Each member once, parent before children, active children first.
+
+    The section order is recency; within one group a parent stays above
+    its children, and among siblings the hosted ones come before the idle
+    (saved/not loaded) ones."""
+    names = {entry.name for entry in members}
     children: dict[str, list[SessionSummary]] = {}
     roots: list[SessionSummary] = []
-    for entry in entries:
+    for entry in members:
         parent = entry.parent_id
         if parent and parent in names and parent != entry.name:
             children.setdefault(parent, []).append(entry)
         else:
             roots.append(entry)
+    roots.sort(key=lambda entry: entry.last_user_message_at or "",
+               reverse=True)
     ordered: list[SessionSummary] = []
     seen: set[str] = set()
 
@@ -242,12 +276,19 @@ def _nested(entries: Sequence[SessionSummary]) -> list[SessionSummary]:
             return
         seen.add(entry.name)
         ordered.append(entry)
-        for child in children.get(entry.name, []):
+        kids = sorted(
+            children.get(entry.name, []),
+            key=lambda child: child.last_user_message_at or "", reverse=True,
+        )
+        # A stable second pass: active siblings first, recency kept inside
+        # each of the two runs.
+        kids.sort(key=lambda child: not child.active)
+        for child in kids:
             add(child)
 
     for entry in roots:
         add(entry)
-    for entry in entries:  # cycles or an out-of-order child
+    for entry in members:  # cycles or an out-of-order child
         add(entry)
     return ordered
 
@@ -274,8 +315,18 @@ def _matches(option: Option, query: str) -> bool:
     return query in str(option.prompt).lower()
 
 
+def _title(summary: SessionSummary) -> str:
+    """The name shown for a session: a child is only its short half.
+
+    Subagents are stored as ``<parent>/agent-N``; under their parent the
+    short half is all there is to show (and can repeat across groups)."""
+    if summary.parent_id:
+        return "↳ " + summary.name.rsplit("/", 1)[-1]
+    return summary.name
+
+
 def _session_row(
-    summary: SessionSummary,
+    title: str,
     state: str,
     age: str,
     directory: str,
@@ -283,19 +334,18 @@ def _session_row(
     minus: str,
     layout: _RowLayout,
 ) -> Text:
-    """One session row: name | age | dir | +/- | ... | state.
+    """One session row: title | age | dir | +/- | ... | state.
 
-    The age, dir, +/- and state columns keep their width even when a row
-    has nothing to show in them, so every column lines up across the list.
+    The title is padded (and truncated, if need be) to the fixed title
+    column, and the age, dir, +/- and state columns keep their width even
+    when a row has nothing to show in them, so every column lines up
+    across the list.
     """
     state_word = STATE_WORDS.get(state)
     word, color_key = state_word if state_word else ("", "")
-    name = summary.name
-    if summary.parent_id:
-        name = "↳ " + name
-    if len(name) > layout.name_width:
-        name = name[:layout.name_width - 1] + "…"
-    row = Text(name)
+    if len(title) > layout.name_width:
+        title = title[:layout.name_width - 1] + "…"
+    row = Text(title.ljust(layout.name_width))
     row.append(
         " " * COLUMN_GAP + age.rjust(AGE_WIDTH),
         style=theme.PALETTE["muted"],

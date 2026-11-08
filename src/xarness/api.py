@@ -105,7 +105,7 @@ def sessions_router(host: Host) -> APIRouter:
         return session.summary()
 
     @router.post(
-        "/sessions/{name}/load",
+        "/sessions/{name:path}/load",
         response_model=SessionSummary,
         summary="Host a saved session (idempotent)",
     )
@@ -114,7 +114,7 @@ def sessions_router(host: Host) -> APIRouter:
         return session.summary()
 
     @router.post(
-        "/sessions/{name}/unload",
+        "/sessions/{name:path}/unload",
         response_model=protocol.DeleteResult,
         summary="Stop hosting a session (it stays saved on disk)",
     )
@@ -122,18 +122,7 @@ def sessions_router(host: Host) -> APIRouter:
         return protocol.DeleteResult(deleted=await host.unload_session(name))
 
     @router.get(
-        "/sessions/{name}",
-        response_model=Snapshot,
-        summary="Snapshot of a session (messages, status, live round)",
-    )
-    async def get_session(name: str) -> Snapshot:
-        """The session's snapshot. A saved-but-released session is re-hosted
-        on demand (cheap: constructing a Session starts no shell); the
-        reaper evicts it again once nothing is attached."""
-        return (await _session_or_load(host, name)).snapshot()
-
-    @router.get(
-        "/sessions/{name}/events",
+        "/sessions/{name:path}/events",
         summary="SSE event stream: one snapshot event, then live events",
         response_class=StreamingResponse,
         responses={
@@ -157,7 +146,7 @@ def sessions_router(host: Host) -> APIRouter:
         )
 
     @router.post(
-        "/sessions/{name}/commands",
+        "/sessions/{name:path}/commands",
         response_model=CommandResult,
         summary="Send one command (CommandEnvelope); the reply goes only to the issuer",
     )
@@ -166,7 +155,7 @@ def sessions_router(host: Host) -> APIRouter:
         return await session.execute(envelope.cmd_id, envelope.command)
 
     @router.get(
-        "/sessions/{name}/images/{image_id}",
+        "/sessions/{name:path}/images/{image_id}",
         summary="Fetch one stored image blob by content hash",
         response_class=Response,
     )
@@ -182,7 +171,7 @@ def sessions_router(host: Host) -> APIRouter:
         return Response(content=data, media_type=sniff_mime(data))
 
     @router.put(
-        "/sessions/{name}/images/{image_id}",
+        "/sessions/{name:path}/images/{image_id}",
         status_code=201,
         summary="Upload one image blob (content-addressed); reference it by hash in SendMessage",
     )
@@ -219,7 +208,7 @@ def sessions_router(host: Host) -> APIRouter:
         return Response(status_code=201)
 
     @router.patch(
-        "/sessions/{name}",
+        "/sessions/{name:path}",
         response_model=protocol.CommandResult,
         summary="Update session settings (mode, model, sandbox, filters, refs)",
     )
@@ -228,7 +217,7 @@ def sessions_router(host: Host) -> APIRouter:
         return await session.update_settings(body)
 
     @router.get(
-        "/sessions/{name}/quit",
+        "/sessions/{name:path}/quit",
         response_model=protocol.QuitVerdict,
         summary="Ask whether closing now needs the continue-headless choice",
     )
@@ -241,7 +230,7 @@ def sessions_router(host: Host) -> APIRouter:
         return (await _session_or_load(host, name)).quit_verdict()
 
     @router.get(
-        "/sessions/{name}/diff",
+        "/sessions/{name:path}/diff",
         response_model=protocol.DiffInfo,
         summary="Pending changes: summary and per-file diffs",
     )
@@ -249,8 +238,23 @@ def sessions_router(host: Host) -> APIRouter:
         session = await _session_or_load(host, name)
         return await session.diff_info(path)
 
+    @router.get(
+        "/sessions/{name:path}",
+        response_model=Snapshot,
+        summary="Snapshot of a session (messages, status, live round)",
+    )
+    async def get_session(name: str) -> Snapshot:
+        """The session's snapshot. A saved-but-released session is re-hosted
+        on demand (cheap: constructing a Session starts no shell); the
+        reaper evicts it again once nothing is attached.
+
+        Registered after the fixed suffixes (``/events``, ``/images/..``,
+        ``/quit``, ``/diff``): its ``:path`` converter also matches those,
+        and first-match-wins."""
+        return (await _session_or_load(host, name)).snapshot()
+
     @router.delete(
-        "/sessions/{name}",
+        "/sessions/{name:path}",
         response_model=protocol.DeleteResult,
         summary="Delete a saved session (idle only; the workspace is untouched)",
     )

@@ -180,6 +180,37 @@ def test_quit_verdict_never_respawns_the_host() -> None:
     assert spawned == []
 
 
+def test_subagent_session_names_are_quoted_in_urls() -> None:
+    """A child is ``<parent-uuid>/agent-N``; the slash must stay inside the
+    route parameter (``{name:path}``) instead of splitting the path."""
+    from xarness import clientlib
+    from xarness.protocol import SessionSummary
+
+    calls: list[httpx.Request] = []
+    parent = "550e8400e29b41d4a716446655440000"
+    child = f"{parent}/agent-1"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200, json=SessionSummary(name=child).model_dump(),
+        )
+
+    async def go():
+        client = clientlib.XarnessClient(httpx.AsyncClient(
+            base_url="http://test", transport=httpx.MockTransport(handler),
+        ))
+        try:
+            await client.load_session(child)
+        finally:
+            await client.aclose()
+
+    asyncio.run(go())
+    assert calls[0].url.raw_path == (
+        f"/v1/sessions/{parent}%2Fagent-1/load".encode()
+    )
+
+
 def test_quit_verdict_transport_error_is_a_client_error() -> None:
     """A dead socket surfaces as ClientError (the TUI treats it as "no
     verdict" and quits), never as a raw httpx error or a respawn."""

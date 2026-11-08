@@ -23,8 +23,9 @@ When a filesystem sandbox is available, the model gets:
 conversation, no `ask_user` and no `subagent` tool of its own, and returns
 the child's last non-empty assistant message. It shares the workspace and
 container with its parent, so its edits are tracked (and undone, accepted or
-rejected) exactly like any other agent's; it appears in `/sessions` under
-its parent, and you can attach to watch it. `mode: "plan"` children are
+rejected) exactly like any other agent's; it is stored as
+`<parent-uuid>/agent-N`, appears in `/sessions` as `agent-N` under its parent, and you
+can attach to watch it. `mode: "plan"` children are
 read-only; a plan-mode agent can only start plan children. Which model they
 run is the preset's `subagent_model`.
 
@@ -269,9 +270,10 @@ with every pending path that an agent changed (anything not `drift`)
 replaced by its current content — one new tree sha, no per-file bookkeeping
 — so your own unrecorded edits stay pending and are never absorbed.
 Everything before the last accept is out of `/diff`'s and `/undo`'s reach —
-use git itself (a repo you control) for history beyond that. When some
-pending files were not made by this agent, the TUI asks before accepting,
-and the command's notice reports the breakdown.
+use git itself (a repo you control) for history beyond that. `/accept`
+never asks: your own drift is never absorbed, so there is nothing to warn
+about, and the command's notice reports how many of the locked-in files
+weren't this agent's work.
 
 `/reject` restores tracked paths to the baseline, discarding everything
 since the last `/accept` — **including changes you made yourself**, which is
@@ -311,8 +313,9 @@ the filesystem.
 
 Conversations autosave in `~/.local/share/xarness/sessions/sessions.db`
 (SQLite: one state row plus one row per message; image blobs live under
-`sessions/<name>/blobs/`) — disable with `--no-session`. Resume with
-`/sessions` in the TUI, or attach/load by name at startup:
+`sessions/<name>/blobs/`) — disable with `--no-session`. Each new session
+gets a UUID as its name. Resume with `/sessions` in the TUI, or
+attach/load by name at startup:
 
 ```sh
 xarness --session my-session   # attach to an active session or load a saved one
@@ -320,12 +323,18 @@ xarness --sessions             # print active sessions and exit
 xarness --kill                 # close every active session (each stays saved)
 ```
 
-`/sessions` lists live sessions first (running / waiting / compacting / idle), then
-this workspace's saved ones. A subagent stays nested under its parent, and while
-the parent is live the child stays in the live section even when it is idle. The
+`/sessions` lists only the sessions of the workspace you are in: first the
+live ones (running / waiting / ask / compacting / idle), then the saved ones.
+Titles are padded to the widest title of the list, so the age, workspace and
++/- columns line up on every row. A subagent is stored as
+`<parent-uuid>/agent-N`, shown as `agent-N` nested under its parent, and a
+whole group moves to the live section
+when any member is live (hosted children above idle ones) — so attaching to a
+finished subagent brings its parent and siblings up with it. The
 +/- columns are that session's own pending work plus whatever its subagents
-wrote; a session blocked on a tool call (including a running subagent) reads
-`waiting`, not `running`.
+wrote; a session blocked on the ask tool reads `ask` (it wants your answer),
+one blocked on a tool call (including a running subagent) reads `waiting`,
+not `running`.
 
 Resuming reconnects to the session's change tracking: the tracked state is
 per workspace, so a resumed session measures against the same baseline as
@@ -463,7 +472,7 @@ container on/off state is overridden.
 | `/model` | Choose the model profile |
 | `/sandbox` | Choose this session's sandbox profile (idle only) |
 | `/filter add <path>` / `/filter remove <path>` / `/filter list` | Add or remove a workspace path excluded from the sandbox mounts |
-| `/sessions` | Resume a previous session; subagent sessions are nested under the session that spawned them |
+| `/sessions` | Resume a previous session of this workspace; a group (parent and its `agent-N` children) stays together, and moves to the live section when any member is live |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `/tmp/refs/<alias>` — the same path tool calls and the shell use (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |

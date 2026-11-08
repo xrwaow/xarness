@@ -105,6 +105,9 @@ class Host:
         # One lock per session name: concurrent loads of the same saved
         # session (e.g. GET snapshot + GET events) must yield one Session.
         self._load_locks: dict[str, asyncio.Lock] = {}
+        # Per-parent subagent counter, seeded from the stored names when the
+        # parent first spawns in this host (so numbering survives replays).
+        self._sub_counts: dict[str, int] = {}
         # Serializes the workspace map (opening a workspace takes awaits).
         self._workspace_lock = asyncio.Lock()
         self._started_at = time.monotonic()
@@ -304,6 +307,30 @@ class Host:
             )
         return session
 
+    def _next_agent_name(self, parent_name: str) -> str:
+        """The next ``<parent>/agent-N`` name for a child of ``parent_name``.
+
+        Numbering is per parent, so the ``agent-N`` short name the UI shows
+        can repeat under different parents. The first spawn in this host
+        scans the hosted and saved names so a restarted host continues the
+        parent's sequence instead of overwriting ``agent-1``."""
+        prefix = f"{parent_name}/agent-"
+        count = self._sub_counts.get(parent_name)
+        if count is None:
+            known = set(self.sessions) | set(session_store.load_metas())
+            count = max(
+                (int(name[len(prefix):]) for name in known
+                 if name.startswith(prefix)
+                 and name[len(prefix):].isdigit()),
+                default=0,
+            )
+        count += 1
+        self._sub_counts[parent_name] = count
+        return f"{prefix}{count}"
+
+    # Kept for callers that still use the old (subagent-based) method name.
+    _next_sub_name = _next_agent_name
+
     async def spawn_subagent(
         self, parent: Session, prompt: str, mode: str,
     ) -> str:
@@ -315,7 +342,7 @@ class Host:
         It shares the parent's workspace, container mounts and no-session
         flag. The caller's tool call awaits this; cancelling that call
         cancels and closes the child."""
-        name = session_store.new_session_name()
+        name = self._next_agent_name(parent.name)
         profile_name, profile, api_key = \
             parent.profile_name, parent.profile, parent.api_key
         if parent.subagent_model and parent.subagent_model != parent.profile_name:
@@ -361,7 +388,8 @@ class Host:
         if not parent.no_save:
             child._persist()
         parent._emit_notice(
-            f"subagent {name} ({mode}) started, /sessions to watch")
+            f"subagent {session_store.display_name(name)} ({mode}) started, "
+            "/sessions to watch")
         try:
             await child.execute(f"subagent-{name}", protocol.SendMessage(text=prompt))
             await child.wait_idle()

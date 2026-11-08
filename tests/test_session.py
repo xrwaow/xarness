@@ -38,7 +38,6 @@ from xarness.workspace import WorkspaceState, open_workspace
 from pydantic import BaseModel as _PydanticBase
 
 from xarness.tools import ToolRegistry, ToolResult, tool
-from xarness.tui.transcript import turn_summary
 
 PROFILE = ProviderProfile(
     base_url="https://api.example.test/v1", model_id="test-model", max_context=1000,
@@ -832,20 +831,20 @@ def test_status_fills_sandbox_name_and_filter_list(tmp_path) -> None:
     assert status.filter_list == ["secrets"]
 
 
-def test_summary_reports_a_pending_ask_as_waiting(tmp_path) -> None:
-    """A pending ask blocks the turn itself, so the /sessions row reads
-    waiting in every activity state."""
+def test_summary_reports_a_pending_ask_as_ask(tmp_path) -> None:
+    """A pending ask blocks the turn and wants the user's answer, so the
+    /sessions row reads "ask" (not "waiting") in every activity state."""
     async def go():
         session = make_session([], tmp_path)
         _, queue = session.subscribe()
         session._pending_ask = protocol.PendingAsk(ask_id="ask-1", questions=["q?"])
 
         session._state = "running"
-        assert session.summary().state == "waiting"
+        assert session.summary().state == "ask"
         session._state = "compacting"
-        assert session.summary().state == "waiting"
+        assert session.summary().state == "ask"
         session._state = "idle"
-        assert session.summary().state == "waiting"
+        assert session.summary().state == "ask"
         session.unsubscribe(queue)
 
     asyncio.run(go())
@@ -854,6 +853,7 @@ def test_summary_reports_a_pending_ask_as_waiting(tmp_path) -> None:
 def test_summary_reports_a_running_tool_as_waiting(tmp_path) -> None:
     """A tool in flight (a subagent can run for minutes) is not generation:
     the /sessions row reads waiting, then running again when it returns."""
+
     async def go():
         session = make_session([], tmp_path)
         session._state = "running"
@@ -1243,50 +1243,84 @@ def test_no_save_disables_persistence(tmp_path) -> None:
     assert not session_store.session_dir("nosave").exists()
 
 
-def test_turn_summary_format(tmp_path) -> None:
-    """turn_summary derives total | running | idle from the persisted stamps
-    (running = streaming + tools)."""
+def test_stamp_turn_end_records_the_turn_stats(tmp_path) -> None:
+    """The host records a finished turn's numbers on its last answer:
+    total | busy | idle, busy being streaming + tools."""
     from datetime import datetime, timedelta, timezone
 
     session = make_session([], tmp_path)
     base = datetime.now(timezone.utc)
     iso = base.isoformat
 
-    session.conversation.add(user_message("hi", timing=Timing(send=iso())))
+    def plus(seconds: float) -> str:
+        return (base + timedelta(seconds=seconds)).isoformat()
+
+    opening = session.conversation.add(
+        user_message("hi", timing=Timing(send=iso())))
+    session.conversation.begin_turn(opening, before_tree=None)
     session.conversation.add(AssistantMessage(content="thinking about it",
         timing=Timing(
-            start=iso(), end=(base + timedelta(seconds=2)).isoformat(),
-            reasoning_seconds=1.7,
+            start=iso(), end=plus(2), reasoning_seconds=1.7,
         ),
     ))
     session.conversation.add(ToolMessage(tool_call_id="c1",
-        timing=Timing(
-            start=(base + timedelta(seconds=2)).isoformat(),
-            end=(base + timedelta(seconds=5)).isoformat(),
-        ),
+        timing=Timing(start=plus(2), end=plus(5)),
     ))
-    session.conversation.add(AssistantMessage(content="done",
-        timing=Timing(
-            start=(base + timedelta(seconds=5)).isoformat(),
-            end=(base + timedelta(seconds=8)).isoformat(),
-        ),
+    last = session.conversation.add(AssistantMessage(content="done",
+        timing=Timing(start=plus(5), end=plus(8)),
     ))
-    summary = turn_summary(session.conversation.messages)
-    assert summary is not None
-    assert summary.busy is not None and summary.idle is not None
-    assert round(summary.total, 1) == 8.0
+    stats = session.conversation.stamp_turn_end()
+    assert stats is not None
+    assert round(stats.total, 1) == 8.0
     # busy = streaming (round 1: 1.7s + round 2: 3s, no reasoning)
     #        + tools (3.0s).
-    assert round(summary.busy, 1) == 7.7
-    # total − busy: the 0.3s pre-first-token latency.
-    assert round(summary.idle, 1) == 0.3
+    assert round(stats.busy, 1) == 7.7
+    # total - busy: the 0.3s pre-first-token latency.
+    assert round(stats.idle, 1) == 0.3
+    # Stored where a reload (and any other client) reads it back from.
+    assert last.timing.stats == stats
 
 
-def test_turn_ended_carries_elapsed_and_timing_breakdown(tmp_path) -> None:
-    """TurnEnded carries the same breakdown a reload derives from the
-    persisted stamps, so the live footer and the replayed one agree."""
+def test_stamp_turn_end_sums_round_usage(tmp_path) -> None:
+    """The stamped spend is the turn's whole: every round it sent."""
+    session = make_session([], tmp_path)
+    session.conversation.add(
+        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")))
+    session.conversation.add(AssistantMessage(
+        content="a", usage=Usage(input_tokens=1_234, output_tokens=56),
+        timing=Timing(
+            start="2025-01-01T00:00:00+00:00",
+            end="2025-01-01T00:00:02+00:00"),
+    ))
+    session.conversation.add(AssistantMessage(
+        content="b", usage=Usage(input_tokens=2_000, output_tokens=400),
+        timing=Timing(
+            start="2025-01-01T00:00:02+00:00",
+            end="2025-01-01T00:00:05+00:00"),
+    ))
+    stats = session.conversation.stamp_turn_end()
+    assert stats is not None and stats.usage is not None
+    assert (stats.usage.input_tokens, stats.usage.output_tokens) == (3_234, 456)
+    # Local estimates are flagged, never passed off as exact counts.
+    estimated = Usage(input_tokens=10, output_tokens=2, approximate=True)
+    assert (estimated + Usage(input_tokens=1, output_tokens=3)).approximate
+
+
+def test_stamp_turn_end_needs_a_completed_round(tmp_path) -> None:
+    """A turn with no timed answer (nothing streamed, or a session from
+    before timing was recorded) leaves no stamp — and so no footer."""
+    session = make_session([], tmp_path)
+    session.conversation.add(user_message("hi"))
+    session.conversation.add(AssistantMessage(content="hello"))
+    assert session.conversation.stamp_turn_end() is None
+
+
+def test_turn_ended_carries_the_stamped_breakdown(tmp_path) -> None:
+    """TurnEnded carries the numbers just stamped on the turn's last answer,
+    and they are on disk: a live footer and a reloaded one agree."""
     session = make_session(
-        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
+        [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"),
+          RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
     )
 
@@ -1304,62 +1338,77 @@ def test_turn_ended_carries_elapsed_and_timing_breakdown(tmp_path) -> None:
     finished = asyncio.run(go())
     last_assistant = session.conversation.messages[-1]
     assert last_assistant.role == "assistant"
-    assert finished is not None and finished.elapsed >= 0
-    assert not hasattr(last_assistant.timing, "summary")
+    stats = last_assistant.timing.stats
+    assert finished is not None and stats is not None
+    assert finished.total == stats.total
+    assert (finished.busy, finished.idle) == (stats.busy, stats.idle)
+    assert stats.usage is not None and stats.usage.input_tokens == 10
 
-    # The live event carries the breakdown, and it is the one a reloaded
-    # client derives from the persisted stamps: no drift between the two.
-    state = session_store.load_state("test")
-    summary = turn_summary(state.conversation.messages)
-    assert summary is not None and summary.busy is not None
-    assert finished.busy == summary.busy
-    assert finished.idle == summary.idle
-    assert finished.busy + finished.idle == pytest.approx(summary.total)
+    # Persisted, so a reload renders the same footer instead of deriving one.
+    reloaded = session_store.load_state("test")
+    assert reloaded.conversation.messages[-1].timing.stats == stats
 
 
-def test_turn_summary_none_without_stamps(tmp_path) -> None:
-    """Messages without stamps (old sessions) produce no summary."""
-    session = make_session([], tmp_path)
-    session.conversation.add(user_message("hi"))
-    session.conversation.add(AssistantMessage(content="hello"))
-    assert turn_summary(session.conversation.messages) is None
+def test_cancelled_turn_is_stamped_without_a_split(tmp_path) -> None:
+    """A turn cancelled while its tool ran ended too: it carries how long it
+    actually ran, but no busy/idle split (nothing was measured to an end)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
 
+    @tool("edit_file", "edit a file", _NoArgs)
+    async def edit(args) -> ToolResult:
+        started.set()
+        await release.wait()
+        return ToolResult(content="ok")
 
-def test_turn_summary_sums_round_usage() -> None:
-    """A turn's footer carries the summed usage of every round it sent."""
-    from xarness.tui.transcript import turn_summary, turn_summaries
+    registry = ToolRegistry()
+    registry.register(edit)
+    session = make_session([_tool_round()], tmp_path, tools=registry)
 
-    messages = [
-        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
-        AssistantMessage(
-            content="a", usage=Usage(input_tokens=1_234, output_tokens=56),
-            timing=Timing(
-                start="2025-01-01T00:00:00+00:00",
-                end="2025-01-01T00:00:02+00:00"),
-        ),
-        AssistantMessage(
-            content="b", usage=Usage(input_tokens=2_000, output_tokens=400),
-            timing=Timing(
-                start="2025-01-01T00:00:02+00:00",
-                end="2025-01-01T00:00:05+00:00"),
-        ),
+    async def go():
+        session.subscribe()
+        await session.execute("c1", SendMessage(text="hi"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await session.execute("c2", Cancel())
+        await wait_idle(session)
+
+    asyncio.run(go())
+    assistants = [
+        m for m in session.conversation.messages if m.role == "assistant"
     ]
-    summary = turn_summary(messages)
-    assert summary is not None and summary.usage is not None
-    assert (summary.usage.input_tokens, summary.usage.output_tokens) == (3_234, 456)
-    # Only the turn's final assistant message carries the footer.
-    assert turn_summaries(messages, {}) == {id(messages[-1]): summary}
-    # A turn with no reported usage still has timings, but no token line.
-    bare = turn_summary([
-        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")),
-        AssistantMessage(content="x", timing=Timing(
+    assert assistants and assistants[0].timing.start  # a measured round exists
+    stats = assistants[-1].timing.stats
+    assert stats is not None and stats.total >= 0
+    assert stats.busy is None and stats.idle is None
+
+
+def test_a_steered_turn_is_one_turn_for_the_stamp(tmp_path) -> None:
+    """A steering message injected mid-turn opens no turn of its own, so the
+    stamp covers the whole turn: pre-steer rounds included."""
+    session = make_session([], tmp_path)
+    conversation = session.conversation
+    opening = conversation.add(
+        user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")))
+    conversation.begin_turn(opening, before_tree=None)
+    conversation.add(AssistantMessage(
+        content="a", usage=Usage(input_tokens=10, output_tokens=1),
+        timing=Timing(
             start="2025-01-01T00:00:00+00:00",
-            end="2025-01-01T00:00:01+00:00")),
-    ])
-    assert bare is not None and bare.usage is None
-    # Local estimates are flagged, never passed off as exact counts.
-    estimated = Usage(input_tokens=10, output_tokens=2, approximate=True)
-    assert (estimated + Usage(input_tokens=1, output_tokens=3)).approximate
+            end="2025-01-01T00:00:01+00:00"),
+    ))
+    conversation.add(user_message(
+        "also this", timing=Timing(send="2025-01-01T00:00:01+00:00")))
+    last = conversation.add(AssistantMessage(
+        content="b", usage=Usage(input_tokens=20, output_tokens=2),
+        timing=Timing(
+            start="2025-01-01T00:00:01+00:00",
+            end="2025-01-01T00:00:04+00:00"),
+    ))
+    stats = conversation.stamp_turn_end()
+    assert stats is not None and stats.usage is not None
+    assert (stats.usage.input_tokens, stats.usage.output_tokens) == (30, 3)
+    assert round(stats.total, 1) == 4.0
+    assert last.timing.stats == stats
 
 
 # ----------------------------------------------------------------------

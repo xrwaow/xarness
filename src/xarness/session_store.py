@@ -31,7 +31,6 @@ import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,19 +48,38 @@ SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
 # _import_v4_rows) or rejected: this build reads and writes one shape.
 SCHEMA_VERSION = 5
 
-_SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_SAFE_SESSION_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$"
+)
 
 
 def _validate_session_name(name: str) -> str:
-    """Reject names that could escape the sessions directory."""
+    """Reject names that could escape the sessions directory.
+
+    A subagent's name is ``<parent>/agent-N``: exactly one slash, with a
+    safe segment on either side."""
     if not isinstance(name, str) or not _SAFE_SESSION_NAME.match(name) or ".." in name:
         raise ValueError(f"invalid session name: {name!r}")
     return name
 
 
+def display_name(name: str) -> str:
+    """The short name shown for a session in a listing.
+
+    A subagent is stored as ``<parent>/agent-N`` so it stays unique across
+    parents; users only ever need the ``agent-N`` half, which is scoped by
+    the group it is nested under."""
+    return name.rsplit("/", 1)[-1]
+
+
 def session_dir(name: str) -> Path:
-    """Per-session directory: the image blobs."""
-    return SESSIONS_DIR / _validate_session_name(name)
+    """Per-session directory: the image blobs.
+
+    The slash in a subagent name is encoded so every session's blobs live
+    in a flat directory: deleting a parent never takes its children's
+    blobs with it."""
+    return SESSIONS_DIR / _validate_session_name(name).replace("/", "%2F")
 
 
 def _blob_path(name: str, image_id: str) -> Path:
@@ -165,8 +183,8 @@ def load_blob(name: str, image_id: str) -> bytes | None:
 
 
 def new_session_name() -> str:
-    """Timestamped unique name for a freshly started session."""
-    return f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    """A fresh UUID (hex, no dashes), unique for a newly started session."""
+    return uuid.uuid4().hex
 
 
 class StoredSession(BaseModel):

@@ -50,7 +50,7 @@ from .conversation import (
     Message,
     RollbackPlan,
     ToolCall,
-    turn_timings,
+    TurnStats,
 )
 from .gitwork import (
     GitWorktreeError,
@@ -376,9 +376,13 @@ class Session:
     def summary(self) -> SessionSummary:
         """The list row for this hosted session."""
         state = self._state
-        # A pending ask, or a tool call in flight, blocks the turn itself, so
-        # it reads as waiting in every state.
-        if self.pending_ask is not None or self._executing_tool is not None:
+        # A pending ask (the user owes it an answer) and a tool call in
+        # flight both block the turn itself, so they read as their own
+        # state in every activity state: "ask" for the first, "waiting"
+        # for the second (a subagent call can run for minutes).
+        if self.pending_ask is not None:
+            state = "ask"
+        elif self._executing_tool is not None:
             state = "waiting"
         # Active derives from the same predicate the grace loop uses — a
         # hosted but fully idle session (no stream, no ask, no running
@@ -1397,11 +1401,21 @@ class Session:
         must not lose the turn. The state flip is not: a session left
         "running" with no task is rendered as a live turn by every later
         attach and is never evicted."""
+        stats: TurnStats | None = None
         try:
             # Record where the turn left the workspace so /undo //retry can
             # reverse exactly this turn's diff later (interruptions
             # included).
             await self._finish_turn()
+            # The turn's numbers are the host's to record (see
+            # Conversation.stamp_turn_end): stamped onto the turn's last
+            # answer before the write, so a reload and a live client read the
+            # same figures. A turn cut short reports how long it ran — it
+            # ended too, just not on its own terms.
+            stats = self.conversation.stamp_turn_end(
+                None if outcome == "finished"
+                else time.monotonic() - turn_start,
+            )
             self._persist()
             await self._flush_persist()
         except asyncio.CancelledError:
@@ -1415,15 +1429,15 @@ class Session:
             self._set_state("idle")
             # After the state flip: TurnEnded describes the end and must not
             # be buffered as a live turn event for the next attach. The
-            # split comes from the persisted stamps, the same derivation a
-            # reload runs, so a live footer and a replayed one agree.
-            busy = idle = None
-            if outcome == "finished":
-                _, busy, idle = turn_timings(
-                    self.conversation.messages) or (None, None, None)
+            # numbers are the ones just stamped on the turn's last answer, so
+            # a live footer and a replayed one are identical.
+            stamped = {} if stats is None else {
+                "total": stats.total, "busy": stats.busy,
+                "idle": stats.idle, "usage": stats.usage,
+            }
             self._emit(protocol.TurnEnded(
                 outcome=outcome, elapsed=time.monotonic() - turn_start,
-                busy=busy, idle=idle,
+                **stamped,
             ))
             self._turn_task = None
         await self._emit_diff_changed()

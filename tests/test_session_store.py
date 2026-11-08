@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import json
+import uuid
 
 from xarness import session_store
 from xarness.config import CotStrength, ProviderProfile
@@ -33,6 +34,32 @@ def _save(name: str, stored: session_store.StoredSession) -> None:
     # the state row at serialize time.
     payload, meta = session_store.serialize_state(stored)
     session_store.write_state(name, payload, meta)
+
+
+def test_new_session_names_are_uuids() -> None:
+    names = {session_store.new_session_name() for _ in range(20)}
+    assert all(uuid.UUID(name).hex == name for name in names)
+    assert len(names) == 20
+
+
+def test_subagent_names_keep_their_parent_but_show_the_short_half(
+    tmp_path, monkeypatch,
+) -> None:
+    """A child is stored as ``<parent>/agent-N`` (unique in the DB) but a
+    listing shows just ``agent-N``; its blobs stay in a flat directory so
+    deleting the parent cannot remove them."""
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    parent = "550e8400e29b41d4a716446655440000"
+    child = f"{parent}/agent-1"
+    assert session_store.display_name(child) == "agent-1"
+    assert session_store.display_name(parent) == parent
+
+    assert session_store.session_dir(child) == (
+        tmp_path / f"{parent}%2Fagent-1"
+    )
+    assert session_store.session_dir(parent) == tmp_path / parent
+    with pytest.raises(ValueError):
+        session_store.session_dir("../../escape")
 
 
 def test_message_fields_round_trip(tmp_path, monkeypatch) -> None:

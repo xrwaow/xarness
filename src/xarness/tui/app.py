@@ -166,7 +166,7 @@ _command("diff", "show pending changes (optionally: /diff <path>)",
          lambda s, a: s._show_diff_command(a), takes_arg=True)
 _command("accept",
          "lock in the changes made so far (they stop showing in /diff and can no longer be undone)",
-         lambda s, a: s._accept_with_confirm())
+         lambda s, a: s._accept())
 _command("reject", "discard all changes made since the last /accept",
          lambda s, a: s._reject_with_confirm())
 _command("undo", "drop the last turn and revert its file edits",
@@ -407,7 +407,7 @@ class AgentApp(App[None]):
         self._command_queue: asyncio.Queue[Command] = asyncio.Queue()
         self._command_worker: Worker | None = None
         self._config_cache = None
-        # Last rendered diff: anchors the accept/reject confirmations.
+        # Last rendered diff: anchors the reject confirmation.
         self._last_diff = None
         # Live phase — the single owner of the ephemeral pending strip.
         # pending = a round is waiting on the provider (turn start and every
@@ -962,7 +962,11 @@ class AgentApp(App[None]):
         # back in the input) is already stored.
         refs: list[ImageRef] = []
         for image in images or ():
-            if isinstance(image, ImageRef):
+            # Check the subclass first: ImageAttachment IS an ImageRef, so
+            # testing for a ref would skip the upload and send a hash the
+            # host never received. Only a plain ref (an undone message put
+            # back in the input) is already stored.
+            if not isinstance(image, ImageAttachment):
                 refs.append(image)
                 continue
             data = image.data()
@@ -1044,22 +1048,12 @@ class AgentApp(App[None]):
     # ------------------------------------------------------------------
     # Slash commands
 
-    @work(group="confirm", exclusive=True)
-    async def _accept_with_confirm(self) -> None:
-        """Accept, first asking when the pending rows were not all this
-        agent's work (bash rows cannot be attributed to a named agent).
+    def _accept(self) -> None:
+        """Accept the pending changes directly, without a confirmation.
 
-        A worker: push_screen_wait requires one."""
-        info = self._last_diff
-        foreign = [f for f in (info.files if info else []) if f.kind != "mine"]
-        if foreign:
-            choice = await self.push_screen_wait(ConfirmScreen(
-                f"{len(foreign)} of {len(info.files)} pending files weren't "
-                "made by this agent. Accept them too?",
-                confirm_label="Accept all",
-            ))
-            if not choice:
-                return
+        Accepting never discards your own drift (it stays pending), so there
+        is nothing to warn about when some rows came from another agent or
+        from bash: the host's notice reports that breakdown instead."""
         self._post_command(Accept())
 
     @work(group="confirm", exclusive=True)

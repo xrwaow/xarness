@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..conversation import SUMMARY_PREFIX, Usage, turn_timings
+from ..conversation import SUMMARY_PREFIX, Usage
 from ..protocol import (
     ContentDelta,
     Level,
@@ -267,12 +267,14 @@ class LineItem(TranscriptItem):
 class TurnSummaryItem(TranscriptItem):
     """The per-turn footer under the final answer.
 
-    Replay derives the ``busy``/``idle`` breakdown from the persisted
-    stamps; a live turn gets the same breakdown on ``TurnEnded`` (with the
-    host's ``elapsed`` as the fallback total when it carries none).
-    ``usage`` sums every round the turn sent, and is None when the provider
-    reported none. One item type for both paths, so a mid-turn attach and a
-    live turn can never disagree about whether a footer exists."""
+    Every number on it is the host's. An ended turn carries them in
+    ``Timing.stats`` on its last answer (what a replay renders); a live turn
+    gets the same figures on ``TurnEnded``. A finished turn also carries the
+    ``busy``/``idle`` split (the breakdown under the total); a turn cut short
+    reports only how long it ran. ``usage`` is the turn's whole spend, None
+    when the provider reported none. One item type for both paths, and only
+    the host decides a turn is over, so a mid-turn attach and a live turn can
+    never disagree about whether a footer exists."""
 
     total: float
     busy: float | None = None
@@ -291,34 +293,26 @@ class DividerItem(TranscriptItem):
 
 
 def turn_summary(messages) -> TurnSummaryItem | None:
-    """Derive a turn's footer from its persisted stamps and round usage.
+    """The footer an ended turn carries, or None while it is still running.
 
-    The timing breakdown comes from :func:`xarness.conversation.turn_timings`,
-    the same derivation the host stamps on ``TurnEnded``; only the usage sum
-    is client-side here."""
-    timings = turn_timings(messages)
-    if timings is None:
+    The numbers are the host's: it stamps an ended turn's
+    total/busy/idle/spend onto the turn's last answer (see
+    :meth:`xarness.conversation.Conversation.stamp_turn_end`), whichever way
+    the turn ended. A turn still in flight carries none, so a resumed
+    transcript cannot claim an end the turn does not have."""
+    last = next((m for m in reversed(messages) if m.role == "assistant"), None)
+    stats = last.timing.stats if last is not None else None
+    if stats is None:
         return None
-    total, busy, idle = timings
-    user_index = next(
-        (i for i, m in reversed(list(enumerate(messages)))
-         if m.role == "user" and m.timing.send and not m.is_summary), None,
+    return TurnSummaryItem(
+        total=stats.total, busy=stats.busy, idle=stats.idle, usage=stats.usage,
     )
-    turn = messages[user_index + 1:] if user_index is not None else messages
-    usage: Usage | None = None
-    for message in turn:
-        if message.role == "assistant" and message.usage is not None:
-            usage = message.usage if usage is None else usage + message.usage
-    return TurnSummaryItem(total=total, busy=busy, idle=idle, usage=usage)
 
 
-def turn_summaries(messages, results: dict) -> dict[int, TurnSummaryItem]:
-    """Map each turn's final assistant message (by object identity) to its
-    footer stats. ``results`` is the tool results by call id.
-
-    A turn whose last round left a tool call unanswered is not over (still
-    executing, or it died mid-tool): a footer there would claim an end the
-    history does not have."""
+def turn_summaries(messages) -> dict[int, TurnSummaryItem]:
+    """Map each ended turn's final assistant message (by object identity) to
+    its footer stats. A turn counts as ended iff the host stamped its stats
+    there: one still running has none."""
     starts = [
         i for i, m in enumerate(messages)
         if m.role == "user" and not m.is_summary
@@ -329,8 +323,6 @@ def turn_summaries(messages, results: dict) -> dict[int, TurnSummaryItem]:
         turn = messages[start:end]
         last = next((m for m in reversed(turn) if m.role == "assistant"), None)
         if last is None:
-            continue
-        if any(call.call_id not in results for call in last.tool_calls or []):
             continue
         summary = turn_summary(turn)
         if summary is not None:
@@ -355,10 +347,6 @@ class Transcript:
         self.assistant: AssistantItem | None = None
         self.tool_blocks: dict[str, ToolItem] = {}
         self.cancelled = False
-        # Summed usage of the turn in flight, folded from RoundComplete
-        # events; replay starts from the rounds already in the history. The
-        # live footer reads it when the turn ends.
-        self._turn_usage: Usage | None = None
         # Emission time of the first reasoning delta in this round. The cot
         # block ends at the first answer/tool token, so that event's stamp
         # minus this one is the block's own duration (never the round's).
@@ -378,22 +366,7 @@ class Transcript:
             m.tool_call_id: m for m in messages
             if m.role == "tool" and m.tool_call_id
         }
-        summaries = turn_summaries(messages, results)
-        # Baseline for the live turn: whatever rounds of it already landed
-        # in the history before this attach.
-        last_user = next(
-            (i for i, m in reversed(list(enumerate(messages)))
-             if m.role == "user" and not m.is_summary),
-            None,
-        )
-        self._turn_usage = None
-        start = last_user + 1 if last_user is not None else 0
-        for message in messages[start:]:
-            if message.role == "assistant" and message.usage is not None:
-                self._turn_usage = (
-                    message.usage if self._turn_usage is None
-                    else self._turn_usage + message.usage
-                )
+        summaries = turn_summaries(messages)
         # A call with no result in a turn that is still running is the call
         # executing now, not a failed one.
         live = snap.status.state == "running"
@@ -534,27 +507,28 @@ class Transcript:
                 # Assistant/tool messages were already rendered from their
                 # stream events (or arrive with the next snapshot).
                 return []
-            # A new turn opens: its spend starts from zero.
-            self._turn_usage = None
             return [self._add(UserItem.from_message(message))]
         if isinstance(event, ProcessingStarted):
             self.start_round()
             return []
         if isinstance(event, TurnEnded):
-            # The turn is over: settle whatever is still live and, for a
-            # completed turn, append the same footer replay derives. The
-            # reducer owns it so a live turn and a reload agree.
+            # The turn is over: settle whatever is still live and append the
+            # footer the host stamped. The numbers ride on the event, so a
+            # live turn and a reload agree exactly — including a turn that was
+            # cancelled or failed, which reports how long it ran.
             if self.cancelled:
                 return []
             changed = self.cancel()
-            if event.outcome == "finished":
-                busy, idle = event.busy, event.idle
-                split = busy is not None and idle is not None
+            total = event.total
+            if total is None and event.outcome == "finished":
+                # An older host sends no stamped total: its wall clock is the
+                # only number there is, so keep drawing the footer.
+                total = event.elapsed
+            if total is not None:
                 changed.append(self._add(TurnSummaryItem(
-                    total=busy + idle if split else event.elapsed,
-                    busy=busy, idle=idle, usage=self._turn_usage,
+                    total=total, busy=event.busy, idle=event.idle,
+                    usage=event.usage,
                 )))
-            self._turn_usage = None
             return changed
         if self.cancelled:
             return []
@@ -620,11 +594,8 @@ class Transcript:
             item.output = event.content
             return [item]
         if isinstance(event, RoundComplete):
-            if event.usage is not None:
-                self._turn_usage = (
-                    event.usage if self._turn_usage is None
-                    else self._turn_usage + event.usage
-                )
+            # The round's usage needs no client-side bookkeeping: the host
+            # sums the turn's spend onto the stamped stats the footer reads.
             return self.settle(event.t)
         if isinstance(event, StreamError):
             return self.settle(None)
