@@ -232,11 +232,17 @@ class TurnEnded(EventBase):
     """The turn is fully unwound (history persisted, state back to idle).
 
     Emitted on every path — finished, cancelled, failed — so clients never
-    have to infer "the turn is over" from a StatusChanged transition."""
+    have to infer "the turn is over" from a StatusChanged transition.
+
+    ``busy``/``idle`` come from the same persisted stamps a reload derives
+    its footer from; together they are the turn's total (None when the turn
+    left no completed round to measure, or when talking to an older host)."""
 
     type: Literal["turn_ended"] = "turn_ended"
     outcome: Literal["finished", "cancelled", "failed"] = "finished"
     elapsed: float = 0.0
+    busy: float | None = None
+    idle: float | None = None
 
 
 class SessionDeleted(EventBase):

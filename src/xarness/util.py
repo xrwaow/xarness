@@ -30,3 +30,13 @@ def format_tokens(count: int) -> str:
 def utcnow_iso() -> str:
     """Wall-clock UTC timestamp (ISO 8601)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(stamp: str | None) -> datetime | None:
+    """Parse :func:`utcnow_iso` output; None when missing or malformed."""
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None

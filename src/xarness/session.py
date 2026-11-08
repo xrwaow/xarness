@@ -48,6 +48,7 @@ from .conversation import (
     Message,
     RollbackPlan,
     ToolCall,
+    turn_timings,
 )
 from .gitwork import (
     GitInfo,
@@ -1454,9 +1455,16 @@ class Session:
             self._reset_partial()
             self._set_state("idle")
             # After the state flip: TurnEnded describes the end and must not
-            # be buffered as a live turn event for the next attach.
+            # be buffered as a live turn event for the next attach. The
+            # split comes from the persisted stamps, the same derivation a
+            # reload runs, so a live footer and a replayed one agree.
+            busy = idle = None
+            if outcome == "finished":
+                _, busy, idle = turn_timings(
+                    self.conversation.messages) or (None, None, None)
             self._emit(protocol.TurnEnded(
                 outcome=outcome, elapsed=time.monotonic() - turn_start,
+                busy=busy, idle=idle,
             ))
             self._turn_task = None
         await self._emit_diff_changed()

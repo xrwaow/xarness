@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
 
 from .gitwork import TurnCheckpoint
 from .images import IMAGE_TOKEN_RE, ImageAttachment, ImageRef, token_text
+from .util import parse_iso
 
 # Every state a tool result can be in. ``parse_error`` means the model's
 # arguments were invalid (it should retry with valid ones); ``interrupted``
@@ -648,3 +649,45 @@ class Conversation(BaseModel):
                 )
             )
         return messages
+
+
+def turn_timings(messages: list[Message]) -> tuple[float, float, float] | None:
+    """``(total, busy, idle)`` for the last turn in ``messages``, or None
+    when it has no completed assistant round to measure.
+
+    ``total`` is send-to-last-answer; ``busy`` is streaming + tool time and
+    ``idle`` is the rest (queueing, provider latency). One derivation for
+    both the host (which stamps it on ``TurnEnded``) and TUI replay."""
+    user_index = next(
+        (i for i, m in reversed(list(enumerate(messages)))
+         if m.role == "user" and m.timing.send and not m.is_summary), None,
+    )
+    turn = messages[user_index + 1:] if user_index is not None else messages
+    assistants = [
+        m for m in turn
+        if m.role == "assistant" and m.timing.start and m.timing.end
+    ]
+    if not assistants:
+        return None
+    end = parse_iso(assistants[-1].timing.end)
+    start = parse_iso(
+        messages[user_index].timing.send if user_index is not None
+        else assistants[0].timing.start
+    )
+    if end is None or start is None:
+        return None
+    total = max(0.0, (end - start).total_seconds())
+
+    def duration(message: Message, *, reasoning: bool = False) -> float:
+        start = parse_iso(message.timing.start)
+        end = parse_iso(message.timing.end)
+        if start is None or end is None:
+            return 0.0
+        elapsed = max(0.0, (end - start).total_seconds())
+        if not reasoning or message.timing.reasoning_seconds is None:
+            return elapsed
+        return min(message.timing.reasoning_seconds, elapsed)
+
+    busy = sum(duration(m, reasoning=True) for m in assistants) + sum(
+        duration(m) for m in turn if m.role == "tool")
+    return total, busy, max(0.0, total - busy)

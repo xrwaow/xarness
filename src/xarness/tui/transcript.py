@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 
-from ..conversation import SUMMARY_PREFIX, Usage
+from ..conversation import SUMMARY_PREFIX, Usage, turn_timings
 from ..protocol import (
     ContentDelta,
     Level,
@@ -43,15 +42,6 @@ MAX_LIVE_TOOL_OUTPUT = 65_536
 
 # The click-to-undo affordance drawn under a clicked user message.
 UNDO_LABEL = "↩ undo to here"
-
-
-def _parse_iso(stamp: str | None) -> datetime | None:
-    if not stamp:
-        return None
-    try:
-        return datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
 
 
 def split_settled(text: str) -> tuple[str, str]:
@@ -278,7 +268,8 @@ class TurnSummaryItem(TranscriptItem):
     """The per-turn footer under the final answer.
 
     Replay derives the ``busy``/``idle`` breakdown from the persisted
-    stamps; a live turn only knows the host's ``elapsed`` (the total).
+    stamps; a live turn gets the same breakdown on ``TurnEnded`` (with the
+    host's ``elapsed`` as the fallback total when it carries none).
     ``usage`` sums every round the turn sent, and is None when the provider
     reported none. One item type for both paths, so a mid-turn attach and a
     live turn can never disagree about whether a footer exists."""
@@ -302,50 +293,23 @@ class DividerItem(TranscriptItem):
 def turn_summary(messages) -> TurnSummaryItem | None:
     """Derive a turn's footer from its persisted stamps and round usage.
 
-    ``total`` is send-to-last-answer; ``busy`` is streaming + tool time and
-    ``idle`` is the rest (queueing, provider latency). Derived client-side,
-    so the host stores no second, preformatted copy."""
+    The timing breakdown comes from :func:`xarness.conversation.turn_timings`,
+    the same derivation the host stamps on ``TurnEnded``; only the usage sum
+    is client-side here."""
+    timings = turn_timings(messages)
+    if timings is None:
+        return None
+    total, busy, idle = timings
     user_index = next(
         (i for i, m in reversed(list(enumerate(messages)))
          if m.role == "user" and m.timing.send and not m.is_summary), None,
     )
     turn = messages[user_index + 1:] if user_index is not None else messages
-    assistants = [
-        m for m in turn if m.role == "assistant" and m.timing.start and m.timing.end
-    ]
-    if not assistants:
-        return None
-    end = _parse_iso(assistants[-1].timing.end)
-    start = _parse_iso(
-        messages[user_index].timing.send if user_index is not None
-        else assistants[0].timing.start
-    )
-    if end is None or start is None:
-        return None
-    total = max(0.0, (end - start).total_seconds())
-
-    def duration(message, *, reasoning: bool = False) -> float:
-        start = _parse_iso(message.timing.start)
-        end = _parse_iso(message.timing.end)
-        if start is None or end is None:
-            return 0.0
-        elapsed = max(0.0, (end - start).total_seconds())
-        if not reasoning or message.timing.reasoning_seconds is None:
-            return elapsed
-        return min(message.timing.reasoning_seconds, elapsed)
-
-    streaming = sum(duration(m, reasoning=True) for m in assistants)
-    tools = sum(duration(m) for m in turn if m.role == "tool")
     usage: Usage | None = None
     for message in turn:
         if message.role == "assistant" and message.usage is not None:
             usage = message.usage if usage is None else usage + message.usage
-    return TurnSummaryItem(
-        total=total,
-        busy=streaming + tools,
-        idle=max(0.0, total - streaming - tools),
-        usage=usage,
-    )
+    return TurnSummaryItem(total=total, busy=busy, idle=idle, usage=usage)
 
 
 def turn_summaries(messages, results: dict) -> dict[int, TurnSummaryItem]:
@@ -584,8 +548,11 @@ class Transcript:
                 return []
             changed = self.cancel()
             if event.outcome == "finished":
+                busy, idle = event.busy, event.idle
+                split = busy is not None and idle is not None
                 changed.append(self._add(TurnSummaryItem(
-                    total=event.elapsed, usage=self._turn_usage,
+                    total=busy + idle if split else event.elapsed,
+                    busy=busy, idle=idle, usage=self._turn_usage,
                 )))
             self._turn_usage = None
             return changed

@@ -26,7 +26,7 @@ from textual.widgets.option_list import Option
 
 from .. import theme
 from ..protocol import SessionSummary
-from ..util import format_duration
+from ..util import format_duration, parse_iso
 
 # State word per session state, colored with this palette key; states not
 # listed here (saved / not loaded) get no state word.
@@ -91,11 +91,8 @@ class _RowLayout:
 
 def relative_time(iso: str | None) -> str:
     """Format an ISO timestamp as age from now: 5m / 3h / 12d."""
-    if not iso:
-        return "?"
-    try:
-        updated = datetime.fromisoformat(iso)
-    except ValueError:
+    updated = parse_iso(iso)
+    if updated is None:
         return "?"
     if updated.tzinfo is None:
         updated = updated.replace(tzinfo=timezone.utc)

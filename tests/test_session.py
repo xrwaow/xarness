@@ -1355,9 +1355,9 @@ def test_turn_summary_format(tmp_path) -> None:
     assert round(summary.idle, 1) == 0.3
 
 
-def test_turn_ended_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
-    """TurnFinished carries elapsed only; the timing line is derived from
-    the persisted stamps on load (no second, preformatted copy)."""
+def test_turn_ended_carries_elapsed_and_timing_breakdown(tmp_path) -> None:
+    """TurnEnded carries the same breakdown a reload derives from the
+    persisted stamps, so the live footer and the replayed one agree."""
     session = make_session(
         [[ReasoningDelta(text="hmm"), ContentDelta(text="Hello"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]],
         tmp_path,
@@ -1380,10 +1380,14 @@ def test_turn_ended_carries_elapsed_and_timing_is_derived(tmp_path) -> None:
     assert finished is not None and finished.elapsed >= 0
     assert not hasattr(last_assistant.timing, "summary")
 
-    # Persisted stamps are enough for the client to derive the same line.
+    # The live event carries the breakdown, and it is the one a reloaded
+    # client derives from the persisted stamps: no drift between the two.
     state = session_store.load_state("test")
     summary = turn_summary(state.conversation.messages)
     assert summary is not None and summary.busy is not None
+    assert finished.busy == summary.busy
+    assert finished.idle == summary.idle
+    assert finished.busy + finished.idle == pytest.approx(summary.total)
 
 
 def test_turn_summary_none_without_stamps(tmp_path) -> None:

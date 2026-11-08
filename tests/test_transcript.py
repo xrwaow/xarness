@@ -303,9 +303,8 @@ class TranscriptTest(unittest.TestCase):
         )
 
     def test_live_and_replay_footer_match(self):
-        """A live turn appends the same footer type replay derives, with
-        the same summed usage; only the timing breakdown differs (live has
-        the host's elapsed, replay reconstructs it from stamps)."""
+        """A live turn appends the same footer replay derives, breakdown
+        included: the host stamps the same numbers it persisted."""
         from xarness.conversation import Usage
 
         usage = Usage(input_tokens=1_234, output_tokens=56)
@@ -313,12 +312,14 @@ class TranscriptTest(unittest.TestCase):
         live.apply(MessageAdded(message=_user("hi")))
         live.apply(ContentDelta(text="hello"))
         live.apply(RoundComplete(usage=usage))
-        changed = live.apply(TurnEnded(outcome="finished", elapsed=5.0))
+        changed = live.apply(
+            TurnEnded(outcome="finished", elapsed=5.0, busy=4.0, idle=1.0))
         footers = [i for i in changed if isinstance(i, tr.TurnSummaryItem)]
         self.assertEqual(len(footers), 1)
         self.assertEqual(footers[0].total, 5.0)
+        self.assertEqual(footers[0].busy, 4.0)
+        self.assertEqual(footers[0].idle, 1.0)
         self.assertEqual(footers[0].usage, usage)
-        self.assertIsNone(footers[0].busy)  # no replay breakdown live
         # Settling a second time never duplicates the footer.
         self.assertEqual(
             live.apply(TurnEnded(outcome="finished", elapsed=5.0)), [])
