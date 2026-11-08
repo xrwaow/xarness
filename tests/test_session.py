@@ -34,6 +34,7 @@ from xarness.protocol import (
     Usage,
 )
 from xarness.session import Session
+from xarness.workspace import WorkspaceState, open_workspace
 from pydantic import BaseModel as _PydanticBase
 
 from xarness.tools import ToolRegistry, ToolResult, tool
@@ -75,10 +76,8 @@ def make_session(script, tmp_path, tools=None) -> Session:
 
 
 async def wait_idle(session: Session, timeout: float = 10.0) -> None:
-    async def _wait():
-        while session._state != "idle" or session._pending_ask is not None:
-            await asyncio.sleep(0.005)
-    await asyncio.wait_for(_wait(), timeout=timeout)
+    """Session.wait_idle with a test timeout, so a stuck turn fails loudly."""
+    await asyncio.wait_for(session.wait_idle(), timeout=timeout)
 
 
 def _image() -> ImageAttachment:
@@ -312,23 +311,20 @@ def _blocking_session(tmp_path, started: asyncio.Event) -> Session:
     )
 
 
-def _tracked_git_info(tmp_path):
-    from xarness.gitwork import GitInfo
-
-    return GitInfo(
-        repo_root=tmp_path, session_id="test", git_dir=tmp_path,
-        baseline_tree="a" * 40, last_seen_tree="a" * 40,
+def _tracked_workspace(tmp_path) -> WorkspaceState:
+    """A workspace state whose snapshots are faked by the caller."""
+    return WorkspaceState(
+        root=tmp_path, git_dir=tmp_path,
+        baseline_tree="a" * 40, head_tree="a" * 40,
     )
 
 
 def _slow_after_tree(monkeypatch, session, gate: asyncio.Event):
     """First snapshot (turn start) is instant; the after-tree snapshot
     blocks on ``gate``, widening the teardown window a Cancel can land in."""
-    import xarness.session as session_mod
-
     calls = 0
 
-    async def snapshot(info):
+    async def snapshot():
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -337,7 +333,7 @@ def _slow_after_tree(monkeypatch, session, gate: asyncio.Event):
         await asyncio.sleep(0.2)
         return "b" * 40
 
-    monkeypatch.setattr(session_mod, "snapshot_state", snapshot)
+    session.workspace_state._snapshot = snapshot
 
     async def noop():
         pass
@@ -353,7 +349,7 @@ def test_cancel_while_turn_is_finishing_does_not_strand_running(
     abort the state flip and leave a phantom "running" session with no task;
     every later attach then rendered a live turn that did not exist."""
     session = make_session([_round("done")], tmp_path)
-    session.git_info = _tracked_git_info(tmp_path)
+    session.workspace_state = _tracked_workspace(tmp_path)
     gate = asyncio.Event()
     _slow_after_tree(monkeypatch, session, gate)
 
@@ -380,7 +376,7 @@ def test_repeated_cancel_during_unwind_does_not_strand_running(
     abort its teardown (the classic phantom-running state)."""
     started = asyncio.Event()
     session = _blocking_session(tmp_path, started)
-    session.git_info = _tracked_git_info(tmp_path)
+    session.workspace_state = _tracked_workspace(tmp_path)
     gate = asyncio.Event()
     _slow_after_tree(monkeypatch, session, gate)
 
@@ -403,7 +399,7 @@ def test_teardown_failure_still_flips_idle(tmp_path, monkeypatch) -> None:
     """A failing after-tree snapshot/persist must not skip the state flip:
     the session reports idle and the turn end is still announced."""
     session = make_session([_round("done")], tmp_path)
-    session.git_info = _tracked_git_info(tmp_path)
+    session.workspace_state = _tracked_workspace(tmp_path)
 
     async def boom() -> None:
         raise RuntimeError("snapshot store exploded")
@@ -825,47 +821,47 @@ def test_undo_emits_typed_rollback_event(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_status_fills_sandbox_name_filter_list_and_drift_detail(tmp_path) -> None:
+def test_status_fills_sandbox_name_and_filter_list(tmp_path) -> None:
     from xarness.config import SandboxSettings
 
     session = make_session([], tmp_path)
     session.sandbox.name = "netless"
     session.sandbox.settings = SandboxSettings(filter_list=["secrets"])
-    session._pending_drift = protocol.PendingDrift(
-            workspace="ws", last_known="aaa", current="bbb", files=["a.txt"],
-        )
     status = session.status()
     assert status.sandbox_name == "netless"
     assert status.filter_list == ["secrets"]
-    assert status.pending_drift is not None
-    assert status.pending_drift.files == ["a.txt"]
-    assert status.pending_drift.last_known == "aaa"
 
 
-def test_summary_does_not_let_pending_drift_mask_a_running_turn(tmp_path) -> None:
-    """The /sessions row is an activity state: a drift prompt the user has
-    not resolved yet must not make a running or compacting session read
-    "waiting". A pending ask DOES block the turn, so it still wins."""
+def test_summary_reports_a_pending_ask_as_waiting(tmp_path) -> None:
+    """A pending ask blocks the turn itself, so the /sessions row reads
+    waiting in every activity state."""
     async def go():
         session = make_session([], tmp_path)
         _, queue = session.subscribe()
-        session._pending_drift = protocol.PendingDrift(
-            workspace="ws", last_known="aaa", current="bbb", files=["a.txt"],
-        )
+        session._pending_ask = protocol.PendingAsk(ask_id="ask-1", questions=["q?"])
 
         session._state = "running"
-        assert session.summary().state == "running"
+        assert session.summary().state == "waiting"
         session._state = "compacting"
-        assert session.summary().state == "compacting"
-        # Idle + an unresolved drift prompt still asks for attention.
+        assert session.summary().state == "waiting"
         session._state = "idle"
         assert session.summary().state == "waiting"
-
-        # The ask tool blocks the turn itself: waiting in every state.
-        session._pending_ask = protocol.PendingAsk(ask_id="ask-1", questions=["q?"])
-        session._state = "running"
-        assert session.summary().state == "waiting"
         session.unsubscribe(queue)
+
+    asyncio.run(go())
+
+
+def test_summary_reports_a_running_tool_as_waiting(tmp_path) -> None:
+    """A tool in flight (a subagent can run for minutes) is not generation:
+    the /sessions row reads waiting, then running again when it returns."""
+    async def go():
+        session = make_session([], tmp_path)
+        session._state = "running"
+        assert session.summary().state == "running"
+        session._executing_tool = "subagent"
+        assert session.summary().state == "waiting"
+        session._executing_tool = None
+        assert session.summary().state == "running"
 
     asyncio.run(go())
 
@@ -882,75 +878,6 @@ def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
     snap = session.snapshot()
     assert [m.id for m in snap.history] == [old.id]
     assert [m.id for m in snap.messages] == [summary.id]
-
-
-def test_resume_drift_uses_accepted_turns_too(tmp_path, monkeypatch) -> None:
-    """A locked (/accepted) turn is not undoable, but it is still the last
-    known workspace state. Comparing against the older baseline made a clean
-    accept look like external drift on the next resume."""
-    import xarness.session as session_mod
-    from xarness.gitwork import GitInfo, TurnCheckpoint
-
-    session = make_session([], tmp_path)
-    session.git_info = GitInfo(
-        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
-        baseline_tree="a" * 40,
-    )
-    user = session.conversation.add(user_message("hi"))
-    session.conversation.turns[user.id] = TurnCheckpoint(
-        before_tree="b" * 40, after_tree="c" * 40,
-    )
-
-    async def fake_snapshot(_info):
-        return "c" * 40
-
-    monkeypatch.setattr(session_mod, "snapshot_state", fake_snapshot)
-
-    assert asyncio.run(session.detect_resume_drift()) is None
-
-
-def test_drift_accept_emits_drift_resolved(tmp_path, monkeypatch) -> None:
-    import xarness.session as session_mod
-    from xarness.gitwork import GitInfo
-
-    session = make_session([], tmp_path)
-
-    async def fake_accept(info):
-        return "f" * 40
-
-    monkeypatch.setattr(session_mod, "accept_changes", fake_accept)
-    session.git_info = GitInfo(
-        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
-        baseline_tree="a" * 40,
-    )
-
-    async def go():
-        queue = session.subscribe()[1]
-        session._pending_drift = protocol.PendingDrift(workspace="ws", last_known="aaa", current="bbb", files=[])
-        result = await session.execute("d1", protocol.ResolveDrift(accept=False))
-        assert result.ok
-        events = []
-        while not queue.empty():
-            events.append(queue.get_nowait())
-        resolved = [e for e in events if type(e).__name__ == "DriftResolved"]
-        assert len(resolved) == 1
-
-    asyncio.run(go())
-
-    # Accept path: the drift is accepted and DriftResolved(accepted=True)
-    # is emitted.
-    async def go2():
-        queue = session.subscribe()[1]
-        session._pending_drift = protocol.PendingDrift(workspace="ws", last_known="aaa", current="bbb", files=[])
-        result = await session.execute("d2", protocol.ResolveDrift(accept=True))
-        assert result.ok
-        events = []
-        while not queue.empty():
-            events.append(queue.get_nowait())
-        resolved = [e for e in events if type(e).__name__ == "DriftResolved"]
-        assert len(resolved) == 1 and resolved[0].accepted is True
-
-    asyncio.run(go2())
 
 
 def test_stream_events_are_protocol_models() -> None:
@@ -1144,10 +1071,10 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
     """Refs added via the command bind read-only under /tmp/refs/<alias> and
     are persisted per workspace; a missing path is rejected and nothing is
     created in the worktree."""
-    from xarness import session_store
+    from xarness import session_store, workspace
     from xarness.config import REFS_ANCHOR, SandboxSettings
 
-    monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "workspaces")
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path / "sessions")
     session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
     session.sandbox.settings = SandboxSettings()
     (tmp_path / "spec.md").write_text("x")
@@ -1166,12 +1093,12 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
         refs = session.status().refs
         assert [(r.path, r.mount) for r in refs] == [
             (expected, f"{REFS_ANCHOR}/spec.md")]
-        assert session_store.load_workspace_refs(str(tmp_path)) == [expected]
+        assert workspace.load_workspace_refs(tmp_path) == [expected]
 
         removed = await session.execute("r2", protocol.Ref(path="spec.md", add=False))
         assert removed.ok
         assert session.workspace_refs == []
-        assert session_store.load_workspace_refs(str(tmp_path)) == []
+        assert workspace.load_workspace_refs(tmp_path) == []
 
     asyncio.run(go())
 
@@ -1440,15 +1367,15 @@ def test_turn_summary_sums_round_usage() -> None:
 
 
 async def _tracked_session(tmp_path, script, registry=None):
-    """A session with real git snapshot tracking and a system message.
+    """A session with real workspace tracking.
 
     The tracked workspace is a subdirectory so the (test-local) session
     files, which live directly under ``tmp_path``, are not themselves
     tracked as drift."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    info, _notes = await gitwork.setup_tracking(ws, "test", allow_init=True)
-    assert info is not None
+    state = await open_workspace(ws, persist=False)
+    assert state is not None
     session = Session(
         name="test", workspace=ws, profile=PROFILE, profile_name="test",
         api_key="key", client=FakeClient(script),
@@ -1456,10 +1383,8 @@ async def _tracked_session(tmp_path, script, registry=None):
     if registry is not None:
         session.tool_registry = registry
         session.controller.tools = registry
-    session.git_info = info
-    session.controller.git_info = info
-    
-    return session, info
+    session.workspace_state = state
+    return session, state
 
 
 def _blocking_edit(tmp_path, name="a.txt"):
@@ -1468,7 +1393,7 @@ def _blocking_edit(tmp_path, name="a.txt"):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    @tool("edit", "edit a file", _NoArgs)
+    @tool("edit_file", "edit a file", _NoArgs)
     async def edit(args) -> ToolResult:
         (tmp_path / name).write_text("agent\n")
         started.set()
@@ -1482,8 +1407,11 @@ def _blocking_edit(tmp_path, name="a.txt"):
 
 def _tool_round(call_id="c1"):
     return [
-        ToolCallStarted(call_id=call_id, name="edit"),
-        ToolCallArgumentsDone(call_id=call_id, name="edit", arguments_json="{}"),
+        ToolCallStarted(call_id=call_id, name="edit_file"),
+        ToolCallArgumentsDone(
+            call_id=call_id, name="edit_file",
+            arguments_json='{"path": "a.txt"}',
+        ),
         RoundComplete(has_tool_calls=True),
     ]
 
@@ -1539,17 +1467,17 @@ def test_diff_info_path_snapshots_workspace_once(tmp_path, monkeypatch) -> None:
     import xarness.session as session_mod
 
     async def go():
-        session, _info = await _tracked_session(tmp_path, [])
+        session, state = await _tracked_session(tmp_path, [])
         (tmp_path / "ws" / "a.txt").write_text("changed\n")
         calls = 0
-        real = session_mod.snapshot_state
+        real = state.observe
 
-        async def counting(info):
+        async def counting():
             nonlocal calls
             calls += 1
-            return await real(info)
+            return await real()
 
-        monkeypatch.setattr(session_mod, "snapshot_state", counting)
+        state.observe = counting
         payload = await session.diff_info("a.txt")
         assert [f.path for f in payload.files] == ["a.txt"]
         assert payload.text
@@ -1558,10 +1486,10 @@ def test_diff_info_path_snapshots_workspace_once(tmp_path, monkeypatch) -> None:
     asyncio.run(go())
 
 
-def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch) -> None:
-    """A mid-turn /accept rewrites the open turn's before tree, but the turn
-    is still open: edits it makes afterwards stay tagged agent, not drift,
-    and it still records its real after tree at the end."""
+def test_accept_rebaselines_mid_turn_edits(tmp_path, monkeypatch) -> None:
+    """A mid-turn /accept moves the baseline; edits recorded by tools after
+    it are still this viewer's (``mine``), while files written outside the
+    harness are drift."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
@@ -1575,35 +1503,104 @@ def test_mid_turn_accept_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
         await asyncio.wait_for(started.wait(), 5)
 
         stat = await session.diff_info(None)
-        by_path = {f.path: f.source for f in stat.files}
-        assert by_path["a.txt"] == "agent"
+        # The blocked tool has not returned yet, so no event exists for its
+        # write: an in-flight edit is indistinguishable from drift.
+        assert {f.path: f.kind for f in stat.files} == {"a.txt": "drift"}
 
         result = await session.execute("acc", Accept())
         assert result.ok
         assert session._state == "running"
 
-        # The turn keeps editing after the accept.
-        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        # Accept keeps drift (the in-flight a.txt write) out of the new
+        # baseline; the raw b.txt write is drift too.
+        (tmp_path / "ws" / "b.txt").write_text("later edit\n")
         stat = await session.diff_info(None)
-        by_path = {f.path: f.source for f in stat.files}
-        assert by_path == {"b.txt": "agent"}, by_path
+        by_path = {f.path: f.kind for f in stat.files}
+        assert by_path == {"a.txt": "drift", "b.txt": "drift"}, by_path
 
         release.set()
         await wait_idle(session)
 
+        # The tool's event now labels its a.txt write as this viewer's, but
+        # the path stayed drift out of the baseline; the raw write is drift.
         stat = await session.diff_info(None)
-        by_path = {f.path: f.source for f in stat.files}
-        assert by_path["b.txt"] == "agent"
-        # finish_turn still recorded the open turn's real after tree.
-        turns = session.turn_checkpoints()
-        assert len(turns) == 1 and turns[0].after_tree
+        by_path = {f.path: f.kind for f in stat.files}
+        assert by_path == {"a.txt": "mine", "b.txt": "drift"}, by_path
+        # The turn spans the accept, so it is no longer revertible.
+        assert session.turn_checkpoints() == []
 
     asyncio.run(go())
 
 
-def test_mid_turn_reject_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch) -> None:
-    """Same as the accept case for /reject, which rewrites every checkpoint
-    to the baseline tree."""
+def test_event_recording_is_atomic_with_accept(tmp_path, monkeypatch) -> None:
+    """A tool's event is appended under the workspace lock, so /accept either
+    sweeps it or runs entirely before it — never between the after-snapshot
+    and the append, which left a pre-accept change pending forever."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        @tool("run_bash", "run a command", _NoArgs)
+        async def bash(args) -> ToolResult:
+            (tmp_path / "ws" / "bash.txt").write_text("written\n")
+            started.set()
+            await release.wait()
+            return ToolResult(content="done")
+
+        registry = ToolRegistry()
+        registry.register(bash)
+        session, state = await _tracked_session(tmp_path, [
+            [
+                ToolCallStarted(call_id="c1", name="run_bash"),
+                ToolCallArgumentsDone(
+                    call_id="c1", name="run_bash", arguments_json="{}",
+                ),
+                RoundComplete(has_tool_calls=True),
+            ],
+            [ContentDelta(text="done"), RoundComplete()],
+        ], registry)
+
+        # Gate the after-snapshot: the test then knows the recorder holds the
+        # workspace lock, between its snapshot and its event append.
+        inside = asyncio.Event()
+        resume = asyncio.Event()
+        real_snapshot = state.snapshot
+
+        async def gated():
+            tree = await real_snapshot()
+            inside.set()
+            await resume.wait()
+            return tree
+
+        state.snapshot = gated
+        await session.execute("s1", SendMessage(text="go"))
+        await asyncio.wait_for(started.wait(), 5)
+        release.set()
+        await asyncio.wait_for(inside.wait(), 5)
+
+        accept = asyncio.create_task(state.accept())
+        await asyncio.sleep(0.05)
+        assert not accept.done(), "accept ran inside the event-recording step"
+        resume.set()
+        await accept
+        await wait_idle(session)
+
+        # The event landed before accept could run, so accept swept it and
+        # folded the file into the new baseline (no pending row, no drift).
+        assert state.events == []
+        assert await gitwork.tree_entry(
+            state, state.baseline_tree, "bash.txt",
+        ) is not None
+        stat = await session.diff_info(None)
+        assert stat.files == []
+
+    asyncio.run(go())
+
+
+def test_reject_restores_the_baseline_mid_turn(tmp_path, monkeypatch) -> None:
+    """A mid-turn /reject restores the baseline; a later raw write is drift
+    while the turn's tool edits were already reverted."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
@@ -1620,23 +1617,23 @@ def test_mid_turn_reject_does_not_tag_later_edits_as_drift(tmp_path, monkeypatch
         assert result.ok
         assert not (tmp_path / "ws" / "a.txt").exists()
 
-        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        (tmp_path / "ws" / "b.txt").write_text("later edit\n")
         stat = await session.diff_info(None)
-        by_path = {f.path: f.source for f in stat.files}
-        assert by_path == {"b.txt": "agent"}, by_path
+        by_path = {f.path: f.kind for f in stat.files}
+        assert by_path == {"b.txt": "drift"}, by_path
 
         release.set()
         await wait_idle(session)
-        turns = session.turn_checkpoints()
-        assert len(turns) == 1 and turns[0].after_tree
+        # The turn spans the reject, so it is no longer revertible.
+        assert session.turn_checkpoints() == []
 
     asyncio.run(go())
 
 
-def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -> None:
+def test_compaction_keeps_open_turn_attribution_and_undo(tmp_path, monkeypatch) -> None:
     """Compaction moves the open turn's message into compact_snapshot. Its
-    before tree must survive so remaining edits stay agent, and finish_turn
-    must still give it an after tree (so /undo can reverse it)."""
+    before tree must survive so the turn's events stay attributable, and
+    finish_turn must still give it an after tree (so /undo can reverse it)."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
@@ -1659,20 +1656,24 @@ def test_mid_turn_compaction_keeps_attribution_and_undo(tmp_path, monkeypatch) -
             await session.controller.compact()
         assert session._open_turn_before() is not None
 
-        (tmp_path / "ws" / "b.txt").write_text("later agent edit\n")
+        (tmp_path / "ws" / "b.txt").write_text("later edit\n")
         stat = await session.diff_info(None)
-        by_path = {f.path: f.source for f in stat.files}
-        assert by_path["a.txt"] == "agent"
-        assert by_path["b.txt"] == "agent"
+        by_path = {f.path: f.kind for f in stat.files}
+        # The blocked tool has not returned, so its a.txt write is drift.
+        assert by_path["b.txt"] == "drift"
+        assert by_path["a.txt"] == "drift"
 
         release.set()
         await wait_idle(session)
 
-        # The open turn survived compaction and now has a reversible diff.
+        # The open turn survived compaction and now has a reversible diff;
+        # its recorded tool event labels a.txt as this viewer's edit.
         turns = session.turn_checkpoints()
         assert len(turns) == 1 and turns[0].after_tree
         stat = await session.diff_info(None)
-        assert {f.path: f.source for f in stat.files}["b.txt"] == "agent"
+        by_path = {f.path: f.kind for f in stat.files}
+        assert by_path["a.txt"] == "mine"
+        assert by_path["b.txt"] == "drift"
 
     asyncio.run(go())
 
@@ -1804,19 +1805,18 @@ def test_patch_settings_validates_before_applying(tmp_path) -> None:
 def test_accept_emits_checkpoints_changed_not_history_replaced(tmp_path, monkeypatch) -> None:
     """/accept rebaselines the checkpoints: clients get a lightweight
     CheckpointsChanged, not a full HistoryReplaced snapshot."""
-    import xarness.session as session_mod
-    from xarness.gitwork import GitInfo
-
     session = make_session([_round("one")], tmp_path)
+    state = _tracked_workspace(tmp_path)
 
-    async def fake_accept(info):
+    async def fake_accept():
         return "f" * 40
 
-    monkeypatch.setattr(session_mod, "accept_changes", fake_accept)
-    session.git_info = GitInfo(
-        repo_root=tmp_path, session_id="s", git_dir=tmp_path,
-        baseline_tree="a" * 40,
-    )
+    async def fake_diff(viewer=None, current=None):
+        return protocol.DiffInfo()
+
+    state.accept = fake_accept
+    state.diff = fake_diff
+    session.workspace_state = state
 
     async def go():
         queue = session.subscribe()[1]
@@ -1929,8 +1929,7 @@ def test_load_starts_watermark_at_end_and_closes_crashed_turns(tmp_path) -> None
         assert loaded.conversation._dirty_from is None
         assert loaded.conversation.open_turn is None  # closed on load
         assert all(t.closed for t in loaded.conversation.turns.values())
-        # Untracked: the crash repair has nothing to stamp.
-        await loaded.repair_crashed_turns()
+        # Untracked: closing a crashed turn leaves its trees unset.
         assert all(t.after_tree is None
                    for t in loaded.conversation.turns.values())
 
@@ -1943,7 +1942,7 @@ def _parts(tmp_path):
     return SessionParts(
         workspace=tmp_path, profile=PROFILE, profile_name="test",
         api_key="key", config_path=None,
-        sandbox=SandboxRuntime(), git_info=None, tool_output_limit=None,
+        sandbox=SandboxRuntime(), workspace_state=None, tool_output_limit=None,
     )
 
 

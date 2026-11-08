@@ -12,9 +12,9 @@ round — one full model response. If that round made tool calls
 The controller does not loop internally; the session stays in control of
 pacing tool execution and persistence between rounds.
 
-It owns no workspace state: git checkpoints, rollback and diff bookkeeping
-belong to the session (which is the thing that has a workspace and a
-:class:`~xarness.gitwork.GitInfo`).
+It owns no workspace state: turn checkpoints, rollback and diff bookkeeping
+belong to the session, and the tracked state it measures against belongs to
+the workspace (:class:`~xarness.workspace.WorkspaceState`).
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ class ChatController:
 
     async def begin_turn(
         self, text: str, images: list[ImageRef] | None,
-        before_tree: str | None,
+        before_tree: str | None, epoch: int = 0,
     ) -> AsyncIterator[StreamEvent]:
         """Add the user message, open the turn's checkpoint, and stream the
         first round.
@@ -112,7 +112,7 @@ class ChatController:
         entry and a rollback never has to guess its scope."""
         message = user_message(text, images, self.image_store)
         self.conversation.add(message)
-        self.conversation.begin_turn(message, before_tree)
+        self.conversation.begin_turn(message, before_tree, epoch)
         if self.on_user_message is not None:
             self.on_user_message(message)
         async for event in self.stream_round():

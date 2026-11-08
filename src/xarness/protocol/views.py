@@ -37,18 +37,6 @@ class PendingAsk(BaseModel):
     questions: list[str]
 
 
-class PendingDrift(BaseModel):
-    """A live resume-drift prompt (session state, resolvable by any client).
-
-    Structured, not prose: clients render their own message from the trees
-    and changed paths."""
-
-    workspace: str
-    last_known: str = ""
-    current: str = ""
-    files: list[str] = Field(default_factory=list)
-
-
 class RefInfo(BaseModel):
     """One external reference bound into the sandbox: the host ``path`` and
     the canonical container ``mount`` the model addresses it by (normally
@@ -80,7 +68,6 @@ class Status(BaseModel):
     last_usage: Usage = Field(default_factory=Usage)
     queued: list[QueuedMessage] = Field(default_factory=list)
     pending_ask: PendingAsk | None = None
-    pending_drift: PendingDrift | None = None
     clients_attached: int = 0
 
     # How it is configured: changes on /model, /sandbox, /filter, /ref.
@@ -195,7 +182,10 @@ class SessionSummary(BaseModel):
     sandbox: str | None = None
     last_user_message_at: str | None = None
     message_count: int = 0
+    parent_id: str | None = None
     tracking: bool = False
+    # The session's own pending (unaccepted) ``mine`` totals: only paths
+    # this session wrote explicitly, not the whole workspace's changes.
     additions: int = 0
     deletions: int = 0
 
@@ -260,13 +250,25 @@ class DiffFileInfo(BaseModel):
     additions: int = 0
     deletions: int = 0
     is_new: bool = False
-    source: Literal["agent", "drift"] = "agent"
+    # Derived per viewer; the default must never be agent.
+    kind: Literal["mine", "agent", "auto", "drift"] = "drift"
+
+
+class DiffGroup(BaseModel):
+    """One directory of ignored paths, reported instead of per-file rows."""
+
+    prefix: str
+    files: int = 0
+    kind: Literal["mine", "agent", "auto", "drift"] = "drift"
 
 
 class DiffInfo(BaseModel):
     files: list[DiffFileInfo] = Field(default_factory=list)
+    groups: list[DiffGroup] = Field(default_factory=list)
     additions: int = 0
     deletions: int = 0
+    # Total number of files behind ``groups``.
+    ignored_files: int = 0
     tracking: bool = False
     text: str = ""
 

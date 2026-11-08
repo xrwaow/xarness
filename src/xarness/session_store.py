@@ -10,9 +10,10 @@ write only ever has to replace rows from a watermark onward
 re-serializes O(history) on every tool result. Image blobs stay
 content-addressed files under the session directory.
 
-Per-workspace state (the external reference paths managed with ``/refs``)
-lives beside the sessions as small JSON files, keyed by the resolved
-workspace path, so every session opened in the same directory shares it.
+Per-workspace state (tracking trees, epoch, ignored set, reference paths)
+lives in the same database, in the ``workspaces`` table: it is shared by every
+session opened in the same repo. That table belongs to
+:mod:`xarness.workspace`; this module owns the schema and the connection.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import sqlite3
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,88 +38,16 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import SandboxSettings
-from .errors import RefError
 from .conversation import MESSAGE_ADAPTER, Conversation, Message, Usage
-from .gitwork import GitInfo, TurnCheckpoint
+from .gitwork import TurnCheckpoint
 from .images import ImageAttachment, ImageRef
 from .util import utcnow_iso as _utcnow_iso
 
 SESSIONS_DIR = Path("~/.local/share/xarness/sessions").expanduser()
-WORKSPACES_DIR = Path("~/.local/share/xarness/workspaces").expanduser()
 
-# Persisted-payload schema. Sessions from any other version are rejected:
-# this build reads and writes exactly one shape.
-SCHEMA_VERSION = 4
-
-
-def _workspace_path(workspace: str) -> Path:
-    """Settings file for a workspace, keyed by its resolved path."""
-    key = hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:16]
-    return WORKSPACES_DIR / f"{key}.json"
-
-
-def load_workspace_refs(workspace: str) -> list[str]:
-    """Reference paths saved for this workspace (shared by its sessions)."""
-    try:
-        data = json.loads(_workspace_path(workspace).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    refs = data.get("refs")
-    if not isinstance(refs, list):
-        return []
-    return [ref for ref in refs if isinstance(ref, str) and ref.strip()]
-
-
-def save_workspace_refs(workspace: str, refs: list[str]) -> None:
-    """Persist the workspace's refs; an empty list drops the file."""
-    refs = [ref for ref in refs if isinstance(ref, str) and ref.strip()]
-    path = _workspace_path(workspace)
-    if not refs:
-        path.unlink(missing_ok=True)
-        return
-    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path.write_text(
-        json.dumps({"workspace": str(workspace), "refs": refs}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def change_workspace_ref(
-    workspace: Path, raw: str, add: bool, *, save: bool = True,
-) -> tuple[list[str], Path]:
-    """Add/remove one workspace reference path — the ONE implementation,
-    used by the session's /ref command and the host's workspace endpoint.
-
-    Returns the canonical (saved) list and the resolved host path. With
-    ``save=False`` the caller persists the returned list itself (the
-    session tolerates a read-only data dir; the host does not).
-
-    Raises :class:`RefError` when the path does not exist (a typo must
-    never mkdir a reference) or is not a known reference."""
-    workspace = Path(workspace).expanduser().resolve()
-    raw = raw.strip()
-    if not raw:
-        raise RefError("references need a path")
-    path = Path(raw).expanduser()
-    host = (path if path.is_absolute() else workspace / path).resolve()
-    specs = list(load_workspace_refs(str(workspace)))
-    if add:
-        if not host.exists():
-            raise RefError(f"no such path: {raw}")
-        if str(host) not in specs:
-            specs.append(str(host))
-    else:
-        kept = [
-            ref for ref in specs
-            if Path(ref).expanduser().resolve() != host
-        ]
-        if len(kept) == len(specs):
-            raise RefError(f"no such reference: {raw}")
-        specs = kept
-    if save:
-        save_workspace_refs(str(workspace), specs)
-    return specs, host
-
+# Persisted-payload schema. Sessions from any other version are imported (see
+# _import_v4_rows) or rejected: this build reads and writes one shape.
+SCHEMA_VERSION = 5
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
@@ -259,7 +189,8 @@ class StoredSession(BaseModel):
     turns: dict[str, TurnCheckpoint] = Field(default_factory=dict)
     profile: str | None = None
     workspace: str | None = None
-    git: GitInfo | None = None
+    # Set only for a subagent's session: the session that spawned it.
+    parent_id: str | None = None
     # Per-session sandbox settings (resolved at creation from the config's
     # sandbox profiles; fixed except via /sandbox or /filter).
     sandbox_name: str | None = None
@@ -269,7 +200,7 @@ class StoredSession(BaseModel):
     mode: str | None = None
 
 
-def _meta_block(stored: StoredSession, tracking: bool) -> dict[str, Any]:
+def _meta_block(stored: StoredSession) -> dict[str, Any]:
     """The small summary block listing and last-used lookups read: no
     conversation parsing needed on those paths.
 
@@ -279,10 +210,10 @@ def _meta_block(stored: StoredSession, tracking: bool) -> dict[str, Any]:
     return {
         "profile": stored.profile,
         "workspace": stored.workspace,
+        "parent_id": stored.parent_id,
         "sandbox_name": stored.sandbox_name,
         "message_count": len(visible),
         "last_user_message_at": stored.conversation.last_user_message_at(),
-        "tracking": tracking,
     }
 
 
@@ -293,38 +224,55 @@ def _db_path() -> Path:
 _local = threading.local()
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(*, readonly: bool = False) -> sqlite3.Connection | None:
     """A per-thread cached connection (keyed by the database path, so tests
     that redirect SESSIONS_DIR get a fresh one).
+
+    ``readonly`` is for paths that must not create anything (a
+    ``--no-session`` run reads metas/refs/events): no database file means no
+    answer, and an existing one is opened ``mode=ro``, so a read can neither
+    create nor migrate it.
 
     The persist writes come from worker threads (to_thread reuses its pool
     threads), listing reads from the event loop; one connection per thread
     avoids cross-thread check_same_thread issues entirely and skips the
     per-operation PRAGMAs/DDL. WAL keeps a reader and the writer from
     blocking each other."""
-    path = str(_db_path())
-    cached = getattr(_local, "connection", None)
-    if cached is not None and _local.path == path:
+    path = _db_path()
+    slot = "ro" if readonly else "rw"
+    cache = getattr(_local, "connections", None)
+    if cache is None:
+        cache = _local.connections = {}
+    cached_path, cached = cache.get(slot, (None, None))
+    if cached is not None and cached_path == path:
         return cached
     if cached is not None:
         cached.close()
-    SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10.0)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA busy_timeout=10000")
-    _ensure_schema(connection)
-    _local.connection = connection
-    _local.path = path
+        cache.pop(slot, None)
+    if readonly:
+        if not path.exists():
+            return None
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=10.0,
+        )
+    else:
+        SESSIONS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=10.0)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=10000")
+        _ensure_schema(connection)
+    cache[slot] = (path, connection)
     return connection
 
 
 @contextlib.contextmanager
 def connection() -> "sqlite3.Connection":
-    """The thread's cached connection. An open transaction is committed on a
-    clean exit (writers that do not manage their own ``with db`` block) and
-    rolled back on error, so the next use starts clean."""
+    """The thread's cached writer connection. An open transaction is
+    committed on a clean exit (writers that do not manage their own ``with
+    db`` block) and rolled back on error, so the next use starts clean."""
     db = _connect()
+    assert db is not None
     try:
         yield db
     except BaseException:
@@ -334,6 +282,13 @@ def connection() -> "sqlite3.Connection":
     else:
         if db.in_transaction:
             db.commit()
+
+
+@contextlib.contextmanager
+def read_connection() -> Iterator["sqlite3.Connection | None"]:
+    """The thread's cached read-only connection, or None when there is no
+    database yet. Reading must never create (or migrate) the file."""
+    yield _connect(readonly=True)
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:
@@ -352,8 +307,45 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             data TEXT NOT NULL,
             PRIMARY KEY (name, seq)
         );
+        CREATE TABLE IF NOT EXISTS workspaces (
+            root TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            refs TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_events (
+            root TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (root, seq)
+        );
         """
     )
+    _import_v4_rows(connection)
+
+
+def _import_v4_rows(connection: sqlite3.Connection) -> None:
+    """One-off import of schema-4 session rows.
+
+    The conversation tables are unchanged, so a row only lost its ``git``
+    block (tracking moved to the shared workspace row) and gained
+    ``parent_id``. Rewritten in place, once."""
+    rows = connection.execute(
+        "SELECT name, state FROM sessions WHERE schema < ?", (SCHEMA_VERSION,),
+    ).fetchall()
+    for name, state_json in rows:
+        try:
+            state = json.loads(state_json)
+        except json.JSONDecodeError:
+            state = {}
+        state.pop("git", None)
+        state.setdefault("parent_id", None)
+        connection.execute(
+            "UPDATE sessions SET schema = ?, state = ? WHERE name = ?",
+            (SCHEMA_VERSION, json.dumps(state, separators=(",", ":")), name),
+        )
+    if rows:
+        connection.commit()
 
 
 def _state_block(stored: StoredSession) -> dict[str, Any]:
@@ -384,8 +376,7 @@ def serialize_state(
     already on disk. Messages are immutable, so rows before the watermark
     stay; ``from_seq=0`` (first write, or after a truncation moved the
     watermark back) rewrites everything."""
-    tracking = stored.git is not None
-    meta = _meta_block(stored, tracking)
+    meta = _meta_block(stored)
     messages = stored.conversation.messages
     from_seq = max(0, min(from_seq, len(messages)))
     state = _state_block(stored)
@@ -436,7 +427,11 @@ def write_state(
 
 
 def load_state(name: str) -> StoredSession:
-    """Load one saved session: the state row plus its replayed messages."""
+    """Load one saved session: the state row plus its replayed messages.
+
+    Uses the writer connection (unlike the listing reads): loading a saved
+    session may have to run the one-off schema import, and it is only
+    reached once a meta row proved the database exists."""
     _validate_session_name(name)
     if not _db_path().exists():
         raise OSError(f"no saved session named {name!r}")
@@ -477,10 +472,10 @@ def load_state(name: str) -> StoredSession:
 
 def load_meta(name: str) -> dict[str, Any] | None:
     """One saved session's small meta block."""
-    if not _db_path().exists():
-        return None
     try:
-        with connection() as db:
+        with read_connection() as db:
+            if db is None:
+                return None
             row = db.execute(
                 "SELECT meta, updated_at FROM sessions WHERE name = ?", (name,)
             ).fetchone()
@@ -491,13 +486,18 @@ def load_meta(name: str) -> dict[str, Any] | None:
 
 def load_metas() -> dict[str, dict[str, Any]]:
     """Every saved session's meta block, in one query (listing hot path:
-    never parses conversations)."""
+    never parses conversations).
+
+    Side-effect free: no database file means no sessions, and the query runs
+    read-only — a ``--no-session`` host may call this at any time."""
     _warn_legacy_json_sessions()
-    if not _db_path().exists():
-        return {}
     try:
-        with connection() as db:
-            rows = db.execute("SELECT name, meta, updated_at FROM sessions").fetchall()
+        with read_connection() as db:
+            if db is None:
+                return {}
+            rows = db.execute(
+                "SELECT name, meta, updated_at FROM sessions"
+            ).fetchall()
     except sqlite3.Error:
         return {}
     metas: dict[str, dict[str, Any]] = {}

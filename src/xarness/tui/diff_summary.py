@@ -27,6 +27,20 @@ from .chat_input import ChatInput
 from .widgets import _render_diff
 
 
+def _display_kind(kind: str) -> str:
+    """The badge text: own work reads ``agent`` too (only its accent
+    differs), so the list never claims a single author."""
+    return "agent" if kind == "mine" else kind
+
+
+async def _mount_cell(row: Horizontal, text: str, classes: str) -> None:
+    await row.mount(Static(Text(text), classes=classes, markup=False))
+
+
+def _cell(row: Horizontal, classes: str) -> Static:
+    return row.query_one(f".{classes}", Static)
+
+
 class DiffText(VerticalScroll):
     """Capped, focusable diff pane with its own scrollbar. Up/down page by
     the pane's full visible height and stop at the pane's top/bottom — they
@@ -202,20 +216,21 @@ class DiffSummary(Vertical):
             self.post_message(self.DiffRequested(cast("str", key)))
 
     async def set_summary(self, stat: DiffStat) -> None:
-        """Update the summary + per-file rows in place; becomes visible.
+        """Update the summary + rows in place; becomes visible.
 
-        The panel refreshes on every tool finish, so a full teardown/mount of
-        the row list makes the widget flicker and loses scroll/highlight
-        state. Reconcile instead: drop rows whose file disappeared, mount rows
-        for new files, and update the existing rows' numbers/source in place
-        when only the counts changed."""
+        Attributed files come first, then a drift header with the drift
+        rows, then one non-clickable row per ignored-path group. The panel
+        refreshes on every tool finish, so reconcile instead of rebuilding:
+        rows whose file disappeared are removed, rows for new files mounted,
+        and surviving rows get their numbers/kind updated in place. A full
+        teardown/mount flickers and loses the scroll position and highlight
+        when only one row changed."""
         self._stat = stat
         count = len(stat.files)
-        # Colors are CSS ($c-* variables) applied to the Statics — keep the
-        # Text unstyled so /theme recolors these rows live.
-        self.query_one("#diff-summary-text", Static).update(
-            Text(f"Edited {count} file{'s' if count != 1 else ''}")
-        )
+        label = f"Edited {count} file{'s' if count != 1 else ''}"
+        if stat.groups:
+            label += f" · {stat.ignored_files} ignored"
+        self.query_one("#diff-summary-text", Static).update(Text(label))
         self.query_one("#diff-summary-add", Static).update(Text(f"+{stat.additions}"))
         self.query_one("#diff-summary-del", Static).update(Text(f"-{stat.deletions}"))
 
@@ -226,87 +241,110 @@ class DiffSummary(Vertical):
         add_w = max((len(f"+{f.additions}") for f in stat.files), default=1)
         del_w = max((len(f"-{f.deletions}") for f in stat.files), default=1)
 
-        # Reconcile against the rows already mounted (keyed by diff_key).
-        rows: dict[str, Horizontal] = {
-            row.diff_key: row  # type: ignore[attr-defined]
-            for row in files.children
-            if isinstance(row, Horizontal) and hasattr(row, "diff_key")
-        }
-        wanted = {f.path for f in stat.files}
-        for path, row in list(rows.items()):
-            if path not in wanted:
-                await row.remove()
-                rows.pop(path)
+        # One keyed row per entry: a file, the drift header, or an ignored
+        # group. The key survives refresh, so the row widget (and its
+        # highlight) can be reused when only its numbers changed.
+        drift = [f for f in stat.files if f.kind == "drift"]
+        ordered_files = [f for f in stat.files if f.kind != "drift"]
+        wanted = [(("file", f.path), f) for f in ordered_files]
+        if drift:
+            wanted.append((("header", "drift"), None))
+            wanted += [(("file", f.path), f) for f in drift]
+        wanted += [(("group", g.prefix), g) for g in stat.groups]
 
-        ordered: list[Horizontal] = []
-        for f in stat.files:
-            row = rows.get(f.path)
+        wanted_keys = {key for key, _ in wanted}
+        existing = {
+            getattr(row, "diff_row_key", None): row
+            for row in list(files.children)
+            if getattr(row, "diff_row_key", None) is not None
+        }
+        for row in list(files.children):
+            key = getattr(row, "diff_row_key", None)
+            if key is not None and key not in wanted_keys:
+                await row.remove()
+                existing.pop(key, None)
+
+        ordered = []
+        for key, entry in wanted:
+            row = existing.get(key)
             if row is None:
-                row = await self._mount_file_row(files, f, add_w, del_w)
-            else:
-                await self._update_file_row(row, f, add_w, del_w)
+                if key[0] == "header":
+                    row = Static(
+                        Text("drift — changes outside this agent"),
+                        classes="diff-drift-header", markup=False,
+                    )
+                    row.diff_row_key = key  # type: ignore[attr-defined]
+                    await files.mount(row)
+                elif key[0] == "group":
+                    row = await self._mount_group_row(files, entry)
+                else:
+                    row = await self._mount_file_row(files, entry, add_w, del_w)
+            elif key[0] == "group":
+                self._update_group_row(row, entry)
+            elif key[0] == "file":
+                await self._update_file_row(row, entry, add_w, del_w)
             ordered.append(row)
 
-        # Keep DOM order matching the stat order (a row may have moved when
-        # the diff list is re-sorted), without touching rows already placed.
+        # Keep DOM order matching the wanted order without touching rows
+        # already in place.
         for index, row in enumerate(ordered):
             if files.children.index(row) != index:
                 files.move_child(row, before=index)
 
-        # Re-apply the open diff's highlight: rows that survived kept it, but
-        # if the active file disappeared no row should stay highlighted. With
-        # no diff open, leave the existing classes alone.
         if self.diff_shown:
             active = self._active_key
             self._mark_active_row(active if isinstance(active, str) else None)
         self.add_class("visible")
 
+    async def _mount_group_row(self, files: Vertical, group) -> Horizontal:
+        """One ignored-path group: not clickable, no ``diff_key``."""
+        row = Horizontal(classes="diff-group-row")
+        row.diff_row_key = ("group", group.prefix)  # type: ignore[attr-defined]
+        await files.mount(row)
+        await _mount_cell(row, group.prefix, "diff-file-name")
+        await _mount_cell(row, _display_kind(group.kind), f"diff-file-source {group.kind}")
+        await _mount_cell(row, f"{group.files} files", "diff-group-count")
+        return row
+
+    @staticmethod
+    def _update_group_row(row: Horizontal, group) -> None:
+        """Refresh one ignored-group row in place."""
+        _cell(row, "diff-file-name").update(Text(group.prefix))
+        source = _cell(row, "diff-file-source")
+        source.update(Text(_display_kind(group.kind)))
+        source.set_classes(f"diff-file-source {group.kind}")
+        _cell(row, "diff-group-count").update(Text(f"{group.files} files"))
+
     async def _mount_file_row(
         self, files: Vertical, f, add_w: int, del_w: int,
     ) -> Horizontal:
         """Create and mount one per-file row, returning it."""
-        # Row layout: name  [new]  {source}  +N -M — the whole row is
+        # Row layout: name  [new]  {kind}  +N -M — the whole row is
         # clickable and requests that file's unified diff. The "new" badge
         # gets its own column so it never wraps the file name.
         row = Horizontal(classes="diff-file-row")
         row.diff_key = f.path  # type: ignore[attr-defined]
+        row.diff_row_key = ("file", f.path)  # type: ignore[attr-defined]
         await files.mount(row)
-        await row.mount(Static(Text(f.path), classes="diff-file-name", markup=False))
+        await _mount_cell(row, f.path, "diff-file-name")
         if f.is_new:
-            await row.mount(Static(
-                Text("new"), classes="diff-file-new", markup=False,
-            ))
-        # Source tag: "agent" for a turn's edits, "drift" for changes made
-        # outside the session.
-        source_class = "drift" if "drift" in f.source else "agent"
-        await row.mount(Static(
-            Text(f.source), classes=f"diff-file-source {source_class}", markup=False,
-        ))
-        await row.mount(Static(
-            Text(f"+{f.additions}".rjust(add_w)), classes="diff-file-add", markup=False,
-        ))
-        await row.mount(Static(
-            Text(f"-{f.deletions}".rjust(del_w)), classes="diff-file-del", markup=False,
-        ))
+            await _mount_cell(row, "new", "diff-file-new")
+        await _mount_cell(row, _display_kind(f.kind), f"diff-file-source {f.kind}")
+        await _mount_cell(row, f"+{f.additions}".rjust(add_w), "diff-file-add")
+        await _mount_cell(row, f"-{f.deletions}".rjust(del_w), "diff-file-del")
         return row
 
     async def _update_file_row(
         self, row: Horizontal, f, add_w: int, del_w: int,
     ) -> None:
-        """Refresh one existing row's values without remounting it."""
-        row.query_one(".diff-file-name", Static).update(Text(f.path))
-        source = row.query_one(".diff-file-source", Static)
-        source.update(Text(f.source))
-        source.set_classes(
-            "diff-file-source " + ("drift" if "drift" in f.source else "agent")
-        )
-        row.query_one(".diff-file-add", Static).update(
-            Text(f"+{f.additions}".rjust(add_w))
-        )
-        row.query_one(".diff-file-del", Static).update(
-            Text(f"-{f.deletions}".rjust(del_w))
-        )
-        # The "new" badge can appear/disappear when the baseline moves (e.g.
+        """Refresh one existing file row without remounting it."""
+        _cell(row, "diff-file-name").update(Text(f.path))
+        source = _cell(row, "diff-file-source")
+        source.update(Text(_display_kind(f.kind)))
+        source.set_classes(f"diff-file-source {f.kind}")
+        _cell(row, "diff-file-add").update(Text(f"+{f.additions}".rjust(add_w)))
+        _cell(row, "diff-file-del").update(Text(f"-{f.deletions}".rjust(del_w)))
+        # The badge can appear/disappear when the baseline moves (e.g.
         # /accept), but the row itself survives: add/remove only the badge.
         badge = next(iter(row.query(".diff-file-new")), None)
         if f.is_new and badge is None:

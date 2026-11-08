@@ -534,7 +534,7 @@ def test_rollback_without_snapshot_truncates_at_last_user_message() -> None:
     plan = controller.conversation.rollback_plan()
     assert plan is not None
     assert plan.user_text == "last"
-    assert plan.revert_turns == [TurnCheckpoint(before_tree="abc123", after_tree="def456")]
+    assert plan.revert_turns == [last.id]
     controller.conversation.apply_rollback(plan)
     assert [m.content for m in controller.conversation.visible_messages()] == ["old", "a"]
     # Totals are monotonic: the undone turn's spend stays counted.

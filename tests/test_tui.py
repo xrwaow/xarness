@@ -43,6 +43,7 @@ class FakeClient:
         self.commands: list[tuple[str, Event]] = []
         self.command_results: dict[str, CommandResult] = {}
         self.unloaded: list[str] = []
+        self.session_calls: list[dict] = []
         self.refs: list[protocol.RefInfo] = []
         self.ref_updates: list[tuple[str, str, bool]] = []
         # The host's answer to "does closing need a choice?". Scripted per
@@ -73,6 +74,7 @@ class FakeClient:
         )
 
     async def sessions(self, **kwargs):
+        self.session_calls.append(kwargs)
         return list(getattr(self, "session_list", []))
 
     async def config(self):
@@ -530,6 +532,91 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.unloaded, [])
 
 
+class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
+    """`/accept` and `/reject` ask first when the pending rows are not the
+    user's to give away (or would be thrown away with them)."""
+
+    def _app(self):
+        from xarness.tui.app import AgentApp
+
+        client = FakeClient(make_snapshot())
+        return client, AgentApp(client, workspace=None, session_name="s1")
+
+    @staticmethod
+    def _diff(*kinds: str) -> DiffInfo:
+        return DiffInfo(files=[
+            protocol.DiffFileInfo(path=f"f{i}.py", kind=kind)
+            for i, kind in enumerate(kinds)
+        ])
+
+    async def test_accept_confirms_foreign_rows_then_accepts(self) -> None:
+        from textual.widgets import Label
+
+        from xarness.tui.confirm_screen import ConfirmScreen
+
+        client, app = self._app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._last_diff = self._diff("mine", "agent", "auto")
+            app._accept_with_confirm()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ConfirmScreen)
+            title = app.screen.query_one("#confirm-title", Label).render()
+            self.assertIn("2 of 3 pending files", str(title))
+            await pilot.press("y")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(
+                [c.type for _, c in client.commands], ["accept"], client.commands,
+            )
+
+    async def test_accept_of_own_rows_posts_without_a_modal(self) -> None:
+        from xarness.tui.confirm_screen import ConfirmScreen
+
+        client, app = self._app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._last_diff = self._diff("mine", "mine")
+            app._accept_with_confirm()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
+            await pilot.pause()
+            self.assertEqual([c.type for _, c in client.commands], ["accept"])
+
+    async def test_reject_confirms_drift_and_a_cancel_posts_nothing(self) -> None:
+        from textual.widgets import Label
+
+        from xarness.tui.confirm_screen import ConfirmScreen
+
+        client, app = self._app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._last_diff = self._diff("mine", "drift")
+            app._reject_with_confirm()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ConfirmScreen)
+            title = app.screen.query_one("#confirm-title", Label).render()
+            self.assertIn("revert 1 drift file", str(title))
+            # Declining leaves the workspace alone.
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(client.commands, [])
+
+    async def test_reject_without_drift_posts_without_a_modal(self) -> None:
+        from xarness.tui.confirm_screen import ConfirmScreen
+
+        client, app = self._app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._last_diff = self._diff("agent")
+            app._reject_with_confirm()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ConfirmScreen)
+            await pilot.pause()
+            self.assertEqual([c.type for _, c in client.commands], ["reject"])
+
+
 class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
     """The /refs manager lists container mounts (/tmp/refs/<alias>) and
     dispatches add/remove without ever touching the worktree."""
@@ -688,26 +775,6 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, app_client, app)
 
 
-class DriftPromptStateTest(unittest.IsolatedAsyncioTestCase):
-    async def test_resolved_drift_is_cleared_from_local_status(self) -> None:
-        """After DriftResolved, a later StatusChanged must not re-open the
-        prompt for a drift that the host already resolved."""
-        from xarness.tui.app import AgentApp
-
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None,
-                       session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app._status = Status(
-                session_name="s1",
-                pending_drift=protocol.PendingDrift(
-                    workspace="/tmp/ws", last_known="aaa", current="bbb",
-                    files=["a.txt"]),
-            )
-            await app._handle_event(protocol.DriftResolved(accepted=False))
-            self.assertIsNone(app._status.pending_drift)
-
-
 class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
     """While a tool is still MAKING_CALL its streamed arguments must already
     show the useful detail: write_file's +LOC, edit_file's +adds -dels and
@@ -770,6 +837,16 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             args = json.dumps({"command": command})
             self.assertEqual(live_parts("run_bash", args), ("run_bash", expected))
             self.assertEqual(_bash_settled(args).plain.strip(), expected)
+
+    def test_tools_without_a_bespoke_view_name_themselves(self) -> None:
+        """subagent/ask_user must not fall back to the anonymous "tool"."""
+        from xarness.tui.tool_view import live_parts
+
+        self.assertEqual(
+            live_parts("subagent", '{"prompt": "do the thing"}'),
+            ("subagent", ""),
+        )
+        self.assertEqual(live_parts("ask_user", "{}"), ("ask_user", ""))
 
     def test_running_command_truncates_like_the_settled_one(self) -> None:
         """A long command may not shrink when the call finishes: the live
@@ -1128,6 +1205,12 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 await app._open_sessions_async()
                 await pilot.pause()
                 self.assertIsInstance(app.screen, ListPicker)
+                # The picker's +/- columns come from the host's stats: the
+                # TUI must ask for them or every live row reads as clean.
+                self.assertTrue(client.session_calls)
+                self.assertTrue(all(
+                    call.get("stats") is True for call in client.session_calls
+                ), client.session_calls)
                 option_list = app.screen.query_one("#picker-list", OptionList)
                 self.assertIn("running", str(option_list.get_option_at_index(0).prompt))
 
@@ -1135,8 +1218,61 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.08)
                 await pilot.pause()
                 self.assertIn("idle", str(option_list.get_option_at_index(0).prompt))
+                # The periodic refresh keeps asking for the live diff totals.
+                self.assertTrue(all(
+                    call.get("stats") is True for call in client.session_calls
+                ), client.session_calls)
         finally:
             app_module.SESSIONS_REFRESH_SECONDS = previous_interval
+
+    def test_child_sessions_nest_under_their_parent(self) -> None:
+        from xarness.tui.list_picker import session_options
+
+        def summary(
+            name: str, parent: str | None = None, at: str = "00:00:00",
+        ) -> SessionSummary:
+            return SessionSummary(
+                name=name, parent_id=parent, state="saved", active=True,
+                last_user_message_at=f"2026-01-01T{at}+00:00",
+            )
+
+        # Recency order puts the child and the grandchild first; the picker
+        # moves each under the parent it names.
+        entries = [
+            summary("child", parent="root", at="00:00:03"),
+            summary("other", at="00:00:02"),
+            summary("root", at="00:00:04"),
+            summary("grandchild", parent="child", at="00:00:01"),
+        ]
+        options = session_options(entries, None)
+        assert [str(o.id) for o in options] == [
+            "root", "child", "grandchild", "other",
+        ]
+        assert str(options[1].prompt).startswith("↳ child")
+        assert str(options[3].prompt).startswith("other")
+
+    def test_idle_child_of_an_active_parent_stays_live(self) -> None:
+        """A finished subagent is saved/inactive, but while its parent is
+        active it belongs above the gap, not with the old sessions."""
+        from xarness.tui.list_picker import SPACER_ID, session_options
+
+        def summary(name, state, active, parent=None, at="00:00:00"):
+            return SessionSummary(
+                name=name, state=state, active=active, parent_id=parent,
+                last_user_message_at=f"2026-01-01T{at}+00:00",
+            )
+
+        entries = [
+            summary("root", "running", True, at="00:00:05"),
+            summary("child", "saved", False, parent="root", at="00:00:04"),
+            summary("old", "saved", False, at="00:00:01"),
+        ]
+        options = session_options(entries, None)
+        assert [str(o.id) for o in options] == [
+            "root", "child", SPACER_ID, "old",
+        ], [str(o.id) for o in options]
+        child_row = next(o for o in options if str(o.id) == "child")
+        self.assertIn("idle", str(child_row.prompt))
 
     def test_workspace_column_shows_innermost_dir(self) -> None:
         from xarness.tui.list_picker import session_options
@@ -1497,7 +1633,7 @@ def make_diff_stat():
     from xarness.protocol import DiffFileInfo, DiffInfo
 
     return DiffInfo(files=[
-        DiffFileInfo(path="a.py", additions=2, deletions=1, is_new=False, source="agent"),
+        DiffFileInfo(path="a.py", additions=2, deletions=1, is_new=False, kind="agent"),
     ])
 
 
@@ -1933,7 +2069,7 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             summary = app.query_one("#diff-summary", DiffSummary)
 
             await summary.set_summary(DiffInfo(files=[
-                DiffFileInfo(path="a.py", additions=9, deletions=3, source="drift"),
+                DiffFileInfo(path="a.py", additions=9, deletions=3, kind="drift"),
                 DiffFileInfo(path="b.py", additions=1, deletions=0, is_new=True),
             ]))
             rows = list(summary.query(".diff-file-row"))
@@ -1951,6 +2087,75 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 rows[0].query_one(".diff-file-del", Static).render().plain, "-3"
             )
+
+    async def test_a_count_change_keeps_every_other_row(self) -> None:
+        """A refresh that changes one file's counts must not remount the
+        whole list (that loses scroll position and the active highlight)."""
+        from textual.widgets import Static
+
+        from xarness.protocol import DiffFileInfo, DiffInfo
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import DiffSummary
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=1, deletions=0, kind="agent"),
+                DiffFileInfo(path="b.py", additions=2, deletions=0, kind="mine"),
+            ]))
+            first = list(summary.query(".diff-file-row"))
+            summary.show_diff("a.py", "--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n")
+
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=5, deletions=1, kind="agent"),
+                DiffFileInfo(path="b.py", additions=2, deletions=0, kind="mine"),
+            ]))
+            after = list(summary.query(".diff-file-row"))
+            self.assertIs(after[0], first[0])
+            self.assertIs(after[1], first[1])
+            self.assertEqual(
+                after[0].query_one(".diff-file-add", Static).render().plain, "+5"
+            )
+            self.assertTrue(after[0].has_class("active"))
+            # Own work is labelled ``agent`` too; its class keeps the accent.
+            own = after[1].query_one(".diff-file-source", Static)
+            self.assertEqual(own.render().plain, "agent")
+            self.assertTrue(own.has_class("mine"))
+
+    async def test_group_and_drift_rows_are_reused(self) -> None:
+        """Ignored groups and the drift header are keyed too: a refresh
+        keeps their widgets when only the counts moved."""
+        from textual.widgets import Static
+
+        from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
+        from xarness.tui.app import AgentApp
+        from xarness.tui.widgets import DiffSummary
+
+        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            summary = app.query_one("#diff-summary", DiffSummary)
+
+            def stat(files: int, ignored: int) -> DiffInfo:
+                return DiffInfo(
+                    files=[DiffFileInfo(
+                        path="x.py", additions=files, deletions=0,
+                        kind="drift",
+                    )],
+                    groups=[DiffGroup(prefix="build/", files=ignored)],
+                    ignored_files=ignored,
+                )
+
+            await summary.set_summary(stat(1, 2))
+            header = summary.query_one(".diff-drift-header")
+            group = summary.query_one(".diff-group-row")
+            await summary.set_summary(stat(3, 4))
+            self.assertIs(summary.query_one(".diff-drift-header"), header)
+            self.assertIs(summary.query_one(".diff-group-row"), group)
+            count = group.query_one(".diff-group-count", Static)
+            self.assertEqual(count.render().plain, "4 files")
 
 
 class ShimmerDirectionTest(unittest.TestCase):

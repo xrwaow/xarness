@@ -255,6 +255,33 @@ def test_legacy_use_container_key_is_rejected_with_the_new_name(tmp_path: Path) 
         load_sectioned(path)
 
 
+def test_subagent_model_lives_in_the_preset(tmp_path: Path) -> None:
+    """`subagent_model` is a preset key: unset by default, "same" and a
+    model key both accepted, and a typo fails at load with the key named."""
+    def write_presets(presets: dict) -> Path:
+        return write(tmp_path, {
+            "models": {
+                "a": minimal_model(),
+                "b": {**minimal_model(), "model_id": "gpt-4.1-mini"},
+            },
+            "presets": presets,
+        })
+
+    config = load_sectioned(write_presets({"default": {"model": "a"}}))
+    assert config.presets["default"].subagent_model is None
+    config = load_sectioned(write_presets({
+        "default": {"model": "a", "subagent_model": "same"},
+        "cheap": {"model": "a", "subagent_model": "b"},
+    }))
+    assert config.presets["default"].subagent_model == "same"
+    assert config.presets["cheap"].subagent_model == "b"
+
+    with pytest.raises(ConfigError, match=r"presets.cheap.subagent_model"):
+        load_sectioned(write_presets({
+            "cheap": {"model": "a", "subagent_model": "gpt-4.1-mini"},
+        }))
+
+
 def test_sandbox_inheritance_over_default(tmp_path: Path) -> None:
     path = write(tmp_path, {
         "sandboxes": {

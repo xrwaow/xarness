@@ -122,18 +122,15 @@ def _tracked_sandbox(workspace: Path) -> SandboxConfig:
     tracked workspace with allow_git_write off: the read-only git shim is
     installed first on PATH."""
     from xarness.config import SandboxSettings
-    from xarness.gitwork import GitInfo
     if shutil.which("bwrap") is None:
         pytest.skip("bwrap not available")
     git_dir = workspace / ".git"
-    info = GitInfo(
-        git_dir=git_dir, external=False, last_seen_tree=None,
-        workspace=workspace, checkpoints=[],
-    ) if hasattr(GitInfo, "checkpoints") else mock_git_info(git_dir)
-    return SandboxConfig.from_settings(workspace, SandboxSettings(), info)
+    return SandboxConfig.from_settings(
+        workspace, SandboxSettings(), mock_workspace(git_dir),
+    )
 
 
-def mock_git_info(git_dir: Path):
+def mock_workspace(git_dir: Path):
     from unittest.mock import Mock
     info = Mock()
     info.git_dir = git_dir

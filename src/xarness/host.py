@@ -7,9 +7,9 @@ TCP.
 
 **Lifecycle.** The host auto-starts (detached, survives the TUI) when the
 first client needs it. It exits once no session is running, compacting, or
-waiting on an ask/drift prompt — attached clients do not count — after a
-short grace period. ``xarness --server`` runs it in the foreground in
-persistent mode (never exits on its own) and prints the stats.
+waiting on an ask — attached clients do not count — after a short grace
+period. ``xarness --server`` runs it in the foreground in persistent mode
+(never exits on its own) and prints the stats.
 
 **Hardening.** An exclusive startup lock keeps racing clients from
 spawning two hosts (the loser retries connecting); a stale socket file
@@ -41,12 +41,17 @@ from .config import (
     resolve_api_key,
     save_preferences,
 )
-from .gitwork import GitInfo, GitWorktreeError
+from .gitwork import GitWorktreeError
 from .protocol import ServerInfo, ServerStats, SessionSummary
 from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable, ref_infos
 from .errors import RefError, SessionError
 from .session import Session, SessionParts
-from .session_store import change_workspace_ref
+from .workspace import (
+    WorkspaceState,
+    change_workspace_ref,
+    load_workspace_refs,
+    open_workspace,
+)
 from .util import utcnow_iso as _utcnow
 
 HOST_DIR = Path("~/.local/share/xarness").expanduser()
@@ -95,9 +100,13 @@ class Host:
             pass
         self.unix_socket = unix_socket
         self.sessions: dict[str, Session] = {}
+        # One tracked state per repo root, shared by every session in it.
+        self._workspace_states: dict[Path, WorkspaceState] = {}
         # One lock per session name: concurrent loads of the same saved
         # session (e.g. GET snapshot + GET events) must yield one Session.
         self._load_locks: dict[str, asyncio.Lock] = {}
+        # Serializes the workspace map (opening a workspace takes awaits).
+        self._workspace_lock = asyncio.Lock()
         self._started_at = time.monotonic()
         self._started_at_wall = _utcnow()
         self._shutdown_event = asyncio.Event()
@@ -106,7 +115,27 @@ class Host:
         self._reaper: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
-    # session construction (config + workspace + git + sandbox)
+    # session construction (config + workspace + sandbox)
+
+    async def open_workspace(
+        self, workspace: Path, *, allow_init: bool = True,
+        persist: bool = True,
+    ) -> WorkspaceState | None:
+        """The tracked state of ``workspace``'s repo root, opened once and
+        shared by every agent in it. None when it cannot be tracked."""
+        root = workspace.resolve()
+        async with self._workspace_lock:
+            existing = self._workspace_states.get(root)
+            if existing is None:
+                opened = await open_workspace(
+                    root, allow_init=allow_init, persist=persist,
+                )
+                if opened is None:
+                    return None
+                existing = self._workspace_states.setdefault(opened.root, opened)
+            if persist:
+                existing.enable_persistence()
+            return existing
 
     def _workspace_last_used(self, workspace: Path) -> tuple[str | None, str | None]:
         """The most recently used (model, sandbox) among the saved sessions
@@ -135,7 +164,6 @@ class Host:
         session_name: str,
         saved_sandbox_name: str | None = None,
         saved_sandbox_settings: "SandboxSettings | None" = None,
-        saved_git_info: GitInfo | None = None,
     ) -> SessionParts:
         """Everything Session needs, from the sectioned config.
 
@@ -178,7 +206,7 @@ class Host:
         # Workspace refs are NEVER baked into the settings: they are per
         # workspace, passed separately, and merged when the sandbox config
         # is built (Session owns the merge).
-        workspace_refs = session_store.load_workspace_refs(str(ws))
+        workspace_refs = load_workspace_refs(ws)
         if saved_sandbox_settings is not None:
             settings = SandboxSettings.model_validate(saved_sandbox_settings)
             sandbox_key = saved_sandbox_name or sandbox_key
@@ -197,27 +225,36 @@ class Host:
             api_key = resolve_api_key(profile)
         except ConfigError as exc:
             raise SessionError(str(exc)) from exc
+        # Which model this session's subagents run. "same" borrows the
+        # spawning agent's model (an override may have picked another one);
+        # unset falls back to the preset's own model, which is usually what
+        # the parent resolved to anyway.
+        subagent_model = preset_settings.subagent_model if preset_settings else None
+        if subagent_model == "same":
+            subagent_model = profile_name
+        elif subagent_model is None:
+            subagent_model = (
+                preset_settings.model if preset_settings and preset_settings.model
+                else profile_name
+            )
 
         # Tracking off (profile or --enable_tracking false): no checkpoints,
         # so skip the workspace scan instead of doing it and discarding the
-        # result. Otherwise reuse a loaded session's saved git block — that
-        # scan is the slow part of resume — and scan fresh only for a new
-        # session.
-        if not settings.enable_tracking:
-            git_info = None
-        elif saved_git_info is not None:
-            git_info = saved_git_info
-        else:
+        # result. Otherwise open the workspace's state — the row already
+        # carries the baseline, so only a first run pays for a snapshot.
+        workspace_state: WorkspaceState | None = None
+        if settings.enable_tracking:
             try:
-                git_info, _notes = await gitwork.setup_tracking(
-                    ws, session_name, allow_init=not request.no_init_repo,
+                workspace_state = await self.open_workspace(
+                    ws, allow_init=not request.no_init_repo,
+                    persist=not request.no_session,
                 )
             except GitWorktreeError:
-                git_info = None
+                workspace_state = None
 
         try:
             sandbox = SandboxRuntime.make(
-                ws, settings, git_info, name=sandbox_key,
+                ws, settings, workspace_state, name=sandbox_key,
                 extra_refs=workspace_refs,
             )
         except SandboxUnavailable:
@@ -231,9 +268,16 @@ class Host:
             api_key=api_key,
             config_path=self.config_path,
             sandbox=sandbox,
-            git_info=git_info,
+            workspace_state=workspace_state,
             tool_output_limit=sectioned.tool_output_limit,
+            subagent_model=subagent_model,
             workspace_refs=workspace_refs,
+            notify_workspace=(
+                (lambda reason=None: self.notify_workspace(
+                    workspace_state, reason=reason))
+                if workspace_state is not None else None
+            ),
+            spawn_subagent=self.spawn_subagent,
         )
 
     # ------------------------------------------------------------------
@@ -260,6 +304,78 @@ class Host:
             )
         return session
 
+    async def spawn_subagent(
+        self, parent: Session, prompt: str, mode: str,
+    ) -> str:
+        """Run one subagent turn and return its final message.
+
+        The child is an ordinary session — its events are recorded like any
+        other agent's and it shows up in /sessions under ``parent`` — but it
+        has no subagent tool and no ask_user, and nobody streams it live.
+        It shares the parent's workspace, container mounts and no-session
+        flag. The caller's tool call awaits this; cancelling that call
+        cancels and closes the child."""
+        name = session_store.new_session_name()
+        profile_name, profile, api_key = \
+            parent.profile_name, parent.profile, parent.api_key
+        if parent.subagent_model and parent.subagent_model != parent.profile_name:
+            try:
+                sectioned = load_sectioned(self.config_path)
+                profile_name, profile = sectioned.resolve_model(parent.subagent_model)
+                api_key = resolve_api_key(profile)
+            except ConfigError as exc:
+                raise SessionError(str(exc)) from exc
+        state = parent.workspace_state
+        try:
+            sandbox = (
+                SandboxRuntime.make(
+                    parent.workspace, parent.sandbox.settings, state,
+                    name=parent.sandbox.name,
+                    extra_refs=parent.workspace_refs,
+                ) if parent.sandbox.settings is not None else SandboxRuntime()
+            )
+        except SandboxUnavailable:
+            # Tools disabled, chat works (same fallback as _build_parts).
+            sandbox = SandboxRuntime(
+                name=parent.sandbox.name, settings=parent.sandbox.settings)
+        child = Session(
+            name=name,
+            workspace=parent.workspace,
+            profile=profile,
+            profile_name=profile_name,
+            api_key=api_key,
+            config_path=self.config_path,
+            sandbox=sandbox,
+            workspace_state=state,
+            mode=mode,
+            tool_output_limit=parent.tool_registry.max_output_chars,
+            no_save=parent.no_save,
+            parent_id=parent.name,
+            workspace_refs=list(parent.workspace_refs),
+            notify_workspace=(
+                (lambda reason=None: self.notify_workspace(state, reason=reason))
+                if state is not None else None
+            ),
+        )
+        self.sessions[name] = child
+        if not parent.no_save:
+            child._persist()
+        parent._emit_notice(
+            f"subagent {name} ({mode}) started, /sessions to watch")
+        try:
+            await child.execute(f"subagent-{name}", protocol.SendMessage(text=prompt))
+            await child.wait_idle()
+            return next(
+                (m.content for m in reversed(child.conversation.messages)
+                 if m.role == "assistant" and m.content.strip()),
+                "",
+            )
+        finally:
+            # A cancelled tool call must not leave the child running: stop()
+            # cancels its turn, flushes the save and closes its shell.
+            self.sessions.pop(name, None)
+            await child.shutdown()
+
     async def load_session(self, name: str) -> Session:
         """Host a saved session (idempotent, safe under concurrent loads)."""
         existing = self.sessions.get(name)
@@ -285,13 +401,10 @@ class Host:
                 f"saved session {name!r} has no workspace recorded; cannot "
                 "rebuild its sandbox and tracking"
             )
-        # Rebind tracking from the SAVED git block: the baseline must be the
-        # one the session measured against when it was last open, not the
-        # workspace's current state (otherwise every saved change would look
-        # like drift and /undo would lose its turn trees). Parse it BEFORE
-        # building the session, so _build_parts can skip a fresh (expensive)
-        # workspace snapshot.
-        saved_git_info: GitInfo | None = state.git
+        # The baseline comes from the workspace row, not from the session:
+        # every agent in a repo shares one tracked state, and it must be the
+        # tree they measured against (a fresh snapshot at load would call
+        # everything saved "drift" and cost a full scan on every resume).
         parts = await self._build_parts(
             protocol.CreateSessionRequest(
                 workspace=state.workspace, model=state.profile,
@@ -299,20 +412,9 @@ class Host:
             session_name=name,
             saved_sandbox_name=state.sandbox_name,
             saved_sandbox_settings=state.sandbox_settings,
-            saved_git_info=saved_git_info,
         )
         session = Session.load(name, parts=parts, state=state)
-        # A turn left open by a host crash or a quit mid-turn gets the live
-        # tree as its after-tree, BEFORE publishing the session: an attach
-        # during this await would otherwise run drift detection against the
-        # stale last_seen_tree and flag the crashed turn's own edits as
-        # user drift.
-        await session.repair_crashed_turns()
         self.sessions[name] = session
-        # Drift is NOT computed here: it is detected lazily when the first
-        # client attaches (Session.prompt_resume_drift). A drifted workspace
-        # with nobody attached must not report "waiting" nor keep the host
-        # alive.
         return session
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:
@@ -345,15 +447,36 @@ class Host:
         self.sessions.pop(session.name, None)
         await session.shutdown(notice=notice)
 
+    def notify_workspace(
+        self, workspace: WorkspaceState, *, reason: str | None = None,
+    ) -> None:
+        """Nudge every agent in a workspace to refresh its diff.
+
+        The workspace (and its event log) is shared, so a change recorded
+        by one agent is visible to all of them; ``reason`` also announces
+        an accept/reject rebaseline."""
+        for session in self.sessions.values():
+            if session.workspace_state is not workspace:
+                continue
+            if reason is not None:
+                session._emit(protocol.CheckpointsChanged(reason=reason))
+            session._schedule_diff_changed()
+
     async def list_sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
         stats: bool = False,
     ) -> list[SessionSummary]:
         """One listing of active and saved sessions.
 
-        ``stats`` adds the unaccepted (pending) diff totals for the hosted
-        sessions. Saved sessions get no totals: computing them from the
-        persisted git block is expensive and often stale. Best-effort — a
+        ``stats`` adds the unaccepted (pending) diff totals each hosted
+        session owns itself: the paths this session wrote explicitly (its
+        ``mine`` rows) plus its subagents' writes (which are ``agent`` to
+        the parent but still its subtree), not the rest of the workspace's
+        pending changes (drift, unrelated agents, bash). The stat itself is
+        computed once per workspace, since every agent in a repo measures
+        against the same baseline and worktree. Saved sessions get no
+        totals: their workspace is usually not open, and opening it just to
+        count pending files would cost a full snapshot. Best-effort — a
         session whose diff cannot be computed lists with zeroed totals."""
         summaries: list[SessionSummary] = []
         for session in self.sessions.values():
@@ -372,17 +495,51 @@ class Host:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
         if stats:
+            # One snapshot per workspace, not per session: every agent in a
+            # repo measures against the same baseline and the same worktree.
+            # The totals, though, are per session: the files that session
+            # wrote explicitly (``mine``) plus the work of its subagents
+            # (which are ``agent`` to the parent but are still its subtree).
+            children = self._children_by_parent()
+            snapshots: dict[int, str] = {}
             for summary in summaries:
                 session = self.sessions.get(summary.name)
-                if session is None or session.git_info is None:
+                state = session.workspace_state if session is not None else None
+                if state is None:
                     continue
                 try:
-                    stat = await gitwork.diff_stat(session.git_info)
+                    if id(state) not in snapshots:
+                        snapshots[id(state)] = await state.observe()
+                    info = await state.diff(
+                        self._subtree(summary.name, children),
+                        current=snapshots[id(state)],
+                    )
                 except Exception:
                     continue
-                summary.additions = stat.additions
-                summary.deletions = stat.deletions
+                rows = [f for f in info.files if f.kind == "mine"]
+                summary.additions = sum(f.additions for f in rows)
+                summary.deletions = sum(f.deletions for f in rows)
         return summaries
+
+    def _children_by_parent(self) -> dict[str, list[str]]:
+        """Hosted sessions indexed by the parent that spawned them."""
+        children: dict[str, list[str]] = {}
+        for session in self.sessions.values():
+            if session.parent_id:
+                children.setdefault(session.parent_id, []).append(session.name)
+        return children
+
+    @staticmethod
+    def _subtree(name: str, children: dict[str, list[str]]) -> set[str]:
+        """``name`` plus every hosted descendant (a subagent's work)."""
+        subtree = {name}
+        pending = [name]
+        while pending:
+            for child in children.get(pending.pop(), ()):
+                if child not in subtree:
+                    subtree.add(child)
+                    pending.append(child)
+        return subtree
 
     def saved_summary(
         self, name: str, meta: dict[str, Any] | None = None,
@@ -398,7 +555,7 @@ class Host:
             sandbox=meta.get("sandbox_name"),
             last_user_message_at=meta.get("last_user_message_at"),
             message_count=meta.get("message_count", 0),
-            tracking=bool(meta.get("tracking")),
+            parent_id=meta.get("parent_id"),
         )
 
     @staticmethod
@@ -411,7 +568,7 @@ class Host:
         """Canonical workspace refs, without hosting a session."""
         ws = Path(workspace).expanduser().resolve()
         return self._workspace_ref_infos(
-            ws, session_store.load_workspace_refs(str(ws)),
+            ws, load_workspace_refs(ws),
         )
 
     async def update_workspace_refs(

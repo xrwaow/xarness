@@ -6,7 +6,8 @@ SandboxSession so shell state survives across calls within one chat.
 
 Plan mode exposes read_file plus run_bash against a read-only workspace
 mount; write mode exposes read_file plus the editing tools (write_file,
-edit_file). ask_user is available in both modes.
+edit_file). ask_user is available in both modes, and subagent in both modes
+when the caller can start one.
 
 Every tool declares a pydantic args model: the JSON schema for the provider
 is generated from it, and :meth:`ToolRegistry.call` validates the call's
@@ -22,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -153,6 +154,24 @@ class RunBashArgs(_ToolArgs):
 
 class AskUserArgs(_ToolArgs):
     questions: list[str] = Field(description="the questions to ask (one or more)")
+
+
+class SubagentArgs(_ToolArgs):
+    prompt: str = Field(
+        description="the whole task, as one self-contained message; the subagent "
+                    "has no access to this conversation")
+    mode: Literal["plan", "write"] = Field(
+        default="write",
+        description="'plan' explores read-only, 'write' may edit files in the "
+                    "shared workspace")
+
+
+class PlanSubagentArgs(SubagentArgs):
+    """A plan-mode agent's variant: defaulting to a plan child, since it can
+    never start a write one (the handler refuses, see _make_subagent_tool)."""
+
+    mode: Literal["plan", "write"] = Field(
+        default="plan", description="'plan' explores read-only")
 
 
 # Output sink for the call in flight: registry.call sets it around the
@@ -773,20 +792,69 @@ def _make_ask_user_tool(
     return ask_user
 
 
+# ----------------------------------------------------------------------
+# subagent
+
+
+def _make_subagent_tool(
+    mode: str, spawn: Callable[[str, str], Awaitable[str]],
+) -> Tool:
+    """subagent: run one fresh agent in the shared workspace, return its answer.
+
+    ``mode`` is the spawning agent's mode: a plan-mode agent is read-only
+    itself, so its args model defaults to plan and a write child is refused."""
+    description = (
+        "Run a fresh agent on one self-contained task in the same workspace "
+        "and return its final answer. It does not see this conversation and "
+        "cannot ask the user, so put everything it needs in the prompt. Use "
+        "it for a bounded side task (a search, a review, a refactor of one "
+        "area) whose back and forth should stay out of this conversation."
+    )
+    if mode != "plan":
+        description += (
+            " mode='plan' explores with read-only tools; mode='write' may edit "
+            "files in the workspace."
+        )
+
+    @tool(
+        "subagent", description,
+        SubagentArgs if mode != "plan" else PlanSubagentArgs,
+    )
+    async def subagent(args: SubagentArgs) -> ToolResult:
+        prompt = args.prompt.strip()
+        if not prompt:
+            return _bad("'prompt' must be a non-empty string")
+        if mode == "plan" and args.mode != "plan":
+            return _bad(
+                "a plan-mode agent is read-only: it can only spawn plan "
+                "subagents (mode='plan')"
+            )
+        reply = await spawn(prompt, args.mode)
+        if not reply:
+            return ToolResult(
+                status="error", content="the subagent finished without a reply",
+            )
+        return _ok(reply)
+
+    return subagent
+
+
 def build_registry(
     sandbox: SandboxConfig | None,
     session: SandboxSession | None,
     mode: str = "write",
     ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
     default_timeout: float = DEFAULT_TIMEOUT,
+    spawn_subagent: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
     Plan mode is read-only: read_file plus run_bash against a read-only
     workspace mount. Write mode adds the editing tools: write_file,
     edit_file. ``ask_user`` is available in both modes when ``ask_callback``
-    is given. The read-only-git policy is enforced by the PATH shim
-    (gitwork.git_shim_script), not here.
+    is given, and ``subagent`` when the caller can start one (``spawn_subagent``;
+    a subagent itself gets neither). The read-only-git policy is enforced by
+    the PATH shim (gitwork.git_shim_script), not here.
 
     Does NOT touch ``sandbox.read_only`` — the caller owns the sandbox's mode
     (set it to ``mode != "write"`` before calling; a persistent
@@ -795,6 +863,8 @@ def build_registry(
     registry = ToolRegistry()
     if ask_callback is not None:
         registry.register(_make_ask_user_tool(ask_callback))
+    if spawn_subagent is not None:
+        registry.register(_make_subagent_tool(mode, spawn_subagent))
     if sandbox is not None:
         registry.register(_make_read_tool(sandbox, default_timeout))  # read_file always available
         # Plan mode is fully read-only: the workspace is mounted read-only

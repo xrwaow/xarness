@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .config import RefSpec, SandboxSettings
-    from .gitwork import GitInfo
+    from .workspace import WorkspaceState
 
 # Runtime import: RefSpec validation and the sandbox must agree on the
 # canonical refs path.
@@ -473,7 +473,7 @@ class SandboxConfig:
         cls,
         workspace: Path,
         settings: "SandboxSettings",
-        git_info: "GitInfo | None" = None,
+        repo: "WorkspaceState | None" = None,
         extra_refs: "Iterable[str | RefSpec] | None" = None,
     ) -> "SandboxConfig":
         """Build a config from a config.SandboxSettings profile.
@@ -491,9 +491,9 @@ class SandboxConfig:
                 workspace,
                 [*settings.auto_include_refs, *(extra_refs or [])],
             ),
-            git_dir=git_info.git_dir if git_info is not None else None,
-            git_external=git_info.external if git_info is not None else False,
-            git_shim=(git_info is not None and not settings.allow_git_write),
+            git_dir=repo.git_dir if repo is not None else None,
+            git_external=repo.external if repo is not None else False,
+            git_shim=(repo is not None and not settings.allow_git_write),
         )
 
     @staticmethod
@@ -1166,11 +1166,11 @@ class SandboxRuntime:
     @classmethod
     def make(
         cls, workspace: Path, settings: "SandboxSettings",
-        git_info: "GitInfo | None", *, name: str | None = None,
+        repo: "WorkspaceState | None", *, name: str | None = None,
         extra_refs: "Iterable[str | RefSpec] | None" = None,
     ) -> "SandboxRuntime":
         config = SandboxConfig.from_settings(
-            workspace, settings, git_info, extra_refs=extra_refs,
+            workspace, settings, repo, extra_refs=extra_refs,
         )
         return cls(
             config=config,

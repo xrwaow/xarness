@@ -38,21 +38,20 @@ def test_open_and_closed_turn() -> None:
     assert conversation.open_turn is None
 
 
-def test_lock_turns_leaves_only_the_open_turn_unlocked() -> None:
+def test_turn_checkpoints_are_epoch_scoped() -> None:
+    """A turn opened before an accept/reject (a new epoch) is not
+    revertible; the current epoch's turns are."""
     conversation = Conversation()
     first = conversation.add(user_message("one"))
-    conversation.begin_turn(first, "a")
+    conversation.begin_turn(first, "a", epoch=0)
     conversation.turns[first.id].after_tree = "b"
     second = conversation.add(user_message("two"))
-    conversation.begin_turn(second, "b")
+    conversation.begin_turn(second, "b", epoch=1)
+    conversation.turns[second.id].after_tree = "c"
 
-    conversation.lock_turns("c")
-
-    first_turn = conversation.turns[first.id]
-    second_turn = conversation.turns[second.id]
-    assert first_turn.before_tree == first_turn.after_tree == "c"
-    assert second_turn.before_tree == "c"
-    assert second_turn.after_tree is None  # still open
+    assert [t.after_tree for t in conversation.turn_checkpoints(epoch=1)] == ["c"]
+    assert len(conversation.turn_checkpoints(epoch=0)) == 1
+    assert len(conversation.turn_checkpoints()) == 2
 
 
 def test_rollback_prunes_dropped_turns() -> None:

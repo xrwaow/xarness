@@ -281,10 +281,6 @@ def _bash_settled(args_text: str) -> Text | None:
     return _muted(" " + command) if command else None
 
 
-def _plain_live(args_text: str) -> tuple[str, str]:
-    return "tool", ""
-
-
 def _bash_live(args_text: str) -> tuple[str, str]:
     return "run_bash", _bash_line(args_text)
 
@@ -304,7 +300,7 @@ def _edit_settled(args_text: str) -> Text | None:
     return _counts_detail(adds, dels, _path(args_text))
 
 
-_DEFAULT: ToolView = (_plain_live, lambda a: None, _plain_body)
+_DEFAULT: ToolView = (lambda a: ("tool", ""), lambda a: None, _plain_body)
 TOOL_VIEWS: dict[str, ToolView] = {
     "write_file": (_write_live, _write_settled, _write_body),
     "edit_file": (_edit_live, _edit_settled, _edit_body),
@@ -317,8 +313,13 @@ def live_parts(tool_name: str, args_text: str) -> tuple[str, str]:
     """The shimmering tool name and the static argument-derived detail.
 
     Truncated at the same width as the settled detail, so the command a
-    running call shows does not shrink when it finishes."""
-    name, detail = TOOL_VIEWS.get(tool_name, _DEFAULT)[0](args_text)
+    running call shows does not shrink when it finishes. A tool without a
+    bespoke view (subagent, ask_user, …) names itself, not the anonymous
+    "tool"."""
+    view = TOOL_VIEWS.get(tool_name)
+    if view is None:
+        return tool_name or "tool", ""
+    name, detail = view[0](args_text)
     return name, _shorten(detail, 80) if detail else detail
 
 

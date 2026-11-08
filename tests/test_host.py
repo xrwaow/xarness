@@ -18,6 +18,7 @@ from xarness.conversation import user_message
 from xarness.host import Host
 from xarness.protocol import ContentDelta, SendMessage, Snapshot, RoundComplete, Usage
 from xarness.session import SessionError
+from xarness.workspace import WorkspaceState, open_workspace
 
 
 class FakeClient:
@@ -122,33 +123,31 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
         try:
             name = await _make_session(host, tmp_path, [[]])
             session = host.sessions[name]
-            # No real git repo here: stub the git-backed pieces of
-            # build_diff_info and give the session a tracking git block.
-            from xarness.gitwork import GitInfo
-            from xarness.gitwork import DiffStat
-            from xarness.protocol import DiffFileInfo
+            # No real git repo here: stub the git-backed pieces of the
+            # diff and give the session a tracked workspace.
+            from xarness.protocol import DiffFileInfo, DiffInfo
 
-            async def fake_stat(info, turns, open_before=None, current=None):
-                return DiffStat(files=[DiffFileInfo(
+            async def fake_diff(viewer=None, current=None):
+                return DiffInfo(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
-                    source="agent",
+                    kind="agent",
                 )], additions=1, deletions=0)
 
-            async def fake_text(info, path, current=None):
+            async def fake_text(repo, path, current=None):
                 return f"diff for {path}"
 
-            session.git_info = GitInfo(
-                session_id="test", repo_root=tmp_path, git_dir=tmp_path / ".git",
+            session.workspace_state = WorkspaceState(
+                root=tmp_path, git_dir=tmp_path / ".git",
                 baseline_tree="t" * 40,
             )
             from xarness import session as session_mod
             monkey = pytest.MonkeyPatch()
-            async def fake_snapshot(info):
+            async def fake_snapshot():
                 return "t" * 40
 
-            monkey.setattr(session_mod, "attributed_diff_stat", fake_stat)
+            session.workspace_state.observe = fake_snapshot
+            session.workspace_state.diff = fake_diff
             monkey.setattr(session_mod, "git_diff", fake_text)
-            monkey.setattr(session_mod, "snapshot_state", fake_snapshot)
             try:
                 async with _unix_http(host.unix_socket) as http:
                     whole_resp = await http.get(f"/v1/sessions/{name}/diff")
@@ -336,9 +335,9 @@ def test_load_session_restores_saved_baseline(tmp_path) -> None:
         summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
-        assert session.git_info is not None
+        assert session.workspace_state is not None
         # Simulate a finished turn that changed the workspace (never accepted).
-        session.git_info.baseline_tree = "b" * 40
+        session.workspace_state.baseline_tree = "b" * 40
         user = session.conversation.add(user_message("do things"))
         session.conversation.begin_turn(user, "b" * 40)
         session.conversation.turns[user.id].after_tree = "c" * 40
@@ -346,7 +345,7 @@ def test_load_session_restores_saved_baseline(tmp_path) -> None:
         await host.unload_session(name)
 
         loaded = await host.load_session(name)
-        info = loaded.git_info
+        info = loaded.workspace_state
         assert info is not None
         # The saved baseline survived the round-trip — it was NOT reset to
         # the workspace's current state by the fresh setup_tracking().
@@ -358,7 +357,7 @@ def test_load_session_restores_saved_baseline(tmp_path) -> None:
         # Drift compares current state against the last known tree — with the
         # saved (real) baseline restored, no drift is reported after a
         # clean exit. (Fake shas above only test persistence.)
-        assert loaded.git_info is not None
+        assert loaded.workspace_state is not None
     asyncio.run(go())
 
 
@@ -373,9 +372,9 @@ def test_no_false_drift_after_clean_exit(tmp_path) -> None:
         summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
-        assert session.git_info is not None
-        from xarness.gitwork import snapshot_state
-        current = await snapshot_state(session.git_info)
+        assert session.workspace_state is not None
+        from xarness.gitwork import snapshot_tree
+        current = await session.workspace_state.refresh()
         user = session.conversation.add(user_message("edit"))
         session.conversation.begin_turn(user, current)
         session.conversation.turns[user.id].after_tree = current
@@ -383,9 +382,9 @@ def test_no_false_drift_after_clean_exit(tmp_path) -> None:
         await host.unload_session(name)
 
         loaded = await host.load_session(name)
-        assert loaded.git_info is not None
-        # Nothing changed since the session closed: no drift.
-        assert await loaded.detect_resume_drift() is None
+        assert loaded.workspace_state is not None
+        # The saved baseline survived: the reopen did not re-baseline.
+        assert loaded.workspace_state.baseline_tree == current
     asyncio.run(go())
 
 
@@ -400,9 +399,9 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
         summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
-        assert session.git_info is not None
-        from xarness.gitwork import snapshot_state
-        current = await snapshot_state(session.git_info)
+        assert session.workspace_state is not None
+        from xarness.gitwork import snapshot_tree
+        current = await session.workspace_state.refresh()
         # A turn with a checkpoint but no after-tree: finish_turn never ran.
         user = session.conversation.add(user_message("still working"))
         session.conversation.begin_turn(user, current)
@@ -410,14 +409,12 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
         await host.unload_session(name)
 
         loaded = await host.load_session(name)
-        assert loaded.git_info is not None
+        assert loaded.workspace_state is not None
         # The crashed turn is closed and stamped with the live tree (no
         # edits since the crash, so it has nothing to revert).
         (turn,) = loaded.conversation.turns.values()
         assert turn.closed and turn.after_tree
         assert loaded.turn_checkpoints() == []
-        # Nothing changed since: no drift.
-        assert await loaded.detect_resume_drift() is None
     asyncio.run(go())
 
 
@@ -430,7 +427,7 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
         summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
         name = summary.name
         session = host.sessions[name]
-        assert session.git_info is not None
+        assert session.workspace_state is not None
         session._persist()
         await host.unload_session(name)
 
@@ -448,9 +445,9 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
             )
 
         loaded = await host.load_session(name)
-        assert loaded.git_info is not None
-        assert loaded.git_info.repo_root == (tmp_path / "ws").resolve()
-        assert loaded.git_info.baseline_tree  # a real tree sha
+        assert loaded.workspace_state is not None
+        assert loaded.workspace_state.root == (tmp_path / "ws").resolve()
+        assert loaded.workspace_state.baseline_tree  # a real tree sha
     asyncio.run(go())
 
 
@@ -506,6 +503,78 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
                 assert second.text == "live one"
             finally:
                 await client.aclose()
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_clientlib_refuses_a_host_that_speaks_another_protocol(
+    tmp_path, monkeypatch,
+) -> None:
+    """The version handshake is the client's /v1/health GET: a host built
+    from a different protocol version is replaced when it has no work, and
+    refused (never killed) while it still hosts active sessions."""
+    from xarness.clientlib import ClientError, XarnessClient
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(
+                host, tmp_path, [[ContentDelta(text="x"), RoundComplete()]],
+            )
+            session = host.sessions[name]
+            session.subscribe()  # an attached client makes it active work
+            real_info = host.server_info
+            monkeypatch.setattr(
+                type(host), "server_info",
+                lambda self: real_info().model_copy(
+                    update={"protocol_version": protocol.PROTOCOL_VERSION + 1},
+                ),
+            )
+            with pytest.raises(ClientError, match="host speaks v"):
+                await XarnessClient.connect_unix(host.unix_socket, spawn=False)
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_clientlib_replaces_a_stale_host_with_no_work(
+    tmp_path, monkeypatch,
+) -> None:
+    """The other half of the handshake: a mismatched host with no active
+    session is shut down (and the client reconnects, respawning it) rather
+    than left running."""
+    from xarness import host as host_mod
+    from xarness.clientlib import XarnessClient
+
+    class Replaced(Exception):
+        """Stops the test where the respawn would start."""
+
+    stopped: list[tuple[int, Path]] = []
+
+    def fake_stop(pid: int, path: Path) -> None:
+        stopped.append((pid, path))
+        raise Replaced
+
+    monkeypatch.setattr(host_mod, "stop_host", fake_stop)
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            real_info = host.server_info
+            monkeypatch.setattr(
+                type(host), "server_info",
+                lambda self: real_info().model_copy(update={"protocol_version": 0}),
+            )
+            with pytest.raises(Replaced):
+                await XarnessClient.connect_unix(host.unix_socket, spawn=False)
+            assert stopped == [(real_info().pid, host.unix_socket)]
         finally:
             await host.request_shutdown()
             await asyncio.wait_for(task, timeout=5)
@@ -734,7 +803,7 @@ def test_cli_overrides_beat_the_sandbox_profile(tmp_path) -> None:
         assert settings.gpu_access is True
         assert settings.enable_tracking is False
         # Tracking off means no git block at all (no checkpoints/undo).
-        assert session.git_info is None
+        assert session.workspace_state is None
         assert session.status().use_sandbox is False
         assert session.status().enable_tracking is False
 
@@ -766,8 +835,8 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         ))
         name = summary.name
         session = host.sessions[name]
-        assert session.git_info is not None
-        saved_tree = session.git_info.baseline_tree
+        assert session.workspace_state is not None
+        saved_tree = session.workspace_state.baseline_tree
         # A distinct saved sandbox state.
         session.sandbox.name = "default"
         session.sandbox.settings = SandboxSettings(allow_git_write=True)
@@ -781,11 +850,11 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
         assert loaded.sandbox.name == "default"
         assert loaded.sandbox.settings is not None
         assert loaded.sandbox.settings.allow_git_write is True
-        assert loaded.git_info is not None
-        assert loaded.git_info.repo_root == (tmp_path / "ws").resolve()
+        assert loaded.workspace_state is not None
+        assert loaded.workspace_state.root == (tmp_path / "ws").resolve()
         # The SAVED git block won: the baseline is the session's own, not a
         # fresh snapshot of the (possibly changed) workspace.
-        assert loaded.git_info.baseline_tree == saved_tree
+        assert loaded.workspace_state.baseline_tree == saved_tree
         if loaded.sandbox.config is not None:
             assert loaded.sandbox.config.workspace == (tmp_path / "ws").resolve()
         return host
@@ -992,85 +1061,6 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> 
     asyncio.run(go())
 
 
-def test_loaded_drifted_session_not_waiting_without_client(tmp_path) -> None:
-    """A saved session in a drifted workspace, loaded with no client
-    attached: state is not "waiting" and the session is not active, so the
-    host can exit. The drift prompt appears only once a client attaches."""
-    async def go():
-        host = make_host(tmp_path)
-        (tmp_path / "ws").mkdir()
-        summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
-        name = summary.name
-        session = host.sessions[name]
-        assert session.git_info is not None
-        session._persist()
-        # Drift: the workspace changes outside the session after the save.
-        (tmp_path / "ws" / "drifted.txt").write_text("changed\n")
-        await host.unload_session(name)
-
-        loaded = await host.load_session(name)
-        assert loaded._pending_drift is None, "drift must not be computed at load"
-        assert not loaded.is_active, "host must be able to exit"
-        row = loaded.summary()
-        assert row.state != "waiting" and row.active is False
-
-        # A client attaches: NOW the drift is detected and prompted.
-        await loaded.prompt_resume_drift()
-        assert loaded._pending_drift is not None
-        assert loaded.status().pending_drift is not None
-
-    asyncio.run(go())
-
-
-def test_kept_drift_is_not_re_prompted_after_reload(tmp_path) -> None:
-    """Acknowledging drift ("Keep tracking") is durable: reloading the
-    session must not re-detect the same external changes as drift, or the
-    /sessions row would say "waiting" forever. A later external change is
-    still reported."""
-    async def go():
-        host = make_host(tmp_path)
-        (tmp_path / "ws").mkdir()
-        (tmp_path / "ws" / "base.txt").write_text("base\n")
-        summary = await host.create_session(
-            protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")),
-        )
-        name = summary.name
-        session = host.sessions[name]
-        assert session.git_info is not None
-        session._persist()
-        # Drift: the workspace changes outside the session after the save.
-        (tmp_path / "ws" / "drifted.txt").write_text("outside\n")
-        await host.unload_session(name)
-
-        loaded = await host.load_session(name)
-        await loaded.prompt_resume_drift()
-        assert loaded._pending_drift is not None
-        result = await loaded._cmd_resolve_drift(
-            protocol.ResolveDrift(accept=False),
-        )
-        assert result.ok
-        acked_tree = loaded.git_info.last_seen_tree
-        assert acked_tree
-        await host.unload_session(name)
-
-        # Reloaded: the acknowledged tree survived and the same drift is
-        # not prompted again.
-        reloaded = await host.load_session(name)
-        assert reloaded.git_info is not None
-        assert reloaded.git_info.last_seen_tree == acked_tree
-        await reloaded.prompt_resume_drift()
-        assert reloaded._pending_drift is None, "acknowledged drift re-prompted"
-        await host.unload_session(name)
-
-        # A genuinely new external change is still detected.
-        (tmp_path / "ws" / "again.txt").write_text("new\n")
-        reloaded_again = await host.load_session(name)
-        await reloaded_again.prompt_resume_drift()
-        assert reloaded_again._pending_drift is not None, "new drift not detected"
-
-    asyncio.run(go())
-
-
 def test_concurrent_load_yields_one_session(tmp_path) -> None:
     """Two simultaneous loads of the same saved session must share one
     Session object (no duplicate sandbox / tracking)."""
@@ -1109,9 +1099,9 @@ def test_unload_closes_sandbox_session(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_loading_a_session_reuses_saved_tracking_without_rescanning(tmp_path) -> None:
-    """Resume must not run setup_tracking (a full workspace snapshot/ignore
-    scan) only to replace the result with the persisted git block."""
+def test_loading_a_session_reuses_the_saved_baseline(tmp_path) -> None:
+    """Resume must reuse the workspace row: re-baselining on load would call
+    everything saved "drift" and pay a full scan on every resume."""
     from unittest import mock
 
     async def go():
@@ -1122,13 +1112,14 @@ def test_loading_a_session_reuses_saved_tracking_without_rescanning(tmp_path) ->
         name = summary.name
         await host.unload_session(name)
 
+        baseline = host._workspace_states[(tmp_path / "ws").resolve()].baseline_tree
         with mock.patch.object(
-            host_mod.gitwork, "setup_tracking",
-            side_effect=AssertionError("resume re-ran tracking setup"),
+            host_mod, "open_workspace",
+            side_effect=AssertionError("resume re-opened the workspace"),
         ):
             loaded = await host.load_session(name)
-        assert loaded.git_info is not None
-        assert loaded.git_info.baseline_tree
+        assert loaded.workspace_state is not None
+        assert loaded.workspace_state.baseline_tree == baseline
     asyncio.run(go())
 
 
@@ -1142,14 +1133,59 @@ def test_daemon_import_does_not_pull_in_textual() -> None:
         "assert 'textual' not in sys.modules, sorted(sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
-def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -> None:
-    """list_sessions_with_stats stamps each row with the session's
-    unaccepted (+/-) totals from the hosted git info — and degrades to
-    zeroed totals instead of failing when a stat cannot be computed."""
+def test_session_listing_counts_a_subagents_work_as_its_parents() -> None:
+    """The /sessions +/- totals follow the parent link: a child's pending
+    work is part of the row for the session that spawned it."""
+    from xarness.host import Host
 
+    children = {"parent": ["child"], "child": ["grandchild"]}
+    assert Host._subtree("parent", children) == {
+        "parent", "child", "grandchild",
+    }
+    assert Host._subtree("child", children) == {"child", "grandchild"}
+    assert Host._subtree("other", children) == {"other"}
+
+
+def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -> None:
+    """list_sessions_with_stats stamps each row with the session's own
+    ``mine`` (+/-) totals from the hosted git info — not the whole
+    workspace's pending changes — and degrades to zeroed totals instead of
+    failing when a stat cannot be computed."""
 
     from xarness import gitwork
-    from xarness.gitwork import DiffStat, GitInfo
+    from xarness.gitwork import DiffFile, DiffStat
+    from xarness.workspace import WorkspaceState
+
+    async def fake_observe():
+        return "current"
+
+    async def fake_ignored():
+        return ()
+
+    def fake_state(name: str):
+        state = WorkspaceState(
+            root=tmp_path, git_dir=tmp_path / ".git", baseline_tree="x",
+            persist=False,
+        )
+        state.observe = fake_observe
+        state.ignored = fake_ignored
+        state.record(
+            session=name, tool="write_file", turn="t",
+            paths=("mine.py",), auto=(),
+        )
+        state.record(
+            session="other-session", tool="write_file", turn="t",
+            paths=("other.py",), auto=(),
+        )
+        state.record(
+            session=name, tool="run_bash", turn="t",
+            paths=("bash.py",), auto=(),
+        )
+        state.record(
+            session=name, tool="edit_file", turn="t",
+            paths=("mine2.py",), auto=(),
+        )
+        return state
 
     async def go():
         host = make_host(tmp_path)
@@ -1159,41 +1195,49 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
             session = host.sessions[name]
 
             # No git info: totals stay zero, listing still works.
-            session.git_info = None
+            session.workspace_state = None
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions, row.tracking) == (0, 0, False)
 
-            # With git info the pending diff totals land on the row.
-            async def fake_diff_stat(info):
-                return DiffStat(additions=7, deletions=2)
+            # With a workspace, only the session's own explicit writes count:
+            # another session's write, this session's bash change and
+            # uncategorised drift are all excluded.
+            files = [
+                DiffFile(path="mine.py", additions=7, deletions=2),
+                DiffFile(path="mine2.py", additions=3, deletions=1),
+                DiffFile(path="other.py", additions=100, deletions=100),
+                DiffFile(path="bash.py", additions=100, deletions=100),
+                DiffFile(path="drift.py", additions=100, deletions=100),
+            ]
 
-            monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
-            session.git_info = GitInfo(
-                session_id="s", repo_root=tmp_path, git_dir=tmp_path / ".git",
-                baseline_tree="x",
-            )
+            async def fake_diff_stat(repo, base, other):
+                return DiffStat(
+                    files=list(files),
+                    additions=sum(f.additions for f in files),
+                    deletions=sum(f.deletions for f in files),
+                )
+
+            monkeypatch.setattr(gitwork, "tree_diff_stat", fake_diff_stat)
+            session.workspace_state = fake_state(name)
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
-            assert (row.additions, row.deletions) == (7, 2)
+            assert (row.additions, row.deletions) == (10, 3)
             assert row.tracking is True
 
             # A failing stat must not break the listing.
-            async def broken_diff_stat(info):
+            async def broken_diff_stat(repo, base, other):
                 raise RuntimeError("git blew up")
 
-            monkeypatch.setattr(gitwork, "diff_stat", broken_diff_stat)
+            monkeypatch.setattr(gitwork, "tree_diff_stat", broken_diff_stat)
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions) == (0, 0)
 
             # Saved (not hosted) sessions get no totals at all: the
             # persisted numbers would be stale, so they stay blank.
-            monkeypatch.setattr(gitwork, "diff_stat", fake_diff_stat)
-            session.git_info = GitInfo(
-                session_id="s", repo_root=tmp_path, git_dir=tmp_path / ".git",
-                baseline_tree="x",
-            )
+            monkeypatch.setattr(gitwork, "tree_diff_stat", fake_diff_stat)
+            session.workspace_state = fake_state(name)
             session._persist()
             await host.unload_session(name)
             assert name not in host.sessions
@@ -1230,7 +1274,7 @@ def test_system_prompt_matches_tracking_status(tmp_path) -> None:
                 workspace=str(tmp_path / "ws")))
             status = session.status()
             prompt = session.controller.system_prompt
-            assert status.enable_tracking is (session.git_info is not None)
+            assert status.enable_tracking is (session.workspace_state is not None)
             if status.enable_tracking:
                 assert "Changes are snapshotted" in prompt
                 assert "git in the shell is read-only" in prompt

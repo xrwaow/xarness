@@ -17,6 +17,25 @@ When a filesystem sandbox is available, the model gets:
 | `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
 | `run_bash` | plan + write | Run a shell command in a persistent sandboxed shell (cwd and env vars survive across calls). In plan mode the workspace is mounted read-only |
 | `ask_user` | plan + write | Ask you a clarifying question in the TUI |
+| `subagent` | plan + write | Run a fresh agent on one self-contained task in the same workspace and return its final answer (see below) |
+
+`subagent` starts a child session with no memory of the current
+conversation, no `ask_user` and no `subagent` tool of its own, and returns
+the child's last non-empty assistant message. It shares the workspace and
+container with its parent, so its edits are tracked (and undone, accepted or
+rejected) exactly like any other agent's; it appears in `/sessions` under
+its parent, and you can attach to watch it. `mode: "plan"` children are
+read-only; a plan-mode agent can only start plan children. Which model they
+run is the preset's `subagent_model`.
+
+A subagent is an ordinary session: once it finishes it stays saved (unless
+the run is `--no-session`), so you can open it from `/sessions` and drive it
+like any other — it keeps its parent link, and the edits it made stay
+labelled as its own. Reopening does not give it back the `subagent` or
+`ask_user` tools (a child never nests and has nobody to ask). A message sent
+to a child that is still running is queued as steering, exactly like one
+sent to a running session. With `--no-session` nothing is saved for the
+parent or the child, so a finished child cannot be reopened.
 
 There is no `ls`, `glob`, `grep`, or `web_search` tool: use `run_bash`
 with `rg`/`find`/`ls` (pipe search output through `head`). Compaction is not
@@ -111,10 +130,7 @@ whole command string up front. Like the string scanner it replaced, this
 is a best-effort accident guardrail, not a security boundary — the
 boundary is the read-only `.git` mount / the mount namespace. All
 snapshots, diffs, and reverts run host-side through throwaway indexes: the
-user's index, HEAD, and refs are never written from inside the sandbox,
-and what counts as "ignored" for change tracking is pinned at session
-start, so editing ignore files in the container cannot shift what `/diff`
-tracks.
+user's index, HEAD, and refs are never written from inside the sandbox.
 
 Expose external files to the agent with `/refs add <path>` (or the
 `auto_include_refs` sandbox setting); the model addresses them as
@@ -125,22 +141,27 @@ mount and mark it writable.
 ## Change tracking and undo
 
 The agent edits your files directly — there is no separate worktree and no
-per-change accept gate before edits land. Instead, every session snapshots
-your workspace state into a git tree object at startup (via a throwaway
-index: your index, HEAD, and refs are never touched), and every turn
-records two more: the state *before* the turn and the state *after* its
-edits finished.
+per-change accept gate before edits land. Instead, the *workspace* keeps the
+tracked state, shared by every agent working in it: a **baseline tree**
+(what `/diff` measures against), an append-only **event log** of what each
+tool call changed, and the set of **ignored paths** as of the baseline.
 
 No setup is required: if the workspace isn't a git repo, xarness keeps a
 private snapshot store under its own state directory and drives git
 against it with an explicit `GIT_DIR` — no `.git` is created in your
 workspace, and your files are never modified. (A repo with no commits yet
 still counts as a repo: snapshots are trees and need no HEAD.) No commits
-are ever created either: snapshots are plain tree objects (plus an
-unreferenced commit wrapper for the 3-way merge below). Opt out with
+are ever created either: snapshots are plain tree objects. Opt out with
 `--no-init-repo`, which disables change tracking entirely (the agent still
 edits the directory directly; there is just no /diff or /undo for file
 changes).
+
+**One workspace, many agents.** The workspace is the repo root and its
+tracked state belongs to it, so every session in that repo — a second
+window, a subagent — shares one baseline, one pending diff and one
+`/accept`. Paths are repo-root-relative everywhere and `/diff` covers the
+whole repo, even when `--workspace repo/sub` points the sandbox's working
+directory at a subdirectory.
 
 **Where snapshots live.** Snapshot objects go into the object store of the
 repo being tracked — your own `.git` — or, only when there is no repo, into
@@ -162,26 +183,76 @@ concurrent `index.lock` cannot make tracking look gone. `/diff` and a
 per-file click are where it surfaces, as `diff failed: …`, and `/undo`
 cannot reach past the point its history was collected. `/accept` — or a
 session started fresh in that workspace — re-baselines from the files on
-disk, which is also the choice the resume-drift prompt offers; until then
-`git diff` / `git status` in the repo still show the pending edits. The
-conversation and the files themselves are unaffected. `git fsck` lists the
-objects as dangling, and they never travel with clone/fetch/push.
+disk; until then `git diff` / `git status` in the repo still show the
+pending edits. The conversation and the files themselves are unaffected.
+`git fsck` lists the objects as dangling, and they never travel with
+clone/fetch/push.
+
+**What is recorded.** Every successful `write_file`/`edit_file` records the
+path it wrote. Every successful `run_bash` snapshots the workspace before
+the command and again after it, and records the paths that differ plus the
+ignored directories the command created (the two snapshots are the only
+part serialized: two agents' commands can run at once). Nothing else is
+recorded, and a command that changes nothing records nothing. The pending
+diff is the real worktree measured against the baseline, labelled by who it
+came from — for the agent looking at it:
+
+| Label | Meaning |
+| --- | --- |
+| `mine` | the path was written by one of *this* agent's `write_file`/`edit_file` calls |
+| `agent` | another agent's explicit write, or any `run_bash` change |
+| `auto` | an ignored directory an agent's command created (build output, `node_modules/`, …) |
+| `drift` | anything no recorded call covers: your own edits, or changes that happened while no agent ran |
+
+`mine` and `agent` rows both display the badge `agent`; the session's own
+work is accent-colored and another agent's is dimmed.
+
+Explicit writes win over bash: if this agent edited a file and another
+agent's `run_bash` then touched it, it stays `mine` here. Another session's
+(or a subagent's) events are never drift — they are that agent's work,
+`agent` to everyone else, including their parent. Because the before
+snapshot is taken fresh for each command, an edit you made *before* it
+stays `drift`: earlier changes are never credited to a later command.
+
+**A bash window.** The before/after snapshots bracket the whole `run_bash`
+call, so an edit *you* make while a command is running lands in that event
+and is labelled `agent`. That is the one attribution hole, and it is
+deliberate: no markers, no timestamps, no heuristics.
+
+**Ignored paths never enter a snapshot.** Benchmarks showed that tracking
+build output adds hundreds of MB of objects to your `.git` and makes
+`/diff` about a thousand times slower, so ignored paths are read separately
+(`git ls-files -o -i … --directory`, about a millisecond) and reported as
+one row per directory (`target/: 412 files`, counted from one full listing
+only when there are groups), never per file. A file *modified* inside an
+already-ignored directory is not reported — that is intentional.
+
+**Which paths are ignored** is resolved again on every snapshot, in three
+layers: xarness's own defaults (build output and caches: `target/` and the
+sandbox's `target-sandbox/` in a project with a `Cargo.toml`, `node_modules/`,
+`dist/`, `build/`, `__pycache__/`, `.venv/`, `.next/`, plus media/binary
+file types and `.xarness/`), then your repo's own ignore rules
+(`.gitignore` including nested ones, `.git/info/exclude`, global excludes),
+then the workspace's `.xarness/ignore` (gitignore syntax, ignore-only, no
+re-includes). Because they are resolved per snapshot, a mid-session edit to
+any of them takes effect at the next snapshot — and a path you *stop*
+ignoring can therefore show up as `drift`, even though nothing changed on
+disk.
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
 (`name  dir/  agent  +N -M`), and click a row to read that file's unified
-diff. Each row is tagged with its source: `agent` for edits a turn made,
-and `drift` (in the warning color) for changes made outside the session —
-manual edits, or edits from a previous harness run while this session was
-closed.
+diff. Rows are tagged with the labels above, with your own unrecorded
+changes under a `drift — changes outside this agent` header and ignored
+directories below them as counted group rows.
 
 | Command | Action |
 | --- | --- |
 | `/diff` | Show the pending-changes panel; `/diff` again hides it |
 | `/diff <path>` | Show one file's unified diff |
-| `/accept` | Lock in the changes made so far: `/diff` resets, `/undo` can no longer revert past this point |
-| `/reject` | Discard all changes made since the last `/accept` |
-| `/undo` | Drop the last turn: reverse its file edits, put your message back in the input |
+| `/accept` | Re-baseline the workspace at what the agents changed (leaving your own drift pending): `/diff` resets and `/undo` can no longer revert past this point |
+| `/reject` | Restore the workspace to the baseline — including your own drift — and remove ignored directories the agents created |
+| `/undo` | Drop the last turn: reverse its own file edits, put your message back in the input |
 | `/retry` | Reverse the last turn's file edits and resend your message |
 
 To undo further back, click any of your messages in the scrollback (the whole
@@ -193,34 +264,37 @@ without undoing. Messages the last compaction summarized away can be clicked
 too (the pre-compaction history is restored first).
 
 `/accept` is how you follow change-per-feature: let the agent build one
-feature, `/accept` it, move on to the next. Everything before the last
-accept is out of `/diff`'s and `/undo`'s reach — use git itself (a repo you
-control) for history beyond that. `/reject` restores the workspace to the
-last accepted snapshot, discarding everything since — including changes you
-made yourself — while keeping the conversation going so the agent sees the
-reverted files on its next turn.
+feature, `/accept` it, move on to the next. The new baseline is the old one
+with every pending path that an agent changed (anything not `drift`)
+replaced by its current content — one new tree sha, no per-file bookkeeping
+— so your own unrecorded edits stay pending and are never absorbed.
+Everything before the last accept is out of `/diff`'s and `/undo`'s reach —
+use git itself (a repo you control) for history beyond that. When some
+pending files were not made by this agent, the TUI asks before accepting,
+and the command's notice reports the breakdown.
 
-If your `--workspace` is a subdirectory of a bigger repo, the session is
-scoped to that subdirectory: the agent's sandbox mounts *your* directory as
-its workspace root (`/workspace`) — the rest of the repo isn't mounted in
-the container at all — and diffs/reverts cover only your directory.
-
-What never enters a snapshot: paths your ignore rules already cover,
-binary/media file types, files over 1 MB, and — in a project with a
-`Cargo.toml` — cargo's build trees: `target/` and the sandbox's own
-`target-sandbox/` (where `CARGO_TARGET_DIR` points, so every build inside
-xarness lands there). Tracking those would bury `/diff` in object files the
-agent's own `cargo build` just produced.
+`/reject` restores tracked paths to the baseline, discarding everything
+since the last `/accept` — **including changes you made yourself**, which is
+why the TUI confirms first when there is drift — while keeping the
+conversation going so the agent sees the reverted files on its next turn.
+It also removes the ignored directories a recorded command created, but
+never one that already existed (a `node_modules/` you installed yourself
+survives). Ignored files an agent edited explicitly cannot be restored,
+since no baseline copy exists; the notice lists them.
 
 ### Undo and retry
 
-Each turn records the workspace state before it and the state after its
-edits finished. `/undo` and `/retry` reverse *exactly that turn's diff* onto
-the live workspace with a 3-way merge, removing every file change the turn
-made — edits, deletions, and newly created files — while leaving changes
-made since (by you, or by a previous harness run) untouched. If a manual
-edit overlaps the lines the turn changed, the merge conflicts: the undo
-reports it and changes nothing rather than picking a side.
+Each turn's events name the paths it changed. `/undo` and `/retry` reverse
+exactly those paths: for each removed turn, newest first, a path is restored
+from the turn's before-state (or deleted, when it did not exist before). If
+any of those paths changed after the turn ended — by you or by another agent
+— nothing is touched at all and the conflict list is reported instead. It is
+therefore all-or-nothing per undo, and it never touches another agent's
+paths.
+
+A turn's checkpoint is stamped with the workspace epoch, so a turn that
+spans an `/accept` or `/reject` is not revertible any more (the pre-accept
+part is already in the new baseline; use `/reject` for the rest).
 
 **Only file edits are reversed.** Non-file side effects of `run_bash` —
 package installs, background jobs, network calls, anything outside the
@@ -246,13 +320,21 @@ xarness --sessions             # print active sessions and exit
 xarness --kill                 # close every active session (each stays saved)
 ```
 
-Resuming reconnects to the session's change tracking (the persisted baseline
-snapshot). A session saved by an older schema is refused with a "start a new
-session" error rather than half-migrated. If the workspace changed outside
-the session while it was closed, resuming shows what drifted and asks
-whether to accept it as the new baseline or keep tracking against the last
-known state — it never silently reverts or accepts. `/delete` removes the
-saved session (its row and image blobs) and starts a fresh chat, and never
+`/sessions` lists live sessions first (running / waiting / compacting / idle), then
+this workspace's saved ones. A subagent stays nested under its parent, and while
+the parent is live the child stays in the live section even when it is idle. The
++/- columns are that session's own pending work plus whatever its subagents
+wrote; a session blocked on a tool call (including a running subagent) reads
+`waiting`, not `running`.
+
+Resuming reconnects to the session's change tracking: the tracked state is
+per workspace, so a resumed session measures against the same baseline as
+the one it left (and as any other agent in that repo). Whatever changed
+while it was closed — your edits, another agent's — simply shows up in
+`/diff` as `drift` or `agent`; nothing is reverted or accepted
+implicitly. A session saved by an older schema is refused with a "start a
+new session" error rather than half-migrated. `/delete` removes the saved
+session (its rows and image blobs) and starts a fresh chat, and never
 touches your workspace files.
 
 ## Install
@@ -336,6 +418,11 @@ Config is JSON at `~/.config/xarness/config.json`. The layout is sectioned:
   `enable_tracking`, `auto_include_refs`, `filter_list`, and
   `default_timeout`.
 - `presets` — named `{model, sandbox}` pairs; `defaults.preset` chooses one.
+  A preset may also carry `subagent_model`: the model its subagents run.
+  Unset means the preset's own `model`, `"same"` means the spawning agent's
+  model (which `--model` may have overridden), and any other value must be a
+  key of `models` — a typo fails at startup, not mid-turn. Subagents share
+  the parent's container, so there is no subagent sandbox setting.
 - `ui.theme` — startup color theme (`ayu-darker`, `one-light`); `/theme`
   switches it live.
 
@@ -376,7 +463,7 @@ container on/off state is overridden.
 | `/model` | Choose the model profile |
 | `/sandbox` | Choose this session's sandbox profile (idle only) |
 | `/filter add <path>` / `/filter remove <path>` / `/filter list` | Add or remove a workspace path excluded from the sandbox mounts |
-| `/sessions` | Resume a previous session |
+| `/sessions` | Resume a previous session; subagent sessions are nested under the session that spawned them |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `/tmp/refs/<alias>` — the same path tool calls and the shell use (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
@@ -454,11 +541,12 @@ src/xarness/
   clientlib.py    async client used by the TUI (host spawn + API calls)
   conversation.py plain message history, wire-format faithful
   prompts.py      the one system-prompt renderer (mode + environment facts)
-  tools.py        tool registry: read/write/edit, run_bash, ask_user
+  tools.py        tool registry: read/write/edit, run_bash, ask_user, subagent
   sandbox.py      bubblewrap sandbox: one-shot file tools + persistent shell
+  workspace.py    per-repo tracked state: baseline, event log, labels, accept/reject/undo
   session_store.py  SQLite persistence: state row, message rows, image blobs
   file_search.py  bounded filename search backing @-mention autocomplete
-  gitwork.py      tree-snapshot checkpoints, diff computation, read-only git shim
+  gitwork.py      tree snapshots, tree diffs, the read-only git shim
   theme.py        the color palettes
   tui/            Textual app, widgets, screens (picker/resume/confirm), stylesheet
 ```

@@ -328,7 +328,7 @@ class RollbackPlan:
     undone turns), so a plan carries no usage bookkeeping."""
 
     user_text: str  # the turn's user message (input box / resend)
-    revert_turns: list[TurnCheckpoint]  # file diffs to reverse (oldest first)
+    revert_turns: list[str]  # turn ids whose file edits to reverse (oldest first)
     # The conversation becomes ``messages[:drop_from]``. Rolling back past a
     # compaction's summary truncates the summary away automatically.
     drop_from: int
@@ -426,6 +426,14 @@ class Conversation(BaseModel):
                 return turn
         return None
 
+    @property
+    def open_turn_id(self) -> str | None:
+        """The message id of the still-open turn, or None."""
+        for message_id, turn in reversed(list(self.turns.items())):
+            if not turn.closed:
+                return message_id
+        return None
+
     def close_crashed_turns(self) -> list[TurnCheckpoint]:
         """Close every turn left open by a crash (a loaded session can never
         have a running turn).
@@ -447,7 +455,10 @@ class Conversation(BaseModel):
                 repaired.append(turn)
         return repaired
 
-    def begin_turn(self, user_message: UserMessage, before_tree: str | None) -> None:
+    def begin_turn(
+        self, user_message: UserMessage, before_tree: str | None,
+        epoch: int = 0,
+    ) -> None:
         """Attach a fresh checkpoint to the turn-opening user message.
 
         Always called — with ``before_tree=None`` when there is no git
@@ -455,7 +466,7 @@ class Conversation(BaseModel):
         and a rollback plan never has to guess from "the last user
         message" (which could be steering)."""
         self.turns[user_message.id] = TurnCheckpoint(
-            before_tree=before_tree, after_tree=None,
+            before_tree=before_tree, after_tree=None, epoch=epoch,
         )
 
     # -- rollback planning ------------------------------------------------
@@ -527,9 +538,10 @@ class Conversation(BaseModel):
         if index is None:
             return None
         # Revert only closed turns that are being dropped and actually
-        # changed files; their file edits can still be undone.
+        # changed files; their file edits can still be undone. A turn's id
+        # is its opening user message id.
         revert = [
-            self.turns[message.id] for message in reversed(self.messages[index:])
+            message.id for message in reversed(self.messages[index:])
             if (turn := self.turns.get(message.id)) is not None
             and turn.before_tree and turn.after_tree
             and turn.before_tree != turn.after_tree
@@ -554,35 +566,18 @@ class Conversation(BaseModel):
             if message_id in keep
         }
 
-    def lock_turns(self, tree: str) -> None:
-        """Point every turn's checkpoints at ``tree`` (an accepted/rejected
-        baseline). A turn whose before/after trees are equal can no longer be
-        reverted — reverting it is a no-op — which is what "locked" means.
-        The open turn keeps ``after_tree = None`` so finish_turn still
-        records its end."""
-        open_turn = self.open_turn
-        for turn in self.turns.values():
-            turn.before_tree = tree
-            if turn is not open_turn:
-                turn.after_tree = tree
-
-    def turn_checkpoints(self) -> list[TurnCheckpoint]:
-        """The reversible turns since the baseline, oldest first."""
+    def turn_checkpoints(self, epoch: int | None = None) -> list[TurnCheckpoint]:
+        """The reversible turns since the baseline, oldest first. With an
+        ``epoch`` only turns opened in that workspace epoch are returned: a
+        turn spanning an accept/reject is deliberately not revertible."""
         return [
             turn for message in self.messages
             if (turn := self.turns.get(message.id)) is not None
             and turn.before_tree and turn.after_tree
             and turn.before_tree != turn.after_tree
+            and (epoch is None or turn.epoch == epoch)
         ]
 
-    def known_trees(self) -> list[str]:
-        """Every after-tree the conversation ever recorded (locked turns
-        included): the workspace states the session has accounted for."""
-        return [
-            turn.after_tree for message in self.messages
-            if (turn := self.turns.get(message.id)) is not None
-            and turn.after_tree
-        ]
 
     def repair_orphaned_tool_calls(self, now: str | None = None) -> bool:
         """Give any assistant tool_call without a matching tool message a

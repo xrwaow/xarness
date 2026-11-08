@@ -5,7 +5,8 @@ Sectioned layout:
     {
       "models":    {"<name>": {ProviderProfile fields}},
       "sandboxes": {"<name>": {SandboxSettings fields}},
-      "presets":   {"<name>": {"model": ..., "sandbox": ...}},
+      "presets":   {"<name>": {"model": ..., "sandbox": ...,
+                     "subagent_model": "same"}},
       "ui":        {"theme": "..."},
       "defaults":  {"preset": "default"},
       "tool_output_limit": 32768
@@ -273,6 +274,11 @@ class PresetSettings(BaseModel):
 
     model: str | None = None
     sandbox: str | None = None
+    # Which model this preset's subagents run: unset = the preset's own
+    # model, "same" = the spawning agent's (which an override may have
+    # changed), anything else a key of "models". Checked in
+    # SectionedConfig, which is the only place that sees the model map.
+    subagent_model: str | None = None
 
 
 class SectionedConfig(BaseModel):
@@ -294,6 +300,21 @@ class SectionedConfig(BaseModel):
         if not isinstance(value, dict):
             return value
         return {name: {"name": name, **fields} for name, fields in value.items()}
+
+    @model_validator(mode="after")
+    def _validate_subagent_models(self) -> "SectionedConfig":
+        """A mistyped ``subagent_model`` fails at startup, not mid-turn."""
+        for name, preset in self.presets.items():
+            value = preset.subagent_model
+            if value is None or value == "same" or value in self.models:
+                continue
+            raise ValueError(
+                f"presets.{name}.subagent_model: no model named {value!r} — "
+                'use a key of the "models" section, or "same" for the '
+                f"spawning agent's model; available models: "
+                + (", ".join(self.models) or "none")
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod

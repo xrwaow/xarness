@@ -212,8 +212,34 @@ DiffSummary.expanded #diff-body {
     color: $c-muted;
 }
 
+.diff-file-source.mine {
+    color: $c-accent;
+}
+
+.diff-file-source.auto {
+    color: $c-muted;
+}
+
 .diff-file-source.drift {
     color: $c-warning;
+}
+
+.diff-drift-header {
+    height: auto;
+    margin-top: 1;
+    color: $c-warning;
+    text-style: italic;
+}
+
+.diff-group-row {
+    height: auto;
+    color: $c-muted;
+}
+
+.diff-group-count {
+    width: auto;
+    margin-left: 2;
+    color: $c-muted;
 }
 
 .diff-file-add {
@@ -298,8 +324,8 @@ DiffSummary.expanded #diff-body {
     color: $c-text;
 }
 
-/* The drift summary: a distinct inset block so the "what changed" detail
-   reads apart from the question, with its own scroll for long lists. */
+/* The confirmation detail: a distinct inset block so the "what will change"
+   detail reads apart from the question, with its own scroll for long lists. */
 #confirm-detail {
     color: $c-text;
     background: $c-bg;

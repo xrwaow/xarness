@@ -22,11 +22,13 @@ and then replays the live stream.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import sqlite3
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -42,7 +44,7 @@ from .config import (
     validate_filter_path,
 )
 from .controller import ChatController
-from .errors import SessionError
+from .errors import RefError, SessionError
 from .conversation import (
     Conversation,
     Message,
@@ -51,17 +53,10 @@ from .conversation import (
     turn_timings,
 )
 from .gitwork import (
-    GitInfo,
     GitWorktreeError,
     RevertConflict,
     TurnCheckpoint,
-    accept_changes,
-    attributed_diff_stat,
-    diff_stat,
     git_diff,
-    revert_to_tree,
-    revert_turns,
-    snapshot_state,
     tree_diff_stat,
 )
 from .images import ImageRef
@@ -83,9 +78,14 @@ from .sandbox import (
     SandboxUnavailable,
     ref_infos,
 )
-from .session_store import RefError, StoredSession, change_workspace_ref
+from .session_store import StoredSession
 from .tools import DEFAULT_TIMEOUT, build_registry
 from .util import utcnow_iso as _utcnow
+from .workspace import (
+    WorkspaceState,
+    change_workspace_ref,
+    save_workspace_refs,
+)
 
 # Tools that can change the workspace; only these trigger a DiffChanged
 # event (read_file/search tools cannot).
@@ -147,10 +147,19 @@ class SessionParts:
     api_key: str | None
     config_path: Path | None
     sandbox: SandboxRuntime
-    git_info: GitInfo | None
+    workspace_state: WorkspaceState | None
     tool_output_limit: int | None
+    # The model a subagent of this session runs (a model key), resolved from
+    # the preset's `subagent_model`.
+    subagent_model: str | None = None
     # Workspace reference paths (shared per workspace, managed with /ref).
     workspace_refs: list[str] = field(default_factory=list)
+    # Called after a workspace event so every agent in the repo refreshes
+    # its diff; injected by the host (None outside it).
+    notify_workspace: Callable[[str | None], None] | None = None
+    # Starts one subagent session for this one and returns its final message;
+    # injected by the host, and None for a subagent itself (no nesting).
+    spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None
 
     def session_kwargs(self, name: str) -> dict[str, Any]:
         """Keyword arguments for ``Session(name=..., **kwargs)`` (shallow:
@@ -171,15 +180,21 @@ class Session:
         api_key: str | None,
         conversation: Conversation | None = None,
         sandbox: SandboxRuntime | None = None,
-        git_info: GitInfo | None = None,
+        workspace_state: WorkspaceState | None = None,
         mode: Mode = "write",
         tool_output_limit: int | None = None,
         client: Any = None,
         config_path: Path | None = None,
         no_save: bool = False,
+        parent_id: str | None = None,
         workspace_refs: list[str] | None = None,
+        notify_workspace: Callable[[str | None], None] | None = None,
+        subagent_model: str | None = None,
+        spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None,
     ) -> None:
         self.name = name
+        # Set only for a subagent's session: the session that spawned it.
+        self.parent_id = parent_id
         self.workspace = workspace
         self.profile = profile
         self.profile_name = profile_name
@@ -187,12 +202,24 @@ class Session:
         self.config_path = config_path
         self.sandbox = sandbox or SandboxRuntime()
         self.sandbox.set_mode(mode)
-        self.git_info = git_info
+        self.workspace_state = workspace_state
         self.mode: Mode = mode
+        # The model a subagent of this session runs (see Host.spawn_subagent).
+        self.subagent_model = subagent_model
+        # Bound here, not in the host, which builds the parts before this
+        # session exists. A subagent has nobody to ask and cannot nest, so it
+        # gets neither capability — enforced on this one invariant, because a
+        # reloaded child's parts DO carry the host's spawn callable.
+        self._spawn_subagent = (
+            None if spawn_subagent is None or parent_id is not None
+            else lambda prompt, mode_arg: spawn_subagent(self, prompt, mode_arg)
+        )
+        self._ask_callback = None if parent_id is not None else self._ask_user
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
-            ask_callback=self._ask_user,
+            ask_callback=self._ask_callback,
             default_timeout=self._tool_timeout(),
+            spawn_subagent=self._spawn_subagent,
         )
         if tool_output_limit is not None:
             self.tool_registry.max_output_chars = tool_output_limit
@@ -205,8 +232,11 @@ class Session:
         if conversation is not None:
             self.controller.conversation = conversation
 
-        # Run state (replaces the TUI's _turn_busy/_compacting flags).
+        # Run state (replaces the TUI's _turn_busy/_compacting flags). The
+        # event flips with it, so wait_idle() needs no polling.
         self._state: State = "idle"
+        self._idle = asyncio.Event()
+        self._idle.set()
         self._turn_task: asyncio.Task[None] | None = None
         self._compact_task: asyncio.Task[None] | None = None
         # The turn task currently inside its end-of-turn teardown. It is
@@ -220,19 +250,14 @@ class Session:
         # Pending ask-tool prompt. Any client may answer; first answer wins.
         self._pending_ask: protocol.PendingAsk | None = None
         self._pending_ask_future: asyncio.Future[str | None] | None = None
-        # Pending resume-drift prompt.
-        self._pending_drift: protocol.PendingDrift | None = None
         # Workspace reference paths (kept separate from the sandbox profile's
         # own auto_include_refs; the effective list is computed when the
         # sandbox is built).
         self.workspace_refs: list[str] = list(workspace_refs or [])
-        # Resume drift is detected lazily, when the first client attaches —
-        # never at load time (a drifted workspace with nobody attached must
-        # not hold the host open or report "waiting").
-        self._drift_checked = False
         # no_session: the client asked for an unsaved conversation — _persist
         # becomes a no-op and nothing is ever written to the session store.
         self.no_save = no_save
+        self._notify_workspace_cb = notify_workspace
         # Content-addressed image blobs for this session's messages.
         self.images = session_store.SessionImageStore(
             self.name, persist=not no_save,
@@ -246,9 +271,10 @@ class Session:
         self._persist_task: asyncio.Task[None] | None = None
         self._diff_task: asyncio.Task[None] | None = None
         self._diff_dirty = False
-        # Turns closed by Session.load because a crash left them open; the
-        # host stamps the real workspace tree over their placeholder.
-        self._crash_repaired: list[TurnCheckpoint] = []
+        # The tool call currently executing (if any). A session whose model
+        # has handed off to a tool is waiting on it, not generating: /sessions
+        # shows that as "waiting" (a subagent call can run for minutes).
+        self._executing_tool: str | None = None
 
         # Fan-out.
         self._subscribers: list[asyncio.Queue[Event]] = []
@@ -277,6 +303,7 @@ class Session:
             **parts.session_kwargs(name),
             conversation=state.conversation,
             mode=state.mode or "write",
+            parent_id=state.parent_id,
         )
         # Restore the persisted token counters so the client's footer shows
         # real in/out/ctx immediately instead of 0 until the next round.
@@ -284,12 +311,10 @@ class Session:
         session.controller.last_usage = state.last_usage
         # A loaded session can never have a running turn: a crash (or a
         # kill) left any open ones behind. Close them all — a turn left
-        # "open" forever makes open_turn()/open_turn_before() return stale
-        # trees for diff attribution and drift suppression. Tracked turns
-        # get the before tree as a placeholder; the host (which can run a
-        # snapshot) stamps the real workspace tree over it via
-        # _crash_repaired and marks it seen.
-        session._crash_repaired = session.conversation.close_crashed_turns()
+        # "open" forever makes open_turn() return stale results. Tracked
+        # turns keep the before tree as their after tree (no edits
+        # attributed).
+        session.conversation.close_crashed_turns()
         # The loaded history is on disk by definition: the first write must
         # not rewrite it.
         session.conversation.mark_clean()
@@ -297,29 +322,6 @@ class Session:
         # them synthetic answers so the next request is valid.
         session._repair_tool_calls()
         return session
-
-    async def repair_crashed_turns(self) -> None:
-        """Stamp the workspace's current tree onto turns a crash left open.
-
-        A turn interrupted by a host crash or a quit mid-turn never got its
-        after-tree (``finish_turn`` never ran); :meth:`load` closed it with
-        the before tree as a placeholder. Record the live tree — what
-        ``finish_turn`` would have written had the process survived — and
-        mark it seen, so a plain reopen does not surface the session's own
-        unaccepted edits as "drift". Nothing to do without tracking or when
-        no turn was open."""
-        repaired = self._crash_repaired
-        self._crash_repaired = []
-        if self.git_info is None or not repaired:
-            return
-        try:
-            tree = await snapshot_state(self.git_info)
-        except GitWorktreeError:
-            return
-        self.git_info.mark_seen(tree)
-        for turn in repaired:
-            turn.after_tree = tree
-        self._persist()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -344,11 +346,7 @@ class Session:
     @property
     def is_active(self) -> bool:
         """True while running, compacting, waiting on an ask, or holding an
-        open event stream.
-
-        A pending drift WITHOUT an attached client does not count: nothing
-        can resolve it, so it must neither report "waiting" nor keep the
-        host alive (the prompt is (re)computed when a client attaches)."""
+        open event stream. Attached clients alone do not keep the host up."""
         return (
             self._state != "idle"
             or self._pending_ask is not None
@@ -375,20 +373,12 @@ class Session:
     def pending_ask(self) -> "protocol.PendingAsk | None":
         return self._pending_ask
 
-    @property
-    def pending_drift(self) -> bool:
-        return self._pending_drift is not None
-
     def summary(self) -> SessionSummary:
         """The list row for this hosted session."""
         state = self._state
-        # A pending ask blocks the turn itself, so it reads as waiting in
-        # every state. A pending drift prompt does not stop a running turn:
-        # it only takes over an otherwise idle row, so the picker keeps
-        # reporting running/compacting while the user has not resolved it.
-        if self.pending_ask is not None or (
-            self.pending_drift is not None and state == "idle"
-        ):
+        # A pending ask, or a tool call in flight, blocks the turn itself, so
+        # it reads as waiting in every state.
+        if self.pending_ask is not None or self._executing_tool is not None:
             state = "waiting"
         # Active derives from the same predicate the grace loop uses — a
         # hosted but fully idle session (no stream, no ask, no running
@@ -401,7 +391,8 @@ class Session:
             model=self.profile_name, sandbox=self.sandbox.name,
             last_user_message_at=self.last_user_message_at(),
             message_count=len(self.conversation.visible_messages()),
-            tracking=self.git_info is not None,
+            parent_id=self.parent_id,
+            tracking=self.workspace_state is not None,
         )
 
     @property
@@ -483,7 +474,7 @@ class Session:
             ),
             refs=self._ref_infos(),
             use_sandbox=self.sandbox.use_sandbox,
-            enable_tracking=self.git_info is not None,
+            enable_tracking=self.workspace_state is not None,
             supports_vision=self.profile.supports_vision,
             tools=[tool.name for tool in self.tool_registry.tools()],
             state=self._state,
@@ -494,7 +485,6 @@ class Session:
                 for item in self._queued
             ],
             pending_ask=self.pending_ask,
-            pending_drift=self._pending_drift,
             clients_attached=self.clients_attached,
         )
 
@@ -642,8 +632,6 @@ class Session:
                 return self._cmd_cancel()
             case protocol.AnswerAsk():
                 return self._cmd_answer_ask(command)
-            case protocol.ResolveDrift():
-                return await self._cmd_resolve_drift(command)
             case protocol.DiscardQueued():
                 return self._cmd_discard_queued()
             case protocol.FlushQueued():
@@ -673,13 +661,22 @@ class Session:
     # state
 
     def _set_state(self, state: State) -> None:
-        """Flip the state and push it. Purely local: the host's reaper polls
-        for inactivity, so nothing here can trigger an eviction and there is
-        no callback ordering to respect."""
+        """Flip the state, wake wait_idle() and push the new status. Purely
+        local: the host's reaper polls for inactivity, so nothing here can
+        trigger an eviction and there is no callback ordering to respect."""
         if self._state == state:
             return
         self._state = state
+        if state == "idle":
+            self._idle.set()
+        else:
+            self._idle.clear()
         self._emit_status()
+
+    async def wait_idle(self) -> None:
+        """Wait for the running turn (if any) to finish, including its
+        teardown. Returns at once when the session is already idle."""
+        await self._idle.wait()
 
     def _emit_status(self) -> None:
         """Push the current status to every client."""
@@ -699,13 +696,6 @@ class Session:
         """Persist and broadcast the rewritten history in one step."""
         self._persist()
         self._emit(self._history_event(reason, **fields))
-
-    def _commit_checkpoints(self, reason: HistoryReason) -> None:
-        """Persist and broadcast a checkpoint rebaseline (accept, reject,
-        drift): no message changed, so clients only need to refresh the
-        diff/pending view — not the whole transcript."""
-        self._persist()
-        self._emit(protocol.CheckpointsChanged(reason=reason))
 
     def _schedule_diff_changed(self) -> None:
         """Coalesce DiffChanged emissions: a dirty flag plus one loop task —
@@ -734,7 +724,7 @@ class Session:
         Only when someone is attached (the computation snapshots the
         workspace) and git tracking exists. Mutating tools and turn end call
         this; clients no longer poll after every tool result."""
-        if self.git_info is None or not self._subscribers:
+        if self.workspace_state is None or not self._subscribers:
             return
         try:
             summary = await self.diff_info(None)
@@ -868,49 +858,6 @@ class Session:
         ))
         return _ok()
 
-    async def _cmd_resolve_drift(self, command: protocol.ResolveDrift) -> CommandResult:
-        if self._pending_drift is None:
-            raise SessionError("no drift prompt is pending")
-        self._pending_drift = None
-        info = self.git_info
-        if command.accept and info is not None:
-            try:
-                await accept_changes(info)
-            except GitWorktreeError as exc:
-                self._emit(protocol.DriftResolved(accepted=False))
-                raise SessionError(f"could not accept the drift: {exc}") from exc
-            self.conversation.lock_turns(info.baseline_tree)
-            self._commit_checkpoints("drift")
-            self._emit(protocol.DriftResolved(accepted=True))
-            self._emit_notice(
-                "drift accepted: the workspace is the new baseline; /diff and "
-                "/undo now measure from here"
-            )
-        else:
-            # Acknowledge the drift durably: remember the tree the user just
-            # saw so a reload does not re-detect and re-prompt the same
-            # changes. /diff still shows them (the baseline is unchanged).
-            if info is not None:
-                try:
-                    info.mark_seen(await snapshot_state(info))
-                except GitWorktreeError:
-                    pass
-                self._persist()
-                await self._flush_persist()
-            self._emit(protocol.DriftResolved(accepted=False))
-            self._emit_notice(
-                "keeping tracking against the last known state — the drift "
-                "shows up in /diff"
-            )
-        return _ok()
-
-    def _cmd_discard_queued(self) -> CommandResult:
-        if not self._queued:
-            return _ok(discarded=0)
-        discarded = self._queued.pop(0)
-        self._emit_status()
-        return _ok(discarded=1, text=discarded.text)
-
     def _cmd_flush_queued(self) -> CommandResult:
         """Send the oldest queued message now: cancel the running turn or
         compaction; the cleanup starts the queued message immediately."""
@@ -946,18 +893,19 @@ class Session:
         if not plan.compaction:
             label = "retry" if resend else "undo"
             try:
-                await self._revert_changes(plan.revert_turns)
+                reverted = await self._revert_changes(plan.revert_turns)
             except RevertConflict as exc:
                 raise SessionError(
-                    f"/{label} conflict: the turn's changes overlap edits made "
-                    f"since — nothing was changed\n{exc}"
+                    f"/{label} conflict: the turn's files changed since it "
+                    f"ended — nothing was changed\n{exc}"
                 ) from exc
+            plan.revert_turns = plan.revert_turns[:reverted]
             # A rollback moves the files too: re-account the workspace before
             # persisting, or the reverted state would look like external drift
             # on the next resume.
-            if self.git_info is not None:
+            if self.workspace_state is not None:
                 try:
-                    self.git_info.mark_seen(await snapshot_state(self.git_info))
+                    await self.workspace_state.refresh()
                 except GitWorktreeError:
                     pass
         self.conversation.apply_rollback(plan)
@@ -965,7 +913,7 @@ class Session:
         # conversation lowered its persist watermark itself.
         if plan.compaction:
             note = "reverted"
-        elif self.git_info is None:
+        elif self.workspace_state is None:
             note = "no_tracking"
         elif not plan.revert_turns:
             note = "no_edits"
@@ -1025,72 +973,81 @@ class Session:
         return True
 
     async def _cmd_accept(self) -> CommandResult:
-        """Lock in the changes made so far (allowed mid-turn)."""
-        info = self.git_info
-        if info is None:
+        """Lock in the non-drift changes made so far (allowed mid-turn)."""
+        ws = self.workspace_state
+        if ws is None:
             raise SessionError(
                 "/accept: no change tracking for this session (the workspace "
                 "isn't a git repo, or tracking setup failed)"
             )
         mid_turn = self._state != "idle"
         try:
-            stat = await diff_stat(info)
-        except GitWorktreeError:
-            stat = None
-        try:
-            sha = await accept_changes(info)
+            summary = await ws.diff(self.name)
+            await ws.accept()
         except GitWorktreeError as exc:
             raise SessionError(f"/accept failed: {exc}") from exc
-        self.conversation.lock_turns(sha)
-        self._commit_checkpoints("accept")
+        self._workspace_changed("accept")
         if mid_turn:
             self._emit_notice(
                 "note: the current turn is still generating — it may keep "
                 "editing files on top of the accepted state", "warn",
             )
-        if stat is None or not stat.files:
+        accepted = [row for row in summary.files if row.kind != "drift"]
+        foreign = [row for row in accepted if row.kind != "mine"]
+        if not summary.files:
             self._emit_notice(
                 "accepted: no pending changes — baseline reset; /diff and /undo "
                 "now measure from here"
             )
         else:
+            detail = ""
+            if foreign:
+                detail = (
+                    f"; {len(foreign)} of {len(summary.files)} pending "
+                    "files weren't made by this agent"
+                )
             self._emit_notice(
-                f"accepted: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
-                "locked in; /diff is reset and /undo can no longer revert them"
+                f"accepted: {len(accepted)} file(s) +{summary.additions} "
+                f"-{summary.deletions} locked in{detail}; /diff is reset and "
+                "/undo can no longer revert them"
             )
         return _ok()
 
     async def _cmd_reject(self) -> CommandResult:
-        """Discard every change made since the last /accept (allowed mid-turn)."""
-        info = self.git_info
-        if info is None:
+        """Discard every change made since the last /accept (allowed
+        mid-turn), including drift."""
+        ws = self.workspace_state
+        if ws is None:
             raise SessionError(
                 "/reject: no change tracking for this session (the workspace "
                 "isn't a git repo, or tracking setup failed)"
             )
         mid_turn = self._state != "idle"
         try:
-            stat = await diff_stat(info)
-            await revert_to_tree(info, info.baseline_tree)
+            summary = await ws.diff(self.name)
+            unrestorable = await ws.reject()
         except GitWorktreeError as exc:
             raise SessionError(f"/reject failed: {exc}") from exc
-        self.conversation.lock_turns(info.baseline_tree)
-        # The workspace is back at the baseline: that is now the last state
-        # the session has accounted for, so a resume must not call the
-        # discarded changes drift.
-        info.reset_to(info.baseline_tree)
-        self._commit_checkpoints("reject")
+        self._workspace_changed("reject")
         if mid_turn:
             self._emit_notice(
                 "note: the current turn is still generating — it may keep "
                 "editing files on top of the reverted state", "warn",
             )
-        if not stat.files:
+        if not summary.files and not summary.groups:
             self._emit_notice("rejected: nothing to discard")
         else:
+            drift = sum(1 for row in summary.files if row.kind == "drift")
+            detail = f" (including {drift} drift file(s))" if drift else ""
             self._emit_notice(
-                f"rejected: {len(stat.files)} file(s) +{stat.additions} -{stat.deletions} "
-                "since the last accept were reverted"
+                f"rejected: {len(summary.files)} file(s) "
+                f"+{summary.additions} -{summary.deletions} since the last "
+                f"accept were reverted{detail}"
+            )
+        if unrestorable:
+            self._emit_notice(
+                f"{len(unrestorable)} ignored file(s) edited by agents were "
+                "not restored: " + ", ".join(unrestorable[:5]), "warn",
             )
         return _ok()
 
@@ -1154,7 +1111,7 @@ class Session:
             rel = validate_filter_path(path).strip("/")
         except ValueError as exc:
             raise SessionError(str(exc)) from exc
-        if self.git_info is not None and (rel == ".git" or rel.startswith(".git/")):
+        if self.workspace_state is not None and (rel == ".git" or rel.startswith(".git/")):
             raise SessionError(
                 ".git cannot be filtered while change tracking is on — the "
                 "tracking dir must stay mounted"
@@ -1224,8 +1181,9 @@ class Session:
         except RefError as exc:
             raise SessionError(str(exc)) from exc
         try:
-            session_store.save_workspace_refs(str(self.workspace), specs)
-        except OSError as exc:
+            if not self.no_save:
+                save_workspace_refs(self.workspace, specs)
+        except (OSError, sqlite3.Error) as exc:
             # a read-only data dir must not block this session's ref,
             # but the user should know the change won't survive a restart
             LOG.warning("could not save refs for %s: %s", self.workspace, exc)
@@ -1284,7 +1242,7 @@ class Session:
         old = self.sandbox
         try:
             config = SandboxConfig.from_settings(
-                self.workspace, settings, self.git_info,
+                self.workspace, settings, self.workspace_state,
                 extra_refs=self.workspace_refs,
             )
         except SandboxUnavailable as exc:
@@ -1346,6 +1304,7 @@ class Session:
             await self._maybe_auto_compact()
             stream = self.controller.begin_turn(
                 text, images, await self._take_checkpoint(),
+                self.workspace_state.epoch if self.workspace_state else 0,
             )
             saw_stream_error = False
             while True:
@@ -1493,9 +1452,22 @@ class Session:
 
         # ToolRegistry.call already converts any tool exception into a
         # failed ToolResult, so no try/except is needed here.
-        result = await self.tool_registry.call(
-            call.name, call.arguments_json, output_sink=sink,
-        )
+        ws = self.workspace_state
+        before = ignored_before = None
+        if ws is not None and call.name == "run_bash":
+            # A fresh snapshot before the command (not the cached head), so
+            # drift that happened earlier is never credited to the agent.
+            before = await ws.observe()
+            ignored_before = await ws.ignored()
+        self._executing_tool = call.name or call_id
+        try:
+            result = await self.tool_registry.call(
+                call.name, call.arguments_json, output_sink=sink,
+            )
+        finally:
+            self._executing_tool = None
+        if ws is not None and result.status == "ok":
+            await self._record_event(ws, call, before, ignored_before)
         end = _utcnow()
         self._emit(protocol.ToolFinished(
             call_id=call_id, status=result.status, content=result.content,
@@ -1503,12 +1475,66 @@ class Session:
         if call.name in MUTATING_TOOLS:
             # Coalesced: a burst of run_bash calls must not trigger a git
             # snapshot each; one trailing debounce covers them all.
-            self._schedule_diff_changed()
+            self._workspace_changed()
         # Refresh the footer's in/out/ctx per message, not just per round.
         self._emit_status()
         self.controller.record_tool_result(
             call_id, result, start_time=start, end_time=end,
         )  # Timing wraps the two stamps inside the controller
+
+    async def _record_event(
+        self, ws: WorkspaceState, call: ToolCall,
+        before: str | None, ignored_before: tuple[str, ...] | None,
+    ) -> None:
+        """Record one successful mutating tool call in the workspace log.
+
+        The whole step runs under the workspace lock, so an event lands
+        entirely before or entirely after an ``/accept`` or ``/reject``: it
+        can never describe pre-rebaseline work to a log the rebaseline just
+        cleared.
+        """
+        if call.name in ("edit_file", "write_file"):
+            try:
+                args = json.loads(call.arguments_json)
+            except (TypeError, ValueError):
+                return
+            path = args.get("path") if isinstance(args, dict) else None
+            if not isinstance(path, str) or not path:
+                return
+            # The tool interprets a relative path against the sandbox cwd
+            # (``--workspace repo/sub``); events are repo-root-relative.
+            try:
+                path = (self.workspace / path).resolve().relative_to(
+                    ws.root).as_posix()
+            except ValueError:
+                return
+            # Always recorded, even for an ignored path: the tree never
+            # holds ignored files, but the event is what makes them agent
+            # work rather than drift.
+            async with ws.lock:
+                ws.record(
+                    session=self.name, tool=call.name,
+                    turn=self.conversation.open_turn_id,
+                    paths=(path,), auto=(),
+                )
+            return
+        if call.name != "run_bash" or before is None:
+            return
+        async with ws.lock:
+            try:
+                after = await ws.snapshot()
+                ignored_after = await ws.ignored()
+            except GitWorktreeError:
+                return
+            stat = await tree_diff_stat(ws, before, after)
+            ws.record(
+                session=self.name, tool=call.name,
+                turn=self.conversation.open_turn_id,
+                paths=tuple(f.path for f in stat.files),
+                auto=tuple(sorted(
+                    set(ignored_after) - set(ignored_before or ())
+                )),
+            )
 
     def _inject_queued(self) -> None:
         """Inject the steering queue at a round boundary: the messages land
@@ -1554,13 +1580,24 @@ class Session:
     # ------------------------------------------------------------------
     # git tracking
 
+    def _workspace_changed(self, reason: str | None = None) -> None:
+        """A tool changed the workspace (or its events): refresh the diff in
+        every agent sharing it, not only this one. ``reason`` also announces
+        an accept/reject rebaseline."""
+        if self._notify_workspace_cb is not None:
+            self._notify_workspace_cb(reason)
+            return
+        self._schedule_diff_changed()
+        if reason is not None:
+            self._emit(protocol.CheckpointsChanged(reason=reason))
+
     async def _take_checkpoint(self) -> str | None:
         """Snapshot the workspace's current state as a tree and return the
-        sha. None when there is no git tracking or the checkpoint failed."""
-        if self.git_info is None:
+        sha. None when there is no change tracking or the checkpoint failed."""
+        if self.workspace_state is None:
             return None
         try:
-            return await snapshot_state(self.git_info)
+            return await self.workspace_state.refresh()
         except GitWorktreeError:
             return None
 
@@ -1573,16 +1610,11 @@ class Session:
         turn = self.conversation.open_turn
         if turn is None:
             return
-        if self.git_info is not None and turn.before_tree:
+        if self.workspace_state is not None and turn.before_tree:
             try:
-                turn.after_tree = await snapshot_state(self.git_info)
+                turn.after_tree = await self.workspace_state.refresh()
             except GitWorktreeError:
                 turn.after_tree = None
-            else:
-                # The turn's end state is now the workspace the session
-                # knows about; resume drift must measure from here, not from
-                # the previous turn.
-                self.git_info.mark_seen(turn.after_tree)
         turn.closed = True
 
     def _open_turn_before(self) -> str | None:
@@ -1591,97 +1623,35 @@ class Session:
         return turn.before_tree if turn is not None else None
 
     def turn_checkpoints(self) -> list[TurnCheckpoint]:
-        """The reversible turns since the baseline, oldest first."""
-        return self.conversation.turn_checkpoints()
+        """The reversible turns in the workspace's current epoch, oldest
+        first. A turn that spans an accept/reject is deliberately excluded:
+        its before tree no longer describes the baseline."""
+        if self.workspace_state is None:
+            return []
+        return self.conversation.turn_checkpoints(self.workspace_state.epoch)
 
-    async def _revert_changes(self, turns: list[TurnCheckpoint]) -> None:
+    async def _revert_changes(self, turn_ids: list[str]) -> int:
         """Reverse the given turns' file edits (newest first) onto the live
-        workspace.
+        workspace. Returns how many turns were actually reverted.
 
-        Raises :class:`RevertConflict` when a turn's changes overlap
-        unresolvably with edits made since (the workspace is left untouched),
-        or :class:`GitWorktreeError` on another git failure. No tracking, or
-        an empty turn list, is a clean no-op."""
-        if self.git_info is None or not turns:
-            return
-        conflict = await revert_turns(self.git_info, turns)
-        if conflict is not None:
-            raise RevertConflict(conflict)
-
-    async def detect_resume_drift(self) -> "protocol.PendingDrift | None":
-        """The drift prompt (last known tree, current tree, changed paths)
-        when the workspace changed outside this session since it was last
-        open, else None."""
-        info = self.git_info
-        if info is None:
-            return None
-        # Compare against the last tree this session ever recorded — including
-        # accepted (locked) turns. ``turn_checkpoints()`` deliberately omits
-        # locked turns (they are not undoable), but they are still the last
-        # known workspace state; using it here made a clean /accept look like
-        # external drift on the next resume.
-        known = self.conversation.known_trees()
-        # ``last_seen_tree`` is maintained at every point the workspace state
-        # is deliberately recorded (turn end, accept, keep-tracking, rollback)
-        # and persisted, so acknowledged drift is not re-prompted on reload.
-        # Older session files have no marker: fall back to the turn history.
-        last_known = (
-            info.last_seen_tree
-            or (known[-1] if known else info.baseline_tree)
-        )
-        try:
-            current = await snapshot_state(info)
-            if current == last_known:
-                return None
-            # A turn may be generating right now (a client attached or
-            # reconnected mid-turn). Its in-flight edits are not drift: only
-            # report a change if something outside the turn's own
-            # before→current diff also moved.
-            open_before = self._open_turn_before()
-            if open_before is not None:
-                since_open = {
-                    f.path for f in (
-                        await tree_diff_stat(info, open_before, current)
-                    ).files
-                }
-                since_last_known = {
-                    f.path for f in (
-                        await tree_diff_stat(info, last_known, current)
-                    ).files
-                }
-                if since_last_known <= since_open:
-                    return None
-        except GitWorktreeError:
-            return None
-        try:
-            files = [
-                f.path for f in
-                (await tree_diff_stat(info, last_known, current)).files
-            ]
-        except GitWorktreeError:
-            files = []
-        return protocol.PendingDrift(
-            workspace=str(self.workspace), last_known=last_known,
-            current=current, files=files,
-        )
-
-    async def prompt_resume_drift(self) -> None:
-        """Detect drift and surface it as session state (a pending prompt
-        any client can resolve).
-
-        Called lazily when the FIRST client attaches — never at load time:
-        a pending drift with nobody attached must not report "waiting" nor
-        keep the host alive."""
-        if self._drift_checked:
-            return
-        self._drift_checked = True
-        drift = await self.detect_resume_drift()
-        if drift is not None and self.git_info is not None:
-            # The prompt is session state: the StatusChanged that follows
-            # carries it (no separate event — state in two places means two
-            # code paths in every client).
-            self._pending_drift = drift
-            self._emit_status()
+        Raises :class:`RevertConflict` with the conflicting paths when any
+        of a turn's files changed since it ended (the workspace is left
+        untouched). No tracking, an empty list, or turns from before an
+        accept/reject (their epoch is stale) is a clean no-op."""
+        ws = self.workspace_state
+        if ws is None or not turn_ids:
+            return 0
+        turns = [
+            (turn_id, turn) for turn_id in turn_ids
+            if (turn := self.conversation.turns.get(turn_id)) is not None
+            and turn.epoch == ws.epoch
+        ]
+        if not turns:
+            return 0
+        conflict = await ws.undo(self.name, turns)
+        if conflict:
+            raise RevertConflict(", ".join(conflict))
+        return len(turns)
 
     # ------------------------------------------------------------------
     # misc
@@ -1691,7 +1661,7 @@ class Session:
         never persisted in the conversation."""
         self.controller.system_prompt = system_prompt(
             self.sandbox.config, self.mode,
-            tracked=self.git_info is not None,
+            tracked=self.workspace_state is not None,
             git_write=self.sandbox.allow_git_write,
         )
 
@@ -1707,8 +1677,9 @@ class Session:
         limit = output_limit if output_limit is not None else self.tool_registry.max_output_chars
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
-            ask_callback=self._ask_user,
+            ask_callback=self._ask_callback,
             default_timeout=self._tool_timeout(),
+            spawn_subagent=self._spawn_subagent,
         )
         self.tool_registry.max_output_chars = limit
         self.controller.tools = self.tool_registry
@@ -1749,7 +1720,7 @@ class Session:
             mode=self.mode,
             profile=self.profile_name,
             workspace=str(self.workspace),
-            git=self.git_info,
+            parent_id=self.parent_id,
             sandbox_name=self.sandbox.name,
             sandbox_settings=self.sandbox.settings,
             usage_total=self.controller.usage_total,
@@ -1838,40 +1809,26 @@ class Session:
     async def diff_info(self, path: str | None) -> protocol.DiffInfo:
         """The /diff payload: per-file stat rows (+ the unified diff text
         for a per-file click-through; the summary poll stays cheap)."""
-        info = self.git_info
-        if info is None:
+        ws = self.workspace_state
+        if ws is None:
             return protocol.DiffInfo(tracking=False)
         try:
             # A per-file click-through needs both the stat rows and the
             # text; snapshot the workspace once and share the sha between
             # them.
-            current = await snapshot_state(info) if path is not None else None
-            stat = await attributed_diff_stat(
-                info, self.turn_checkpoints(),
-                open_before=self._open_turn_before(), current=current,
-            )
-            files = [
-                protocol.DiffFileInfo(
-                    path=f.path, additions=f.additions, deletions=f.deletions,
-                    is_new=f.is_new, source=f.source or "agent",
-                )
-                for f in stat.files
-                if path is None or f.path == path
-            ]
+            current = await ws.observe()
+            info = await ws.diff(self.name, current=current)
+            if path is not None:
+                info.files = [row for row in info.files if row.path == path]
+                info.groups = []
+                info.ignored_files = 0
+                info.text = await git_diff(ws, path, current=current)
         except GitWorktreeError as exc:
             # Git failures raise instead of reporting tracking=False: a
             # transient index.lock (concurrent snapshots) must not make
             # clients believe tracking disappeared.
             raise SessionError(f"diff failed: {exc}") from exc
-        result = protocol.DiffInfo(
-            files=files,
-            additions=sum(f.additions for f in files),
-            deletions=sum(f.deletions for f in files),
-            tracking=True,
-        )
-        if path is not None:
-            try:
-                result.text = await git_diff(info, path, current=current)
-            except GitWorktreeError as exc:
-                raise SessionError(f"diff failed: {exc}") from exc
-        return result
+        info.additions = sum(row.additions for row in info.files)
+        info.deletions = sum(row.deletions for row in info.files)
+        info.tracking = True
+        return info

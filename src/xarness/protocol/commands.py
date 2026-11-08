@@ -36,11 +36,6 @@ class AnswerAsk(CommandBase):
     answers: list[str] | None = None
 
 
-class ResolveDrift(CommandBase):
-    type: Literal["resolve_drift"] = "resolve_drift"
-    accept: bool
-
-
 class DiscardQueued(CommandBase):
     type: Literal["discard_queued"] = "discard_queued"
 
@@ -108,7 +103,6 @@ Command = Annotated[
         SendMessage,
         Cancel,
         AnswerAsk,
-        ResolveDrift,
         DiscardQueued,
         FlushQueued,
         Rollback,

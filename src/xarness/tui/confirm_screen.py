@@ -1,7 +1,8 @@
 """Generic yes/no modal for decisions the harness must not make for the user.
 
-Used by the resume flow to surface workspace drift: the harness shows what
-changed and lets the user choose, rather than silently reverting or accepting.
+Used by the `/accept` and `/reject` confirmations: when pending files were
+not made by this agent (or when rejecting would revert the user's own edits),
+the harness asks instead of choosing for them.
 
 Follows the same shape as the other modals (``ListPicker``):
 a titled surface panel centered on screen, dismissed with the app's modal

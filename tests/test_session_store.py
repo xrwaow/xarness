@@ -200,17 +200,15 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
     conversation.add(user_message("q", timing=Timing(send="2026-01-01T00:00:00+00:00")))
     conversation.add(AssistantMessage(content="a"))
     _save("s", store.StoredSession(
-        profile="p", workspace="/w",
-        git=__import__("xarness.gitwork", fromlist=["GitInfo"]).GitInfo(
-            session_id="s", repo_root="/w", git_dir="/w/.git",
-        ),
+        profile="p", workspace="/w", parent_id="parent",
         sandbox_name="sb", conversation=conversation,
     ))
     meta = store.load_meta("s")
     assert meta["workspace"] == "/w"
     assert meta["message_count"] == 2
     assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
-    assert meta["tracking"] is True
+    assert meta["parent_id"] == "parent"
+    assert "tracking" not in meta
     assert meta["profile"] == "p" and meta["sandbox_name"] == "sb"
 
     # Reading the meta must not build Conversation objects (the whole point:
@@ -249,6 +247,39 @@ def test_tool_calls_persist_in_internal_shape(tmp_path, monkeypatch) -> None:
     assert loaded.tool_calls == [
         ToolCall(call_id="c1", name="run_bash", arguments_json="{}"),
     ]
+
+
+def test_schema_4_rows_are_imported(tmp_path, monkeypatch) -> None:
+    """Opening an old database once rewrites its rows in place: the git
+    block is dropped and parent_id appears."""
+    import sqlite3
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    connection = sqlite3.connect(tmp_path / "sessions.db")
+    connection.executescript(
+        "CREATE TABLE sessions ("
+        "name TEXT PRIMARY KEY, schema INTEGER NOT NULL, state TEXT NOT NULL,"
+        " meta TEXT NOT NULL, updated_at TEXT NOT NULL);"
+    )
+    old_state = {
+        "workspace": "/w",
+        "git": {"repo_root": "/w", "git_dir": "/w/.git"},
+    }
+    with connection:
+        connection.execute(
+            "INSERT INTO sessions (name, schema, state, meta, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("old", 4, json.dumps(old_state), "{}", ""),
+        )
+    connection.close()
+
+    loaded = session_store.load_state("old")
+    assert loaded.schema_version == session_store.SCHEMA_VERSION
+    assert loaded.parent_id is None
+    with session_store.connection() as db:
+        (schema,) = db.execute(
+            "SELECT schema FROM sessions WHERE name = 'old'").fetchone()
+    assert schema == session_store.SCHEMA_VERSION
 
 
 def test_unsupported_schemas_are_rejected(tmp_path, monkeypatch) -> None:
@@ -360,18 +391,44 @@ def test_turns_persist_in_the_state_row_not_the_messages(tmp_path, monkeypatch) 
     assert turn.closed is False
 
 
+def test_reads_never_create_the_database(tmp_path, monkeypatch) -> None:
+    """The read side is side-effect free: with no database file the loaders
+    answer "nothing saved" and leave the store directory unwritten (a
+    --no-session run must never create sessions.db)."""
+    from xarness import workspace as workspace_mod
+
+    store = tmp_path / "db"
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", store)
+    assert session_store.load_metas() == {}
+    assert session_store.load_meta("anything") is None
+    assert workspace_mod.load_workspace_refs(tmp_path) == []
+    assert not store.exists()
+
+    # Once a database exists, reads work against it in ``mode=ro``: they see
+    # what was written (here by the writer path) without opening it for
+    # writing themselves.
+    workspace_mod.save_workspace_refs(tmp_path, ["notes.md"])
+    assert workspace_mod.load_workspace_refs(tmp_path) == ["notes.md"]
+    assert session_store.load_metas() == {}
+
+
 def test_change_workspace_ref_adds_and_removes(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(session_store, "WORKSPACES_DIR", tmp_path / "ws")
+    from xarness import workspace as workspace_mod
+    from xarness.errors import RefError
+
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path / "db")
     notes = tmp_path / "notes"
     notes.mkdir()
-    specs, host = session_store.change_workspace_ref(tmp_path, str(notes), add=True)
+    specs, host = workspace_mod.change_workspace_ref(
+        tmp_path, str(notes), add=True,
+    )
     assert specs == [str(notes.resolve())]
     # Adding twice is idempotent (no duplicate).
-    specs, _ = session_store.change_workspace_ref(tmp_path, "notes", add=True)
+    specs, _ = workspace_mod.change_workspace_ref(tmp_path, "notes", add=True)
     assert specs == [str(notes.resolve())]
-    specs, _ = session_store.change_workspace_ref(tmp_path, "notes", add=False)
+    specs, _ = workspace_mod.change_workspace_ref(tmp_path, "notes", add=False)
     assert specs == []
-    with pytest.raises(session_store.RefError):
-        session_store.change_workspace_ref(tmp_path, "missing", add=True)
-    with pytest.raises(session_store.RefError):
-        session_store.change_workspace_ref(tmp_path, "notes", add=False)
+    with pytest.raises(RefError):
+        workspace_mod.change_workspace_ref(tmp_path, "missing", add=True)
+    with pytest.raises(RefError):
+        workspace_mod.change_workspace_ref(tmp_path, "notes", add=False)

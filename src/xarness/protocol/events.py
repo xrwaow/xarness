@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from ..conversation import Message, ToolStatus, Usage
 from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 
 # Error convention: REST routes fail with HTTP 4xx (400 bad request, 404
 # missing session/path); a ``command`` always returns 200 with
@@ -26,10 +26,10 @@ PROTOCOL_VERSION = 14
 
 Level = Literal["info", "warn", "error"]
 
-# Why a HistoryReplaced fired. accept/reject/drift stay valid (an older host
-# may still send them) but are no longer emitted — they carry no message
-# change, so they use :class:`CheckpointsChanged` instead.
-HistoryReason = Literal["compaction", "rollback", "drift", "accept", "reject"]
+# Why a HistoryReplaced fired. accept/reject stay valid (an older host may
+# still send them) but are no longer emitted — they carry no message change,
+# so they use :class:`CheckpointsChanged` instead.
+HistoryReason = Literal["compaction", "rollback", "accept", "reject"]
 
 
 class EventBase(BaseModel):
@@ -198,9 +198,8 @@ class HistoryReplaced(EventBase):
 
 
 class CheckpointsChanged(EventBase):
-    """Turn checkpoints were rebaselined (accept, reject, drift resolve) but
-    NO message changed — clients refresh the diff/pending view and status,
-    not the transcript. A full ``HistoryReplaced`` (snapshot attached) is
+    """The workspace was rebaselined (accept/reject) but NO message changed —
+    clients refresh the diff/pending view and status, not the transcript. A full ``HistoryReplaced`` (snapshot attached) is
     reserved for rewrites that actually changed history: rollback and
     compaction."""
 
@@ -212,11 +211,6 @@ class AskResolved(EventBase):
     type: Literal["ask_resolved"] = "ask_resolved"
     ask_id: str
     answers: list[str] | None = None
-
-
-class DriftResolved(EventBase):
-    type: Literal["drift_resolved"] = "drift_resolved"
-    accepted: bool
 
 
 class DiffChanged(EventBase):
@@ -260,7 +254,6 @@ HostEvent = (
     | HistoryReplaced
     | CheckpointsChanged
     | AskResolved
-    | DriftResolved
     | DiffChanged
     | TurnEnded
     | SessionDeleted

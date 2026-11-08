@@ -331,15 +331,8 @@ async def _event_stream(session: Session) -> AsyncIterator[str]:
     always re-snapshot: on a local unix socket the only real disconnect is
     host death, and replaying deltas across a history rewrite would corrupt
     the transcript."""
-    # (Re)attach time is when resume drift is detected (never at load time —
-    # a drifted workspace with nobody attached must not report "waiting" nor
-    # keep the host alive). Run it AFTER the snapshot: the check snapshots the
-    # workspace's git tree, which can take a while on a large repo; blocking
-    # the first frame on it made resume feel slow. It emits StatusChanged when
-    # it finds drift, so the client still gets the prompt.
     snapshot, queue = session.subscribe()
     yield _sse("snapshot", snapshot)
-    drift_task = asyncio.create_task(session.prompt_resume_drift())
     try:
         while True:
             event = await queue.get()
@@ -347,7 +340,6 @@ async def _event_stream(session: Session) -> AsyncIterator[str]:
             if isinstance(event, protocol.SessionDeleted):
                 break
     finally:
-        drift_task.cancel()
         session.unsubscribe(queue)
 
 

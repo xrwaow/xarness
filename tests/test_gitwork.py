@@ -13,16 +13,25 @@ from unittest import mock
 
 from xarness import gitwork
 from xarness.gitwork import (
-    GitInfo, TurnCheckpoint, accept_changes, attributed_diff_stat,
-    detect_repo, diff_stat, git_diff, revert_to_tree, revert_turns,
-    snapshot_state,
-    setup_tracking, snapshot_tree, tree_diff_stat,
+    detect_repo, git_diff, revert_to_tree, snapshot_tree,
+    tree_diff_stat,
 )
+from xarness.workspace import WorkspaceState, open_workspace
 
 
-def _turn(before: str, after: str) -> TurnCheckpoint:
-    """The one checkpoint a single-turn revert needs."""
-    return TurnCheckpoint(before_tree=before, after_tree=after)
+async def open_state(path: Path, **kwargs) -> WorkspaceState:
+    """The tracked state of ``path``'s repo, without persisting anything."""
+    kwargs.setdefault("persist", False)
+    state = await open_workspace(path, **kwargs)
+    assert state is not None
+    return state
+
+
+async def diff(state: WorkspaceState) -> gitwork.DiffStat:
+    """The pending diff: baseline vs the live worktree."""
+    return await tree_diff_stat(
+        state, state.baseline_tree, await state.observe(),
+    )
 
 
 def _git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
@@ -64,7 +73,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert info is not None
         assert info.root == repo.resolve()
 
-    async def test_setup_tracking_auto_initializes_non_repo(self):
+    async def test_open_auto_initializes_non_repo(self):
         """No git init from the user: the harness tracks via an external
         snapshot store — and never drops a .git into the workspace."""
         workspace = self.base / "plain"
@@ -72,23 +81,21 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (workspace / "notes.txt").write_text("user's file\n")
 
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "state")}):
-            info, notes = await setup_tracking(workspace, "sess1")
+            state = await open_state(workspace)
 
-        assert info is not None
-        assert info.repo_root == workspace.resolve()
-        assert info.external
+        assert state.root == workspace.resolve()
+        assert state.external
         with self.assertRaises(ValueError):
-            info.git_dir.relative_to(workspace.resolve())  # store is outside
+            state.git_dir.relative_to(workspace.resolve())  # store is outside
         # No .git appears in the workspace; the user's files are untouched.
         assert not (workspace / ".git").exists()
         assert (workspace / "notes.txt").read_text() == "user's file\n"
-        assert any("no .git created" in n for n in notes)
-        env = {**os.environ, "GIT_DIR": str(info.git_dir)}
+        env = {**os.environ, "GIT_DIR": str(state.git_dir)}
         out = _git(workspace, "config", "xarness.managed", env=env)
         assert out.strip() == "true"
         # Snapshots/diffs work against the external store.
         (workspace / "notes.txt").write_text("agent edited\n")
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert [f.path for f in stat.files] == ["notes.txt"]
 
     async def test_external_store_revert_works(self):
@@ -98,17 +105,15 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         workspace.mkdir()
         (workspace / "doc.txt").write_text("base\n")
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "state")}):
-            info, _ = await setup_tracking(workspace, "sess2")
-        assert info is not None
+            state = await open_state(workspace)
 
-        before = await snapshot_state(info)
+        before = await state.refresh()
         (workspace / "doc.txt").write_text("agent edit\n")
         (workspace / "new.txt").write_text("created\n")
-        after = await snapshot_state(info)
+        after = await state.refresh()
 
-        conflict = await revert_turns(info, [_turn(before, after)])
+        await revert_to_tree(state, before, after)
 
-        assert conflict is None
         assert (workspace / "doc.txt").read_text() == "base\n"
         assert not (workspace / "new.txt").exists()
         assert not (workspace / ".git").exists()
@@ -122,17 +127,15 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "big.bin").write_bytes(b"0" * (1024 * 1024 + 1))
         (repo / "small.txt").write_text("tracked\n")
 
-        info, notes = await setup_tracking(repo, "sess3")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "small.txt").write_text("edited\n")
         (repo / "pic.png").write_bytes(b"changed")
         (repo / "big.bin").write_bytes(b"1" * (1024 * 1024 + 1))
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert [f.path for f in stat.files] == ["small.txt"]
-        # The oversized files were pinned as ignored at session start.
-        assert "big.bin" in info.ignored_paths
-        assert any("1 MB" in n for n in notes)
+        # The oversized file was found under the size limit at workspace open.
+        assert "big.bin" in state.oversized
 
     async def test_mid_session_oversized_file_is_dropped(self):
         """A file that is small at session start but grows past 1 MB later is
@@ -149,26 +152,25 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "bins")
 
-        info, _ = await setup_tracking(repo, "sess-grow")
-        assert info is not None
-        assert "data.dat" not in info.ignored_paths
+        state = await open_state(repo)
+        assert "data.dat" not in state.oversized
 
         big = b"0" * (gitwork._MAX_TRACKED_SIZE + 1)
         (repo / "data.dat").write_bytes(big)
         (repo / "odd[1].dat").write_bytes(big)
         (repo / "app.py").write_text("edited\n")
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         paths = [f.path for f in stat.files]
         # Neither the grown files nor a phantom "deleted" row for them: the
         # file is ignored, so /diff says nothing about it.
         assert paths == ["app.py"]
         # Grown files are pinned now, so the next snapshot does not re-hash them.
-        assert "data.dat" in info.ignored_paths
-        assert "odd[1].dat" in info.ignored_paths
+        assert "data.dat" in state.oversized
+        assert "odd[1].dat" in state.oversized
 
         # The snapshot keeps the pre-growth blob for each of them...
-        tree = await snapshot_state(info)
+        tree = await state.refresh()
         tracked = {
             path: meta.split()[2]
             for meta, path in (
@@ -188,17 +190,16 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         """A file that appears mid-session already over the limit is left out
         of the snapshot (mode-0 index record), so /diff never shows it."""
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess-new-big")
-        assert info is not None
+        state = await open_state(repo)
 
         big = b"0" * (gitwork._MAX_TRACKED_SIZE + 1)
         (repo / "dump.dat").write_bytes(big)
         (repo / "app.py").write_text("edited\n")
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert [f.path for f in stat.files] == ["app.py"]
-        assert "dump.dat" in info.ignored_paths
-        tree = await snapshot_state(info)
+        assert "dump.dat" in state.oversized
+        tree = await state.refresh()
         assert "dump.dat" not in _git(repo, "ls-tree", "-r", "--name-only", tree).split()
 
     async def test_cargo_build_dirs_are_not_tracked(self):
@@ -210,10 +211,7 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "cargo")
 
-        info, _ = await setup_tracking(repo, "sess-cargo")
-        assert info is not None
-        assert "target" in info.ignored_paths
-        assert "target-sandbox" in info.ignored_paths
+        state = await open_state(repo)
 
         # Both trees appear *after* the session started (first build).
         for tree in ("target", "target-sandbox"):
@@ -222,8 +220,10 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "src").mkdir()
         (repo / "src" / "main.rs").write_text("fn main() {}\n")
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert [f.path for f in stat.files] == ["src/main.rs"]
+        listing = await gitwork.ignored_listing(repo)
+        assert "target" in listing and "target-sandbox" in listing
 
     async def test_target_dir_tracked_without_cargo_toml(self):
         """Not every `target/` is cargo's: without Cargo.toml it stays a
@@ -232,97 +232,106 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "target").mkdir()
         (repo / "target" / "notes.txt").write_text("user data\n")
 
-        info, _ = await setup_tracking(repo, "sess-plain")
-        assert info is not None
-        assert "target" not in info.ignored_paths
+        state = await open_state(repo)
 
         (repo / "target" / "notes.txt").write_text("edited\n")
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert [f.path for f in stat.files] == ["target/notes.txt"]
 
-    async def test_cargo_build_dirs_follow_the_workspace_subtree(self):
-        """--workspace on a crate inside a bigger repo: only that crate's
-        build trees are excluded, and at their repo-root-relative paths."""
+    async def test_xarness_ignore_is_resolved_per_snapshot(self):
+        """`.xarness/ignore` (gitignore syntax) takes effect on the next
+        snapshot — writing it mid-session is enough."""
         repo = self.make_repo()
-        (repo / "f").mkdir()
-        (repo / "f" / "Cargo.toml").write_text("[package]\nname = 'f'\n")
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "crate")
+        (repo / "out").mkdir()
+        (repo / "out" / "artifact.txt").write_text("v1\n")
+        (repo / "scratch").mkdir()
+        (repo / "scratch" / "note.txt").write_text("v1\n")
 
-        info, _ = await setup_tracking(repo / "f", "sess-sub")
-        assert info is not None
-        assert "f/target" in info.ignored_paths
-        assert "f/target-sandbox" in info.ignored_paths
-        assert "target" not in info.ignored_paths
+        state = await open_state(repo)
+        before = await state.refresh()
+        names = _git(repo, "ls-tree", "-r", "--name-only", before).splitlines()
+        assert "out/artifact.txt" in names
 
-        (repo / "f" / "target" / "debug").mkdir(parents=True)
-        (repo / "f" / "target" / "debug" / "build.o").write_bytes(b"\x7fELF")
-        (repo / "f" / "src").mkdir()
-        (repo / "f" / "src" / "lib.rs").write_text("pub fn f() {}\n")
+        # Now the user tells the harness to ignore both directories.
+        (repo / ".xarness").mkdir()
+        (repo / ".xarness" / "ignore").write_text("out/\nscratch/\n")
+        (repo / "out" / "artifact.txt").write_text("v2\n")
+        (repo / "scratch" / "note.txt").write_text("v2\n")
+        (repo / "app.py").write_text("edited\n")
 
-        stat = await diff_stat(info)
-        # Diff paths stay relative to the workspace, and the crate's build
-        # tree (repo-root-relative `f/target`) never shows up.
-        assert [f.path for f in stat.files] == ["src/lib.rs"]
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["app.py"]
 
-    async def test_setup_tracking_snapshots_uncommitted_state(self):
+    async def test_ignore_paths_are_not_globs(self):
+        """A resolved ignore path is excluded literally: a name like
+        `x[1].dat` must not become a character class that takes `x1.dat`
+        with it."""
+        repo = self.make_repo()
+        (repo / ".xarness").mkdir()
+        # gitignore syntax, so the brackets are escaped there too.
+        (repo / ".xarness" / "ignore").write_text("x\\[1\\].dat\n")
+        (repo / "x[1].dat").write_text("v1\n")
+        (repo / "x1.dat").write_text("v1\n")
+
+        state = await open_state(repo)
+        (repo / "x[1].dat").write_text("v2\n")
+        (repo / "x1.dat").write_text("v2\n")
+
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["x1.dat"]
+
+    async def test_harness_build_output_is_excluded(self):
+        """node_modules/dist/build etc. never enter a snapshot: their blobs
+        would bloat the object store and make /diff unusable."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+
+        for name in ("node_modules", "dist", "build"):
+            (repo / name).mkdir()
+            (repo / name / "out.js").write_text("x\n")
+        (repo / "app.py").write_text("edited\n")
+
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["app.py"]
+        listing = await gitwork.ignored_listing(repo)
+        assert set(listing) >= {"node_modules", "dist", "build"}
+
+    async def test_open_snapshots_uncommitted_state(self):
         """The baseline tree captures uncommitted + untracked files, so /diff
         starts empty even in a dirty repo."""
         repo = self.make_repo()
         (repo / "app.py").write_text("line1\nedited\n")  # uncommitted
         (repo / "draft.txt").write_text("untracked\n")
 
-        info, _ = await setup_tracking(repo, "sess1")
+        state = await open_state(repo)
+        assert (await diff(state)).files == []
 
-        assert info is not None
-        stat = await diff_stat(info)
-        assert stat.files == []
-
-    async def test_setup_tracking_respects_allow_init_false(self):
+    async def test_open_respects_allow_init_false(self):
         workspace = self.base / "plain"
         workspace.mkdir()
-        info, _ = await setup_tracking(workspace, "sess1", allow_init=False)
-        assert info is None
+        assert await open_workspace(workspace, allow_init=False) is None
         assert not (workspace / ".git").exists()
 
-    async def test_setup_tracking_scopes_to_workspace_subdir(self):
-        """--workspace pointing at a subdirectory of a bigger repo: the
-        session is scoped to that subtree — snapshots, diffs, and reverts
-        only ever touch it."""
+    async def test_diffs_cover_the_whole_repo(self):
+        """--workspace on a subdirectory only sets the sandbox's working
+        directory: tracking covers the repo root, with repo-root-relative
+        paths."""
         repo = self.make_repo()
         (repo / "f").mkdir()
         (repo / "f" / "notes.txt").write_text("tracked\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "f")
-        (repo / "stray.txt").write_text("untracked\n")  # outside f
 
-        info, notes = await setup_tracking(repo / "f", "sess1")
+        state = await open_state(repo / "f")
+        assert state.root == repo.resolve()
 
-        assert info is not None
-        assert info.subtree == "f"
-        assert info.agent_workspace == repo / "f"
-        assert any("scoped to f/" in n for n in notes)
-
-        # Edits outside the subtree don't show in the diff; edits inside do,
-        # with subtree-relative paths. A file created inside the subtree
-        # after setup shows up as new.
-        (repo / "f" / "draft.txt").write_text("untracked\n")
         (repo / "f" / "notes.txt").write_text("tracked\nagent edit\n")
-        (repo / "app.py").write_text("outside the subtree\n")
-        stat = await diff_stat(info)
+        (repo / "stray.txt").write_text("untracked\n")
+        stat = await diff(state)
         by_path = {f.path: f for f in stat.files}
-        assert set(by_path) == {"notes.txt", "draft.txt"}
-        assert by_path["notes.txt"].additions == 1
-        assert by_path["draft.txt"].is_new
-
-        # Revert restores the subtree (and only it).
-        sha = await snapshot_state(info)
-        (repo / "f" / "extra.txt").write_text("created\n")
-        (repo / "f" / "notes.txt").unlink()
-        await revert_to_tree(info, sha)
-        assert (repo / "f" / "notes.txt").read_text() == "tracked\nagent edit\n"
-        assert not (repo / "f" / "extra.txt").exists()
-        assert (repo / "app.py").read_text() == "outside the subtree\n"
+        assert set(by_path) == {"f/notes.txt", "stray.txt"}
+        assert by_path["f/notes.txt"].additions == 1
+        assert by_path["stray.txt"].is_new
 
     # ------------------------------------------------------------------
     # snapshots never touch the user's index / HEAD
@@ -360,17 +369,16 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         """Edits, deletions, and creations since the checkpoint are all
         undone by revert_to_tree."""
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
 
-        sha = await snapshot_state(info)
+        sha = await state.refresh()
 
         # Agent turn: modify, delete, create.
         (repo / "app.py").write_text("line1\nagent edit\n")
         (repo / "pkg" / "mod.py").unlink()
         (repo / "new_file.py").write_text("created\n")
 
-        await revert_to_tree(info, sha)
+        await revert_to_tree(state, sha)
 
         assert (repo / "app.py").read_text() == "line1\nline2\n"
         assert (repo / "pkg" / "mod.py").read_text() == "a = 1\n"
@@ -383,12 +391,11 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         tree holds their content, not just tracked files'."""
         repo = self.make_repo()
         (repo / "draft.txt").write_text("untracked\n")
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        sha = await snapshot_state(info)
+        state = await open_state(repo)
+        sha = await state.refresh()
 
         (repo / "draft.txt").unlink()
-        await revert_to_tree(info, sha)
+        await revert_to_tree(state, sha)
 
         assert (repo / "draft.txt").read_text() == "untracked\n"
         # Still untracked — the user's index was never involved.
@@ -399,32 +406,29 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / ".gitignore").write_text("ignored*\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "gitignore")
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        sha = await snapshot_state(info)
+        state = await open_state(repo)
+        sha = await state.refresh()
 
         (repo / "ignored.dir").mkdir()
         (repo / "ignored.dir" / "artifact.bin").write_text("x\n")
-        await revert_to_tree(info, sha)
+        await revert_to_tree(state, sha)
 
         assert (repo / "ignored.dir" / "artifact.bin").exists()
 
     async def test_revert_to_missing_tree_fails_loudly(self):
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         with self.assertRaises(gitwork.GitWorktreeError):
-            await revert_to_tree(info, "0" * 40)
+            await revert_to_tree(state, "0" * 40)
 
     async def test_revert_deletes_created_non_ascii_paths(self):
         """Without -z, git quotes non-ASCII paths and the file created since
         the checkpoint silently survived /undo."""
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        sha = await snapshot_state(info)
+        state = await open_state(repo)
+        sha = await state.refresh()
         (repo / "café.txt").write_text("new\n")
-        await revert_to_tree(info, sha)
+        await revert_to_tree(state, sha)
         assert not (repo / "café.txt").exists()
 
     async def test_rename_is_reported_at_its_new_path(self):
@@ -434,22 +438,20 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "a" / "old" / "f.txt").write_text("x\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "add")
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "a" / "new").mkdir()
         (repo / "a" / "old" / "f.txt").rename(repo / "a" / "new" / "f.txt")
         (repo / "a" / "old").rmdir()
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert {f.path for f in stat.files} == {"a/new/f.txt"}
 
     async def test_grown_files_drop_out_of_the_snapshot(self):
         """The 1 MB rule holds mid-session, not just at setup."""
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "big.bin").write_text("x" * (gitwork._MAX_TRACKED_SIZE + 1))
-        sha = await snapshot_state(info)
+        sha = await state.refresh()
         names = _git(repo, "ls-tree", "-r", "--name-only", sha).splitlines()
         assert "big.bin" not in names
         assert "app.py" in names
@@ -458,261 +460,23 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         """A persistent index keeps git's stat cache; a fresh one per
         snapshot would re-hash the whole worktree twice per turn."""
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        await snapshot_state(info)
-        assert info.index_path.is_file()
-        assert repo not in info.index_path.parents  # never inside the repo
-
-    # ------------------------------------------------------------------
-    # revert_turns: reverse a turn's diff, preserving later edits
-
-    async def test_revert_turn_reverses_only_the_turns_diff(self):
-        """A turn's edits are reversed; an unrelated file changed after the
-        turn (outside the session) survives."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before = await snapshot_state(info)
-        (repo / "app.py").write_text("agent edit\n")  # the turn's edit
-        after = await snapshot_state(info)
-        (repo / "unrelated.txt").write_text("manual edit\n")  # after the turn
-
-        conflict = await revert_turns(info, [_turn(before, after)])
-
-        assert conflict is None
-        assert (repo / "app.py").read_text() == "line1\nline2\n"
-        assert (repo / "unrelated.txt").read_text() == "manual edit\n"
-
-    async def test_revert_turn_conflict_leaves_workspace_untouched(self):
-        """A manual edit on the same lines the turn changed conflicts; the
-        revert reports it and changes nothing."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before = await snapshot_state(info)
-        (repo / "app.py").write_text("agent change\n")  # the turn's edit
-        after = await snapshot_state(info)
-        (repo / "app.py").write_text("manual change\n")  # overlapping manual edit
-
-        conflict = await revert_turns(info, [_turn(before, after)])
-
-        assert conflict is not None
-        # A readable summary, not raw merge-tree output (tree oids, stage
-        # lines, git's internal CONFLICT notices).
-        assert "app.py" in conflict
-        assert "CONFLICT" not in conflict
-        assert (repo / "app.py").read_text() == "manual change\n"  # untouched
-
-    async def test_revert_turn_is_a_noop_when_the_turn_made_no_edits(self):
-        """before_tree == after_tree (a plan-mode or no-edit turn): nothing to
-        reverse, and drift made since is left alone."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        tree = await snapshot_state(info)
-        (repo / "manual.txt").write_text("manual\n")
-
-        result = await revert_turns(info, [_turn(tree, tree)])
-
-        assert result is None
-        assert (repo / "manual.txt").read_text() == "manual\n"
-
-    async def test_revert_turn_noop_skips_the_merge(self):
-        """A no-edit turn (before == after) needs no commit wrapping and no
-        merge-tree: only the one snapshot to find the live state."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        tree = await snapshot_state(info)
-
-        with mock.patch.object(gitwork, "_wrap_commit", new=mock.AsyncMock()) as wrap:
-            result = await revert_turns(info, [_turn(tree, tree)])
-
-        assert result is None
-        wrap.assert_not_called()
-
-    async def test_tree_diff_stat_cache_returns_fresh_rows(self):
-        """Repeated diffs of the same immutable tree pair are cached, but each
-        call hands back fresh rows so a caller can't corrupt the cache."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        before = await snapshot_state(info)
-        (repo / "app.py").write_text("agent\n")
-        after = await snapshot_state(info)
-
-        first = await tree_diff_stat(info, before, after)
-        first.files[0].additions = 999  # mutate the returned row
-        second = await tree_diff_stat(info, before, after)
-
-        assert second.files[0].additions == 1
-
-    async def test_revert_turns_applies_newest_first(self):
-        """A range reverts each turn's own diff; the net effect is the state
-        before the oldest turn, with no later turn's edit left behind."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before1 = await snapshot_state(info)
-        (repo / "one.txt").write_text("one\n")
-        after1 = await snapshot_state(info)
-        before2 = await snapshot_state(info)
-        (repo / "two.txt").write_text("two\n")
-        after2 = await snapshot_state(info)
-
-        conflict = await gitwork.revert_turns(info, [
-            _turn(before1, after1), _turn(before2, after2),
-        ])
-
-        assert conflict is None
-        assert not (repo / "one.txt").exists()
-        assert not (repo / "two.txt").exists()
-
-    async def test_revert_turns_conflict_leaves_every_file_untouched(self):
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        before1 = await snapshot_state(info)
-        (repo / "one.txt").write_text("one\n")
-        after1 = await snapshot_state(info)
-        before2 = await snapshot_state(info)
-        (repo / "two.txt").write_text("two\n")
-        after2 = await snapshot_state(info)
-        (repo / "one.txt").write_text("manual\n")  # makes the older revert conflict
-
-        conflict = await gitwork.revert_turns(info, [
-            _turn(before1, after1), _turn(before2, after2),
-        ])
-
-        assert conflict is not None
-        assert (repo / "two.txt").read_text() == "two\n"
-        assert (repo / "one.txt").read_text() == "manual\n"
-
-    # ------------------------------------------------------------------
-    # attributed diff
-
-    async def test_attributed_diff_tags_agent_and_drift(self):
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before = await snapshot_state(info)
-        (repo / "agent.txt").write_text("agent\n")  # turn edit
-        after = await snapshot_state(info)
-        (repo / "manual.txt").write_text("manual\n")  # drift after the turn
-
-        stat = await attributed_diff_stat(info, [_turn(before, after)])
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["agent.txt"].source == "agent"
-        assert by_path["manual.txt"].source == "drift"
-        assert by_path["manual.txt"].is_new
-
-    async def test_attributed_diff_tags_open_turn_as_agent(self):
-        """Mid-turn (after_tree not yet recorded), the in-flight turn's edits
-        are tagged agent — not drift, and not flipping at end of streaming."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before = await snapshot_state(info)
-        (repo / "agent.txt").write_text("in flight\n")
-
-        # No completed turns; the open turn is folded in via open_before.
-        stat = await attributed_diff_stat(info, [], open_before=before)
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["agent.txt"].source == "agent"
-        # Coarse by design: mid-turn, anything changed since the turn's
-        # before tree counts as the turn's (same as end-of-turn tagging,
-        # where the before→after diff folds manual mid-turn edits in too).
-        (repo / "manual.txt").write_text("manual\n")
-        stat = await attributed_diff_stat(info, [], open_before=before)
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["manual.txt"].source == "agent"
-
-        # Once the turn finishes, normal attribution resumes.
-        after = await snapshot_state(info)
-        stat = await attributed_diff_stat(info, [_turn(before, after)])
-        (repo / "stray.txt").write_text("outside\n")
-        stat = await attributed_diff_stat(info, [_turn(before, after)])
-        assert {f.path: f for f in stat.files}["stray.txt"].source == "drift"
-
-    async def test_attributed_diff_keeps_drift_after_a_later_turn(self):
-        """Drift is anchored to baseline_tree, not the last turn: a file made
-        outside the session still shows (tagged drift) after a later agent
-        turn, even though both sides of that turn's diff contain it."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        # Drift created outside the session, never accepted.
-        (repo / "drift.txt").write_text("outside\n")
-        # A later agent turn: its before_tree already contains the drift, and
-        # it edits a different file.
-        before = await snapshot_state(info)
-        (repo / "agent.txt").write_text("agent\n")
-        after = await snapshot_state(info)
-
-        stat = await attributed_diff_stat(info, [_turn(before, after)])
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["drift.txt"].source == "drift"
-        assert by_path["agent.txt"].source == "agent"
-
-    async def test_attributed_diff_tags_drift_between_turns(self):
-        """Drift injected between two turns (not just before the first or
-        after the last) is still tagged drift, not absorbed."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before1 = await snapshot_state(info)
-        (repo / "one.txt").write_text("one\n")
-        after1 = await snapshot_state(info)
-        (repo / "mid.txt").write_text("mid\n")  # drift between the turns
-        before2 = await snapshot_state(info)
-        (repo / "two.txt").write_text("two\n")
-        after2 = await snapshot_state(info)
-
-        stat = await attributed_diff_stat(info, [
-            _turn(before1, after1), _turn(before2, after2),
-        ])
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["mid.txt"].source == "drift"
-        assert by_path["one.txt"].source == "agent"
-        assert by_path["two.txt"].source == "agent"
-
-    async def test_attributed_diff_turn_touched_wins_within_a_file(self):
-        """Attribution is per-file: a file a turn touched stays tagged agent
-        even if it was also edited outside the session afterwards."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-
-        before = await snapshot_state(info)
-        (repo / "app.py").write_text("agent\n")
-        after = await snapshot_state(info)
-        (repo / "app.py").write_text("agent\nmanual\n")
-
-        stat = await attributed_diff_stat(info, [_turn(before, after)])
-        by_path = {f.path: f for f in stat.files}
-        assert by_path["app.py"].source == "agent"
+        state = await open_state(repo)
+        await state.refresh()
+        assert state.index_path.is_file()
+        assert repo not in state.index_path.parents  # never inside the repo
 
     # ------------------------------------------------------------------
     # diff
 
     async def test_diff_stat_tracks_edits_and_new_files(self):
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
 
         (repo / "app.py").write_text("line1\nline2\nline3\n")
         (repo / "added.txt").write_text("new\n")
         (repo / "pkg" / "mod.py").unlink()
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         by_path = {f.path: f for f in stat.files}
         assert set(by_path) == {"app.py", "added.txt", "pkg/mod.py"}
         assert by_path["app.py"].additions == 1
@@ -722,24 +486,22 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_and_file_diff(self):
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "app.py").write_text("line1\nagent\n")
 
-        full = await git_diff(info)
+        full = await git_diff(state)
         assert "app.py" in full and "agent" in full
-        one = await git_diff(info, "app.py")
+        one = await git_diff(state, "app.py")
         assert "app.py" in one
-        other = await git_diff(info, "pkg/mod.py")
+        other = await git_diff(state, "pkg/mod.py")
         assert other.strip() == ""
 
     async def test_diff_detects_renames(self):
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "app.py").rename(repo / "renamed.py")
 
-        stat = await diff_stat(info)
+        stat = await diff(state)
         assert {f.path for f in stat.files} == {"renamed.py"}
 
     # ------------------------------------------------------------------
@@ -747,51 +509,30 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_accept_changes_rebaselines(self):
         repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
+        state = await open_state(repo)
         (repo / "app.py").write_text("feature\n")
-        assert (await diff_stat(info)).files
+        state.record(
+            session="A", tool="edit_file", turn="t1",
+            paths=("app.py",), auto=(),
+        )
+        assert (await diff(state)).files
 
-        sha = await accept_changes(info)
+        sha = await state.accept()
 
-        assert info.baseline_tree == sha
-        assert (await diff_stat(info)).files == []  # /diff resets
+        assert state.baseline_tree == sha
+        assert (await diff(state)).files == []  # /diff resets
 
         # Later work measures against the new baseline only.
         (repo / "app.py").write_text("feature\nmore\n")
         (repo / "second.py").write_text("two\n")
-        stat = await diff_stat(info)
+        state.record(
+            session="A", tool="edit_file", turn="t2",
+            paths=("app.py", "second.py"), auto=(),
+        )
+        stat = await diff(state)
         by_path = {f.path: f for f in stat.files}
         assert set(by_path) == {"app.py", "second.py"}
         assert stat.additions == 2
-
-    # ------------------------------------------------------------------
-    # session-block round trip
-
-    async def test_git_info_block_round_trip(self):
-        """The persisted block (a JSON model dump) restores field for field."""
-        repo = self.make_repo()
-        info, _ = await setup_tracking(repo, "sess1")
-        assert info is not None
-        block = info.model_dump(mode="json")
-        assert all(
-            isinstance(v, (str, int, list, type(None))) for v in block.values()
-        )
-        assert GitInfo.model_validate(block) == info
-
-    async def test_git_info_rejects_legacy_worktree_block(self):
-        """GitInfo is a plain pydantic model now; the legacy worktree block
-        (removed fields, no repo_root) must not validate."""
-        import pydantic
-        with self.assertRaises(pydantic.ValidationError):
-            GitInfo.model_validate({
-                "session_id": "old",
-                "base_ref": "abc",
-                "branch": "agent/old",
-                "worktree": "/tmp/wt",
-                "original_workspace": "/tmp/ws",
-                "git_common_dir": "/tmp/ws/.git",
-            })
 
     # ------------------------------------------------------------------
     # the generated git shim (the read-only policy at execution time)
@@ -925,28 +666,27 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert "found no real git binary" in result.stderr
 
     # ------------------------------------------------------------------
-    # pinned ignore exclusions (snapshots ignore .gitignore edits)
+    # ignore rules are resolved per snapshot, never pinned
 
-    async def test_snapshots_exclude_pinned_ignored_paths(self):
+    async def test_mid_session_gitignore_change_takes_effect(self):
+        """A `.gitignore` written mid-session applies to the next snapshot;
+        paths already in the baseline stay tracked."""
         repo = self.make_repo()
-        (repo / ".gitignore").write_text("junk.log\n")
-        (repo / "keep.txt").write_text("k\n")
-        (repo / "junk.log").write_text("noise\n")
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "init")
-        info, _ = await setup_tracking(repo, "sess")
-        assert "junk.log" in info.ignored_paths
+        (repo / "kept.txt").write_text("k\n")
+        state = await open_state(repo)
 
-        # The agent edits an ignored file and strips the ignore rule —
-        # neither may show up in snapshots/diffs.
-        (repo / "junk.log").write_text("agent noise\n")
-        (repo / ".gitignore").write_text("")
+        (repo / ".gitignore").write_text("junk.log\n")
+        (repo / "junk.log").write_text("noise\n")
         (repo / "new.txt").write_text("n\n")
-        stat = await diff_stat(info)
-        paths = {f.path for f in stat.files}
-        # junk.log's contents stay untracked; the .gitignore edit itself is
-        # a normal tracked change.
-        assert paths == {"new.txt", ".gitignore"}
+        assert {f.path for f in (await diff(state)).files} == {
+            ".gitignore", "new.txt",
+        }
+
+        # A path that is already in the baseline stays there: the rule does
+        # not retroactively untrack it.
+        (repo / ".gitignore").write_text("junk.log\nkept.txt\n")
+        (repo / "kept.txt").write_text("k2\n")
+        assert "kept.txt" in {f.path for f in (await diff(state)).files}
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -48,7 +48,6 @@ from ..protocol import (
     CreateSessionRequest,
     DiffChanged,
     DiscardQueued,
-    DriftResolved,
     Event,
     Filter,
     FlushQueued,
@@ -59,7 +58,6 @@ from ..protocol import (
     QuitVerdict,
     ReasoningDelta,
     Reject,
-    ResolveDrift,
     Rollback,
     RoundComplete,
     SendMessage,
@@ -168,9 +166,9 @@ _command("diff", "show pending changes (optionally: /diff <path>)",
          lambda s, a: s._show_diff_command(a), takes_arg=True)
 _command("accept",
          "lock in the changes made so far (they stop showing in /diff and can no longer be undone)",
-         lambda s, a: s._post_command(Accept()))
+         lambda s, a: s._accept_with_confirm())
 _command("reject", "discard all changes made since the last /accept",
-         lambda s, a: s._post_command(Reject()))
+         lambda s, a: s._reject_with_confirm())
 _command("undo", "drop the last turn and revert its file edits",
          lambda s, a: s.call_later(s._run_undo))
 _command("retry", "revert the last turn's file edits and resend your message",
@@ -399,7 +397,6 @@ class AgentApp(App[None]):
         self._ask_future: asyncio.Future[str | None] | None = None
         self._ask_id: str | None = None
         self._ask_worker: Worker | None = None
-        self._drift_modal_open = False
         # Double-Esc interrupt: the first Esc arms it (and shows a prompt),
         # the second one within INTERRUPT_ARM_SECONDS actually cancels.
         self._interrupt_armed = False
@@ -410,6 +407,8 @@ class AgentApp(App[None]):
         self._command_queue: asyncio.Queue[Command] = asyncio.Queue()
         self._command_worker: Worker | None = None
         self._config_cache = None
+        # Last rendered diff: anchors the accept/reject confirmations.
+        self._last_diff = None
         # Live phase — the single owner of the ephemeral pending strip.
         # pending = a round is waiting on the provider (turn start and every
         # post-tools round); the transitions below are the strip's only
@@ -535,7 +534,6 @@ class AgentApp(App[None]):
                         self._refresh_bars()
                         await self.refresh_diff_summary()
                         self._sync_ask()
-                        self._maybe_prompt_drift()
                     else:
                         await self._handle_event(item)
                 return
@@ -560,9 +558,6 @@ class AgentApp(App[None]):
             self._refresh_bars()
             self._sync_refs_screen()
             self._sync_ask()
-            # Spawned, not awaited: it is a worker (push_screen_wait needs
-            # one) and must not block the event pump on its modal.
-            self._maybe_prompt_drift()
             return
         if isinstance(event, Notice):
             if event.level == "error":
@@ -579,7 +574,7 @@ class AgentApp(App[None]):
             await self._on_history_replaced(event)
             return
         if isinstance(event, CheckpointsChanged):
-            # Checkpoints were rebaselined (accept/reject/drift) but no
+            # Checkpoints were rebaselined (accept/reject) but no
             # message changed: only the diff/pending view moves.
             self.call_later(self.refresh_diff_summary)
             return
@@ -588,14 +583,6 @@ class AgentApp(App[None]):
             return
         if isinstance(event, DiffChanged):
             await self._show_diff_summary(event.summary)
-            return
-        if isinstance(event, DriftResolved):
-            self._drift_modal_open = False
-            # The prompt is resolved: drop the pending flag locally too, or
-            # the next StatusChanged would reopen the modal for a drift that
-            # no longer exists.
-            if self._status is not None:
-                self._status.pending_drift = None
             return
         if isinstance(event, TurnEnded):
             # The turn is fully unwound: the reducer settles anything still
@@ -659,7 +646,8 @@ class AgentApp(App[None]):
             "reverted": "file edits reverted",
             "no_edits": "no file edits to revert",
             "no_tracking": (
-                "no git tracking for this session — file edits could not be reverted"
+                "no change tracking for this workspace — file edits could not "
+                "be reverted"
             ),
         }[event.note]
         if event.resend:
@@ -886,9 +874,11 @@ class AgentApp(App[None]):
             widget = self.query_one("#diff-summary", DiffSummary)
         except NoMatches:
             return  # app shutting down; DOM already pruned
-        if info is None or not info.files:
+        if info is None or (not info.files and not info.groups):
+            self._last_diff = None
             await widget.clear()
         else:
+            self._last_diff = info
             await widget.set_summary(info)
 
     # ------------------------------------------------------------------
@@ -1052,60 +1042,41 @@ class AgentApp(App[None]):
         self._ask_worker = self._ask_flow(pending.ask_id, pending.questions)
 
     # ------------------------------------------------------------------
-    # Drift prompt (session state; any client may resolve)
-
-    @work(group="drift-prompt", exclusive=True)
-    async def _maybe_prompt_drift(self) -> None:
-        """The workspace changed outside this session while it was closed.
-
-        Show what drifted and let the user choose: accept it as the new
-        baseline, or keep tracking against the last known state. Never pick
-        for them. The prompt is session state — if another client resolves
-        it first, DriftResolved closes this modal's follow-up.
-
-        A worker, not an await inside the event pump: push_screen_wait
-        requires one, and blocking the pump on a modal would stall the
-        event stream while the prompt is open."""
-        if (
-            self._status is None or self._status.pending_drift is None
-            or self._drift_modal_open
-        ):
-            return
-        self._drift_modal_open = True
-        detail = self._drift_detail(self._status.pending_drift)
-        choice = await self.push_screen_wait(ConfirmScreen(
-            "Workspace changed outside this session since it was last open:",
-            detail=detail,
-            confirm_label="Accept as baseline",
-            cancel_label="Keep tracking",
-        ))
-        self._drift_modal_open = False
-        if self._status is None or self._status.pending_drift is None:
-            return  # resolved elsewhere while the modal was open
-        if choice is None:
-            return  # dismissed: leave the prompt pending
-        await self._send_command(ResolveDrift(accept=bool(choice)))
-
-    @staticmethod
-    def _drift_detail(pending) -> str:
-        """Render the structured drift state for the confirmation modal."""
-        files = pending.files or []
-        if files:
-            shown = ", ".join(files[:8])
-            if len(files) > 8:
-                shown += f" (+{len(files) - 8} more)"
-        else:
-            shown = "(paths unavailable)"
-        return (
-            "the workspace changed while this session was closed "
-            f"(last known tree {pending.last_known[:7]}, now "
-            f"{pending.current[:7]})\n\n{shown}\n\n"
-            "accept to make the workspace the new baseline, or keep "
-            "tracking against the last known state"
-        )
-
-    # ------------------------------------------------------------------
     # Slash commands
+
+    @work(group="confirm", exclusive=True)
+    async def _accept_with_confirm(self) -> None:
+        """Accept, first asking when the pending rows were not all this
+        agent's work (bash rows cannot be attributed to a named agent).
+
+        A worker: push_screen_wait requires one."""
+        info = self._last_diff
+        foreign = [f for f in (info.files if info else []) if f.kind != "mine"]
+        if foreign:
+            choice = await self.push_screen_wait(ConfirmScreen(
+                f"{len(foreign)} of {len(info.files)} pending files weren't "
+                "made by this agent. Accept them too?",
+                confirm_label="Accept all",
+            ))
+            if not choice:
+                return
+        self._post_command(Accept())
+
+    @work(group="confirm", exclusive=True)
+    async def _reject_with_confirm(self) -> None:
+        """Reject, first warning when drift (the user's own edits) would be
+        reverted too."""
+        info = self._last_diff
+        drift = [f for f in (info.files if info else []) if f.kind == "drift"]
+        if drift:
+            choice = await self.push_screen_wait(ConfirmScreen(
+                f"This will also revert {len(drift)} drift file(s) you "
+                "changed yourself.",
+                confirm_label="Reject all",
+            ))
+            if not choice:
+                return
+        self._post_command(Reject())
 
     def _handle_slash_command(self, text: str) -> bool:
         """Run a registered slash command. Returns False (handling nothing)
@@ -1221,7 +1192,9 @@ class AgentApp(App[None]):
     async def _open_sessions_async(self) -> None:
         entries = []
         with self._reporting("/sessions failed: "):
-            entries = await self.client.sessions()
+            # stats: the picker's +/- columns are the live pending-diff totals
+            # of the hosted sessions; without it every row reads as clean.
+            entries = await self.client.sessions(stats=True)
         if not entries:
             return
         workspace = str(self.workspace) if self.workspace else None
@@ -1247,7 +1220,7 @@ class AgentApp(App[None]):
             if screen not in self.screen_stack:
                 return
             try:
-                entries = await self.client.sessions()
+                entries = await self.client.sessions(stats=True)
             except (ClientError, httpx.HTTPError):
                 continue
             if entries and screen in self.screen_stack:
@@ -1584,12 +1557,12 @@ class AgentApp(App[None]):
         self._refresh_status()
 
     async def _on_history_replaced(self, event: HistoryReplaced) -> None:
-        """The conversation was rewritten (undo, retry, accept, compaction,
-        drift accept): re-render from the new snapshot. A data-only rebuild
+        """The conversation was rewritten (undo, retry, accept, compaction):
+        re-render from the new snapshot. A data-only rebuild
         is cheap under FlowView, so there is no incremental trim path."""
-        # The snapshot also carries the fresh status (a drift resolve clears
-        # pending_drift there); adopt it so local prompts/bars don't keep
-        # showing state the host already moved past.
+        # The snapshot also carries the fresh status (e.g. a cleared
+        # pending_ask); adopt it so local prompts/bars don't keep showing
+        # state the host already moved past.
         self._status = event.snapshot.status
         self._refresh_bars()
         await self._render_history(event.snapshot)
