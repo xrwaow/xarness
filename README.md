@@ -19,6 +19,11 @@ When a filesystem sandbox is available, the model gets:
 | `ask_user` | plan + write | Ask you a clarifying question in the TUI |
 | `subagent` | plan + write | Run a fresh agent on one self-contained task in the same workspace and return its final answer (see below) |
 
+Each tool's description names only the environment it runs in — the
+container for a sandboxed session, your machine for `--sandbox false` — and
+is fixed when the session's tool set is built, so the schema stays stable
+for the provider's prompt cache.
+
 `subagent` starts a child session with no memory of the current
 conversation, no `ask_user` and no `subagent` tool of its own, and returns
 the child's last non-empty assistant message. It shares the workspace and
@@ -190,13 +195,17 @@ pending edits. The conversation and the files themselves are unaffected.
 clone/fetch/push.
 
 **What is recorded.** Every successful `write_file`/`edit_file` records the
-path it wrote. Every successful `run_bash` snapshots the workspace before
+path it wrote **and the provenance of that write**: the blob shas of the
+file just before the call and just after it (either one absent when the path
+did not exist). Every successful `run_bash` snapshots the workspace before
 the command and again after it, and records the paths that differ plus the
 ignored directories the command created (the two snapshots are the only
 part serialized: two agents' commands can run at once). Nothing else is
-recorded, and a command that changes nothing records nothing. The pending
-diff is the real worktree measured against the baseline, labelled by who it
-came from — for the agent looking at it:
+recorded, and a command that changes nothing records nothing.
+
+The pending diff is the real worktree measured against the baseline. Its
+rows are labelled by who the change came from — for the agent looking at
+it:
 
 | Label | Meaning |
 | --- | --- |
@@ -207,6 +216,21 @@ came from — for the agent looking at it:
 
 `mine` and `agent` rows both display the badge `agent`; the session's own
 work is accent-colored and another agent's is dimmed.
+
+**One file, several agents.** A path written explicitly reports *one
+author's delta*, not the whole file's pending change: the row's `+A -D`, the
+summary totals and the per-file diff all count the change between the blob
+that author found and the blob it left, so two sessions on one file are
+never credited with each other's hunks. The row that is not the viewer's
+shows the last author's delta, and a file more than one session wrote
+carries a count badge (the number of authors) so its totals read as shared.
+A path with only `run_bash` or drift changes has no author and keeps the
+whole pending delta.
+
+The blob shas live in the same object store as the snapshots, so authorship
+survives a restart; if a store is pruned under it the rows fall back to
+whole-file counts instead of failing. `/accept` clears the event log along
+with the pending set, so authorship starts over from the new baseline.
 
 Explicit writes win over bash: if this agent edited a file and another
 agent's `run_bash` then touched it, it stays `mine` here. Another session's
@@ -229,10 +253,10 @@ only when there are groups), never per file. A file *modified* inside an
 already-ignored directory is not reported — that is intentional.
 
 **Which paths are ignored** is resolved again on every snapshot, in three
-layers: xarness's own defaults (build output and caches: `target/` and the
-sandbox's `target-sandbox/` in a project with a `Cargo.toml`, `node_modules/`,
-`dist/`, `build/`, `__pycache__/`, `.venv/`, `.next/`, plus media/binary
-file types and `.xarness/`), then your repo's own ignore rules
+layers: xarness's own defaults (build output and caches: `target/`, the
+sandbox's `target-sandbox/` and `Cargo.lock` in a project with a `Cargo.toml`,
+`node_modules/`, `dist/`, `build/`, `__pycache__/`, `.venv/`, `.next/`, plus
+media/binary file types and `.xarness/`), then your repo's own ignore rules
 (`.gitignore` including nested ones, `.git/info/exclude`, global excludes),
 then the workspace's `.xarness/ignore` (gitignore syntax, ignore-only, no
 re-includes). Because they are resolved per snapshot, a mid-session edit to
@@ -242,15 +266,38 @@ disk.
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
-(`name  dir/  agent  +N -M`), and click a row to read that file's unified
-diff. Rows are tagged with the labels above, with your own unrecorded
-changes under a `drift — changes outside this agent` header and ignored
-directories below them as counted group rows.
+(`name  [new]  [2]  agent  +N -M`), and click a row to read that
+file's unified diff. The numbers are the shown author's own delta and the
+count between the name and the badge is how many sessions wrote the file
+(see "One file, several agents" above).
+
+The agent's own files lead, then a full-width rule separates them from the
+three sections below — a dimmed `agent` (another session's work, and the
+ignored groups agents created), `auto` (ignored directories agents created,
+with their file count) and `drift` (changes no recorded call covers). All
+three headers are always there, each reading label, `▸`/`▾` fold arrow, then
+its own `+A -D` totals on the right. Clicking a header unfolds its rows
+(indented below it), where a file row opens that file's unified diff; the
+sections start folded, so the diff view shows only the agent's diffs by
+default. An ignored group is a click target too: it has no baseline copy to
+diff against, so it opens what is under it as added files (one `+++` per
+file, read-only).
+
+The right of the summary line carries one chip reading `agent`; clicking
+it cycles the scope. With every session included the `age` is
+accent-colored and the `nt` dimmed; scoped to this session the whole word
+is accent-colored, and another session's (or a subagent's) files fold into
+the `agent` section between this session's files and `auto`. The selection
+is saved with the session (not in the config file), so reopening it —
+later in this run or after a restart — shows the same scope, with a chip
+clicked in a draft carrying over to the session it starts. The chip stays
+a view filter: `/diff <path>`, `/accept`, `/reject` and the panel label's
+file count still see everything pending.
 
 | Command | Action |
 | --- | --- |
 | `/diff` | Show the pending-changes panel; `/diff` again hides it |
-| `/diff <path>` | Show one file's unified diff |
+| `/diff <path>` | Show one file's unified diff (an ignored path or group reads as added) |
 | `/accept` | Re-baseline the workspace at what the agents changed (leaving your own drift pending): `/diff` resets and `/undo` can no longer revert past this point |
 | `/reject` | Restore the workspace to the baseline — including your own drift — and remove ignored directories the agents created |
 | `/undo` | Drop the last turn: reverse its own file edits, put your message back in the input |
@@ -273,7 +320,7 @@ Everything before the last accept is out of `/diff`'s and `/undo`'s reach —
 use git itself (a repo you control) for history beyond that. `/accept`
 never asks: your own drift is never absorbed, so there is nothing to warn
 about, and the command's notice reports how many of the locked-in files
-weren't this agent's work.
+weren't this agent's work and how many more than one agent wrote.
 
 `/reject` restores tracked paths to the baseline, discarding everything
 since the last `/accept` — **including changes you made yourself**, which is
@@ -287,12 +334,18 @@ since no baseline copy exists; the notice lists them.
 ### Undo and retry
 
 Each turn's events name the paths it changed. `/undo` and `/retry` reverse
-exactly those paths: for each removed turn, newest first, a path is restored
+exactly those paths: for each removed turn, newest first, one of two things
+happens per path. If the path still holds what the turn left, it is restored
 from the turn's before-state (or deleted, when it did not exist before). If
-any of those paths changed after the turn ended — by you or by another agent
-— nothing is touched at all and the conflict list is reported instead. It is
-therefore all-or-nothing per undo, and it never touches another agent's
-paths.
+something changed after the turn — you, or another agent — the turn's own
+change is merged out of the live file instead: a three-way merge with the
+turn's after-state as the base, the file on disk as ours and the turn's
+before-state as theirs, so a later edit to a *different* part of the file is
+kept and the turn's hunk is undone. Only overlapping hunks conflict (and a
+path the turn created or deleted, which has no content to merge into). When
+any path conflicts nothing is touched at all and the conflict list is
+reported instead. It is therefore all-or-nothing per undo, and it never
+touches another agent's paths.
 
 A turn's checkpoint is stamped with the workspace epoch, so a turn that
 spans an `/accept` or `/reject` is not revertible any more (the pre-accept

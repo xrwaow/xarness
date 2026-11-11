@@ -1,15 +1,23 @@
 """The pending-changes summary bar and its inline diff pane.
 
-Collapsed by default, same click-to-expand interaction as ThinkingBlock:
-clicking the summary line toggles the per-file list; clicking a file row
-posts a ``DiffRequested`` the App fulfills with a git call, since the
-widget holds no git state itself. Hidden entirely when there are no
-pending changes.
+Collapsed by default: clicking the summary line toggles the per-file list, and
+clicking a row (a file, or an ignored group, which reads as files added from
+nothing) posts a ``DiffRequested`` the App answers with a git call — the
+widget holds no git state itself. Hidden entirely with no pending changes.
 
-Keyboard, once the list has focus (escape minimizes an open diff into
-this state): up/down move the highlighted row, enter opens its diff, and
-a further escape (via the app's priority interrupt binding) collapses
-the list back to the bare summary line.
+Keyboard, once the list has focus (escape minimizes an open diff into this
+state): up/down move the highlighted row, enter opens its diff, a further
+escape (the app's priority interrupt binding) collapses the list.
+
+The list leads with this session's own rows; below a full-width rule sits one
+foldable section per other kind — a dimmed ``agent`` (other sessions, and the
+ignored groups agents created), ``auto`` and ``drift`` — so the default view
+is the agent's diffs alone.
+
+The summary line carries one click-to-cycle scope chip, always reading
+``agent``: with other sessions included the tail dims (``age`` accent, ``nt``
+muted), scoped to this session the whole word is accent-colored. The chip is
+display state only; the App saves the choice on the session.
 """
 
 from __future__ import annotations
@@ -22,30 +30,54 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
+from .. import theme
 from ..protocol import DiffInfo as DiffStat  # same shape as gitwork.DiffStat
+from ..protocol import DiffScope
 from .chat_input import ChatInput
 from .widgets import _render_diff
 
 
 def _display_kind(kind: str) -> str:
-    """The badge text: own work reads ``agent`` too (only its accent
-    differs), so the list never claims a single author."""
+    """The badge text: own work reads ``agent`` too, only its accent differs."""
     return "agent" if kind == "mine" else kind
 
 
-async def _mount_cell(row: Horizontal, text: str, classes: str) -> None:
-    await row.mount(Static(Text(text), classes=classes, markup=False))
+def _section_of(kind: str) -> str:
+    """The section a kind belongs to: own work folds with ``agent``."""
+    return "agent" if kind in ("mine", "agent") else kind
 
 
-def _cell(row: Horizontal, classes: str) -> Static:
-    return row.query_one(f".{classes}", Static)
+# Expandable sections, in display order. Only ``agent`` can also lead the
+# list (see DiffSummary._inline); the other two never do.
+_SECTIONS = ("agent", "auto", "drift")
+# Fold arrows for the section headers.
+TRIANGLE_CLOSED = "▸"
+TRIANGLE_OPEN = "▾"
+
+# One row cell: its classes, then its text. The first class keys the cell, so
+# a refresh updates it in place instead of remounting the whole row.
+Cell = tuple[str, str]
+
+
+def _chip_text(all_sessions: bool) -> Text:
+    """The chip always reads ``agent``: the ``nt`` tail dims while other
+    sessions are included. Palette colors are baked in, so ``recolor``
+    repaints it."""
+    accent = theme.PALETTE.get("accent", "")
+    muted = theme.PALETTE.get("muted", "")
+    text = Text()
+    if all_sessions:
+        text.append("age", style=accent)
+        text.append("nt", style=muted)
+    else:
+        text.append("agent", style=accent)
+    return text
 
 
 class DiffText(VerticalScroll):
-    """Capped, focusable diff pane with its own scrollbar. Up/down page by
-    the pane's full visible height and stop at the pane's top/bottom — they
-    never switch files. Left/right step to the previous/next file's diff.
-    At the first/last file the arrows do nothing."""
+    """Capped, focusable diff pane. Up/down page by the pane's full height and
+    stop at its top/bottom — they never switch files; left/right step to the
+    previous/next row's diff."""
 
     can_focus = True
 
@@ -87,18 +119,65 @@ class DiffSummary(Vertical):
             self.key = key
             super().__init__()
 
+    class ScopeChanged(Message):
+        """The chip was clicked; the app saves the scope on the session."""
+
+        def __init__(self, scope: DiffScope) -> None:
+            self.scope = scope
+            super().__init__()
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._stat: DiffStat | None = None
         self._active_key: str | None = None
         self._active_text = ""
+        # Which sessions lead the list: "all" of them, or "mine" alone (every
+        # other session's row then folds into the agent section).
+        self._scope: DiffScope = "all"
+        # Sections whose rows are unfolded; every section starts folded, so
+        # the default view is the agent's diffs alone.
+        self._expanded: set[str] = set()
+
+    @property
+    def scope(self) -> DiffScope:
+        return self._scope
+
+    async def set_scope(self, scope: DiffScope) -> None:
+        """Apply a saved scope; a no-op when nothing changes, so a busy status
+        stream does not re-render the list."""
+        if scope == self._scope:
+            return
+        self._scope = scope
+        if self.is_mounted:
+            await self._apply_scope()
+
+    async def _apply_scope(self) -> None:
+        """Re-render after the scope changed: other sessions' rows fold into
+        (or out of) the agent section. ``_refresh_rows`` closes an open diff
+        whose row is no longer listed rather than letting it float orphaned."""
+        self._refresh_chip()
+        self._refresh_header()
+        if self.diff_shown and isinstance(self._active_key, str):
+            # Keep an open diff on screen when narrowing the scope moves its
+            # row into a section: unfold that section with it.
+            section = self._section_for(self._active_key)
+            if section is not None:
+                self._expanded.add(section)
+        await self._refresh_rows()
+
+    async def toggle_scope(self) -> None:
+        """The chip's click: flip the scope, re-render, tell the app (which
+        saves it on the session)."""
+        self._scope = "mine" if self._scope == "all" else "all"
+        await self._apply_scope()
+        self.post_message(self.ScopeChanged(self._scope))
 
     def _request_neighbour(self, key: str, delta: int) -> bool:
-        """Post a DiffRequested for the file adjacent to ``key`` in the file
-        list (delta -1/+1); True if a request was posted."""
+        """Post a DiffRequested for the row adjacent to ``key`` (delta
+        -1/+1); True if a request was posted."""
         if self._stat is None:
             return False
-        paths = [f.path for f in self._stat.files]
+        paths = self._visible_paths()
         try:
             index = paths.index(key)
         except ValueError:
@@ -112,6 +191,7 @@ class DiffSummary(Vertical):
     def compose(self):
         with Horizontal(id="diff-summary-row"):
             yield Static("", id="diff-summary-text", markup=False)
+            yield Static("", id="diff-filter", classes="diff-filter", markup=False)
             yield Static("", id="diff-summary-add", markup=False)
             yield Static("", id="diff-summary-del", markup=False)
         with Vertical(id="diff-body"):
@@ -136,8 +216,7 @@ class DiffSummary(Vertical):
             self.add_class("expanded")
 
     def _reset_diff(self) -> None:
-        """Drop the open diff pane: forget the active key/text, clear the
-        Static and hide the scroll container."""
+        """Drop the open diff pane: forget the key/text and hide it."""
         self._active_key = None
         self._active_text = ""
         if self.is_mounted:
@@ -145,9 +224,8 @@ class DiffSummary(Vertical):
             self.query_one("#diff-content", DiffText).remove_class("show")
 
     def minimize_diff(self) -> None:
-        """Hide the open diff pane but keep the file list up with the last
-        viewed file's row still highlighted, and take focus so arrow keys +
-        enter can open another file's diff (escape again collapses)."""
+        """Hide the open diff pane but keep the list up with its row still
+        highlighted, and take focus so arrows + enter can open another."""
         self._reset_diff()
         self.focus()
 
@@ -156,13 +234,21 @@ class DiffSummary(Vertical):
         self.remove_class("expanded")
         self.app.query_one("#chat-input", ChatInput).focus()
 
-    def on_click(self, event: events.Click) -> None:
-        # Rows carry a ``diff_key`` attribute; clicks on anything else toggle
-        # the expanded file list — except clicks inside the open diff pane,
-        # which only minimize the diff (the file list and its highlight stay
-        # up, same as esc), not collapse the whole panel.
+    async def on_click(self, event: events.Click) -> None:
+        # The chip flips the scope, headers fold their rows, rows request
+        # their diff; anything else toggles the list — except inside the open
+        # diff pane, which only minimizes it (as esc does).
         node = event.widget
         while node is not None and node is not self:
+            if node.id == "diff-filter":
+                event.stop()
+                await self.toggle_scope()
+                return
+            diff_section = getattr(node, "diff_section", None)
+            if diff_section is not None:
+                event.stop()
+                await self.toggle_section(cast("str", diff_section))
+                return
             diff_key = getattr(node, "diff_key", None)
             if diff_key is not None:
                 event.stop()
@@ -178,10 +264,9 @@ class DiffSummary(Vertical):
         event.stop()
 
     def on_key(self, event: events.Key) -> None:
-        """File-list navigation while focused with no diff open: up/down move
-        the row highlight, enter opens the highlighted file's diff. With a
-        diff open the keys belong to the diff pane (scroll/page), so stay out
-        of the way — they only reach here bubbled up from DiffText."""
+        """List navigation while focused with no diff open: up/down move the
+        highlight, enter opens it. With a diff open the keys belong to the
+        pane (scroll/page), so stay out of the way."""
         if self.diff_shown or not self.has_class("expanded") or self._stat is None:
             return
         if event.key in ("up", "down", "enter"):
@@ -193,96 +278,188 @@ class DiffSummary(Vertical):
                 self._move_highlight(-1 if event.key == "up" else 1)
 
     def _active_row_index(self) -> int | None:
-        for index, row in enumerate(self.query(".diff-file-row")):
+        for index, row in enumerate(self.query(".diff-row")):
             if row.has_class("active"):
                 return index
         return None
 
     def _move_highlight(self, delta: int) -> None:
-        rows = list(self.query(".diff-file-row"))
+        rows = list(self.query(".diff-row"))
         if not rows:
             return
         current = self._active_row_index()
         index = 0 if current is None else max(0, min(len(rows) - 1, current + delta))
-        self._mark_active_row(getattr(rows[index], "diff_key", None))
+        self._mark_active_row(_row_path(rows[index]))
 
     def _open_highlighted(self) -> None:
-        rows = list(self.query(".diff-file-row"))
+        rows = list(self.query(".diff-row"))
         index = self._active_row_index()
         if index is None or index >= len(rows):
             return
-        key = getattr(rows[index], "diff_key", None)
+        key = _row_path(rows[index])
         if key is not None:
-            self.post_message(self.DiffRequested(cast("str", key)))
+            self.post_message(self.DiffRequested(key))
 
     async def set_summary(self, stat: DiffStat) -> None:
         """Update the summary + rows in place; becomes visible.
 
-        Attributed files come first, then a drift header with the drift
-        rows, then one non-clickable row per ignored-path group. The panel
-        refreshes on every tool finish, so reconcile instead of rebuilding:
-        rows whose file disappeared are removed, rows for new files mounted,
-        and surviving rows get their numbers/kind updated in place. A full
-        teardown/mount flickers and loses the scroll position and highlight
-        when only one row changed."""
+        The panel refreshes on every tool finish, so reconcile instead of
+        rebuilding: gone rows are removed, new ones mounted, survivors updated
+        in place. A teardown/mount flickers and loses the scroll position and
+        highlight when only one row changed."""
         self._stat = stat
+        self._refresh_chip()
+        self._refresh_header()
+        await self._refresh_rows()
+        self.add_class("visible")
+
+    def _refresh_chip(self) -> None:
+        """Repaint the scope chip: every session, or this session alone."""
+        if self.is_mounted:
+            self.query_one("#diff-filter", Static).update(
+                _chip_text(self._scope == "all"))
+
+    def _refresh_header(self) -> None:
+        """Paint the label and the +A/-D totals: the count is the whole pending
+        diff, the totals follow the scope (the section headers carry their
+        own), right-aligned to the row columns so the badges line up."""
+        stat = self._stat
+        if stat is None:
+            return
         count = len(stat.files)
         label = f"Edited {count} file{'s' if count != 1 else ''}"
         if stat.groups:
             label += f" · {stat.ignored_files} ignored"
+        shown = [f for f in stat.files if self._inline(f)]
+        add_w, del_w = self._widths()
         self.query_one("#diff-summary-text", Static).update(Text(label))
-        self.query_one("#diff-summary-add", Static).update(Text(f"+{stat.additions}"))
-        self.query_one("#diff-summary-del", Static).update(Text(f"-{stat.deletions}"))
+        self.query_one("#diff-summary-add", Static).update(
+            Text(f"+{sum(f.additions for f in shown)}".rjust(add_w))
+        )
+        self.query_one("#diff-summary-del", Static).update(
+            Text(f"-{sum(f.deletions for f in shown)}".rjust(del_w))
+        )
+        self.add_class("visible")
 
+    def _widths(self) -> tuple[int, int]:
+        """Uniform widths for the +A/-D columns: the widest string across every
+        row and every total, so the badge before the numbers sits at the same
+        column everywhere."""
+        stat = self._stat
+        if stat is None:
+            return 1, 1
+        totals = [[f for f in stat.files if self._inline(f)]]
+        totals += [self._section_entries(section)[0] for section in _SECTIONS]
+        return (
+            max([len(f"+{f.additions}") for f in stat.files]
+                + [len(f"+{sum(f.additions for f in g)}") for g in totals]),
+            max([len(f"-{f.deletions}") for f in stat.files]
+                + [len(f"-{sum(f.deletions for f in g)}") for g in totals]),
+        )
+
+    def _inline(self, f) -> bool:
+        """Whether a file row leads the list: this session's work, plus other
+        sessions' while the scope includes them."""
+        return f.kind == "mine" or (f.kind == "agent" and self._scope == "all")
+
+    def _section_entries(self, section: str) -> tuple[list, list]:
+        """The (files, groups) a section holds: what the list does not lead
+        with."""
+        stat = self._stat
+        if stat is None:
+            return [], []
+        return (
+            [
+                f for f in stat.files
+                if _section_of(f.kind) == section and not self._inline(f)
+            ],
+            [g for g in stat.groups if _section_of(g.kind) == section],
+        )
+
+    def _visible_paths(self) -> list[str]:
+        """Row paths in display order — what up/down/enter and the pane's
+        left/right step through (folded sections are absent)."""
+        return [
+            path for path in (
+                _row_path(row) for row in self.query(".diff-row")
+            ) if path is not None
+        ]
+
+    async def _refresh_rows(self) -> None:
+        """Reconcile the list against the current stat: own files, then the
+        rule and one section per kind (header always present, rows only while
+        unfolded). Rows are keyed so a refresh reuses the widget and its
+        highlight when only the numbers changed."""
+        stat = self._stat
+        if stat is None:
+            return
         files = self.query_one("#diff-files", Vertical)
-        # Pad the +/- counts to a uniform width across the file list so the
-        # right-aligned tail (and the "new" badge) sits at the same column
-        # on every row regardless of digit count.
-        add_w = max((len(f"+{f.additions}") for f in stat.files), default=1)
-        del_w = max((len(f"-{f.deletions}") for f in stat.files), default=1)
+        add_w, del_w = self._widths()
+        # (key, row classes, cells) in display order; rows after the rule are
+        # indented so the fold structure reads.
+        wanted: list[tuple[tuple[str, str], str, list[Cell], bool]] = [
+            (("file", f.path), "diff-file-row diff-row",
+             self._file_cells(f, add_w, del_w), False)
+            for f in stat.files if self._inline(f)
+        ]
+        wanted.append((("divider", ""), "diff-divider", [], False))
+        for section in _SECTIONS:
+            expanded = section in self._expanded
+            entries = self._section_entries(section)
+            state = (" expanded" if expanded else "") + (
+                "" if any(entries) else " empty")
+            wanted.append((
+                ("section", section), f"diff-section-row {section}{state}",
+                self._section_cells(section, entries, expanded, add_w, del_w),
+                False,
+            ))
+            if not expanded:
+                continue
+            section_files, section_groups = entries
+            wanted += [
+                (("file", f.path), "diff-file-row diff-row",
+                 self._file_cells(f, add_w, del_w), True)
+                for f in section_files
+            ]
+            wanted += [
+                (("group", g.prefix), "diff-group-row diff-row",
+                 self._group_cells(g), True)
+                for g in section_groups
+            ]
 
-        # One keyed row per entry: a file, the drift header, or an ignored
-        # group. The key survives refresh, so the row widget (and its
-        # highlight) can be reused when only its numbers changed.
-        drift = [f for f in stat.files if f.kind == "drift"]
-        ordered_files = [f for f in stat.files if f.kind != "drift"]
-        wanted = [(("file", f.path), f) for f in ordered_files]
-        if drift:
-            wanted.append((("header", "drift"), None))
-            wanted += [(("file", f.path), f) for f in drift]
-        wanted += [(("group", g.prefix), g) for g in stat.groups]
-
-        wanted_keys = {key for key, _ in wanted}
+        wanted_keys = {key for key, *_ in wanted}
         existing = {
             getattr(row, "diff_row_key", None): row
             for row in list(files.children)
             if getattr(row, "diff_row_key", None) is not None
         }
-        for row in list(files.children):
-            key = getattr(row, "diff_row_key", None)
-            if key is not None and key not in wanted_keys:
+        for key, row in list(existing.items()):
+            if key not in wanted_keys:
                 await row.remove()
-                existing.pop(key, None)
+                existing.pop(key)
 
         ordered = []
-        for key, entry in wanted:
+        for key, classes, cells, nested in wanted:
             row = existing.get(key)
             if row is None:
-                if key[0] == "header":
-                    row = Static(
-                        Text("drift — changes outside this agent"),
-                        classes="diff-drift-header", markup=False,
-                    )
-                    row.diff_row_key = key  # type: ignore[attr-defined]
-                    await files.mount(row)
-                elif key[0] == "group":
-                    row = await self._mount_group_row(files, entry)
+                row = Horizontal(classes=classes) if cells else Static(
+                    "", classes=classes, markup=False,
+                )
+                row.diff_row_key = key  # type: ignore[attr-defined]
+                # The semantic handle the click handler navigates by (the
+                # keyed one above only identifies the row across refreshes).
+                if key[0] == "section":
+                    row.diff_section = key[1]  # type: ignore[attr-defined]
                 else:
-                    row = await self._mount_file_row(files, entry, add_w, del_w)
-            elif key[0] == "group":
-                self._update_group_row(row, entry)
-            elif key[0] == "file":
-                await self._update_file_row(row, entry, add_w, del_w)
+                    # A file's path, or an ignored group's prefix: a click
+                    # asks the app for that path's diff (a group's being the
+                    # read-only "added" patch of everything under it).
+                    row.diff_key = key[1]  # type: ignore[attr-defined]
+                await files.mount(row)
+            else:
+                row.set_classes(classes)
+            row.set_class(nested, "nested")
+            await _sync_cells(row, cells)
             ordered.append(row)
 
         # Keep DOM order matching the wanted order without touching rows
@@ -293,83 +470,94 @@ class DiffSummary(Vertical):
 
         if self.diff_shown:
             active = self._active_key
-            self._mark_active_row(active if isinstance(active, str) else None)
-        self.add_class("visible")
+            if active not in {_row_path(row) for row in ordered}:
+                # The row folded away (its section closed or its scope
+                # dropped): close the pane instead of floating it orphaned,
+                # and keep the keyboard on the list for arrow navigation —
+                # unless the user had moved it elsewhere (e.g. the input).
+                self._reset_diff()
+                focused = self.screen.focused
+                if focused is not None and self in focused.ancestors_with_self:
+                    self.focus()
+            else:
+                self._mark_active_row(active if isinstance(active, str) else None)
 
-    async def _mount_group_row(self, files: Vertical, group) -> Horizontal:
-        """One ignored-path group: not clickable, no ``diff_key``."""
-        row = Horizontal(classes="diff-group-row")
-        row.diff_row_key = ("group", group.prefix)  # type: ignore[attr-defined]
-        await files.mount(row)
-        await _mount_cell(row, group.prefix, "diff-file-name")
-        await _mount_cell(row, _display_kind(group.kind), f"diff-file-source {group.kind}")
-        await _mount_cell(row, f"{group.files} files", "diff-group-count")
-        return row
+    def _file_cells(self, f, add_w: int, del_w: int) -> list[Cell]:
+        """One per-file row: name, badges, kind, then the counts in their own
+        right-hand columns (so they never wrap the name)."""
+        cells = [("diff-file-name", f.path)]
+        if f.is_new:
+            cells.append(("diff-file-new", "new"))
+        if len(f.authors) > 1:
+            cells.append(("diff-file-shared", str(len(f.authors))))
+        cells.append((f"diff-file-source {f.kind}", _display_kind(f.kind)))
+        cells.append(("diff-file-add", f"+{f.additions}".rjust(add_w)))
+        cells.append(("diff-file-del", f"-{f.deletions}".rjust(del_w)))
+        return cells
 
     @staticmethod
-    def _update_group_row(row: Horizontal, group) -> None:
-        """Refresh one ignored-group row in place."""
-        _cell(row, "diff-file-name").update(Text(group.prefix))
-        source = _cell(row, "diff-file-source")
-        source.update(Text(_display_kind(group.kind)))
-        source.set_classes(f"diff-file-source {group.kind}")
-        _cell(row, "diff-group-count").update(Text(f"{group.files} files"))
+    def _group_cells(group) -> list[Cell]:
+        """One ignored-path group row: its prefix (the directory's or just
+        the one file) and how many files hide behind it."""
+        return [
+            ("diff-file-name", group.prefix),
+            (f"diff-file-source {group.kind}", _display_kind(group.kind)),
+            ("diff-group-count", f"{group.files} files"),
+        ]
 
-    async def _mount_file_row(
-        self, files: Vertical, f, add_w: int, del_w: int,
-    ) -> Horizontal:
-        """Create and mount one per-file row, returning it."""
-        # Row layout: name  [new]  {kind}  +N -M — the whole row is
-        # clickable and requests that file's unified diff. The "new" badge
-        # gets its own column so it never wraps the file name.
-        row = Horizontal(classes="diff-file-row")
-        row.diff_key = f.path  # type: ignore[attr-defined]
-        row.diff_row_key = ("file", f.path)  # type: ignore[attr-defined]
-        await files.mount(row)
-        await _mount_cell(row, f.path, "diff-file-name")
-        if f.is_new:
-            await _mount_cell(row, "new", "diff-file-new")
-        await _mount_cell(row, _display_kind(f.kind), f"diff-file-source {f.kind}")
-        await _mount_cell(row, f"+{f.additions}".rjust(add_w), "diff-file-add")
-        await _mount_cell(row, f"-{f.deletions}".rjust(del_w), "diff-file-del")
-        return row
+    @staticmethod
+    def _section_cells(
+        section: str, entries: tuple[list, list], expanded: bool,
+        add_w: int, del_w: int,
+    ) -> list[Cell]:
+        """One section header: label, fold arrow, then the ignored count and
+        the section's line totals."""
+        section_files, section_groups = entries
+        ignored = sum(g.files for g in section_groups)
+        adds = sum(f.additions for f in section_files)
+        dels = sum(f.deletions for f in section_files)
+        return [
+            ("diff-section-name", section),
+            ("diff-section-toggle", TRIANGLE_OPEN if expanded else TRIANGLE_CLOSED),
+            ("diff-section-spacer", ""),
+            ("diff-section-count", f"{ignored} files" if ignored else ""),
+            ("diff-file-add", f"+{adds}".rjust(add_w)),
+            ("diff-file-del", f"-{dels}".rjust(del_w)),
+        ]
 
-    async def _update_file_row(
-        self, row: Horizontal, f, add_w: int, del_w: int,
-    ) -> None:
-        """Refresh one existing file row without remounting it."""
-        _cell(row, "diff-file-name").update(Text(f.path))
-        source = _cell(row, "diff-file-source")
-        source.update(Text(_display_kind(f.kind)))
-        source.set_classes(f"diff-file-source {f.kind}")
-        _cell(row, "diff-file-add").update(Text(f"+{f.additions}".rjust(add_w)))
-        _cell(row, "diff-file-del").update(Text(f"-{f.deletions}".rjust(del_w)))
-        # The badge can appear/disappear when the baseline moves (e.g.
-        # /accept), but the row itself survives: add/remove only the badge.
-        badge = next(iter(row.query(".diff-file-new")), None)
-        if f.is_new and badge is None:
-            await row.mount(
-                Static(Text("new"), classes="diff-file-new", markup=False),
-                before=source,
-            )
-        elif not f.is_new and badge is not None:
-            await badge.remove()
+    async def toggle_section(self, section: str) -> None:
+        """Fold/unfold one section's rows."""
+        if section in self._expanded:
+            self._expanded.discard(section)
+        else:
+            self._expanded.add(section)
+        await self._refresh_rows()
 
     async def clear(self) -> None:
         """Hide entirely — no pending changes (or no worktree)."""
         self._stat = None
         self._reset_diff()
+        self._expanded.clear()  # a fresh pending set starts folded
         self.remove_class("expanded")
         self.remove_class("visible")
         if self.is_mounted:
             await self.query_one("#diff-files", Vertical).remove_children()
 
     def show_diff(self, key: str, text: str) -> None:
-        """Display one file's unified diff inline."""
+        """Display one file's (or group's) unified diff inline.
+
+        A section-held row (auto, drift, or another session's work while
+        scoped to this one) unfolds its section first, so the highlighted row
+        is really on screen — even for ``/diff <path>`` typed directly."""
         self._active_key = key
         self._active_text = text
         self.add_class("visible")
         self.add_class("expanded")
+        section = self._section_for(key)
+        if section is not None and section not in self._expanded:
+            self._expanded.add(section)
+            if self.is_mounted:
+                self.run_worker(self._refresh_rows())
         content = self.query_one("#diff-content", DiffText)
         self.query_one("#diff-text", Static).update(_render_diff(text))
         content.add_class("show")
@@ -377,6 +565,19 @@ class DiffSummary(Vertical):
         # Defer until the container is laid out, or scrolling is a no-op.
         content.call_after_refresh(content.scroll_home, animate=False)
         self._mark_active_row(key)
+
+    def _section_for(self, key: str) -> str | None:
+        """The folded section a path belongs to, if any."""
+        stat = self._stat
+        if stat is None:
+            return None
+        for f in stat.files:
+            if f.path == key and not self._inline(f):
+                return _section_of(f.kind)
+        for g in stat.groups:
+            if g.prefix == key:
+                return _section_of(g.kind)
+        return None
 
     def hide_diff(self) -> None:
         self._reset_diff()
@@ -387,19 +588,45 @@ class DiffSummary(Vertical):
 
     def _mark_active_row(self, key: str | None) -> None:
         """Highlight the row whose diff is currently displayed."""
-        for row in self.query(".diff-file-row"):
-            if getattr(row, "diff_key", None) == key:
+        for row in self.query(".diff-row"):
+            if _row_path(row) == key:
                 row.add_class("active")
             else:
                 row.remove_class("active")
 
     def recolor(self) -> None:
-        """Re-render with the current palette (/theme).
-
-        All row/summary/button colors are CSS variables, so the stylesheet
-        recolors them live; only the diff text bakes palette colors into
-        rich styles and needs a re-render."""
+        """Re-render with the current palette (/theme): CSS variables recolor
+        the rows live, but the chip and the diff text bake palette colors into
+        rich styles."""
         if not self.is_mounted:
             return
+        self._refresh_chip()
         if self._active_key is not None:
             self.query_one("#diff-text", Static).update(_render_diff(self._active_text))
+
+
+def _row_path(row) -> str | None:
+    """The path a row leads to (a file's, an ignored group's prefix), or None
+    for a section header."""
+    return getattr(row, "diff_key", None)
+
+
+async def _sync_cells(row, cells: list[Cell]) -> None:
+    """Bring one row's cells in line with ``cells``: update the survivors,
+    mount the new ones in place and drop the gone ones, so a refresh never
+    rebuilds the row."""
+    existing = {
+        getattr(cell, "diff_cell", None): cell for cell in row.children
+    }
+    for index, (classes, text) in enumerate(cells):
+        name = classes.split()[0]
+        cell = existing.pop(name, None)
+        if cell is None:
+            cell = Static(Text(text), classes=classes, markup=False)
+            cell.diff_cell = name  # type: ignore[attr-defined]
+            await row.mount(cell, before=index)
+        else:
+            cell.set_classes(classes)
+            cell.update(Text(text))
+    for cell in existing.values():
+        await cell.remove()

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import unittest
+from contextlib import asynccontextmanager
 
 from textual.app import App
 from textual.pilot import Pilot
@@ -28,6 +29,15 @@ from xarness.protocol import (
 )
 from xarness.tui import flow as tflow
 from xarness.tui.transcript import ToolStatus
+
+
+@asynccontextmanager
+async def run_app(app, size=None):
+    """Run ``app`` and hand back a pilot with the first frame settled — what
+    nearly every test does before it asserts anything."""
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        yield pilot
 
 
 def _model_info() -> dict:
@@ -138,6 +148,16 @@ class FakeClient:
         pass
 
 
+def make_app(client=None, session_name="s1", **kwargs):
+    """An AgentApp over a scripted client, with no workspace to attach to."""
+    from xarness.tui.app import AgentApp
+
+    return AgentApp(
+        client if client is not None else FakeClient(make_snapshot()),
+        workspace=None, session_name=session_name, **kwargs,
+    )
+
+
 def make_snapshot(state: str = "idle") -> Snapshot:
     return Snapshot(
         messages=[],
@@ -155,11 +175,9 @@ def running_status_event() -> Event:
 
 class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
     async def _run(self, snapshot: Snapshot, script):
-        from xarness.tui.app import AgentApp
         client = FakeClient(snapshot)
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await script(pilot, client, app)
 
     async def test_running_ctrl_c_shows_modal_and_continue_headless_exits(self) -> None:
@@ -271,12 +289,10 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
 
 class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
     async def test_user_message_reaches_the_log_only_via_the_event_stream(self) -> None:
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             # Nothing in the model yet: the client does not echo its own sends.
             self.assertEqual(
                 [type(e.item).__name__ for e in app._flow_model.entries
@@ -297,13 +313,11 @@ class NoLocalEchoTest(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_status_changed_updates_the_steer_bar(self) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import SteerQueueBar
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             client.queue.put_nowait(protocol.StatusChanged(status=Status(
                 state="running",  # type: ignore[arg-type]
                 session_name="s1", workspace="/tmp/ws", mode="write",
@@ -333,13 +347,11 @@ class ImageUploadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_attachment_is_uploaded_and_sent_as_a_ref(self) -> None:
         from xarness.images import ImageRef, token_text
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
+        app = make_app(client)
         attachment = self._attachment()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._submit(f"look {token_text(attachment)}", [attachment])
             await pilot.pause()
 
@@ -356,16 +368,14 @@ class ImageUploadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_restored_ref_is_not_uploaded_again(self) -> None:
         from xarness.images import ImageRef, token_text
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
+        app = make_app(client)
         ref = ImageRef(
             id=hashlib.sha256(b"cat").hexdigest(), name="clipboard.png",
             mime="image/png", width=8, height=8,
         )
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._submit(f"look {token_text(ref)}", [ref])
             await pilot.pause()
 
@@ -385,12 +395,10 @@ class WordmarkTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_empty_session_shows_it_and_first_message_clears_it(self) -> None:
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             self.assertIn("... ...", self._text(app))
 
             client.queue.put_nowait(protocol.MessageAdded(
@@ -403,7 +411,6 @@ class WordmarkTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("... ...", self._text(app))
 
     async def test_new_session_brings_it_back(self) -> None:
-        from xarness.tui.app import AgentApp
 
         snap = make_snapshot()
         snap.messages.append(UserMessage(
@@ -411,9 +418,8 @@ class WordmarkTest(unittest.IsolatedAsyncioTestCase):
             timing=Timing(send="2026-01-01T00:00:00+00:00"),
         ))
         client = FakeClient(snap)
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             self.assertNotIn("... ...", self._text(app))
 
             app._start_new_session()
@@ -455,7 +461,6 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_connection_loss_reattaches(self) -> None:
         from xarness.tui import app as app_module
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
         client.fail_attach_first = True
@@ -470,9 +475,8 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
         previous = app_module.RECONNECT_MIN
         app_module.RECONNECT_MIN = 0.01
         try:
-            app = AgentApp(client, workspace=None, session_name="s1")
-            async with app.run_test() as pilot:
-                await pilot.pause()
+            app = make_app(client)
+            async with run_app(app) as pilot:
                 # The loop backs off before retrying the stream.
                 await asyncio.sleep(app_module.RECONNECT_MIN + 0.02)
                 await pilot.pause()
@@ -525,12 +529,10 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_interrupt_and_steer_commands_are_sent(self) -> None:
         from xarness.protocol import QueuedMessage
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot("running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             client.queue.put_nowait(running_status_event())
             await pilot.pause()
             # Double-esc interrupts the running turn.
@@ -554,13 +556,11 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
     async def test_popup_confirm_on_arg_command_completes_instead_of_running(self) -> None:
         """Enter on /filter (takes an argument) must leave the word in the
         input for the user to finish, not execute it with an empty arg."""
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import ChatInput
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             app._accept_popup_value("filter", was_slash=True)
             await pilot.pause()
             chat_input = app.query_one("#chat-input", ChatInput)
@@ -572,16 +572,14 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
         quit is one viewer leaving, so there is nothing to decide — and
         "Stop and quit" must not be offered, because the other client's
         turn would be interrupted."""
-        from xarness.tui.app import AgentApp
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client = FakeClient(make_snapshot("running"))
         client.quit_verdict_result = protocol.QuitVerdict(
             ask=False, state="running", other_clients=1,
         )
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             status = running_status_event().status.model_copy(
                 update={"clients_attached": 2},
             )
@@ -603,10 +601,9 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
     it."""
 
     def _app(self):
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        return client, AgentApp(client, workspace=None, session_name="s1")
+        return client, make_app(client)
 
     @staticmethod
     def _diff(*kinds: str) -> DiffInfo:
@@ -621,8 +618,7 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client, app = self._app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._last_diff = self._diff("mine", "agent", "auto")
             app._accept()
             await pilot.pause()
@@ -636,8 +632,7 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client, app = self._app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._last_diff = self._diff("mine", "mine")
             app._accept()
             await pilot.pause()
@@ -651,8 +646,7 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client, app = self._app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._last_diff = self._diff("mine", "drift")
             app._reject_with_confirm()
             await pilot.pause()
@@ -669,8 +663,7 @@ class AcceptRejectConfirmTest(unittest.IsolatedAsyncioTestCase):
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client, app = self._app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app._last_diff = self._diff("agent")
             app._reject_with_confirm()
             await pilot.pause()
@@ -685,13 +678,11 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_lists_mounts_and_dispatches_remove(self) -> None:
         from xarness.protocol import RefInfo
-        from xarness.tui.app import AgentApp
         from xarness.tui.refs_screen import RefsScreen
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             refs = [RefInfo(path="/tmp/notes.md", mount="/tmp/refs/notes.md")]
             client.refs = list(refs)
             app.push_screen(RefsScreen(refs))
@@ -712,13 +703,11 @@ class RefsScreenTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.ref_updates[-1][1:], ("/tmp/other.md", True))
 
     async def test_slash_command_opens_the_manager(self) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.refs_screen import RefsScreen
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             app._handle_slash_command("/refs")
             await pilot.pause()
             self.assertIsInstance(app.screen, RefsScreen)
@@ -729,13 +718,11 @@ class SlashCommandDispatchTest(unittest.IsolatedAsyncioTestCase):
     any other input is ordinary chat text, not an unknown-command error."""
 
     async def test_unknown_slash_text_is_sent_as_a_message(self) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import ChatInput
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             app.on_chat_input_chat_submitted(
                 ChatInput.ChatSubmitted("/not-a-command hello"))
             await pilot.pause()
@@ -744,13 +731,11 @@ class SlashCommandDispatchTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([c.text for c in sends], ["/not-a-command hello"])
 
     async def test_registered_slash_command_still_runs(self) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import ChatInput
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             app.on_chat_input_chat_submitted(ChatInput.ChatSubmitted("/mode"))
             await pilot.pause()
             await pilot.pause()
@@ -769,7 +754,6 @@ class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_is_called_with_the_session_name(self) -> None:
 
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
         calls: list[str] = []
@@ -787,10 +771,9 @@ class AttachSeedsPumpTest(unittest.IsolatedAsyncioTestCase):
             messages=[],
             status=client.snapshot_data.status,
         )
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
-        self.assertEqual(calls, ["s1"])
+        app = make_app(client)
+        async with run_app(app):
+            self.assertEqual(calls, ["s1"])
 
 
 class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
@@ -799,7 +782,6 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
     appending to them made later CoT and answers invisible until reload."""
 
     async def test_second_round_streams_into_new_widgets(self) -> None:
-        from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
             def items(cls):
@@ -831,9 +813,8 @@ class MultiRoundStreamTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
         app_client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(app_client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(app_client)
+        async with run_app(app) as pilot:
             await script(pilot, app_client, app)
 
 
@@ -921,7 +902,6 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(live), 80)
 
     async def test_streamed_arguments_render_live_details(self) -> None:
-        from xarness.tui.app import AgentApp
 
         calls = [
             ("w1", "write_file",
@@ -936,9 +916,8 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
              "la -la /workspace"),
         ]
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             for call_id, name, args, _expected in calls:
                 client.queue.put_nowait(
                     protocol.ToolCallStarted(call_id=call_id, name=name))
@@ -987,12 +966,10 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
     async def test_running_run_bash_shows_streamed_output(self) -> None:
         """While the call is still running, each ToolOutputDelta must repaint
         the expanded body (not wait for ToolFinished)."""
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             client.queue.put_nowait(
                 protocol.ToolCallStarted(call_id="b1", name="run_bash"))
             client.queue.put_nowait(protocol.ToolCallArgumentsDone(
@@ -1034,12 +1011,10 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
         """End-to-end live path: the finished call's output feeds the
         expanded body, not just a bare "applied" line."""
         from xarness.tools import _format_edit_diff
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             output = "applied 1 edit to a.py\n" + _format_edit_diff(
                 "a.py", "old\nkeep\n", "new\nkeep\n",
             )
@@ -1173,8 +1148,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 yield Label("")
 
         app = Host()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app.push_screen(ListPicker(session_options(self._summaries(), None), title="Open session", filterable=True))
             await pilot.pause()
             option_list = app.screen.query_one("#picker-list", OptionList)
@@ -1226,8 +1200,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 yield Label("")
 
         app = Host()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app.push_screen(ListPicker(
                 session_options(self._summaries(), None),
                 title="Open session", filterable=True,
@@ -1266,8 +1239,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 yield Label("")
 
         app = Host()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app.push_screen(ListPicker(
                 session_options(self._summaries(), None),
                 title="Open session", filterable=True,
@@ -1312,7 +1284,6 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         from textual.widgets import OptionList
 
         from xarness.tui import app as app_module
-        from xarness.tui.app import AgentApp
         from xarness.tui.list_picker import ListPicker
 
         def summary(state: str) -> SessionSummary:
@@ -1327,9 +1298,8 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         previous_interval = app_module.SESSIONS_REFRESH_SECONDS
         app_module.SESSIONS_REFRESH_SECONDS = 0.02
         try:
-            app = AgentApp(client, workspace=None, session_name="s1")
-            async with app.run_test() as pilot:
-                await pilot.pause()
+            app = make_app(client)
+            async with run_app(app) as pilot:
                 await app._open_sessions_async()
                 await pilot.pause()
                 self.assertIsInstance(app.screen, ListPicker)
@@ -1470,8 +1440,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                 yield Input()
 
         app = Host()
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        async with run_app(app) as pilot:
             app.push_screen(ListPicker(session_options(entries, None), title="Open session", filterable=True))
             await pilot.pause()
             ol = app.screen.query_one("#picker-list", OptionList)
@@ -1493,7 +1462,6 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
     """The CLI tab title follows the attached session's workspace."""
 
     async def test_title_follows_attached_session_workspace(self) -> None:
-        from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
             written: list[str] = []
@@ -1516,19 +1484,16 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(written, "title not restored on detach")
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name=None)
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client, session_name=None)
+        async with run_app(app) as pilot:
             await script(pilot, client, app)
 
     async def test_finished_suffix_clears_when_the_next_turn_starts(self) -> None:
         from xarness.protocol import ProcessingStarted
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name=None)
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client, session_name=None)
+        async with run_app(app) as pilot:
             written: list[str] = []
             app._set_terminal_title = written.append  # type: ignore[method-assign]
             snap = make_snapshot()
@@ -1560,11 +1525,9 @@ class TerminalTitlePathTest(unittest.IsolatedAsyncioTestCase):
     ``/home/me/xarness`` must both read ``xarness xarness``."""
 
     async def test_title_for_uses_the_last_path_component(self) -> None:
-        from xarness.tui.app import AgentApp
 
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name=None)
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(session_name=None)
+        async with run_app(app):
             self.assertEqual(app._title_for("/workspace/projects/xarness"), "xarness")
             self.assertEqual(app._title_for("/home/me/larkspur"), "larkspur")
             self.assertEqual(app._title_for("/home/me/larkspur/"), "larkspur")
@@ -1577,7 +1540,6 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
     settle when the explicit TurnEnded arrives, not shimmer forever."""
 
     async def test_turn_end_settles_thinking_shimmer(self) -> None:
-        from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
@@ -1598,9 +1560,8 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                  if isinstance(e.item, tflow.ThinkingItem)][0].item.done)
 
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await script(pilot, client, app)
 
     async def test_turn_end_settles_tool_writing_shimmer(self) -> None:
@@ -1635,12 +1596,10 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
                  if isinstance(e.item, tflow.PendingItem) and e.alive],
                 "pending strip outlived the interrupt")
 
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await script(pilot, client, app)
 
     async def test_pending_strip_only_while_waiting_on_provider(self) -> None:
@@ -1650,7 +1609,6 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
         strip); the strip only comes back when the *next* round's
         ``ProcessingStarted`` opens a provider request, then goes away on the
         first delta."""
-        from xarness.tui.app import AgentApp
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
@@ -1678,9 +1636,8 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._phase, "idle")
 
         client = FakeClient(make_snapshot(state="running"))
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await script(pilot, client, app)
 
 
@@ -1692,16 +1649,14 @@ class ResumeListHeightTest(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_rows_visible(self) -> None:
         from textual.widgets import OptionList
 
-        from xarness.tui.app import AgentApp
         from xarness.tui.list_picker import ListPicker, session_options
         summaries = [
             SessionSummary(name=f"s{i}", state="saved", active=False)
             for i in range(5)
         ]
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name=None)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.pause()
+        app = make_app(client, session_name=None)
+        async with run_app(app, size=(100, 40)) as pilot:
             app.push_screen(ListPicker(session_options(summaries, None), title="Open session", filterable=True))
             await pilot.pause()
             screen = app.screen
@@ -1727,7 +1682,6 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
     arrived LIVE during the attach."""
 
     async def test_history_replaced_rebuilds_after_undo(self) -> None:
-        from xarness.tui.app import AgentApp
 
         messages = [
             _msg("user", "u1", "first"),
@@ -1738,9 +1692,8 @@ class UndoTrimTest(unittest.IsolatedAsyncioTestCase):
         snap = make_snapshot()
         object.__setattr__(snap, "messages", messages)
         client = FakeClient(snap)
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             # A live turn adds a message the snapshot never contained.
             client.queue.put_nowait(protocol.MessageAdded(
                 message=UserMessage(parts=[TextPart(text="live")], id="u3")))
@@ -1766,14 +1719,12 @@ class DiffClickMinimizeTest(unittest.IsolatedAsyncioTestCase):
     async def test_click_on_diff_pane_keeps_file_list(self) -> None:
         from textual.geometry import Offset
 
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import DiffSummary
 
         snap = make_snapshot()
         client = FakeClient(snap)
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             summary = app.query_one("#diff-summary", DiffSummary)
             await summary.set_summary(make_diff_stat())
             summary.add_class("expanded")
@@ -1806,13 +1757,11 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
     session created by the first message."""
 
     async def test_draft_shows_default_model_and_tab_applies_mode(self) -> None:
-        from xarness.tui.app import AgentApp
 
         snap = make_snapshot()
         client = FakeClient(snap)
-        app = AgentApp(client, workspace=None, session_name=None)
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client, session_name=None)
+        async with run_app(app) as pilot:
             await pilot.pause()
             bar = app.query_one("#status-bar")
             # Default model visible before any session exists.
@@ -1851,7 +1800,6 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
         """Picking a model in a draft chat repaints the status bar right
         away (and remembers the choice for the first message), rather than
         leaving the old default until a message creates the session."""
-        from xarness.tui.app import AgentApp
 
         snap = make_snapshot()
         client = FakeClient(snap)
@@ -1873,9 +1821,8 @@ class DraftStatusTest(unittest.IsolatedAsyncioTestCase):
 
         client.config = config
         # config_path=None keeps the preference save off the real config file.
-        app = AgentApp(client, workspace=None, session_name=None, config_path=None)
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client, session_name=None, config_path=None)
+        async with run_app(app) as pilot:
             await pilot.pause()
             bar = app.query_one("#status-bar")
             self.assertIn("GLM Flash", str(bar.render()))
@@ -1933,7 +1880,6 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         """The snapshot's ``history`` (older compaction epochs) is folded
         before the current messages, so resuming shows the whole session."""
         from xarness.conversation import SUMMARY_PREFIX
-        from xarness.tui.app import AgentApp
         from xarness.tui.transcript import DividerItem, UserItem
 
         snap = make_snapshot()
@@ -1947,9 +1893,8 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         snap.messages = [
             AssistantMessage(content="after", id="a0"),
         ]
-        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(snap))
+        async with run_app(app) as pilot:
             await pilot.pause()
             items = [entry.item for entry in app._flow_model.entries]
             self.assertIsInstance(items[0], UserItem)
@@ -1959,12 +1904,10 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(items[2].chunks, ["after"])
 
     async def test_replay_has_no_shimmer_and_shows_timing(self) -> None:
-        from xarness.tui.app import AgentApp
 
         client = FakeClient(self._snapshot_with_history())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await pilot.pause()
             flow = app.query_one("#chat-log")
             # The tool result is paired with its call: succeeded, not failed.
@@ -1987,14 +1930,12 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
     async def test_replay_footer_shows_turn_token_counts(self) -> None:
         """The footer's ↑input ↓output spend is the host's turn total,
         stamped next to the timings — the client sums nothing."""
-        from xarness.tui.app import AgentApp
 
         snap = self._snapshot_with_history()
         snap.messages[3].timing.stats.usage = Usage(
             input_tokens=3_234, output_tokens=456)
-        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(snap))
+        async with run_app(app) as pilot:
             await pilot.pause()
             flow = app.query_one("#chat-log")
             all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
@@ -2005,14 +1946,12 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         """The reported bug: continue headless, then reattach while the turn
         still works. The host has not ended that turn, so its last answer
         carries no stats and no \"Worked for\" line is drawn under it."""
-        from xarness.tui.app import AgentApp
 
         snap = self._snapshot_with_history()
         snap.status.state = "running"  # type: ignore[assignment]
         snap.messages[-1].timing.stats = None  # not over: nothing stamped
-        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(snap))
+        async with run_app(app) as pilot:
             await pilot.pause()
             flow = app.query_one("#chat-log")
             all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
@@ -2024,7 +1963,6 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         calls yet. Drawn from the history alone the call reads as failed
         ("interrupted") and the round's stamp as a finished turn; the live
         round in the snapshot must win."""
-        from xarness.tui.app import AgentApp
 
         snap = make_snapshot("running")
         snap.messages = [
@@ -2044,9 +1982,8 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
                 call_id="c1", name="read_file", arguments="{}",
             )],
         )
-        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(snap))
+        async with run_app(app) as pilot:
             await pilot.pause()
             flow = app.query_one("#chat-log")
             all_text = "\n".join(flow.row_text(y) for y in range(flow.row_count))
@@ -2061,7 +1998,6 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         """The host says the turn is running, so a call with no result is the
         one in flight — even if the snapshot carries no live round for it
         (an older host, or a gap in the bookkeeping)."""
-        from xarness.tui.app import AgentApp
 
         snap = make_snapshot("running")
         snap.messages = [
@@ -2076,9 +2012,8 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
                              "arguments_json": "{}"}],
             ),
         ]
-        app = AgentApp(FakeClient(snap), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(snap))
+        async with run_app(app) as pilot:
             await pilot.pause()
             tools = [e.item for e in app._flow_model.entries
                      if isinstance(e.item, tflow.ToolItem)]
@@ -2105,12 +2040,9 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
     async def test_full_history_in_model_one_widget(self) -> None:
         from textual_flowview import FlowView
 
-        from xarness.tui.app import AgentApp
 
-        app = AgentApp(FakeClient(self._big_snapshot()), workspace=None,
-                       session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(self._big_snapshot()))
+        async with run_app(app) as pilot:
             await pilot.pause()
             self.assertEqual(len(list(app.query(FlowView))), 1)
             self.assertEqual(len(app._flow_model), 1200)
@@ -2127,12 +2059,9 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
         # the visible band (+ overscan) has ever been presented.
         from textual_flowview import FlowView
 
-        from xarness.tui.app import AgentApp
 
-        app = AgentApp(FakeClient(self._big_snapshot()), workspace=None,
-                       session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(FakeClient(self._big_snapshot()))
+        async with run_app(app) as pilot:
             await pilot.pause()
             flow = app.query_one("#chat-log", FlowView)
             self.assertLess(len(flow._layout), 100)
@@ -2195,11 +2124,9 @@ class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_drag_selects_and_highlights_transcript_text(self) -> None:
         from xarness import theme
-        from xarness.tui.app import AgentApp
         from xarness.tui.flow import UserItem
 
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None,
-                       session_name="s1")
+        app = make_app()
         async with app.run_test(size=(80, 24)) as pilot:
             for _ in range(5):
                 await pilot.pause()
@@ -2234,41 +2161,242 @@ class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
-    """The pending-changes panel is a row of per-file cells, matching the
-    pre-refactor layout (name flexes, counts sit in their own right-hand
-    columns, source/new are separate badges)."""
+    """The pending-changes panel leads with the agent's own files and always
+    shows one foldable section per other kind below them."""
 
-    async def test_set_summary_lists_files(self) -> None:
+    async def test_agent_files_lead_and_other_kinds_fold(self) -> None:
+        from textual.widgets import Static
+
+        from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+
+            await summary.set_summary(DiffInfo(
+                files=[
+                    DiffFileInfo(path="own.py", additions=4, deletions=1, kind="mine"),
+                    DiffFileInfo(path="a.py", additions=9, deletions=3, kind="drift"),
+                ],
+                groups=[DiffGroup(prefix="build/", files=7, kind="auto")],
+                ignored_files=7,
+            ))
+            summary.add_class("expanded")
+            await pilot.pause()
+            # Default view: only the agent's file (and the section headers).
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+            )
+            self.assertEqual(
+                [r.diff_section for r in summary.query(".diff-section-row")],
+                ["agent", "auto", "drift"],
+            )
+            drift = summary.query_one(".diff-section-row.drift")
+            self.assertEqual(
+                drift.query_one(".diff-file-add", Static).render().plain, "+9"
+            )
+            self.assertEqual(
+                drift.query_one(".diff-file-del", Static).render().plain, "-3"
+            )
+            auto = summary.query_one(".diff-section-row.auto")
+            self.assertEqual(
+                auto.query_one(".diff-section-count", Static).render().plain, "7 files"
+            )
+
+            # Clicking the drift header unfolds its file row, which keeps the
+            # drift badge and opens its diff on click.
+            await pilot.click(drift)
+            await pilot.pause()
+            rows = list(summary.query(".diff-file-row"))
+            self.assertEqual([r.diff_key for r in rows], ["own.py", "a.py"])
+            self.assertTrue(rows[1].has_class("nested"))
+            self.assertEqual(
+                rows[1].query_one(".diff-file-source", Static).render().plain,
+                "drift",
+            )
+            toggle = drift.query_one(".diff-section-toggle", Static)
+            self.assertEqual(toggle.render().plain, "\u25be")
+
+            # Clicking again folds it back, keeping the header.
+            await pilot.click(drift)
+            await pilot.pause()
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+            )
+            self.assertEqual(toggle.render().plain, "\u25b8")
+
+    async def test_a_shared_file_shows_its_author_count(self) -> None:
+        """A path written by more than one session carries a count badge, so
+        the row's +A/-D read as that author's delta, not the whole file's."""
         from textual.widgets import Static
 
         from xarness.protocol import DiffFileInfo, DiffInfo
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import DiffSummary
 
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
             summary = app.query_one("#diff-summary", DiffSummary)
-
             await summary.set_summary(DiffInfo(files=[
-                DiffFileInfo(path="a.py", additions=9, deletions=3, kind="drift"),
-                DiffFileInfo(path="b.py", additions=1, deletions=0, is_new=True),
+                DiffFileInfo(
+                    path="shared.py", additions=2, deletions=0, kind="mine",
+                    authors=("s1", "other"),
+                ),
+                DiffFileInfo(path="solo.py", additions=1, deletions=0, kind="mine"),
             ]))
+            summary.add_class("expanded")
+            await pilot.pause()
+
+            rows = {r.diff_key: r for r in summary.query(".diff-file-row")}
+            self.assertEqual(
+                [cell.classes for cell in rows["shared.py"].children], [
+                    {"diff-file-name"}, {"diff-file-shared"},
+                    {"diff-file-source", "mine"}, {"diff-file-add"},
+                    {"diff-file-del"},
+                ],
+            )
+            self.assertEqual(
+                rows["shared.py"].query_one(
+                    ".diff-file-shared", Static,
+                ).render().plain,
+                "2",
+            )
+            self.assertFalse(rows["solo.py"].query(".diff-file-shared"))
+
+            # A row that becomes shared after the fact gains the badge in the
+            # right column, without remounting the row.
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(
+                    path="shared.py", additions=2, deletions=0, kind="mine",
+                    authors=("s1", "other", "third"),
+                ),
+                DiffFileInfo(
+                    path="solo.py", additions=1, deletions=0, kind="mine",
+                    authors=("s1", "other"),
+                ),
+            ]))
+            await pilot.pause()
+            badges = list(summary.query(".diff-file-shared"))
+            self.assertEqual(
+                [badge.render().plain for badge in badges], ["3", "2"],
+            )
+
+    async def test_clicking_an_ignored_group_requests_its_diff(self) -> None:
+        """A group row is a click target like a file row: it asks the app for
+        the group's own patch (files added from nothing) instead of
+        collapsing the whole panel."""
+        from xarness.protocol import DiffGroup, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        client = FakeClient(make_snapshot())
+        requested: list[str | None] = []
+
+        async def diff(name, path=None):
+            requested.append(path)
+            return DiffInfo(
+                text="diff --git a/build/ b/build/\n+++ b/build/out.o\n+obj\n",
+            )
+
+        client.diff = diff
+        app = make_app(client)
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await summary.set_summary(DiffInfo(
+                groups=[DiffGroup(prefix="build/", files=7, kind="auto")],
+                ignored_files=7,
+            ))
+            summary.add_class("expanded")
+            await summary.toggle_section("auto")
+            await pilot.pause()
+
+            group = summary.query_one(".diff-group-row")
+            await pilot.click(group)
+            await pilot.pause()
+            self.assertEqual([p for p in requested if p], ["build/"])
+            self.assertEqual(summary.active_diff_key, "build/")
+            self.assertTrue(summary.diff_shown)
+            # The list stays up, with the group row highlighted.
+            self.assertTrue(summary.has_class("expanded"))
+            self.assertTrue(group.has_class("active"))
+
+    async def test_section_headers_follow_a_divider_with_the_arrow_first(self) -> None:
+        """A full-width rule separates the agent files from the sections;
+        each header reads label, fold arrow, then the totals on the right."""
+        from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await summary.set_summary(DiffInfo(
+                files=[
+                    DiffFileInfo(path="own.py", additions=1, deletions=0, kind="mine"),
+                ],
+                groups=[DiffGroup(prefix="build/", files=7, kind="auto")],
+                ignored_files=7,
+            ))
+            summary.add_class("expanded")
+            await pilot.pause()
+
+            files = summary.query_one("#diff-files")
+            divider = summary.query_one(".diff-divider")
+            self.assertEqual(list(files.children).index(divider), 1)
+
+            auto = summary.query_one(".diff-section-row.auto")
+            self.assertEqual(
+                [next(iter(cell.classes)) for cell in auto.children],
+                [
+                    "diff-section-name",
+                    "diff-section-toggle",
+                    "diff-section-spacer",
+                    "diff-section-count",
+                    "diff-file-add",
+                    "diff-file-del",
+                ],
+            )
+            # ``agent``/``auto``/``drift`` share a 5-cell label column, so the
+            # fold arrows start at the same x on every header.
+            names = list(summary.query(".diff-section-name"))
+            self.assertEqual({name.size.width for name in names}, {5})
+            toggles = list(summary.query(".diff-section-toggle"))
+            self.assertEqual(len({toggle.region.x for toggle in toggles}), 1)
+
+    async def test_totals_widen_the_columns_so_badges_line_up(self) -> None:
+        """The summary total can be wider than any single row; the +/- columns
+        grow to it so the ``agent`` badges (and the totals) line up."""
+        from textual.widgets import Static
+
+        from xarness.protocol import DiffFileInfo, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=1500, deletions=100, kind="mine"),
+                DiffFileInfo(path="b.py", additions=17, deletions=12, kind="agent"),
+                DiffFileInfo(path="c.py", additions=1, deletions=0,
+                             is_new=True, kind="mine"),
+            ]))
+            summary.add_class("expanded")
+            await pilot.pause()
+
+            summary_add = summary.query_one("#diff-summary-add", Static)
+            summary_del = summary.query_one("#diff-summary-del", Static)
+            self.assertEqual(summary_add.render().plain, "+1518")
+            self.assertEqual(summary_del.render().plain, "-112")
+
             rows = list(summary.query(".diff-file-row"))
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[0].diff_key, "a.py")
-            self.assertEqual(rows[0].query_one(".diff-file-name", Static).render().plain, "a.py")
-            self.assertEqual(
-                rows[0].query_one(".diff-file-source", Static).render().plain, "drift"
-            )
-            self.assertTrue(rows[1].query_one(".diff-file-new"))
-            # Counts are separate cells so CSS can right-align them.
-            self.assertEqual(
-                rows[0].query_one(".diff-file-add", Static).render().plain, "+9"
-            )
-            self.assertEqual(
-                rows[0].query_one(".diff-file-del", Static).render().plain, "-3"
-            )
+            adds = {row.query_one(".diff-file-add", Static).render().plain for row in rows}
+            dels = {row.query_one(".diff-file-del", Static).render().plain for row in rows}
+            self.assertEqual({len(text) for text in adds}, {len("+1518")})
+            self.assertEqual({len(text) for text in dels}, {len("-112")})
+            # The badge before the numbers sits at the summary chip's column,
+            # new-badge row included.
+            chip = summary.query_one(".diff-filter")
+            for row in rows:
+                source = row.query_one(".diff-file-source")
+                self.assertEqual(source.region.x, chip.region.x)
 
     async def test_a_count_change_keeps_every_other_row(self) -> None:
         """A refresh that changes one file's counts must not remount the
@@ -2276,12 +2404,10 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
         from textual.widgets import Static
 
         from xarness.protocol import DiffFileInfo, DiffInfo
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import DiffSummary
 
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app()
+        async with run_app(app):
             summary = app.query_one("#diff-summary", DiffSummary)
             await summary.set_summary(DiffInfo(files=[
                 DiffFileInfo(path="a.py", additions=1, deletions=0, kind="agent"),
@@ -2306,18 +2432,16 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(own.render().plain, "agent")
             self.assertTrue(own.has_class("mine"))
 
-    async def test_group_and_drift_rows_are_reused(self) -> None:
-        """Ignored groups and the drift header are keyed too: a refresh
-        keeps their widgets when only the counts moved."""
+    async def test_section_rows_and_their_children_are_reused(self) -> None:
+        """Section headers and their unfolded rows are keyed too: a refresh
+        keeps the widgets when only the counts moved."""
         from textual.widgets import Static
 
         from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import DiffSummary
 
-        app = AgentApp(FakeClient(make_snapshot()), workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app()
+        async with run_app(app) as pilot:
             summary = app.query_one("#diff-summary", DiffSummary)
 
             def stat(files: int, ignored: int) -> DiffInfo:
@@ -2326,18 +2450,321 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
                         path="x.py", additions=files, deletions=0,
                         kind="drift",
                     )],
-                    groups=[DiffGroup(prefix="build/", files=ignored)],
+                    groups=[DiffGroup(prefix="build/", files=ignored, kind="auto")],
                     ignored_files=ignored,
                 )
 
             await summary.set_summary(stat(1, 2))
-            header = summary.query_one(".diff-drift-header")
+            await summary.toggle_section("drift")
+            await summary.toggle_section("auto")
+            await pilot.pause()
+            drift = summary.query_one(".diff-section-row.drift")
+            auto = summary.query_one(".diff-section-row.auto")
+            row = summary.query_one(".diff-file-row")
             group = summary.query_one(".diff-group-row")
             await summary.set_summary(stat(3, 4))
-            self.assertIs(summary.query_one(".diff-drift-header"), header)
+            await pilot.pause()
+            self.assertIs(summary.query_one(".diff-section-row.drift"), drift)
+            self.assertIs(summary.query_one(".diff-section-row.auto"), auto)
+            self.assertIs(summary.query_one(".diff-file-row"), row)
             self.assertIs(summary.query_one(".diff-group-row"), group)
             count = group.query_one(".diff-group-count", Static)
             self.assertEqual(count.render().plain, "4 files")
+            self.assertEqual(
+                auto.query_one(".diff-section-count", Static).render().plain,
+                "4 files",
+            )
+
+
+class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
+    """The summary line carries one ``agent`` chip; clicking it cycles the
+    scope between this session plus other sessions and this session alone.
+    Every section below the list is always there, folded."""
+
+    def _stat(self):
+        from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
+
+        return DiffInfo(
+            files=[
+                DiffFileInfo(path="own.py", additions=1, deletions=0, kind="mine"),
+                DiffFileInfo(path="other.py", additions=2, deletions=2, kind="agent"),
+                DiffFileInfo(path="yours.py", additions=3, deletions=1, kind="drift"),
+            ],
+            groups=[DiffGroup(prefix="build/", files=7, kind="auto")],
+            ignored_files=7,
+            additions=6,
+            deletions=3,
+        )
+
+    async def _summary(self, pilot, app):
+        from xarness.tui.widgets import DiffSummary
+
+        summary = app.query_one("#diff-summary", DiffSummary)
+        await summary.set_summary(self._stat())
+        await pilot.pause()
+        return summary
+
+    @staticmethod
+    def _chip_colors(text) -> list[tuple[str, str]]:
+        return [
+            (text.plain[span.start:span.end], str(span.style))
+            for span in text.spans
+        ]
+
+    async def test_the_chip_reads_agent_in_two_tones(self) -> None:
+        from xarness import theme
+        from xarness.tui.diff_summary import _chip_text
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            chip = summary.query_one(".diff-filter")
+            self.assertEqual(chip.render().plain, "agent")
+            palette = theme.PALETTE
+            both = _chip_text(True)
+            self.assertEqual(both.plain, "agent")
+            self.assertEqual(
+                self._chip_colors(both),
+                [("age", palette["accent"]), ("nt", palette["muted"])],
+            )
+            own = _chip_text(False)
+            self.assertEqual(own.plain, "agent")
+            self.assertEqual(
+                self._chip_colors(own), [("agent", palette["accent"])]
+            )
+
+    async def test_clicking_the_chip_cycles_the_scope(self) -> None:
+        from textual.widgets import Static
+
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            await pilot.pause()
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                ["own.py", "other.py"],
+            )
+
+            def loc() -> tuple[str, str]:
+                return tuple(  # type: ignore[return-value]
+                    summary.query_one(f"#diff-summary-{side}", Static).render().plain
+                    for side in ("add", "del")
+                )
+
+            self.assertEqual(loc(), ("+3", "-2"))
+
+            chip = summary.query_one(".diff-filter")
+            await pilot.click(chip)
+            await pilot.pause()
+            self.assertEqual(summary.scope, "mine")
+            # Only this session's file leads; the other session's work has
+            # moved into the (still folded) dimmed "agent" section.
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+            )
+            self.assertEqual(
+                [r.diff_section for r in summary.query(".diff-section-row")],
+                ["agent", "auto", "drift"],
+            )
+            from textual.widgets import Static
+
+            others = summary.query_one(".diff-section-row.agent")
+            self.assertEqual(
+                others.query_one(".diff-section-name", Static).render().plain,
+                "agent",
+            )
+            self.assertEqual(loc(), ("+1", "-0"))
+            self.assertEqual(chip.render().plain, "agent")
+            self.assertEqual(len(chip.render().spans), 1)
+
+            # Unfolding the section brings the other session's row back.
+            await summary.toggle_section("agent")
+            await pilot.pause()
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                ["own.py", "other.py"],
+            )
+
+            # Clicking again includes every session inline and drops the
+            # section.
+            await pilot.click(chip)
+            await pilot.pause()
+            self.assertEqual(summary.scope, "all")
+            self.assertEqual(
+                [r.diff_section for r in summary.query(".diff-section-row")],
+                ["agent", "auto", "drift"],
+            )
+            self.assertEqual(loc(), ("+3", "-2"))
+
+    async def test_collapsing_a_section_closes_its_open_diff(self) -> None:
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            summary.show_diff("yours.py", "--- a/yours.py\n+++ b/yours.py\n@@\n-x\n+y\n")
+            await pilot.pause()
+            self.assertTrue(summary.diff_shown)
+            # show_diff unfolded the drift section for it.
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                ["own.py", "other.py", "yours.py"],
+            )
+
+            await summary.toggle_section("drift")
+            await pilot.pause()
+            # The pane closes with its row instead of floating orphaned.
+            self.assertFalse(summary.diff_shown)
+            self.assertFalse(summary.query_one("#diff-content").has_class("show"))
+
+    async def test_sections_are_always_visible_even_when_empty(self) -> None:
+        from xarness.protocol import DiffFileInfo, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="own.py", additions=1, deletions=0, kind="mine"),
+            ]))
+            await pilot.pause()
+            self.assertEqual(
+                [r.diff_section for r in summary.query(".diff-section-row")],
+                ["agent", "auto", "drift"],
+            )
+            self.assertTrue(summary.query_one(".diff-section-row.drift").has_class("empty"))
+
+    async def test_stepping_skips_folded_files(self) -> None:
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            await pilot.pause()
+            self.assertEqual(summary._visible_paths(), ["own.py", "other.py"])
+            self.assertFalse(summary._request_neighbour("other.py", 1))
+
+            await summary.toggle_section("drift")
+            await pilot.pause()
+            self.assertEqual(
+                summary._visible_paths(), ["own.py", "other.py", "yours.py"]
+            )
+            self.assertTrue(summary._request_neighbour("other.py", 1))
+
+    async def test_narrowing_the_scope_keeps_the_open_diff(self) -> None:
+        """Switching to this session moves another session's open diff into
+        the dimmed `agent` section — unfolding it with the pane rather
+        than closing the diff the user is reading."""
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            summary.show_diff("other.py", "--- a/other.py\n+++ b/other.py\n@@\n-x\n+y\n")
+            await pilot.pause()
+            self.assertTrue(summary.diff_shown)
+
+            await pilot.click(summary.query_one(".diff-filter"))
+            await pilot.pause()
+            self.assertTrue(summary.diff_shown)
+            self.assertIn("agent", summary._expanded)
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                ["own.py", "other.py"],
+            )
+
+    async def test_a_chip_click_is_saved_on_the_session(self) -> None:
+        """The choice is session state: the widget posts it and the app sends
+        SetViewState so a reattach (or a later run) shows the same rows."""
+
+        client = FakeClient(make_snapshot())
+        app = make_app(client)
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            await pilot.pause()
+            chip = summary.query_one(".diff-filter")
+            await pilot.click(chip)
+            for _ in range(3):
+                await pilot.pause()
+            sent = [c for _, c in client.commands if c.type == "set_view_state"]
+            self.assertEqual([c.view.diff_scope for c in sent], ["mine"])
+
+    async def test_the_saved_filter_is_restored_on_attach(self) -> None:
+        """A session saved scoped to this session reopens the same way: the
+        status carries the choice, and the panel applies it without a click."""
+
+        snap = make_snapshot()
+        snap.status.view.diff_scope = "mine"
+        app = make_app(FakeClient(snap))
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            await pilot.pause()
+            self.assertEqual(summary.scope, "mine")
+            self.assertEqual(
+                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+            )
+            self.assertEqual(
+                [r.diff_section for r in summary.query(".diff-section-row")],
+                ["agent", "auto", "drift"],
+            )
+
+    async def test_a_draft_keeps_its_scope_for_the_session_it_starts(self) -> None:
+        """No session yet: the click is not lost — the selection rides out on
+        the create request, so the first session starts scoped."""
+
+        client = FakeClient(make_snapshot())
+        app = make_app(client, session_name=None)
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            await summary.toggle_scope()
+            await pilot.pause()
+            # A draft must not revert the click on the next status refresh.
+            app._refresh_bars()
+            await pilot.pause()
+            self.assertEqual(summary.scope, "mine")
+            self.assertEqual(app._selected_diff_scope(), "mine")
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "set_view_state"], []
+            )
+
+    async def test_a_stale_status_does_not_revert_the_click(self) -> None:
+        """Clicking the chip updates the panel immediately; a StatusChanged
+        already in flight (with the pre-click value) must not undo it before
+        the host's own echo lands."""
+
+        client = FakeClient(make_snapshot())
+        app = make_app(client)
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = await self._summary(pilot, app)
+            summary.add_class("expanded")
+            await pilot.pause()
+            chip = summary.query_one(".diff-filter")
+            await pilot.click(chip)
+            await pilot.pause()
+            # A status computed before the host applied the command.
+            client.queue.put_nowait(
+                protocol.StatusChanged(status=make_snapshot().status))
+            for _ in range(3):
+                await pilot.pause()
+            self.assertEqual(summary.scope, "mine")
+            # The host's echo settles it; from then on status is authoritative
+            # (another client's choice included).
+            status = make_snapshot().status
+            status.view.diff_scope = "mine"
+            client.queue.put_nowait(protocol.StatusChanged(status=status))
+            for _ in range(3):
+                await pilot.pause()
+            self.assertEqual(summary.scope, "mine")
+            status = make_snapshot().status
+            status.view.diff_scope = "all"
+            client.queue.put_nowait(protocol.StatusChanged(status=status))
+            for _ in range(3):
+                await pilot.pause()
+            self.assertEqual(summary.scope, "all")
 
 
 class ShimmerDirectionTest(unittest.TestCase):
@@ -2364,13 +2791,11 @@ class ShimmerDirectionTest(unittest.TestCase):
 
 class UndoCommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_plain_undo_puts_the_user_text_back_in_the_input(self) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.widgets import ChatInput
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
-        async with app.run_test() as pilot:
-            await pilot.pause()
+        app = make_app(client)
+        async with run_app(app) as pilot:
             await app._run_undo()
             await pilot.pause()
             self.assertEqual(app.query_one("#chat-input", ChatInput).text, "put back")
@@ -2383,11 +2808,10 @@ class UndoAffordanceClickTest(unittest.IsolatedAsyncioTestCase):
     a click anywhere else closes it."""
 
     async def _run(self, script) -> None:
-        from xarness.tui.app import AgentApp
         from xarness.tui.flow import UserItem
 
         client = FakeClient(make_snapshot())
-        app = AgentApp(client, workspace=None, session_name="s1")
+        app = make_app(client)
         async with app.run_test(size=(60, 20)) as pilot:
             for _ in range(5):
                 await pilot.pause()

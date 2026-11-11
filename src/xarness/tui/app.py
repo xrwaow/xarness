@@ -47,6 +47,7 @@ from ..protocol import (
     ContentDelta,
     CreateSessionRequest,
     DiffChanged,
+    DiffScope,
     DiscardQueued,
     Event,
     Filter,
@@ -64,6 +65,7 @@ from ..protocol import (
     SessionDeleted,
     SetMode,
     SetSandbox,
+    SetViewState,
     Snapshot,
     Status,
     StatusChanged,
@@ -71,6 +73,7 @@ from ..protocol import (
     SwitchModel,
     ToolCallStarted,
     TurnEnded,
+    ViewState,
 )
 from . import flow as tflow
 from .confirm_screen import ConfirmScreen
@@ -409,6 +412,11 @@ class AgentApp(App[None]):
         self._config_cache = None
         # Last rendered diff: anchors the reject confirmation.
         self._last_diff = None
+        # The /diff scope we just sent to the host, held until its status
+        # echoes it back. Without it, a StatusChanged already in flight (the
+        # stream emits one per round) would briefly revert the click before
+        # the host applied it.
+        self._diff_scope_pending: DiffScope | None = None
         # Live phase — the single owner of the ephemeral pending strip.
         # pending = a round is waiting on the provider (turn start and every
         # post-tools round); the transitions below are the strip's only
@@ -512,6 +520,7 @@ class AgentApp(App[None]):
             self._pump_worker.cancel()
             self._pump_worker = None
         self.session_name = name
+        self._diff_scope_pending = None
         self._pump_worker = self._pump_events(name)
 
     @work(group="stream", exit_on_error=False)
@@ -747,6 +756,28 @@ class AgentApp(App[None]):
         self._refresh_status()
         self._refresh_steer_bar()
         self._refresh_generating()
+        self._sync_diff_scope()
+
+    def _sync_diff_scope(self) -> None:
+        """Push the session's saved view state into the panel.
+
+        The choice is session state (the chip posts SetViewState and the host
+        saves it), so it survives a restart too: a reattached client shows
+        what the user last selected. A draft chat has no session to ask, so
+        the widget's own selection stands until one exists."""
+        if self._status is None:
+            return
+        try:
+            widget = self.query_one("#diff-summary", DiffSummary)
+        except NoMatches:
+            return  # app shutting down
+        saved = self._status.view.diff_scope
+        if self._diff_scope_pending is not None:
+            if saved != self._diff_scope_pending:
+                return  # a status older than our click: keep the click
+            self._diff_scope_pending = None
+        if widget.scope != saved:
+            self.call_later(widget.set_scope, saved)
 
     def _refresh_status(self) -> None:
         status = self.view_status
@@ -930,6 +961,8 @@ class AgentApp(App[None]):
                 enable_tracking=self.enable_tracking,
                 no_init_repo=self.no_init_repo,
                 no_session=self.no_session,
+                # The view picked in the draft becomes the new session's.
+                view=ViewState(diff_scope=self._selected_diff_scope()),
             ))
         except ClientError as exc:
             self._error(f"could not start a session: {exc}")
@@ -1160,6 +1193,7 @@ class AgentApp(App[None]):
             self._pump_worker = None
         self.session_name = None
         self._status = None
+        self._diff_scope_pending = None
         self._refresh_title()
         self._flow_model.clear()
         # The reducer outlives the view: reset it too, so a new draft starts
@@ -1876,6 +1910,27 @@ class AgentApp(App[None]):
             widget.hide_diff()
             self._error(f"/diff failed: {exc}")
 
+    async def on_diff_summary_scope_changed(
+        self, event: DiffSummary.ScopeChanged,
+    ) -> None:
+        """The chip flipped: save the scope on the session.
+
+        The widget already applied it locally (so the list, the totals and
+        the open diff react immediately); this makes it session state, which
+        is what a reattach reads back. A draft chat has no session yet — the
+        selection goes out with the create request instead."""
+        if self.session_name is None:
+            return
+        self._diff_scope_pending = event.scope
+        self._post_command(SetViewState(view=ViewState(diff_scope=event.scope)))
+
+    def _selected_diff_scope(self) -> DiffScope:
+        """The scope the panel shows, for a session this app is creating."""
+        try:
+            return self.query_one("#diff-summary", DiffSummary).scope
+        except NoMatches:
+            return "all"
+
     async def on_diff_summary_diff_requested(self, event: DiffSummary.DiffRequested) -> None:
         if self.session_name is None:
             return
@@ -1892,6 +1947,9 @@ class AgentApp(App[None]):
         except ClientError as exc:
             widget.hide_diff()
             self._error(f"diff failed: {exc}")
+            return
+        if not text.strip():
+            self._notice(f"no pending changes for {event.key}")
             return
         widget.show_diff(event.key, text)
 

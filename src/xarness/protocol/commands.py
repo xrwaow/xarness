@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..images import ImageRef
-from .views import Mode, RefInfo
+from .views import Mode, RefInfo, ViewState
 
 
 class CommandBase(BaseModel):
@@ -71,6 +71,15 @@ class SetMode(CommandBase):
     mode: Mode
 
 
+class SetViewState(CommandBase):
+    """Replace the clients' saved view state for this session (the /diff
+    panel's scope chip today). Saved with the session, so it survives a
+    reattach."""
+
+    type: Literal["set_view_state"] = "set_view_state"
+    view: ViewState
+
+
 class SwitchModel(CommandBase):
     type: Literal["switch_model"] = "switch_model"
     name: str
@@ -110,6 +119,7 @@ Command = Annotated[
         Accept,
         Reject,
         SetMode,
+        SetViewState,
         SwitchModel,
         SetSandbox,
         Filter,
@@ -147,6 +157,7 @@ class CommandResult(BaseModel):
     sandbox: str | None = None
     filter_list: list[str] | None = None
     refs: list[RefInfo] | None = None
+    view: ViewState | None = None
 
 
 class CommandEnvelope(BaseModel):
@@ -193,3 +204,6 @@ class CreateSessionRequest(BaseModel):
     enable_tracking: bool | None = None
     no_session: bool = False
     first_message: str | None = None
+    # The view state the creating client had selected, so a session started
+    # from a narrowed view keeps that view.
+    view: ViewState = Field(default_factory=ViewState)

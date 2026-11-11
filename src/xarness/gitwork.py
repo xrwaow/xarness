@@ -8,10 +8,13 @@ and no accept/reject copy. Git is used purely as a change record:
     ``baseline_tree``) — the base /diff measures against
   - every successful tool call is recorded as an event in
     :mod:`xarness.workspace`; labels (mine/agent/auto/drift) are derived
-    from those events, never stored
-  - /undo and /retry restore only the paths a turn's events touched, from
-    the turn's before tree, and refuse (all-or-nothing) when a path changed
-    since the turn
+    from those events, never stored, and an explicit write's before/after
+    blob shas are recorded with it so each agent's own delta can be diffed
+  - /undo and /retry reverse only the paths a turn's events touched: an
+    untouched path is restored from the turn's before tree, and a path that
+    changed since is three-way merged (see :func:`merge_texts`) so another
+    agent's later edit elsewhere in the file survives. Any conflict makes
+    the whole undo a no-op
 
 Snapshots are built with a throwaway index (``GIT_INDEX_FILE`` pointing at a
 temp file): the user's index, HEAD, and refs are never touched, and no
@@ -66,7 +69,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
@@ -154,8 +157,10 @@ class TurnCheckpoint(BaseModel):
 
 async def _run_git(
     args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None,
-    input_bytes: bytes | None = None,
-) -> tuple[int, str, str]:
+    input_bytes: bytes | None = None, *, text: bool = True,
+) -> tuple[int, Any, Any]:
+    """One git subprocess; output decoded unless ``text=False`` (blob
+    contents and merge output are bytes, not text)."""
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
         cwd=str(cwd) if cwd else None,
@@ -172,11 +177,14 @@ async def _run_git(
         proc.kill()
         await proc.wait()
         raise GitWorktreeError(f"git {' '.join(args)} timed out") from None
-    return (
-        proc.returncode or 0,
-        stdout.decode(errors="replace"),
-        stderr.decode(errors="replace"),
-    )
+    if not text:
+        return proc.returncode or 0, stdout, stderr
+    return proc.returncode or 0, _text(stdout), _text(stderr)
+
+
+def _text(data: bytes) -> str:
+    """git output as text; undecodable bytes are replaced, never raised."""
+    return data.decode(errors="replace")
 
 
 # ----------------------------------------------------------------------
@@ -300,8 +308,10 @@ HARNESS_IGNORES: tuple[str, ...] = (
 )
 
 # Cargo's own ``target/`` and the sandbox's redirected ``target-sandbox/``
-# (the sandbox sets CARGO_TARGET_DIR): both are build output, not source.
-_CARGO_IGNORES: tuple[str, ...] = ("target/", "target-sandbox/")
+# (the sandbox sets CARGO_TARGET_DIR) are build output, not source; so is
+# ``Cargo.lock`` (a binary crate's is not source, and a lockfile diff across
+# a dependency fetch is noise).
+_CARGO_IGNORES: tuple[str, ...] = ("target/", "target-sandbox/", "Cargo.lock")
 
 # Files larger than this are excluded from tracking (snapshots/diffs/undo).
 _MAX_TRACKED_SIZE = 1024 * 1024
@@ -317,8 +327,9 @@ _XARNESS_IGNORE = ".xarness/ignore"
 def harness_ignores(root: Path) -> tuple[str, ...]:
     """The harness's ignore rules for ``root``, in gitignore syntax.
 
-    The cargo build trees are gated: a directory that merely happens to be
-    called ``target`` in a non-Cargo project is still tracked."""
+    The cargo entries are gated: a directory that merely happens to be
+    called ``target`` in a non-Cargo project is still tracked, and so is a
+    ``Cargo.lock`` left over outside a crate."""
     if (root / "Cargo.toml").is_file():
         return (*_CARGO_IGNORES, *HARNESS_IGNORES)
     return HARNESS_IGNORES
@@ -680,23 +691,32 @@ async def tree_entry(
     return (mode, sha) if kind == "blob" else None
 
 
-def worktree_entry(root: Path, path: str) -> tuple[str, str] | None:
-    """``(mode, blob sha)`` of one worktree path, or None when it is absent.
+async def write_blob(repo: RepoStore, data: bytes) -> str:
+    """Store ``data`` in the object store and return its blob sha.
 
-    The worktree twin of :func:`tree_entry`: git hashes a file's content the
-    same way whether it is read from a tree or from disk, so what a turn
-    left behind can be compared with the entry its after tree recorded
-    without touching the index. Symlinks hash their target path."""
-    target = root / path
-    try:
-        if target.is_symlink():
-            data, mode = os.readlink(target).encode(), "120000"
-        else:
-            data = target.read_bytes()
-            mode = "100755" if os.access(target, os.X_OK) else "100644"
-    except OSError:
-        return None
-    return mode, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    Explicit writes record the shas of the file before and after the tool
+    call (see ``WorkspaceState.record``), so /diff can show each agent's own
+    delta without snapshotting the workspace on every edit."""
+    rc, out, err = await _run_git(
+        ["hash-object", "-w", "--stdin"],
+        cwd=repo.root, env=repo.git_env(), input_bytes=data,
+    )
+    if rc != 0:
+        raise GitWorktreeError(f"could not store a blob: {err.strip()}")
+    return out.strip()
+
+
+async def read_blob(repo: RepoStore, sha: str) -> bytes:
+    """The bytes of one blob (raises when the object is gone: a pruned
+    store takes pending provenance with it, exactly like the trees)."""
+    rc, out, err = await _run_git(
+        ["cat-file", "blob", sha], cwd=repo.root, env=repo.git_env(), text=False,
+    )
+    if rc != 0:
+        raise GitWorktreeError(
+            f"could not read blob {sha[:8]}: {_text(err).strip()}"
+        )
+    return out
 
 
 async def restore_paths(repo: RepoStore, tree: str, paths: list[str]) -> None:
@@ -916,32 +936,34 @@ async def _diff_trees(repo: RepoStore, *extra: str, current: str | None = None) 
     return await _diff_tree_pair(repo, repo.baseline_tree, current, *extra)
 
 
-# Snapshot trees are immutable, so a tree pair's diff never changes once the
-# objects exist. Cache it so /diff stays cheap on long sessions. The cached
-# strings are immutable, so callers can't corrupt the cache by mutating what
-# they get back. Bounded (oldest entry evicted) so a long-lived process
-# doesn't grow without end.
-_CACHE_LIMIT = 512
-_numstat_cache: dict[tuple[str, str], tuple[str, str]] = {}
+# Snapshot trees and recorded blobs are immutable, so their diffs never
+# change once the objects exist: /diff reads the same few tree pairs on every
+# poll and a recorded provenance pair never moves at all. Remember those
+# results for the life of the process, keyed (kind, …) so they share one
+# bounded dict (oldest entry evicted); the values are immutable, so no caller
+# can corrupt them.
+_MEMO_LIMIT = 512
+_memo: dict[tuple, Any] = {}
 
 
-def _cache_put(cache: dict, key, value):
-    if len(cache) >= _CACHE_LIMIT:
-        cache.pop(next(iter(cache)))
-    cache[key] = value
+def _memo_put(key: tuple, value: Any) -> Any:
+    """Remember one entry (evicting the oldest when full) and return it."""
+    if len(_memo) >= _MEMO_LIMIT:
+        _memo.pop(next(iter(_memo)))
+    _memo[key] = value
+    return value
 
 
 async def _diff_between(repo: RepoStore, base_tree: str, other_tree: str) -> tuple[str, str]:
     """Cached ``(--numstat, --name-status)`` NUL-separated output between two
     snapshot trees. ``--name-status`` is where ``is_new`` comes from (the
     ``A`` rows), so no second ``ls-tree`` pass per tree is needed."""
-    key = (base_tree, other_tree)
-    cached = _numstat_cache.get(key)
+    key = ("numstat", base_tree, other_tree)
+    cached = _memo.get(key)
     if cached is None:
         numstat = await _diff_tree_pair(repo, base_tree, other_tree, "--numstat", "-z")
         status = await _diff_tree_pair(repo, base_tree, other_tree, "--name-status", "-z")
-        cached = (numstat, status)
-        _cache_put(_numstat_cache, key, cached)
+        cached = _memo_put(key, (numstat, status))
     return cached
 
 
@@ -965,6 +987,161 @@ async def git_diff(
     the workspace only once."""
     extra: tuple[str, ...] = ("--", path) if path else ()
     return await _diff_trees(repo, *extra, current=current)
+
+
+# Patches one ignored group's /diff lists before it says "… N more files".
+_IGNORED_PATCHES = 50
+
+
+async def ignored_diff(repo: RepoStore, prefix: str) -> str:
+    """An "added" patch for an ignored path: one file, or the files under a
+    directory group (``prefix`` is the row the summary shows, trailing slash
+    included).
+
+    Ignored paths never enter a snapshot tree, so the baseline→worktree diff
+    has nothing to compare them against. Diffing each against ``/dev/null``
+    is the only view of their contents; a directory's patches are headed with
+    the group so the pane keeps naming the row that was clicked. Symlinks are
+    skipped (reading one would print whatever it points at) and a big group is
+    cut off, since the pane shows one scrollback, not a directory browser."""
+    root, env = repo.root, repo.git_env()
+    target = root / prefix
+    if target.is_dir():
+        listing = await ignored_listing(root, env, collapsed=False)
+        paths = [path for path in listing if path.startswith(prefix)]
+        header = prefix
+    elif target.is_file():
+        paths, header = [prefix], prefix
+    else:
+        return ""
+    shown = paths[:_IGNORED_PATCHES]
+    patches = [
+        await _added_patch(root, env, path, header) for path in shown
+        if not (root / path).is_symlink()
+    ]
+    if len(paths) > len(shown):
+        patches.append(f"… {len(paths) - len(shown)} more files\n")
+    return "".join(patches)
+
+
+async def _added_patch(
+    root: Path, env: dict[str, str], path: str, header: str,
+) -> str:
+    """One path's ``/dev/null`` diff, its header naming ``header``."""
+    rc, out, err = await _run_git(
+        ["diff", "--no-index", "--no-color", "--", os.devnull, path],
+        cwd=root, env=env,
+    )
+    if rc > 1:
+        raise GitWorktreeError(f"git diff failed: {err.strip()}")
+    lines = out.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            lines[index] = f"diff --git a/{header} b/{header}"
+        elif not line.startswith(("index ", "--- ", "+++ ")):
+            break
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+# The empty blob has to exist in the store before it can be diffed against:
+# one write per store, remembered in the same memo (its sha is the same
+# everywhere).
+
+
+async def _blob_pair(
+    repo: RepoStore, base: str | None, other: str | None,
+) -> tuple[str, str]:
+    """The pair to diff, with an absent side mapped to the empty blob."""
+    if base and other:
+        return base, other
+    empty = _memo.get(("empty", repo.root))
+    if empty is None:
+        empty = _memo_put(("empty", repo.root), await write_blob(repo, b""))
+    return base or empty, other or empty
+
+
+async def blob_diff_stat(
+    repo: RepoStore, base: str | None, other: str | None,
+) -> tuple[int, int]:
+    """``(additions, deletions)`` of one path between two blobs, where
+    ``None`` means the path was absent.
+
+    This is the per-author delta /diff reports: a patch between the content
+    just before an agent's first write and just after its last one, so an
+    earlier agent's hunks in the same file are not credited to it."""
+    key = ("blobstat", *await _blob_pair(repo, base, other))
+    if key[1] == key[2]:
+        return 0, 0
+    cached = _memo.get(key)
+    if cached is not None:
+        return cached
+    rc, out, err = await _run_git(
+        ["diff", "--numstat", "-z", key[1], key[2]],
+        cwd=repo.root, env=repo.git_env(),
+    )
+    if rc != 0:
+        raise GitWorktreeError(f"git diff failed: {err.strip()}")
+    files = _parse_numstat_z(out)
+    stat = (files[0].additions, files[0].deletions) if files else (0, 0)
+    return _memo_put(key, stat)
+
+
+async def blob_diff_text(
+    repo: RepoStore, path: str, base: str | None, other: str | None,
+) -> str:
+    """Unified diff of one path between two blobs, with the sha-named header
+    lines rewritten to the real path so the pane renders it like any other
+    file diff."""
+    first, second = await _blob_pair(repo, base, other)
+    if first == second:
+        return ""
+    rc, out, err = await _run_git(
+        ["diff", "--no-color", first, second],
+        cwd=repo.root, env=repo.git_env(),
+    )
+    if rc != 0:
+        raise GitWorktreeError(f"git diff failed: {err.strip()}")
+    lines = out.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("@@"):
+            break
+        if line.startswith("diff --git "):
+            lines[index] = f"diff --git a/{path} b/{path}"
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            side = "a" if line.startswith("--- ") else "b"
+            lines[index] = f"{line[:4]}{side}/{path}"
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+async def merge_texts(
+    repo: RepoStore, *, base: bytes, ours: bytes, theirs: bytes,
+) -> bytes | None:
+    """Three-way merge of one file's contents; None when the changes
+    conflict.
+
+    ``WorkspaceState.undo`` reverses a turn by merging that turn's *own*
+    edit away: ``base`` is what the turn left, ``ours`` what is on disk now
+    (another agent's later edits included) and ``theirs`` what the path held
+    before the turn. Overlapping hunks conflict; disjoint ones merge, so a
+    later agent's edit elsewhere in the file no longer blocks the undo."""
+    with tempfile.TemporaryDirectory(prefix="xarness-merge-") as tmp:
+        sides = []
+        for name, data in (("ours", ours), ("base", base), ("theirs", theirs)):
+            side = Path(tmp) / name
+            side.write_bytes(data)
+            sides.append(str(side))
+        rc, out, err = await _run_git(
+            ["merge-file", "-p", "-L", "ours", "-L", "base", "-L", "theirs",
+             *sides],
+            cwd=repo.root, env=repo.git_env(), text=False,
+        )
+        if rc < 0:
+            raise GitWorktreeError(
+                f"git merge-file failed: {_text(err).strip()}"
+            )
+        if rc > 0:
+            return None  # rc is the number of conflicted hunks
+        return out
 
 
 # ----------------------------------------------------------------------

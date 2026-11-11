@@ -225,6 +225,34 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         listing = await gitwork.ignored_listing(repo)
         assert "target" in listing and "target-sandbox" in listing
 
+    async def test_cargo_lock_is_not_tracked(self):
+        """The first build writes Cargo.lock; it is resolved output, so it
+        stays out of snapshots (only a Cargo project ignores it)."""
+        repo = self.make_repo()
+        (repo / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "cargo")
+
+        state = await open_state(repo)
+
+        (repo / "Cargo.lock").write_text("version = 3\n")
+        (repo / "app.py").write_text("edited\n")
+
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["app.py"]
+        assert "Cargo.lock" in await gitwork.ignored_listing(repo)
+
+    async def test_cargo_lock_tracked_without_cargo_toml(self):
+        """A stray `Cargo.lock` outside a crate is just a file."""
+        repo = self.make_repo()
+        (repo / "Cargo.lock").write_text("v1\n")
+
+        state = await open_state(repo)
+
+        (repo / "Cargo.lock").write_text("v2\n")
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["Cargo.lock"]
+
     async def test_target_dir_tracked_without_cargo_toml(self):
         """Not every `target/` is cargo's: without Cargo.toml it stays a
         normal tracked directory."""

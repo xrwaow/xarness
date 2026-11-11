@@ -9,6 +9,11 @@ mount; write mode exposes read_file plus the editing tools (write_file,
 edit_file). ask_user is available in both modes, and subagent in both modes
 when the caller can start one.
 
+A tool whose text names the machine it runs on is described by the factory
+that builds it, which is handed the sandbox the tool will run against — so
+the model is never told about a container that is not there, or the other way
+around (see :func:`_make_run_bash_tool`).
+
 Every tool declares a pydantic args model: the JSON schema for the provider
 is generated from it, and :meth:`ToolRegistry.call` validates the call's
 arguments with it in one place — so handlers read ``args.x`` (typed, with
@@ -419,25 +424,28 @@ def _line_window(
 
 
 def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
+    # What the workspace root is, and what an absolute path can reach, differ
+    # per environment; the rest of the description holds either way.
+    root, reach = (
+        (" (/workspace)", "e.g. /cache/...") if sandbox.use_sandbox
+        else (", which is your project directory", "e.g. the user's home directory")
+    )
+
     @tool(
         "read_file",
-        "Read a file's contents. Paths are relative to the workspace root. "
-        "Absolute paths are accepted for reads when the session runs in a "
-        "container (e.g. /cache/...); use workspace-relative paths "
-        "otherwise. "
-        f"Files over {OUTLINE_THRESHOLD} lines return a structural outline with line "
-        "numbers instead of contents; read specific sections of those by "
-        "passing start_line and end_line (1-based, inclusive).",
+        "Read a file's contents. Paths are relative to the workspace root"
+        f"{root}. Absolute paths are accepted for reads outside it ({reach}). "
+        f"Files over {OUTLINE_THRESHOLD} lines return a structural outline "
+        "with line numbers instead of contents; read specific sections of "
+        "those by passing start_line and end_line (1-based, inclusive).",
         ReadFileArgs,
     )
     async def read_file(args: ReadFileArgs) -> ToolResult:
         path = args.path
         if Path(path).is_absolute():
-            if not sandbox.use_sandbox:
-                return _bad(
-                    "absolute paths only exist inside the sandbox container; "
-                    "use a workspace-relative path"
-                )
+            # Taken as given: the environment bounds it, not this check. The
+            # container mounts the workspace, the caches and the refs and
+            # nothing else; the host has no jail, exactly like run_bash there.
             target = path
         elif err := _check_path(sandbox, path):
             return err
@@ -714,22 +722,28 @@ def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
 
 
 def _make_run_bash_tool(session: SandboxSession) -> Tool:
-    description = ["Run a shell command inside the sandboxed workspace, as /bin/sh."]
-    description.append(
+    # Which machine the command lands on is the one thing the model must not
+    # get wrong; the rest of the description holds in both environments.
+    where = (
+        "inside the sandboxed workspace, as /bin/sh. "
+        if session.config.use_sandbox
+        else "on the host, as /bin/sh: it runs directly in the user's project, "
+        "on the user's machine, with the user's own permissions. "
+    )
+
+    @tool(
+        "run_bash",
+        "Run a shell command " + where +
         "The shell persists across calls within this chat — cd and exported "
         "variables carry over until it restarts (a timeout, or a mode switch). "
         "The command's stdin is /dev/null, so interactive commands read EOF "
-        "instead of hanging."
+        "instead of hanging. The command runs as one shell string: the "
+        "reported exit code is the last statement's, so a chain whose final "
+        "command finds nothing (grep, test -f) reads as a failure even when "
+        "everything before it worked — and a pipe reports the last stage's "
+        "status. Every result ends with an `[exit N]` status line.",
+        RunBashArgs,
     )
-    description.append(
-        "The command runs as one shell string: the reported exit code is the "
-        "last statement's, so a chain whose final command finds nothing "
-        "(grep, test -f) reads as a failure even when everything before it "
-        "worked — and a pipe reports the last stage's status. Every result "
-        "ends with an `[exit N]` status line."
-    )
-
-    @tool("run_bash", " ".join(description), RunBashArgs)
     async def run_bash(args: RunBashArgs) -> ToolResult:
         command = args.command
         if not command.strip():

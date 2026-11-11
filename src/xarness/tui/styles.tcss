@@ -9,7 +9,6 @@ Screen {
     /* The diff pane owns scrolling when a diff is open; never show the
        screen-level (outer) scrollbar next to it. Wheel/key scrolling of the
        screen still works if the content ever exceeds the terminal. */
-    scrollbar-size: 0 0;
 }
 
 #chat-log {
@@ -21,7 +20,6 @@ Screen {
        (see Presenter.present in flow.py). The background deliberately stays
        unstyled on text cells: a baked bgcolor would defeat Textual's
        screen--selection highlight, so the bg comes from this rule instead. */
-    scrollbar-size: 0 0; /* hide the scrollbar visual; wheel/key scrolling still works */
 }
 
 StatusBar {
@@ -136,14 +134,34 @@ DiffSummary.visible {
     color: $c-success;
 }
 
+/* The scope chip: one click target on the summary line, always reading
+   ``agent``. Its two-tone label is baked into rich spans (accent + muted),
+   so the chip itself only carries the shared chrome. It underlines on its
+   own hover, so the whole summary bar does not underline with it. */
+.diff-filter {
+    width: auto;
+    height: 1;
+    margin-left: 1;
+    text-style: italic bold;
+}
+
+.diff-filter:hover {
+    text-style: italic bold underline;
+}
+
 #diff-summary-del {
     width: auto;
     margin-left: 1;
     color: $c-error;
 }
 
-DiffSummary:hover #diff-summary-row,
-.diff-file-row:hover {
+/* Hovering the bar underlines what a click does: toggle the list (label and
+   counts). The scope chip is a click target of its own, so it keeps its own
+   styling instead. */
+DiffSummary:hover #diff-summary-text,
+DiffSummary:hover #diff-summary-add,
+DiffSummary:hover #diff-summary-del,
+.diff-row:hover {
     text-style: underline;
 }
 
@@ -181,11 +199,12 @@ DiffSummary.expanded #diff-body {
     height: auto;
 }
 
-.diff-file-row {
+/* One click target in the list: a file row or an ignored-path group row. */
+.diff-row {
     height: auto;
 }
 
-.diff-file-row.active {
+.diff-row.active {
     background: $c-border;
 }
 
@@ -202,13 +221,23 @@ DiffSummary.expanded #diff-body {
     text-style: italic;
 }
 
+/* How many sessions explicitly wrote this path: more than one means the
+   file is shared and the row's +A/-D count only this author's delta. */
+.diff-file-shared {
+    width: auto;
+    margin-left: 1;
+    color: $c-muted;
+    text-style: italic;
+}
+
 .diff-file-source {
     width: auto;
     margin-left: 1;
     text-style: italic;
 }
 
-.diff-file-source.agent {
+.diff-file-source.agent,
+.diff-file-source.auto {
     color: $c-muted;
 }
 
@@ -216,29 +245,68 @@ DiffSummary.expanded #diff-body {
     color: $c-accent;
 }
 
-.diff-file-source.auto {
-    color: $c-muted;
-}
-
 .diff-file-source.drift {
     color: $c-warning;
 }
 
-.diff-drift-header {
+/* Expandable sections below the agent files (agent / auto /
+   drift). The header is always visible; clicking it folds its rows in and
+   out, and the arrow shows which way. Headers sit one under another, with
+   no blank line between them. */
+.diff-section-row {
     height: auto;
-    margin-top: 1;
-    color: $c-warning;
+}
+
+.diff-section-row:hover {
+    text-style: underline;
+}
+
+.diff-section-name {
+    /* Fixed 5-cell label column (``agent``, ``auto ``, ``drift``) so the
+       fold arrows line up under each other. */
+    width: 5;
+    text-overflow: ellipsis;
+    color: $c-muted;
     text-style: italic;
 }
 
-.diff-group-row {
-    height: auto;
-    color: $c-muted;
+.diff-section-row.drift .diff-section-name {
+    color: $c-warning;
 }
 
+/* Pushes the line totals to the right, so the fold arrow stays next to
+   the label and the +/- diff sits at the far right. */
+.diff-section-spacer {
+    width: 1fr;
+}
+
+/* The ignored-file count on a section header, and on a group row. */
+.diff-section-count,
 .diff-group-count {
     width: auto;
     margin-left: 2;
+    color: $c-muted;
+}
+
+.diff-section-toggle {
+    width: auto;
+    margin-left: 1;
+    color: $c-muted;
+}
+
+/* Full-width rule between the agent files and the section headers. */
+.diff-divider {
+    width: 1fr;
+    height: 1;
+    border-top: solid $c-border;
+}
+
+/* Rows inside a section are indented so the fold structure reads. */
+.diff-row.nested {
+    padding-left: 2;
+}
+
+.diff-group-row {
     color: $c-muted;
 }
 
@@ -384,11 +452,7 @@ ConfirmScreen, RefsScreen, ListPicker {
     max-height: 24;
 }
 
-#refs-add-label {
-    color: $c-muted;
-}
-
-#refs-empty, .refs-mount {
+#refs-add-label, #refs-empty, .refs-mount {
     color: $c-muted;
 }
 

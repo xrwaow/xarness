@@ -1415,14 +1415,17 @@ def test_a_steered_turn_is_one_turn_for_the_stamp(tmp_path) -> None:
 # mid-turn change attribution (/diff source tags)
 
 
-async def _tracked_session(tmp_path, script, registry=None):
+async def _tracked_session(tmp_path, script, registry=None, files=None):
     """A session with real workspace tracking.
 
     The tracked workspace is a subdirectory so the (test-local) session
     files, which live directly under ``tmp_path``, are not themselves
-    tracked as drift."""
+    tracked as drift. ``files`` are written into the workspace before the
+    baseline snapshot, so they start out tracked rather than pending."""
     ws = tmp_path / "ws"
     ws.mkdir()
+    for name, content in (files or {}).items():
+        (ws / name).write_text(content)
     state = await open_workspace(ws, persist=False)
     assert state is not None
     session = Session(
@@ -1463,6 +1466,47 @@ def _tool_round(call_id="c1"):
         ),
         RoundComplete(has_tool_calls=True),
     ]
+
+
+def test_an_explicit_write_records_its_own_provenance(tmp_path, monkeypatch) -> None:
+    """edit_file's event carries the before/after blob shas, so /diff reports
+    that call's delta instead of the whole pending file."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        ws = tmp_path / "ws"
+
+        @tool("edit_file", "edit a file", _NoArgs)
+        async def edit(args) -> ToolResult:
+            (ws / "a.txt").write_text("after\n")
+            return ToolResult(content="ok")
+
+        registry = ToolRegistry()
+        registry.register(edit)
+        session, state = await _tracked_session(
+            tmp_path, [_tool_round()], registry, files={"a.txt": "before\n"},
+        )
+        session.subscribe()
+        await session.execute("s1", SendMessage(text="hi"))
+        await wait_idle(session)
+
+        event = state.events[0]
+        assert event.paths == ("a.txt",)
+        path, before, after = event.writes[0]
+        assert path == "a.txt"
+        assert before is not None and after is not None
+        assert await gitwork.read_blob(state, before) == b"before\n"
+        assert await gitwork.read_blob(state, after) == b"after\n"
+
+        info = await session.diff_info(None)
+        assert [
+            (row.path, row.kind, row.additions, row.deletions)
+            for row in info.files
+        ] == [("a.txt", "mine", 1, 1)]
+        assert info.text == ""  # the summary poll stays cheap
+        assert await session.diff_info("a.txt") is not None
+
+    asyncio.run(go())
 
 
 def test_mutating_tool_and_turn_end_emit_diff_changed(tmp_path, monkeypatch) -> None:
@@ -1981,6 +2025,30 @@ def test_load_starts_watermark_at_end_and_closes_crashed_turns(tmp_path) -> None
         # Untracked: closing a crashed turn leaves its trees unset.
         assert all(t.after_tree is None
                    for t in loaded.conversation.turns.values())
+
+    asyncio.run(go())
+
+
+def test_view_state_is_saved_with_the_session(tmp_path) -> None:
+    """The /diff scope is session state: it goes out in the status, is
+    written to the session row, and comes back on load."""
+    async def go():
+        session = make_session([], tmp_path)
+        assert session.status().view.diff_scope == "all"
+
+        result = await session.execute(
+            "f1", protocol.SetViewState(view=protocol.ViewState(diff_scope="mine")),
+        )
+        assert result.ok
+        assert result.view.diff_scope == "mine"
+        assert session.status().view.diff_scope == "mine"
+
+        await session._flush_persist()
+        stored = session_store.load_state("test")
+        assert stored.view.diff_scope == "mine"
+
+        loaded = Session.load("test", parts=_parts(tmp_path), state=stored)
+        assert loaded.status().view.diff_scope == "mine"
 
     asyncio.run(go())
 

@@ -294,6 +294,7 @@ class Host:
         session = Session(
             **parts.session_kwargs(name),
             no_save=request.no_session,
+            view=request.view,
         )
         self.sessions[name] = session
         if not request.no_session:

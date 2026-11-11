@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .config import SandboxSettings
 from .conversation import MESSAGE_ADAPTER, Conversation, Message, Usage
 from .gitwork import TurnCheckpoint
+from .protocol.views import ViewState
 from .images import ImageAttachment, ImageRef
 from .util import utcnow_iso as _utcnow_iso
 
@@ -216,6 +217,9 @@ class StoredSession(BaseModel):
     usage_total: Usage = Field(default_factory=Usage)
     last_usage: Usage = Field(default_factory=Usage)
     mode: str | None = None
+    # The clients' view choices (see protocol.ViewState). View state, but
+    # per-session, so it rides along with the rest of the session info.
+    view: ViewState = Field(default_factory=ViewState)
 
 
 def _meta_block(stored: StoredSession) -> dict[str, Any]:

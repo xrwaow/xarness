@@ -127,27 +127,26 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
             # diff and give the session a tracked workspace.
             from xarness.protocol import DiffFileInfo, DiffInfo
 
-            async def fake_diff(viewer=None, current=None):
+            async def fake_diff(viewer=None, current=None, path=None):
                 return DiffInfo(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
                     kind="agent",
                 )], additions=1, deletions=0)
 
-            async def fake_text(repo, path, current=None):
+            async def fake_text(viewer, path, current=None):
                 return f"diff for {path}"
 
             session.workspace_state = WorkspaceState(
                 root=tmp_path, git_dir=tmp_path / ".git",
                 baseline_tree="t" * 40,
             )
-            from xarness import session as session_mod
             monkey = pytest.MonkeyPatch()
             async def fake_snapshot():
                 return "t" * 40
 
             session.workspace_state.observe = fake_snapshot
             session.workspace_state.diff = fake_diff
-            monkey.setattr(session_mod, "git_diff", fake_text)
+            session.workspace_state.file_diff = fake_text
             try:
                 async with _unix_http(host.unix_socket) as http:
                     whole_resp = await http.get(f"/v1/sessions/{name}/diff")
@@ -192,6 +191,48 @@ def test_saved_session_reads_load_and_host_the_session(tmp_path) -> None:
                 # Same saved git block: the baseline survived the reload.
                 assert diff_resp.json()["tracking"] is True
             assert name in host.sessions
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_view_state_round_trips_through_the_session(tmp_path) -> None:
+    """The /diff scope travels with the session: it can be set at creation,
+    changed by a command over HTTP, and it is still there after the host
+    reloads the session from disk."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            (tmp_path / "ws").mkdir(exist_ok=True)
+            summary = await host.create_session(protocol.CreateSessionRequest(
+                workspace=str(tmp_path / "ws"),
+                view=protocol.ViewState(diff_scope="mine"),
+            ))
+            name = summary.name
+            assert host.sessions[name].status().view.diff_scope == "mine"
+            async with _unix_http(host.unix_socket) as http:
+                result = (await http.post(
+                    f"/v1/sessions/{name}/commands",
+                    json={"cmd_id": "f1", "command": {
+                        "type": "set_view_state",
+                        "view": {"diff_scope": "all"},
+                    }},
+                )).json()
+                assert result["ok"], result
+                assert result["view"]["diff_scope"] == "all"
+                snap = (await http.get(f"/v1/sessions/{name}")).json()
+                assert snap["status"]["view"]["diff_scope"] == "all"
+
+            # Reload from disk: the saved filter comes back on attach.
+            await host.unload_session(name)
+            assert name not in host.sessions
+            async with _unix_http(host.unix_socket) as http:
+                snap = (await http.get(f"/v1/sessions/{name}")).json()
+                assert snap["status"]["view"]["diff_scope"] == "all"
         finally:
             await host.request_shutdown()
             await asyncio.wait_for(task, timeout=5)

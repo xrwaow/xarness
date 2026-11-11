@@ -263,6 +263,10 @@ def _render_diff(text: str, show_headers: bool = True) -> Text:
             old_no += 1
         elif line.startswith("\\"):
             out.append("      ⋯ no newline at end of file\n", style=f"italic {p['diff_meta']}")
+        elif line.startswith("…"):
+            # A truncation notice (a long list of added files), not a hunk.
+            flush_header()
+            out.append(line + "\n", style=f"italic {p['diff_meta']}")
         else:
             flush_header()
             row(str(old_no), str(new_no), " ", line[1:] if line else "", p["text"], None)

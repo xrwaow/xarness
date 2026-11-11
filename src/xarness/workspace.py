@@ -5,8 +5,8 @@ work in one workspace — they share one container and one filesystem — so the
 tracked state is per workspace, not per session:
 
   - ``baseline_tree``: the tree /diff measures against, moved by accept
-  - ``head_tree``: the last state a turn ended on (advanced by ``refresh``),
-    and the incremental base the next snapshot is built on
+  - ``head_tree``: the last state a turn ended on, and the incremental base
+    the next snapshot is built on
   - ``epoch``: bumped on accept/reject, so turn checkpoints taken before a
     rebaseline stop being revertible
   - ``auto``: the collapsed ignored-path listing as of the baseline
@@ -16,18 +16,17 @@ It also owns the one persistent snapshot index and the lock that serializes
 snapshots, accept, reject and undo (a second ``git add`` on the same index
 would fail on ``index.lock``).
 
-Rows live in the session store's sqlite database: the schema and the
-connection belong to :mod:`xarness.session_store`, the rows to this module.
-A workspace opened by a ``--no-session`` run keeps its state in memory and
-never opens the database (the read side is ``mode=ro``, so even reading
-cannot create it); if a saved session later joins it, persistence is
-switched on and the state and its events are flushed in one transaction.
+Rows live in the session store's sqlite database (schema and connection in
+:mod:`xarness.session_store`). A ``--no-session`` run keeps its state in
+memory and never opens the database; if a saved session later joins it,
+persistence switches on and state + events are flushed in one transaction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sqlite3
 from collections.abc import Collection
@@ -48,16 +47,32 @@ _EXPLICIT_WRITES = frozenset({"edit_file", "write_file"})
 class Event:
     """One recorded tool call: what it changed, and for which turn.
 
-    ``paths`` are repo-root-relative tracked paths; ``auto`` the collapsed
-    ignored paths the call created. There is intentionally no timestamp and
-    no stored label — labels are derived per viewer."""
+    ``auto`` are the collapsed ignored paths the call created; ``changed`` the
+    tracked paths it changed for the calls known only from a before/after
+    snapshot (``run_bash``). There is intentionally no timestamp and no stored
+    label — labels are derived per viewer, and :attr:`paths` is the one answer
+    to "which paths did this touch".
+
+    ``writes`` is the provenance behind per-agent attribution: for an explicit
+    ``write_file``/``edit_file``, ``(path, before blob sha, after blob sha)``
+    per path (``None`` where it did not exist). Content-addressed, so the
+    delta between the shas is that call's own patch — the baseline→worktree
+    diff would credit it with earlier agents' hunks in the same file. A
+    ``run_bash`` event records none: its changes are never one agent's."""
 
     seq: int
     session: str
     tool: str
     turn: str | None
-    paths: tuple[str, ...]
+    changed: tuple[str, ...]
     auto: tuple[str, ...]
+    writes: tuple[tuple[str, str | None, str | None], ...] = ()
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        """Every path the call touched. A write's own provenance names its
+        path, so ``changed`` stays empty for it: one fact, one field."""
+        return tuple(path for path, _, _ in self.writes) or self.changed
 
 
 @dataclass
@@ -116,9 +131,9 @@ class WorkspaceState:
     async def _snapshot(self) -> str:
         """Snapshot the worktree (the caller holds the lock).
 
-        Files that grew past the size limit are dropped from the snapshot
-        AND added to the exclusion set, or the next ``git add -A`` would
-        re-hash the same huge blob every time."""
+        Files that grew past the size limit are dropped from the snapshot AND
+        added to the exclusion set, or the next ``git add -A`` would re-hash
+        the same huge blob every time."""
         grown: list[str] = []
         tree = await gitwork.snapshot_tree(
             self.root, exclude=self.oversized, env_base=self.git_env(),
@@ -139,14 +154,21 @@ class WorkspaceState:
 
     def record(
         self, *, session: str, tool: str, turn: str | None,
-        paths: tuple[str, ...], auto: tuple[str, ...],
+        auto: tuple[str, ...], paths: tuple[str, ...] = (),
+        writes: tuple[tuple[str, str | None, str | None], ...] = (),
     ) -> None:
-        """Append one event (a no-op row for an unchanged call)."""
-        if not paths and not auto:
+        """Append one event (a no-op row for an unchanged call).
+
+        ``paths`` are the paths the call touched; when ``writes`` carries
+        provenance it already names them, so they are not stored twice (a
+        write that changed nothing has none and keeps its path here)."""
+        if not (paths or auto or writes):
             return
+        if writes:
+            paths = ()
         event = Event(
             seq=self.next_seq, session=session, tool=tool, turn=turn,
-            paths=paths, auto=auto,
+            changed=paths, auto=auto, writes=writes,
         )
         self.next_seq += 1
         self.events.append(event)
@@ -176,73 +198,125 @@ class WorkspaceState:
 
     # -- diff, labelled per viewer --------------------------------------
 
+    def provenance(self) -> dict[str, dict[str, tuple[str | None, str | None]]]:
+        """``path -> {session: (before sha, after sha)}``, in event order.
+
+        Each session's entry spans its own writes to the path — the blob it
+        found before its first write and the blob it left after its last — so
+        its diff is that session's delta, not the whole file's pending change.
+        A session that writes twice with another agent in between absorbs the
+        interleaved change; the log has no per-line attribution to do better."""
+        chains: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+        for event in self.events:
+            for path, before, after in event.writes:
+                by_session = chains.setdefault(path, {})
+                first = by_session.get(event.session)
+                by_session[event.session] = (
+                    first[0] if first is not None else before, after,
+                )
+        return chains
+
     async def diff(
         self,
         viewer: str | Collection[str] | None = None,
         current: str | None = None,
+        path: str | None = None,
     ) -> DiffInfo:
         """Every pending change since the baseline, labelled for ``viewer``.
 
         Rows and groups are identical for every session; only the label of
         paths the viewer wrote itself differs (``mine``). A viewer may be a
-        set of session names (a session plus its subagents), so /sessions
-        can report the work a parent delegated. Explicit writes win over
-        bash, another session's events are never drift, and any path no
-        event covers is drift."""
+        set of session names (a session plus its subagents), so /sessions can
+        report the work a parent delegated. Explicit writes win over bash,
+        another session's events are never drift, and any path no event
+        covers is drift.
+
+        A path with recorded provenance reports **one author's delta**: the
+        viewer's when it wrote the path, otherwise the last session that did,
+        with ``authors`` naming everyone (the file is shared). Paths with only
+        bash/drift changes have no author and keep the whole pending delta.
+
+        With ``path``, only that path's row is built and no groups are
+        listed: /diff <path> wants one row next to one diff, not the tree."""
         current = current or await self.snapshot()
         stat = await gitwork.tree_diff_stat(self, self.baseline_tree, current)
-        # Pending explicitly written path -> the sessions that wrote it. Only
-        # write_file/edit_file count: bash changes and drift have no author,
-        # so they never appear here.
+        # Pending path -> the sessions that wrote it explicitly. Only
+        # write_file/edit_file count: bash changes and drift have no author.
         explicit: dict[str, set[str]] = {}
         bash: set[str] = set()
         event_auto: set[str] = set()
         for event in self.events:
             event_auto.update(event.auto)
             if event.tool in _EXPLICIT_WRITES:
-                for path in event.paths:
-                    explicit.setdefault(path, set()).add(event.session)
+                for written in event.paths:
+                    explicit.setdefault(written, set()).add(event.session)
             else:
                 bash.update(event.paths)
 
-        def is_mine(editors: set[str]) -> bool:
+        def is_mine(editors: Collection[str]) -> bool:
             if viewer is None:
                 return False
             if isinstance(viewer, str):
                 return viewer in editors
             return any(name in editors for name in viewer)
 
-        def label(path: str) -> str:
+        chains = self.provenance()
+
+        async def file_row(
+            path: str, is_new: bool, pending: tuple[int, int] | None = None,
+        ) -> DiffFileInfo:
+            """One path's row: the shown author's own delta when the log has
+            provenance for it, else ``pending`` (the file's whole change)."""
+            by_session = chains.get(path)
+            if by_session:
+                author, mine = _pick_author(by_session, viewer)
+                additions, deletions = await gitwork.blob_diff_stat(
+                    self, *by_session[author],
+                )
+                if pending and not (additions or deletions):
+                    # The path also changed outside that agent's writes (a
+                    # bash touch, or the user): the whole pending delta is
+                    # the honest count, and the explicit author the label.
+                    additions, deletions = pending
+                return DiffFileInfo(
+                    path=path, additions=additions, deletions=deletions,
+                    is_new=is_new, kind="mine" if mine else "agent",
+                    authors=tuple(by_session),
+                )
             editors = explicit.get(path)
             if editors:
-                return "mine" if is_mine(editors) else "agent"
-            return "agent" if path in bash else "drift"
-
-        files = [
-            DiffFileInfo(
-                path=f.path, additions=f.additions, deletions=f.deletions,
-                is_new=f.is_new, kind=label(f.path),
+                kind = "mine" if is_mine(editors) else "agent"
+            else:
+                kind = "agent" if path in bash else "drift"
+            additions, deletions = pending or (0, 0)
+            return DiffFileInfo(
+                path=path, additions=additions, deletions=deletions,
+                is_new=is_new, kind=kind, authors=tuple(sorted(editors or ())),
             )
-            for f in stat.files
-        ]
+
+        files = list(await asyncio.gather(*(
+            file_row(f.path, f.is_new, (f.additions, f.deletions))
+            for f in stat.files if path is None or f.path == path
+        )))
         current_ignored = await self.ignored()
-        tracked = {row.path for row in files}
-        for path, editors in explicit.items():
+        tracked = {f.path for f in files}
+        for candidate in explicit:
             # An explicit write to an ignored path never enters a tree (so it
             # has no stat row) and has no baseline copy, but it is still that
             # agent's pending edit. Accept folds the path into `auto` and
             # clears the event, so it stops showing there; reject lists it as
             # unrestorable.
-            if path in tracked or not _is_ignored(path, current_ignored):
+            if candidate in tracked or (path is not None and candidate != path):
                 continue
-            files.append(DiffFileInfo(
-                path=path, is_new=True,
-                kind="mine" if viewer in editors else "agent",
-            ))
-        known = set(self.auto)
-        fresh = [group for group in current_ignored if group not in known]
+            if _is_ignored(candidate, current_ignored):
+                files.append(await file_row(candidate, True))
         groups: list[DiffGroup] = []
         ignored_files = 0
+        known = set(self.auto)
+        fresh = [
+            group for group in current_ignored
+            if path is None and group not in known
+        ]
         if fresh:
             # One uncollapsed listing buys every group's file count.
             uncollapsed = await gitwork.ignored_listing(
@@ -271,12 +345,33 @@ class WorkspaceState:
             ignored_files=ignored_files,
         )
 
+    async def file_diff(
+        self,
+        viewer: str | Collection[str] | None,
+        path: str,
+        current: str | None = None,
+    ) -> str:
+        """One file's unified diff for ``viewer``.
+
+        With recorded provenance the text is the shown author's own delta — the
+        same hunks its +A/-D row counts — so a shared file never displays an
+        earlier agent's lines as this one's work. Paths with no author (bash,
+        drift) keep the whole pending diff; an ignored path or group has no
+        baseline copy at all, so it reads as added."""
+        by_session = self.provenance().get(path)
+        if by_session:
+            author, _ = _pick_author(by_session, viewer)
+            return await gitwork.blob_diff_text(self, path, *by_session[author])
+        if _is_ignored(path.rstrip("/"), await self.ignored()):
+            return await gitwork.ignored_diff(self, path)
+        return await gitwork.git_diff(self, path, current=current)
+
     # -- rebaselining ---------------------------------------------------
 
     async def accept(self) -> str:
         """Lock in every non-drift change: the worktree becomes the new
-        baseline, but paths no event covers keep their old baseline entry.
-        Returns the new baseline tree."""
+        baseline, but paths no event covers keep their old entry. Returns the
+        new baseline tree."""
         async with self.lock:
             current = await self._snapshot()
             summary = await self.diff(current=current)
@@ -318,13 +413,18 @@ class WorkspaceState:
     ) -> list[str]:
         """Path-scoped undo of one session's turns (newest first).
 
-        Returns the conflicting paths and touches nothing when any path
-        changed since its turn; otherwise restores each path from the
-        turn's before tree, unlinks the ones it created, and drops the
-        turns' events."""
+        A turn is reversed by merging its *own* change out of the live file:
+        three-way merge with the turn's after state as the base, the worktree
+        as ours and the turn's before state as theirs. A file another agent
+        later edited elsewhere merges cleanly and keeps their hunks; only
+        overlapping hunks (or a path the turn created/deleted, which has no
+        content to merge into) conflict. Returns the conflicting paths, and
+        touches nothing when any path conflicts."""
         async with self.lock:
-            desired: dict[str, str | None] = {}
-            target: dict[str, str] = {}
+            # path -> ("bytes", content) | ("absent", None) | ("tree", sha).
+            # A tree is the untouched-file fast path: restoring it through
+            # git keeps the mode (the exec bit) without reading it back.
+            desired: dict[str, tuple[str, Any]] = {}
             conflicts: list[str] = []
             for turn_id, turn in reversed(turns):
                 paths = {
@@ -333,32 +433,54 @@ class WorkspaceState:
                     for path in event.paths
                 }
                 for path in sorted(paths):
-                    after = await gitwork.tree_entry(
-                        self, turn.after_tree, path,
-                    )
+                    base = await _tree_content(self, turn.after_tree, path)
                     if path in desired:
-                        current = desired[path]
+                        kind, value = desired[path]
+                        if kind == "absent":
+                            current = None
+                        elif kind == "tree":
+                            current = await _tree_content(self, value, path)
+                        else:
+                            current = value
                     else:
-                        current = gitwork.worktree_entry(self.root, path)
-                    if current != after:
+                        current = _read_path(self.root, path)
+                    before = await _tree_content(self, turn.before_tree, path)
+                    if current == base:
+                        # Untouched since the turn: reverse it whole.
+                        desired[path] = (
+                            ("absent", None) if before is None
+                            else ("tree", turn.before_tree)
+                        )
+                        continue
+                    if base is None or before is None or current is None:
+                        # The turn created, deleted or would delete the whole
+                        # path and it changed since: nothing to merge into.
                         conflicts.append(path)
                         continue
-                    before = await gitwork.tree_entry(
-                        self, turn.before_tree, path,
+                    if (self.root / path).is_symlink():
+                        # A later change to a link is never merged: writing
+                        # through it would hit whatever it points at.
+                        conflicts.append(path)
+                        continue
+                    merged = await gitwork.merge_texts(
+                        self, base=base, ours=current, theirs=before,
                     )
-                    if before is None:
-                        desired[path] = None
+                    if merged is None:
+                        conflicts.append(path)
                     else:
-                        desired[path] = path
-                        target[path] = turn.before_tree
+                        desired[path] = ("bytes", merged)
             if conflicts:
                 return sorted(set(conflicts))
             by_tree: dict[str, list[str]] = {}
-            for path, keep in desired.items():
-                if keep is not None:
-                    by_tree.setdefault(target[path], []).append(path)
+            for path, (kind, value) in desired.items():
+                if kind == "tree":
+                    by_tree.setdefault(value, []).append(path)
                     continue
                 target_path = self.root / path
+                if kind == "bytes":
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_bytes(value)
+                    continue
                 _remove_path(target_path)
                 # Drop the directories the deletion left empty, up to (not
                 # including) the repo root.
@@ -400,9 +522,9 @@ class WorkspaceState:
         }, separators=(",", ":"))
 
     def enable_persistence(self) -> None:
-        """A saved session joined a workspace that a --no-session run created:
-        turn persistence on and flush the in-memory state and events to the
-        database in one transaction (never a row without its events)."""
+        """A saved session joined a workspace a --no-session run created: turn
+        persistence on and flush state + events in one transaction (never a
+        row without its events)."""
         if self.persist:
             return
         with session_store.connection() as db:
@@ -414,13 +536,29 @@ class WorkspaceState:
         self.persist = True
 
 
+def _parse_writes(
+    raw: Any,
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """The ``(path, before, after)`` provenance of a persisted event.
+
+    Rows written before provenance existed have none, and an unreadable row is
+    dropped rather than turning every /diff into an error — its path still
+    shows, counted as the whole file's pending diff."""
+    writes = []
+    for entry in raw if isinstance(raw, list) else ():
+        if isinstance(entry, (list, tuple)) and len(entry) == 3:
+            path, before, after = entry
+            if isinstance(path, str) and path:
+                writes.append((path, before or None, after or None))
+    return tuple(writes)
+
+
 def _write(
     db: sqlite3.Connection, root: Path, *,
     state: str | None = None, refs: str | None = None,
 ) -> None:
-    """Upsert one row's columns on ``db``. The tracking state and the refs
-    share a row but are written independently, so neither can clobber the
-    other."""
+    """Upsert one row's columns on ``db``. State and refs share a row but are
+    written independently, so neither can clobber the other."""
     # COALESCE keeps the column this call does not set (the INSERT's own
     # value only matters for the row it creates).
     db.execute(
@@ -432,20 +570,61 @@ def _write(
     )
 
 
-def _is_ignored(path: str, listing: tuple[str, ...]) -> bool:
-    """Whether ``path`` is covered by an ignored-path listing.
+def _pick_author(
+    by_session: dict[str, tuple[str | None, str | None]],
+    viewer: str | Collection[str] | None,
+) -> tuple[str, bool]:
+    """The author whose delta a row shows, and whether it is the viewer's.
 
-    The listing is the collapsed one (``git ls-files --directory``), so a
+    The viewer's own latest write wins (so a row it touched reads ``mine`` and
+    counts its hunks); otherwise the session that wrote the path last.
+    ``by_session`` preserves event order."""
+    if viewer is not None:
+        names = {viewer} if isinstance(viewer, str) else set(viewer)
+        mine = None
+        for name in by_session:
+            if name in names:
+                mine = name
+        if mine is not None:
+            return mine, True
+    return next(reversed(by_session)), False
+
+
+async def _tree_content(
+    store: gitwork.RepoStore, tree: str, path: str,
+) -> bytes | None:
+    """One path's bytes in a snapshot tree (None when absent there)."""
+    entry = await gitwork.tree_entry(store, tree, path)
+    if entry is None:
+        return None
+    return await gitwork.read_blob(store, entry[1])
+
+
+def _read_path(root: Path, path: str) -> bytes | None:
+    """One worktree path's bytes (None when it does not exist). A symlink
+    reads as its target path, exactly what git stores as its blob, so undo's
+    content comparison sees a link the way the tree does."""
+    target = root / path
+    try:
+        if target.is_symlink():
+            return os.readlink(target).encode()
+        return target.read_bytes()
+    except OSError:
+        return None
+
+
+def _is_ignored(path: str, listing: tuple[str, ...]) -> bool:
+    """Whether ``path`` is covered by the collapsed ignored-path listing (a
     directory entry covers everything beneath it; a file inside a mixed
-    directory appears verbatim."""
+    directory appears verbatim)."""
     return any(
         path == entry or path.startswith(entry + "/") for entry in listing
     )
 
 
 def _row(root: Path) -> tuple[str, str] | None:
-    """The (state, refs) JSON columns for ``root``, or None (also when there
-    is no database yet: opening a workspace for reading must not create it)."""
+    """The (state, refs) JSON columns for ``root``, or None — also when there
+    is no database yet, since reading must not create one."""
     try:
         with session_store.read_connection() as db:
             if db is None:
@@ -464,7 +643,8 @@ def _write_event(db: sqlite3.Connection, root: Path, event: Event) -> None:
         "VALUES (?, ?, ?)",
         (str(root), event.seq, json.dumps({
             "session": event.session, "tool": event.tool, "turn": event.turn,
-            "paths": list(event.paths), "auto": list(event.auto),
+            "paths": list(event.changed), "auto": list(event.auto),
+            "writes": [list(write) for write in event.writes],
         }, separators=(",", ":"))),
     )
 
@@ -473,10 +653,8 @@ def _delete_events(
     db: sqlite3.Connection, root: Path, *,
     session: str | None = None, turns: set[str] | None = None,
 ) -> None:
-    """Clear a workspace's events, or one session's events for ``turns``.
-
-    The session and turn live inside the row's JSON, so they are matched
-    with sqlite's JSON functions rather than read back into Python."""
+    """Clear a workspace's events, or one session's events for ``turns``. Both
+    live inside the row's JSON, so sqlite's JSON functions match them."""
     sql = "DELETE FROM workspace_events WHERE root = ?"
     params: list[Any] = [str(root)]
     if session is not None:
@@ -503,13 +681,13 @@ def _remove_path(target: Path) -> None:
 async def open_workspace(
     root: Path, *, persist: bool = True, allow_init: bool = True,
 ) -> "WorkspaceState | None":
-    """Open the tracked state for ``root``'s repo (detecting or, when
-    allowed, initializing one). None when the directory cannot be tracked.
+    """Open the tracked state for ``root``'s repo (detecting, or when allowed
+    initializing one). None when the directory cannot be tracked.
 
     An existing row is used as-is: the baseline belongs to the workspace, so
     reopening an agent must never re-baseline it (everything saved would look
-    like drift and every turn checkpoint would lose its trees). A row that is
-    missing (first run, or an upgrade) is created from a fresh snapshot."""
+    like drift and every turn checkpoint would lose its trees). A missing row
+    (first run, or an upgrade) is created from a fresh snapshot."""
     root = Path(root).resolve()
     repo = await gitwork.detect_repo(root)
     if repo is None:
@@ -536,8 +714,10 @@ async def open_workspace(
                 raw = json.loads(data)
                 state.events.append(Event(
                     seq=seq, session=raw["session"], tool=raw["tool"],
-                    turn=raw.get("turn"), paths=tuple(raw.get("paths", ())),
+                    turn=raw.get("turn"),
+                    changed=tuple(raw.get("paths", ())),
                     auto=tuple(raw.get("auto", ())),
+                    writes=_parse_writes(raw.get("writes")),
                 ))
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
@@ -592,15 +772,14 @@ def save_workspace_refs(workspace: Path | str, refs: list[str]) -> None:
 def change_workspace_ref(
     workspace: Path, raw: str, add: bool, *, save: bool = True,
 ) -> tuple[list[str], Path]:
-    """Add/remove one workspace reference path — the ONE implementation,
-    used by the session's /ref command and the host's workspace endpoint.
+    """Add/remove one workspace reference path — the ONE implementation, used
+    by the session's /ref command and the host's workspace endpoint.
 
     Returns the canonical (saved) list and the resolved host path. With
-    ``save=False`` the caller persists the returned list itself (the
-    session tolerates a read-only data dir; the host does not).
-
-    Raises :class:`RefError` when the path does not exist (a typo must
-    never mkdir a reference) or is not a known reference."""
+    ``save=False`` the caller persists the returned list itself (the session
+    tolerates a read-only data dir; the host does not). Raises
+    :class:`RefError` when the path does not exist (a typo must never mkdir a
+    reference) or is not a known reference."""
     workspace = Path(workspace).expanduser().resolve()
     raw = raw.strip()
     if not raw:

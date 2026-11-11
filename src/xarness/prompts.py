@@ -89,7 +89,8 @@ def system_prompt(
     if container and (sandbox.workspace / "Cargo.toml").is_file():
         lines.append(
             "- Cargo: builds use `target-sandbox/`, which is not tracked; "
-            "the user's `target/` is untouched."
+            "the user's `target/` is untouched. `Cargo.lock` is not tracked "
+            "either."
         )
     # Nothing can change in READ mode, so git/undo facts only matter when
     # editing is possible.

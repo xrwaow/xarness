@@ -151,6 +151,41 @@ def test_refs_do_not_vary_the_tool_descriptions(tmp_path) -> None:
     assert after == before
 
 
+def test_descriptions_split_on_host_vs_container(tmp_path) -> None:
+    """A tool whose text names the sandbox names the real one: an
+    unsandboxed session gets the host wording, and a tool that reads the same
+    either way keeps one description."""
+    container = _sandbox(tmp_path)
+    host = SandboxConfig(workspace=tmp_path, use_sandbox=False)
+
+    in_container = _descriptions(build_registry(
+        container, SimpleNamespace(config=container), mode="write"))
+    on_host = _descriptions(build_registry(
+        host, SimpleNamespace(config=host), mode="write"))
+
+    assert set(in_container) == set(on_host)
+    assert "inside the sandboxed workspace" in in_container["run_bash"]
+    assert "inside the sandboxed workspace" not in on_host["run_bash"]
+    assert "on the host" in on_host["run_bash"]
+    assert "Absolute paths are accepted" in in_container["read_file"]
+    assert "Absolute paths are accepted" in on_host["read_file"]
+
+    # Each description states only its own environment: no "when the session
+    # runs in a container", no "there is no container" hedge.
+    for name in ("read_file", "run_bash"):
+        assert "container" not in on_host[name]
+        assert "host" not in in_container[name]
+
+    # Only the environment-naming tools differ; every other description is
+    # the same text, byte for byte (a stable schema keeps the prompt cache
+    # warm).
+    assert set(in_container) - {"read_file", "run_bash"} == {
+        "write_file", "edit_file",
+    }
+    for name in ("write_file", "edit_file"):
+        assert in_container[name] == on_host[name]
+
+
 # ---------------------------------------------------------------------------
 # read_file
 
@@ -170,6 +205,24 @@ def test_read_accepts_absolute_container_path(tmp_path) -> None:
     (tmp_path / "a.txt").write_text("one\ntwo\n")
     result = asyncio.run(_registry_for(tmp_path).call(
         "read_file", '{"path": "/workspace/a.txt"}'
+    ))
+    assert result.ok
+    assert result.content == "one\ntwo\n"
+
+
+def test_read_accepts_absolute_path_outside_the_workspace(tmp_path) -> None:
+    """Unsandboxed: an absolute path is a real path on the machine, so a file
+    outside the workspace reads like any other — run_bash could already cat
+    it, and nothing else in that mode is jailed either."""
+    outside = tmp_path.parent / f"outside-{tmp_path.name}.txt"
+    outside.write_text("one\ntwo\n")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    sandbox = SandboxConfig(workspace=workspace, use_sandbox=False)
+
+    registry = build_registry(sandbox, None, mode="write")
+    result = asyncio.run(registry.call(
+        "read_file", json.dumps({"path": str(outside)})
     ))
     assert result.ok
     assert result.content == "one\ntwo\n"

@@ -21,6 +21,25 @@ from ..images import ImageRef
 
 State = Literal["idle", "running", "compacting"]
 Mode = Literal["plan", "write"]
+# Who a pending diff row came from (see the README's attribution table).
+# ``mine`` displays as ``agent`` with the accent color; it is kept separate
+# so the client can tell its own writes from another agent's.
+DiffKind = Literal["mine", "agent", "auto", "drift"]
+# Which sessions the /diff panel lists: every session's work, or this
+# session's own (the panel's scope chip).
+DiffScope = Literal["all", "mine"]
+
+
+class ViewState(BaseModel):
+    """A client's view choices for one session, saved with it so a reattach
+    (or a later run) shows the same thing.
+
+    One bag on purpose: a new per-session view setting is a field here and an
+    assignment in the widget, not a new field on Status, StoredSession,
+    CreateSessionRequest and a command of its own."""
+
+    # The /diff panel's scope chip.
+    diff_scope: DiffScope = "all"
 
 
 class QueuedMessage(BaseModel):
@@ -90,6 +109,8 @@ class Status(BaseModel):
     refs: list[RefInfo] = Field(default_factory=list)
     # Tool names exposed to the model (for the /tools command).
     tools: list[str] = Field(default_factory=list)
+    # This session's saved view choices (see ViewState).
+    view: ViewState = Field(default_factory=ViewState)
 
 
 class QuitVerdict(BaseModel):
@@ -255,7 +276,11 @@ class DiffFileInfo(BaseModel):
     deletions: int = 0
     is_new: bool = False
     # Derived per viewer; the default must never be agent.
-    kind: Literal["mine", "agent", "auto", "drift"] = "drift"
+    kind: DiffKind = "drift"
+    # The sessions that wrote this path explicitly, in event order (empty for
+    # bash-only or drift rows). More than one means the file is shared: the
+    # row's +A/-D count the shown author's own delta, not the whole file's.
+    authors: tuple[str, ...] = ()
 
 
 class DiffGroup(BaseModel):
@@ -263,7 +288,7 @@ class DiffGroup(BaseModel):
 
     prefix: str
     files: int = 0
-    kind: Literal["mine", "agent", "auto", "drift"] = "drift"
+    kind: DiffKind = "drift"
 
 
 class DiffInfo(BaseModel):

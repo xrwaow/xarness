@@ -30,6 +30,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, fields
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -56,8 +57,8 @@ from .gitwork import (
     GitWorktreeError,
     RevertConflict,
     TurnCheckpoint,
-    git_diff,
     tree_diff_stat,
+    write_blob,
 )
 from .images import ImageRef
 from .prompts import system_prompt
@@ -82,6 +83,7 @@ from .session_store import StoredSession
 from .tools import DEFAULT_TIMEOUT, build_registry
 from .util import utcnow_iso as _utcnow
 from .workspace import (
+    _EXPLICIT_WRITES,
     WorkspaceState,
     change_workspace_ref,
     save_workspace_refs,
@@ -107,7 +109,9 @@ IDLE_ONLY = (
 
 # Commands that only touch a flag or a future: they skip the command lock, so
 # a slow /accept (up to seconds of git) never delays a cancel or an answer.
-LOCK_FREE = (protocol.Cancel, protocol.AnswerAsk)
+# SetViewState lands here too: it only stores a view choice and schedules the
+# debounced persist, so nothing may queue behind /accept.
+LOCK_FREE = (protocol.Cancel, protocol.AnswerAsk, protocol.SetViewState)
 
 
 @dataclass(slots=True)
@@ -191,6 +195,7 @@ class Session:
         notify_workspace: Callable[[str | None], None] | None = None,
         subagent_model: str | None = None,
         spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None,
+        view: protocol.ViewState | None = None,
     ) -> None:
         self.name = name
         # Set only for a subagent's session: the session that spawned it.
@@ -204,6 +209,9 @@ class Session:
         self.sandbox.set_mode(mode)
         self.workspace_state = workspace_state
         self.mode: Mode = mode
+        # The clients' saved view choices for this session (the /diff panel's
+        # scope chip); a saved session restores them on load.
+        self.view = view or protocol.ViewState()
         # The model a subagent of this session runs (see Host.spawn_subagent).
         self.subagent_model = subagent_model
         # Bound here, not in the host, which builds the parts before this
@@ -304,6 +312,7 @@ class Session:
             conversation=state.conversation,
             mode=state.mode or "write",
             parent_id=state.parent_id,
+            view=state.view,
         )
         # Restore the persisted token counters so the client's footer shows
         # real in/out/ctx immediately instead of 0 until the next round.
@@ -490,6 +499,7 @@ class Session:
             ],
             pending_ask=self.pending_ask,
             clients_attached=self.clients_attached,
+            view=self.view,
         )
 
     def quit_verdict(self) -> protocol.QuitVerdict:
@@ -650,6 +660,8 @@ class Session:
                 return await self._cmd_reject()
             case protocol.SetMode():
                 return self._cmd_set_mode(command)
+            case protocol.SetViewState():
+                return self._cmd_set_view_state(command)
             case protocol.SwitchModel():
                 return await self._cmd_switch_model(command)
             case protocol.SetSandbox():
@@ -998,6 +1010,7 @@ class Session:
             )
         accepted = [row for row in summary.files if row.kind != "drift"]
         foreign = [row for row in accepted if row.kind != "mine"]
+        shared = [row for row in accepted if len(row.authors) > 1]
         if not summary.files:
             self._emit_notice(
                 "accepted: no pending changes — baseline reset; /diff and /undo "
@@ -1009,6 +1022,12 @@ class Session:
                 detail = (
                     f"; {len(foreign)} of {len(summary.files)} pending "
                     "files weren't made by this agent"
+                )
+            if shared:
+                detail += (
+                    f"; {len(shared)} of the pending files were written by "
+                    "more than one agent, so the totals count each author's "
+                    "own delta"
                 )
             self._emit_notice(
                 f"accepted: {len(accepted)} file(s) +{summary.additions} "
@@ -1060,6 +1079,17 @@ class Session:
         self._rebuild_tools()
         self._emit_status()
         return _ok(mode=self.mode)
+
+    def _cmd_set_view_state(self, command: protocol.SetViewState) -> CommandResult:
+        """Remember the client's view choices with the session.
+
+        View state, so it is allowed mid-turn and takes no command lock; it is
+        persisted like any other session field so a reattach (or a later run)
+        shows the same thing."""
+        self.view = command.view
+        self._persist()
+        self._emit_status()
+        return _ok(view=command.view)
 
     async def _cmd_switch_model(self, command: protocol.SwitchModel) -> CommandResult:
         profile = self._validate_model(command.name)
@@ -1467,12 +1497,7 @@ class Session:
         # ToolRegistry.call already converts any tool exception into a
         # failed ToolResult, so no try/except is needed here.
         ws = self.workspace_state
-        before = ignored_before = None
-        if ws is not None and call.name == "run_bash":
-            # A fresh snapshot before the command (not the cached head), so
-            # drift that happened earlier is never credited to the agent.
-            before = await ws.observe()
-            ignored_before = await ws.ignored()
+        record = None if ws is None else await self._observe(ws, call)
         self._executing_tool = call.name or call_id
         try:
             result = await self.tool_registry.call(
@@ -1480,8 +1505,8 @@ class Session:
             )
         finally:
             self._executing_tool = None
-        if ws is not None and result.status == "ok":
-            await self._record_event(ws, call, before, ignored_before)
+        if record is not None and result.status == "ok":
+            await record()
         end = _utcnow()
         self._emit(protocol.ToolFinished(
             call_id=call_id, status=result.status, content=result.content,
@@ -1496,44 +1521,95 @@ class Session:
             call_id, result, start_time=start, end_time=end,
         )  # Timing wraps the two stamps inside the controller
 
-    async def _record_event(
+    def _write_target(
         self, ws: WorkspaceState, call: ToolCall,
-        before: str | None, ignored_before: tuple[str, ...] | None,
-    ) -> None:
-        """Record one successful mutating tool call in the workspace log.
+    ) -> tuple[str, bytes | None] | None:
+        """``(repo path, content)`` of an edit_file/write_file target, read
+        before the tool runs: the "before" side of the provenance blob pair,
+        so the event can attribute this call's own delta instead of the whole
+        file's pending diff.
 
-        The whole step runs under the workspace lock, so an event lands
-        entirely before or entirely after an ``/accept`` or ``/reject``: it
-        can never describe pre-rebaseline work to a log the rebaseline just
-        cleared.
-        """
-        if call.name in ("edit_file", "write_file"):
+        The tool interprets a relative path against the sandbox cwd
+        (``--workspace repo/sub``); events are repo-root-relative. None when
+        the arguments do not name a file inside the workspace."""
+        try:
+            args = json.loads(call.arguments_json)
+        except (TypeError, ValueError):
+            return None
+        path = args.get("path") if isinstance(args, dict) else None
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            rel = (self.workspace / path).resolve().relative_to(
+                ws.root).as_posix()
+        except ValueError:
+            return None
+        try:
+            return rel, (ws.root / rel).read_bytes()
+        except OSError:
+            return rel, None
+
+    async def _observe(
+        self, ws: WorkspaceState, call: ToolCall,
+    ) -> Callable[[], Awaitable[None]] | None:
+        """The log step for one tool call, with its "before" state read now.
+
+        A mutating tool is observed *before* it runs, so the event it records
+        describes this call's own change and never credits it with drift that
+        happened earlier. None for a call that never logs (read-only tools,
+        or arguments that name no file inside the workspace)."""
+        if call.name in _EXPLICIT_WRITES:
+            target = self._write_target(ws, call)
+            if target is None:
+                return None
+            return partial(self._record_write, ws, call, *target)
+        if call.name != "run_bash":
+            return None
+        # A fresh snapshot before the command (not the cached head).
+        before = await ws.observe()
+        ignored_before = await ws.ignored()
+        return partial(self._record_bash, ws, call, before, ignored_before)
+
+    async def _record_write(
+        self, ws: WorkspaceState, call: ToolCall,
+        path: str, before: bytes | None,
+    ) -> None:
+        """Log one explicit write, with the blob shas of its own delta.
+
+        Runs under the workspace lock, so an event lands entirely before or
+        entirely after an ``/accept`` or ``/reject``: it can never describe
+        pre-rebaseline work to a log the rebaseline just cleared."""
+        async with ws.lock:
             try:
-                args = json.loads(call.arguments_json)
-            except (TypeError, ValueError):
-                return
-            path = args.get("path") if isinstance(args, dict) else None
-            if not isinstance(path, str) or not path:
-                return
-            # The tool interprets a relative path against the sandbox cwd
-            # (``--workspace repo/sub``); events are repo-root-relative.
+                after: bytes | None = (ws.root / path).read_bytes()
+            except OSError:
+                after = None
             try:
-                path = (self.workspace / path).resolve().relative_to(
-                    ws.root).as_posix()
-            except ValueError:
-                return
-            # Always recorded, even for an ignored path: the tree never
-            # holds ignored files, but the event is what makes them agent
-            # work rather than drift.
-            async with ws.lock:
-                ws.record(
-                    session=self.name, tool=call.name,
-                    turn=self.conversation.open_turn_id,
-                    paths=(path,), auto=(),
-                )
-            return
-        if call.name != "run_bash" or before is None:
-            return
+                # A call that left the file as it found it has no provenance:
+                # there is no delta to attribute.
+                writes = () if before == after else ((
+                    path,
+                    None if before is None else await write_blob(ws, before),
+                    None if after is None else await write_blob(ws, after),
+                ),)
+            except GitWorktreeError:
+                # No provenance this time: /diff falls back to the whole
+                # file's pending delta for the path.
+                writes = ()
+            # Always recorded, even for an ignored path: the tree never holds
+            # ignored files, but the event is what makes them agent work
+            # rather than drift.
+            ws.record(
+                session=self.name, tool=call.name,
+                turn=self.conversation.open_turn_id,
+                paths=(path,), auto=(), writes=writes,
+            )
+
+    async def _record_bash(
+        self, ws: WorkspaceState, call: ToolCall,
+        before: str, ignored_before: tuple[str, ...],
+    ) -> None:
+        """Log what one command changed, from the snapshots around it."""
         async with ws.lock:
             try:
                 after = await ws.snapshot()
@@ -1545,9 +1621,7 @@ class Session:
                 session=self.name, tool=call.name,
                 turn=self.conversation.open_turn_id,
                 paths=tuple(f.path for f in stat.files),
-                auto=tuple(sorted(
-                    set(ignored_after) - set(ignored_before or ())
-                )),
+                auto=tuple(sorted(set(ignored_after) - set(ignored_before))),
             )
 
     def _inject_queued(self) -> None:
@@ -1739,6 +1813,7 @@ class Session:
             sandbox_settings=self.sandbox.settings,
             usage_total=self.controller.usage_total,
             last_usage=self.controller.last_usage,
+            view=self.view,
         )
         from_seq = self.conversation.take_dirty_from()
         payload, meta = session_store.serialize_state(stored, from_seq)
@@ -1827,16 +1902,17 @@ class Session:
         if ws is None:
             return protocol.DiffInfo(tracking=False)
         try:
-            # A per-file click-through needs both the stat rows and the
-            # text; snapshot the workspace once and share the sha between
-            # them.
+            # A per-file click-through needs both the stat row and the text;
+            # snapshot the workspace once and share the sha between them.
             current = await ws.observe()
-            info = await ws.diff(self.name, current=current)
+            info = await ws.diff(self.name, current=current, path=path)
             if path is not None:
-                info.files = [row for row in info.files if row.path == path]
-                info.groups = []
-                info.ignored_files = 0
-                info.text = await git_diff(ws, path, current=current)
+                # The shown author's own delta, matching the row's counts:
+                # a file another session also edited never displays their
+                # hunks as this session's work.
+                info.text = await ws.file_diff(
+                    self.name, path, current=current,
+                )
         except GitWorktreeError as exc:
             # Git failures raise instead of reporting tracking=False: a
             # transient index.lock (concurrent snapshots) must not make
