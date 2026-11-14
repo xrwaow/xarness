@@ -27,7 +27,6 @@ from .commands import (  # noqa: F401
     Cancel,
     Command,
     CommandBase,
-    CommandEnvelope,
     CommandResult,
     Compact,
     CreateSessionRequest,
@@ -39,7 +38,6 @@ from .commands import (  # noqa: F401
     Reject,
     Rollback,
     SendMessage,
-    SessionUpdate,
     SetViewState,
     SetMode,
     SetSandbox,
@@ -76,6 +74,7 @@ from .events import (  # noqa: F401
     TurnEnded,
 )
 from .views import (  # noqa: F401
+    AskQuestion,
     ConfigDefaults,
     ConfigInfo,
     DiffFileInfo,

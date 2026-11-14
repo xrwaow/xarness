@@ -13,23 +13,20 @@ from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from ..conversation import Message, ToolStatus, Usage
+from ..conversation import Message, ToolStatus, TurnStats, Usage
 from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 17
+PROTOCOL_VERSION = 19
 
-# Error convention: REST routes fail with HTTP 4xx (400 bad request, 404
-# missing session/path); a ``command`` always returns 200 with
-# ``CommandResult.ok=False`` and ``error`` text, because a rejected command is
-# a valid, attributable outcome the UI renders inline.
+# Error convention: every route fails with HTTP 4xx (400 bad request, 404
+# missing session/path), commands included — a rejected command raises
+# SessionError and the API maps it to one 400 with the message.
 
 
 Level = Literal["info", "warn", "error"]
 
-# Why a HistoryReplaced fired. accept/reject stay valid (an older host may
-# still send them) but are no longer emitted — they carry no message change,
-# so they use :class:`CheckpointsChanged` instead.
-HistoryReason = Literal["compaction", "rollback", "accept", "reject"]
+# Why a HistoryReplaced fired: the rewrites that actually change history.
+HistoryReason = Literal["compaction", "rollback"]
 
 
 class EventBase(BaseModel):
@@ -204,7 +201,7 @@ class CheckpointsChanged(EventBase):
     compaction."""
 
     type: Literal["checkpoints_changed"] = "checkpoints_changed"
-    reason: HistoryReason = "accept"
+    reason: Literal["accept", "reject"] = "accept"
 
 
 class AskResolved(EventBase):
@@ -228,21 +225,14 @@ class TurnEnded(EventBase):
     Emitted on every path — finished, cancelled, failed — so clients never
     have to infer "the turn is over" from a StatusChanged transition.
 
-    ``total``/``busy``/``idle``/``usage`` are the figures the host just
-    stamped on the turn's last answer (``Timing.stats``); they are exactly
-    what a reload renders, so a live footer and a replayed one agree. All of
-    them are None when there was nothing to stamp (a turn that streamed no
-    answer, or a host talking an older protocol). ``busy``/``idle`` are
-    additionally None for a turn cut short: it reports how long it ran, not a
-    split nobody measured to the end."""
+    ``stats`` are the figures the host just stamped on the turn's last answer
+    (``Timing.stats``); they are exactly what a reload renders, so a live
+    footer and a replayed one agree. None when there was nothing to stamp (a
+    turn that streamed no answer, or a host talking an older protocol)."""
 
     type: Literal["turn_ended"] = "turn_ended"
     outcome: Literal["finished", "cancelled", "failed"] = "finished"
-    elapsed: float = 0.0
-    total: float | None = None
-    busy: float | None = None
-    idle: float | None = None
-    usage: Usage | None = None
+    stats: TurnStats | None = None
 
 
 class SessionDeleted(EventBase):

@@ -1,4 +1,4 @@
-"""Write models: commands, their flat result, and the PATCH settings body.
+"""Write models: the command union and its flat result.
 
 Commands are the only way to mutate a session (the HTTP handlers route
 them through the session's serialized ``execute``). ``CommandResult`` is
@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..images import ImageRef
-from .views import Mode, RefInfo, ViewState
+from .views import Mode, ViewState
 
 
 class CommandBase(BaseModel):
@@ -83,7 +83,6 @@ class SetViewState(CommandBase):
 class SwitchModel(CommandBase):
     type: Literal["switch_model"] = "switch_model"
     name: str
-    persist_default: bool = False
 
 
 class SetSandbox(CommandBase):
@@ -132,54 +131,12 @@ Command = Annotated[
 class CommandResult(BaseModel):
     """Reply to one command, delivered only to its issuer.
 
-    One flat model instead of a payload union per command: the fields a
-    given command sets are the ones its caller reads."""
+    Only what the command's issuer needs and no broadcast carries: the
+    settings it changed already arrive on ``StatusChanged``."""
 
-    cmd_id: str = ""
-    ok: bool
-    error: str | None = None
-    # send_message
-    started: bool | None = None
-    queued: bool | None = None
-    # cancel
-    cancelled: bool | None = None
-    # discard_queued
-    discarded: int | None = None
-    text: str | None = None
-    # flush_queued
-    flushed: bool | None = None
-    # rollback
+    # rollback: what the input box gets back
     user_text: str | None = None
     images: list[ImageRef] | None = None
-    # settings commands
-    mode: Mode | None = None
-    model: str | None = None
-    sandbox: str | None = None
-    filter_list: list[str] | None = None
-    refs: list[RefInfo] | None = None
-    view: ViewState | None = None
-
-
-class CommandEnvelope(BaseModel):
-    """POST /sessions/{name}/commands body: one command + a client-generated id."""
-
-    cmd_id: str
-    command: Command
-
-
-class SessionUpdate(BaseModel):
-    """PATCH /sessions/{name}: the settings commands, on one typed body.
-
-    A cleaner fit than five command types for slow-changing settings; the
-    equivalent commands remain available for clients that prefer them."""
-
-    mode: Mode | None = None
-    model: str | None = None
-    sandbox: str | None = None
-    filter_path: str | None = None
-    filter_add: bool | None = None
-    ref_path: str | None = None
-    ref_add: bool | None = None
 
 
 class DeleteResult(BaseModel):

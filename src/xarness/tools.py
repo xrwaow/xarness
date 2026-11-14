@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .conversation import ToolResult
+from .conversation import AskQuestion, ToolResult
 from .sandbox import (
     DEFAULT_TIMEOUT,
     REFS_ANCHOR,
@@ -124,9 +124,11 @@ class _ToolArgs(BaseModel):
 class ReadFileArgs(_ToolArgs):
     path: str
     start_line: int | None = Field(
-        default=None, description="1-based line to start reading from (default 1)")
+        default=None,
+        description="1-based first line to read (omit to start at line 1)")
     end_line: int | None = Field(
-        default=None, description="1-based last line to read (default: end of file)")
+        default=None,
+        description="1-based last line to read, inclusive (omit to read to EOF)")
 
 
 class WriteFileArgs(_ToolArgs):
@@ -152,13 +154,12 @@ class RunBashArgs(_ToolArgs):
     command: str
     timeout_seconds: int | None = Field(
         default=None, ge=1,
-        description="kill the command after this many seconds (default: the session "
-                    "timeout); on timeout the shell is restarted and the output so "
-                    "far is returned")
+        description="kill the command after this many seconds; on timeout the "
+                    "shell is restarted and the output so far is returned")
 
 
 class AskUserArgs(_ToolArgs):
-    questions: list[str] = Field(description="the questions to ask (one or more)")
+    questions: list[AskQuestion] = Field(description="the questions to ask")
 
 
 class SubagentArgs(_ToolArgs):
@@ -223,7 +224,9 @@ class ToolRegistry:
         llama.cpp and older vLLM reject ``anyOf: [..., null]``, ``$defs``
         and ``$ref``. Optional fields become their plain type (null is
         optional, not a type), and ``$ref``s are inlined — tool argument
-        models are tiny, so duplication is harmless."""
+        models are tiny, so duplication is harmless. ``title``s are dropped
+        at every level: noise for the model, and otherwise two identical
+        nested shapes differ by the pydantic class name."""
         if isinstance(node, list):
             return [ToolRegistry._flatten_schema(item, defs) for item in node]
         if not isinstance(node, dict):
@@ -247,24 +250,18 @@ class ToolRegistry:
             return ToolRegistry._flatten_schema({**node, "anyOf": variants}, defs)
         return {
             k: ToolRegistry._flatten_schema(v, defs)
-            for k, v in node.items() if k != "$defs"
+            for k, v in node.items() if k not in ("$defs", "title")
         }
 
     @staticmethod
     def _schema_of(tool: Tool) -> dict[str, Any]:
         """The provider-facing ``parameters`` object for one tool.
 
-        Generated from the args model; ``title`` keys are stripped (noise
-        for the model, and they would make otherwise-identical schemas
-        differ by class name) and the schema is flattened for local
-        servers (see :meth:`_flatten_schema`)."""
+        Generated from the args model and flattened for local servers (see
+        :meth:`_flatten_schema`, which also drops every ``title``)."""
         schema = tool.args_model.model_json_schema()
         defs = schema.pop("$defs", {})
-        schema = ToolRegistry._flatten_schema(schema, defs)
-        schema.pop("title", None)
-        for prop in (schema.get("properties") or {}).values():
-            prop.pop("title", None)
-        return schema
+        return ToolRegistry._flatten_schema(schema, defs)
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -435,9 +432,11 @@ def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
         "read_file",
         "Read a file's contents. Paths are relative to the workspace root"
         f"{root}. Absolute paths are accepted for reads outside it ({reach}). "
-        f"Files over {OUTLINE_THRESHOLD} lines return a structural outline "
-        "with line numbers instead of contents; read specific sections of "
-        "those by passing start_line and end_line (1-based, inclusive).",
+        f"With no range, files over {OUTLINE_THRESHOLD} lines return an outline "
+        "(class/def signatures with line ranges for Python, the first "
+        f"{PREVIEW_LINES} lines otherwise) instead of the full contents; pass "
+        "start_line and/or end_line to read a section of any file, however "
+        "large.",
         ReadFileArgs,
     )
     async def read_file(args: ReadFileArgs) -> ToolResult:
@@ -669,7 +668,8 @@ def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
         "true to replace every occurrence, e.g. for a rename), and must match "
         "the file exactly: include a few surrounding lines to disambiguate. "
         "The batch is all-or-nothing — if any edit fails, nothing is written "
-        "and the error names the edit. The result includes a diff of what "
+        "and the error identifies the offending edit (e.g. `edit 2: old_string "
+        "not found in file`). The result includes a diff of what "
         "changed. Use write_file to create a file or replace its whole "
         "contents; use run_bash on non-UTF-8 files.",
         EditFileArgs,
@@ -731,17 +731,24 @@ def _make_run_bash_tool(session: SandboxSession) -> Tool:
         "on the user's machine, with the user's own permissions. "
     )
 
+    # Where the shell comes up, and that it stays there across calls: an
+    # agent cannot see its cwd, so it `cd`s to the root before every command
+    # unless the description says it is already there.
+    root = session.config.tool_root
+
     @tool(
         "run_bash",
         "Run a shell command " + where +
-        "The shell persists across calls within this chat — cd and exported "
-        "variables carry over until it restarts (a timeout, or a mode switch). "
+        f"The shell starts in {root} and keeps its cwd between calls — a "
+        "timeout or a mode switch restarts it. Exported variables stick the same way. "
+        f"Commands are killed after {int(session.default_timeout)}s unless "
+        "timeout_seconds says otherwise. "
         "The command's stdin is /dev/null, so interactive commands read EOF "
-        "instead of hanging. The command runs as one shell string: the "
-        "reported exit code is the last statement's, so a chain whose final "
-        "command finds nothing (grep, test -f) reads as a failure even when "
-        "everything before it worked — and a pipe reports the last stage's "
-        "status. Every result ends with an `[exit N]` status line.",
+        "instead of hanging. The command runs as one shell string, so the exit "
+        "code is the last stage's alone — a `grep` with no match or a `test "
+        "-f` on a missing file fails despite earlier steps succeeding, and "
+        "piping into `tail` or `head` reports 0 even when the command before "
+        "it failed. Every result ends with an `[exit N]` status line.",
         RunBashArgs,
     )
     async def run_bash(args: RunBashArgs) -> ToolResult:
@@ -780,27 +787,45 @@ def _make_run_bash_tool(session: SandboxSession) -> Tool:
 # ask_user
 
 
+def _answer_text(question: AskQuestion, answers: list[str], index: int) -> str:
+    """One answer as text: a number picks the choice it names (a client sends
+    the key the user typed, and people type ``4)`` and ``4.`` as readily as
+    ``4``), and a missing answer reads as unanswered rather than vanishing
+    from the pairing."""
+    answer = answers[index].strip() if index < len(answers) else ""
+    key = answer.rstrip(").:-").strip()  # a trailing separator is still a pick
+    if key.isdigit() and 1 <= int(key) <= len(question.options):
+        return question.options[int(key) - 1]
+    return answer or "(no answer given)"
+
+
 def _make_ask_user_tool(
-    ask_callback: Callable[[list[str]], Awaitable[list[str] | None]],
+    ask_callback: Callable[[list[AskQuestion]], Awaitable[list[str] | None]],
 ) -> Tool:
     """ask_user: hand questions to the user and return their answers as the result."""
 
     @tool(
         "ask_user",
-        "Ask the user one or more questions and wait for their answers. "
-        "Use when you need a decision, a missing detail, or confirmation "
-        "before acting. Keep questions short and self-contained.",
+        "Ask the user questions and wait for their answers. Use when you "
+        "need a decision, a missing detail, or confirmation. Each item in "
+        "'questions' is one self-contained question. Put its choices in that "
+        "question's 'options' field, not as separate items; omit 'options' "
+        "for an open question. The user may always write their own answer "
+        "instead of picking one.",
         AskUserArgs,
     )
     async def ask_user(args: AskUserArgs) -> ToolResult:
-        raw = args.questions
-        questions = [q.strip() for q in raw if q.strip()]
+        questions = [q for q in args.questions if q.question.strip()]
         if not questions:
             return _bad("'questions' must be a non-empty list")
         answers = await ask_callback(questions)
         if answers is None:
             return _ok("(user skipped the questions — no answers given)")
-        pairs = [f"Q: {q}\nA: {a}" for q, a in zip(questions, answers)]
+        pairs = [
+            f"Q: {question.question.strip()}\n"
+            f"A: {_answer_text(question, answers, index)}"
+            for index, question in enumerate(questions)
+        ]
         return _ok("\n\n".join(pairs))
 
     return ask_user
@@ -857,7 +882,7 @@ def build_registry(
     sandbox: SandboxConfig | None,
     session: SandboxSession | None,
     mode: str = "write",
-    ask_callback: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
+    ask_callback: Callable[[list[AskQuestion]], Awaitable[list[str] | None]] | None = None,
     default_timeout: float = DEFAULT_TIMEOUT,
     spawn_subagent: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> ToolRegistry:

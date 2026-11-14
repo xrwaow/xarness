@@ -10,14 +10,16 @@ state): up/down move the highlighted row, enter opens its diff, a further
 escape (the app's priority interrupt binding) collapses the list.
 
 The list leads with this session's own rows; below a full-width rule sits one
-foldable section per other kind — a dimmed ``agent`` (other sessions, and the
-ignored groups agents created), ``auto`` and ``drift`` — so the default view
-is the agent's diffs alone.
+foldable section per other kind — ``auto`` and ``drift``, plus a dimmed
+``agent`` (other sessions' rows, and the ignored groups agents created) — so
+the default view is the agent's diffs alone.
 
 The summary line carries one click-to-cycle scope chip, always reading
 ``agent``: with other sessions included the tail dims (``age`` accent, ``nt``
-muted), scoped to this session the whole word is accent-colored. The chip is
-display state only; the App saves the choice on the session.
+muted) and a shared file is one row per path counting its whole pending
+change, badged with whoever wrote it last; scoped to this session the whole
+word is accent-colored and a shared file becomes one row per author. The chip
+is session state (the host computes the rows), so flipping it refetches.
 """
 
 from __future__ import annotations
@@ -37,8 +39,8 @@ from .chat_input import ChatInput
 from .widgets import _render_diff
 
 
-def _display_kind(kind: str) -> str:
-    """The badge text: own work reads ``agent`` too, only its accent differs."""
+def _badge(kind: str) -> str:
+    """The word crediting a row's numbers: own work reads ``agent`` too."""
     return "agent" if kind == "mine" else kind
 
 
@@ -50,6 +52,12 @@ def _section_of(kind: str) -> str:
 # Expandable sections, in display order. Only ``agent`` can also lead the
 # list (see DiffSummary._inline); the other two never do.
 _SECTIONS = ("agent", "auto", "drift")
+
+
+def _sections(scope: DiffScope) -> tuple[str, ...]:
+    """The sections that get a header in ``scope``: ``agent`` only folds
+    other sessions' rows, so it is left out when they lead the list."""
+    return _SECTIONS if scope == "mine" else _SECTIONS[1:]
 # Fold arrows for the section headers.
 TRIANGLE_CLOSED = "▸"
 TRIANGLE_OPEN = "▾"
@@ -57,6 +65,9 @@ TRIANGLE_OPEN = "▾"
 # One row cell: its classes, then its text. The first class keys the cell, so
 # a refresh updates it in place instead of remounting the whole row.
 Cell = tuple[str, str]
+
+# A row's identity: its path (a group's prefix) plus the author it counts.
+Key = tuple[str, str | None]
 
 
 def _chip_text(all_sessions: bool) -> Text:
@@ -115,8 +126,11 @@ class DiffSummary(Vertical):
     can_focus = True  # arrow-key navigation over the file list once minimized
 
     class DiffRequested(Message):
-        def __init__(self, key: str) -> None:
-            self.key = key
+        """A row was clicked: open the patch it counts."""
+
+        def __init__(self, path: str, author: str | None) -> None:
+            self.path = path
+            self.author = author
             super().__init__()
 
     class ScopeChanged(Message):
@@ -129,7 +143,7 @@ class DiffSummary(Vertical):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._stat: DiffStat | None = None
-        self._active_key: str | None = None
+        self._active_key: Key | None = None
         self._active_text = ""
         # Which sessions lead the list: "all" of them, or "mine" alone (every
         # other session's row then folds into the agent section).
@@ -151,41 +165,44 @@ class DiffSummary(Vertical):
         if self.is_mounted:
             await self._apply_scope()
 
+    def _unfold_active(self) -> None:
+        """Keep an open diff on screen when its row lives in a folded
+        section: narrowing the scope moves another session's row there."""
+        if self._active_key is None:
+            return
+        section = self._section_for(self._active_key)
+        if section is not None and section not in self._expanded:
+            self._expanded.add(section)
+
     async def _apply_scope(self) -> None:
-        """Re-render after the scope changed: other sessions' rows fold into
-        (or out of) the agent section. ``_refresh_rows`` closes an open diff
-        whose row is no longer listed rather than letting it float orphaned."""
+        """Re-render after the scope changed: the rows were fetched for it
+        (the host computes them), so only the list layout is redone."""
         self._refresh_chip()
         self._refresh_header()
-        if self.diff_shown and isinstance(self._active_key, str):
-            # Keep an open diff on screen when narrowing the scope moves its
-            # row into a section: unfold that section with it.
-            section = self._section_for(self._active_key)
-            if section is not None:
-                self._expanded.add(section)
+        self._unfold_active()
         await self._refresh_rows()
 
     async def toggle_scope(self) -> None:
-        """The chip's click: flip the scope, re-render, tell the app (which
-        saves it on the session)."""
+        """The chip's click: flip the scope and tell the app, which saves it
+        on the session and refetches the rows in the new granularity."""
         self._scope = "mine" if self._scope == "all" else "all"
-        await self._apply_scope()
+        self._refresh_chip()
         self.post_message(self.ScopeChanged(self._scope))
 
-    def _request_neighbour(self, key: str, delta: int) -> bool:
+    def _request_neighbour(self, key: Key, delta: int) -> bool:
         """Post a DiffRequested for the row adjacent to ``key`` (delta
         -1/+1); True if a request was posted."""
         if self._stat is None:
             return False
-        paths = self._visible_paths()
+        keys = self._visible_keys()
         try:
-            index = paths.index(key)
+            index = keys.index(key)
         except ValueError:
             return False
         neighbor = index + delta
-        if not 0 <= neighbor < len(paths):
+        if not 0 <= neighbor < len(keys):
             return False
-        self.post_message(self.DiffRequested(paths[neighbor]))
+        self.post_message(self.DiffRequested(*keys[neighbor]))
         return True
 
     def compose(self):
@@ -202,7 +219,7 @@ class DiffSummary(Vertical):
                 yield Static("", id="diff-text", markup=False)
 
     @property
-    def active_diff_key(self) -> str | None:
+    def active_diff_key(self) -> Key | None:
         return self._active_key
 
     @property
@@ -252,7 +269,7 @@ class DiffSummary(Vertical):
             diff_key = getattr(node, "diff_key", None)
             if diff_key is not None:
                 event.stop()
-                self.post_message(self.DiffRequested(cast("str", diff_key)))
+                self.post_message(self.DiffRequested(*cast(Key, diff_key)))
                 return
             if node.id == "diff-content":
                 event.stop()
@@ -289,16 +306,16 @@ class DiffSummary(Vertical):
             return
         current = self._active_row_index()
         index = 0 if current is None else max(0, min(len(rows) - 1, current + delta))
-        self._mark_active_row(_row_path(rows[index]))
+        self._mark_active_row(_row_key(rows[index]))
 
     def _open_highlighted(self) -> None:
         rows = list(self.query(".diff-row"))
         index = self._active_row_index()
         if index is None or index >= len(rows):
             return
-        key = _row_path(rows[index])
+        key = _row_key(rows[index])
         if key is not None:
-            self.post_message(self.DiffRequested(key))
+            self.post_message(self.DiffRequested(*key))
 
     async def set_summary(self, stat: DiffStat) -> None:
         """Update the summary + rows in place; becomes visible.
@@ -308,9 +325,7 @@ class DiffSummary(Vertical):
         in place. A teardown/mount flickers and loses the scroll position and
         highlight when only one row changed."""
         self._stat = stat
-        self._refresh_chip()
-        self._refresh_header()
-        await self._refresh_rows()
+        await self._apply_scope()
         self.add_class("visible")
 
     def _refresh_chip(self) -> None:
@@ -320,9 +335,8 @@ class DiffSummary(Vertical):
                 _chip_text(self._scope == "all"))
 
     def _refresh_header(self) -> None:
-        """Paint the label and the +A/-D totals: the count is the whole pending
-        diff, the totals follow the scope (the section headers carry their
-        own), right-aligned to the row columns so the badges line up."""
+        """Paint the label and the +A/-D totals: the count is the whole
+        pending diff, the totals follow the scope."""
         stat = self._stat
         if stat is None:
             return
@@ -342,14 +356,15 @@ class DiffSummary(Vertical):
         self.add_class("visible")
 
     def _widths(self) -> tuple[int, int]:
-        """Uniform widths for the +A/-D columns: the widest string across every
-        row and every total, so the badge before the numbers sits at the same
-        column everywhere."""
+        """Uniform widths for the +A/-D columns, so the numbers line up."""
         stat = self._stat
         if stat is None:
             return 1, 1
         totals = [[f for f in stat.files if self._inline(f)]]
-        totals += [self._section_entries(section)[0] for section in _SECTIONS]
+        totals += [
+            self._section_entries(section)[0]
+            for section in _sections(self._scope)
+        ]
         return (
             max([len(f"+{f.additions}") for f in stat.files]
                 + [len(f"+{sum(f.additions for f in g)}") for g in totals]),
@@ -357,14 +372,13 @@ class DiffSummary(Vertical):
                 + [len(f"-{sum(f.deletions for f in g)}") for g in totals]),
         )
 
-    def _inline(self, f) -> bool:
-        """Whether a file row leads the list: this session's work, plus other
+    def _inline(self, item) -> bool:
+        """Whether a row leads the list: this session's work, plus other
         sessions' while the scope includes them."""
-        return f.kind == "mine" or (f.kind == "agent" and self._scope == "all")
+        return item.kind == "mine" or (item.kind == "agent" and self._scope == "all")
 
     def _section_entries(self, section: str) -> tuple[list, list]:
-        """The (files, groups) a section holds: what the list does not lead
-        with."""
+        """The (files, groups) a section holds."""
         stat = self._stat
         if stat is None:
             return [], []
@@ -373,16 +387,18 @@ class DiffSummary(Vertical):
                 f for f in stat.files
                 if _section_of(f.kind) == section and not self._inline(f)
             ],
-            [g for g in stat.groups if _section_of(g.kind) == section],
+            [
+                g for g in stat.groups
+                if _section_of(g.kind) == section and not self._inline(g)
+            ],
         )
 
-    def _visible_paths(self) -> list[str]:
-        """Row paths in display order — what up/down/enter and the pane's
-        left/right step through (folded sections are absent)."""
+    def _visible_keys(self) -> list[Key]:
+        """Row keys in display order (folded sections are absent)."""
         return [
-            path for path in (
-                _row_path(row) for row in self.query(".diff-row")
-            ) if path is not None
+            key for key in (
+                _row_key(row) for row in self.query(".diff-row")
+            ) if key is not None
         ]
 
     async def _refresh_rows(self) -> None:
@@ -395,37 +411,37 @@ class DiffSummary(Vertical):
             return
         files = self.query_one("#diff-files", Vertical)
         add_w, del_w = self._widths()
-        # (key, row classes, cells) in display order; rows after the rule are
-        # indented so the fold structure reads.
-        wanted: list[tuple[tuple[str, str], str, list[Cell], bool]] = [
-            (("file", f.path), "diff-file-row diff-row",
-             self._file_cells(f, add_w, del_w), False)
-            for f in stat.files if self._inline(f)
-        ]
-        wanted.append((("divider", ""), "diff-divider", [], False))
-        for section in _SECTIONS:
+        # (key, row classes, cells) in display order. The key's kind keeps a
+        # shared file's rows distinct from a group's.
+        Entry = tuple[tuple[str, str, str | None], str, list[Cell]]
+
+        def entries(file_rows, group_rows) -> list[Entry]:
+            return [
+                (("file", f.path, f.author), "diff-file-row diff-row",
+                 self._file_cells(f, add_w, del_w))
+                for f in file_rows
+            ] + [
+                (("group", g.prefix, None), "diff-group-row diff-row",
+                 self._group_cells(g))
+                for g in group_rows
+            ]
+
+        wanted = entries(
+            [f for f in stat.files if self._inline(f)],
+            [g for g in stat.groups if self._inline(g)],
+        )
+        wanted.append((("divider", "", None), "diff-divider", []))
+        for section in _sections(self._scope):
             expanded = section in self._expanded
-            entries = self._section_entries(section)
+            held = self._section_entries(section)
             state = (" expanded" if expanded else "") + (
-                "" if any(entries) else " empty")
+                "" if any(held) else " empty")
             wanted.append((
-                ("section", section), f"diff-section-row {section}{state}",
-                self._section_cells(section, entries, expanded, add_w, del_w),
-                False,
+                ("section", section, None), f"diff-section-row {section}{state}",
+                self._section_cells(section, held, expanded, add_w, del_w),
             ))
-            if not expanded:
-                continue
-            section_files, section_groups = entries
-            wanted += [
-                (("file", f.path), "diff-file-row diff-row",
-                 self._file_cells(f, add_w, del_w), True)
-                for f in section_files
-            ]
-            wanted += [
-                (("group", g.prefix), "diff-group-row diff-row",
-                 self._group_cells(g), True)
-                for g in section_groups
-            ]
+            if expanded:
+                wanted += entries(*held)
 
         wanted_keys = {key for key, *_ in wanted}
         existing = {
@@ -439,7 +455,7 @@ class DiffSummary(Vertical):
                 existing.pop(key)
 
         ordered = []
-        for key, classes, cells, nested in wanted:
+        for key, classes, cells in wanted:
             row = existing.get(key)
             if row is None:
                 row = Horizontal(classes=classes) if cells else Static(
@@ -451,14 +467,13 @@ class DiffSummary(Vertical):
                 if key[0] == "section":
                     row.diff_section = key[1]  # type: ignore[attr-defined]
                 else:
-                    # A file's path, or an ignored group's prefix: a click
-                    # asks the app for that path's diff (a group's being the
-                    # read-only "added" patch of everything under it).
-                    row.diff_key = key[1]  # type: ignore[attr-defined]
+                    # A path plus the author whose delta it counts (an
+                    # ignored group's prefix, which has none): a click asks
+                    # the app for exactly that patch.
+                    row.diff_key = (key[1], key[2])  # type: ignore[attr-defined]
                 await files.mount(row)
             else:
                 row.set_classes(classes)
-            row.set_class(nested, "nested")
             await _sync_cells(row, cells)
             ordered.append(row)
 
@@ -470,7 +485,7 @@ class DiffSummary(Vertical):
 
         if self.diff_shown:
             active = self._active_key
-            if active not in {_row_path(row) for row in ordered}:
+            if active not in {_row_key(row) for row in ordered}:
                 # The row folded away (its section closed or its scope
                 # dropped): close the pane instead of floating it orphaned,
                 # and keep the keyboard on the list for arrow navigation —
@@ -480,28 +495,28 @@ class DiffSummary(Vertical):
                 if focused is not None and self in focused.ancestors_with_self:
                     self.focus()
             else:
-                self._mark_active_row(active if isinstance(active, str) else None)
+                self._mark_active_row(active)
 
     def _file_cells(self, f, add_w: int, del_w: int) -> list[Cell]:
         """One per-file row: name, badges, kind, then the counts in their own
-        right-hand columns (so they never wrap the name)."""
+        right-hand columns."""
         cells = [("diff-file-name", f.path)]
         if f.is_new:
             cells.append(("diff-file-new", "new"))
-        if len(f.authors) > 1:
+        if f.author is None and len(f.authors) > 1:
+            # A combined row: the count says whose edits its totals add up.
             cells.append(("diff-file-shared", str(len(f.authors))))
-        cells.append((f"diff-file-source {f.kind}", _display_kind(f.kind)))
+        cells.append((f"diff-file-source {f.kind}", _badge(f.kind)))
         cells.append(("diff-file-add", f"+{f.additions}".rjust(add_w)))
         cells.append(("diff-file-del", f"-{f.deletions}".rjust(del_w)))
         return cells
 
     @staticmethod
     def _group_cells(group) -> list[Cell]:
-        """One ignored-path group row: its prefix (the directory's or just
-        the one file) and how many files hide behind it."""
+        """One ignored-path group row: its prefix and its file count."""
         return [
             ("diff-file-name", group.prefix),
-            (f"diff-file-source {group.kind}", _display_kind(group.kind)),
+            (f"diff-file-source {group.kind}", _badge(group.kind)),
             ("diff-group-count", f"{group.files} files"),
         ]
 
@@ -510,8 +525,7 @@ class DiffSummary(Vertical):
         section: str, entries: tuple[list, list], expanded: bool,
         add_w: int, del_w: int,
     ) -> list[Cell]:
-        """One section header: label, fold arrow, then the ignored count and
-        the section's line totals."""
+        """One section header: label, fold arrow, ignored count, totals."""
         section_files, section_groups = entries
         ignored = sum(g.files for g in section_groups)
         adds = sum(f.additions for f in section_files)
@@ -543,12 +557,13 @@ class DiffSummary(Vertical):
         if self.is_mounted:
             await self.query_one("#diff-files", Vertical).remove_children()
 
-    def show_diff(self, key: str, text: str) -> None:
-        """Display one file's (or group's) unified diff inline.
+    def show_diff(self, key: Key, text: str) -> None:
+        """Display one row's unified diff inline.
 
-        A section-held row (auto, drift, or another session's work while
-        scoped to this one) unfolds its section first, so the highlighted row
-        is really on screen — even for ``/diff <path>`` typed directly."""
+        A section-held row unfolds its section first, so the highlighted row
+        is really on screen — even for ``/diff <path>`` typed directly, whose
+        bare path resolves to the first row listed for it."""
+        key = self.resolve_key(key)
         self._active_key = key
         self._active_text = text
         self.add_class("visible")
@@ -566,17 +581,26 @@ class DiffSummary(Vertical):
         content.call_after_refresh(content.scroll_home, animate=False)
         self._mark_active_row(key)
 
-    def _section_for(self, key: str) -> str | None:
-        """The folded section a path belongs to, if any."""
+    def resolve_key(self, key: Key) -> Key:
+        """``key`` as listed: a bare path resolves to the first row for it."""
+        stat = self._stat
+        if stat is None or key[1] is not None:
+            return key
+        for f in stat.files:
+            if f.path == key[0]:
+                return (f.path, f.author)
+        return key
+
+    def _section_for(self, key: Key) -> str | None:
+        """The folded section a row belongs to, if any."""
         stat = self._stat
         if stat is None:
             return None
-        for f in stat.files:
-            if f.path == key and not self._inline(f):
-                return _section_of(f.kind)
-        for g in stat.groups:
-            if g.prefix == key:
-                return _section_of(g.kind)
+        sections = _sections(self._scope)
+        for item in (*stat.files, *stat.groups):
+            if _item_key(item) == key and not self._inline(item):
+                section = _section_of(item.kind)
+                return section if section in sections else None
         return None
 
     def hide_diff(self) -> None:
@@ -586,18 +610,17 @@ class DiffSummary(Vertical):
             # The diff pane may have held focus; hand it back to the input.
             self.app.query_one("#chat-input", ChatInput).focus()
 
-    def _mark_active_row(self, key: str | None) -> None:
+    def _mark_active_row(self, key: Key | None) -> None:
         """Highlight the row whose diff is currently displayed."""
         for row in self.query(".diff-row"):
-            if _row_path(row) == key:
+            if _row_key(row) == key:
                 row.add_class("active")
             else:
                 row.remove_class("active")
 
     def recolor(self) -> None:
         """Re-render with the current palette (/theme): CSS variables recolor
-        the rows live, but the chip and the diff text bake palette colors into
-        rich styles."""
+        the rows live, the chip and diff text bake palette colors in."""
         if not self.is_mounted:
             return
         self._refresh_chip()
@@ -605,16 +628,21 @@ class DiffSummary(Vertical):
             self.query_one("#diff-text", Static).update(_render_diff(self._active_text))
 
 
-def _row_path(row) -> str | None:
-    """The path a row leads to (a file's, an ignored group's prefix), or None
-    for a section header."""
+def _item_key(item) -> Key:
+    """The key a row (a file or an ignored group) opens."""
+    return (getattr(item, "path", None) or item.prefix,
+            getattr(item, "author", None))
+
+
+def _row_key(row) -> Key | None:
+    """The key a row opens (a file's path plus its author, a group's
+    prefix), or None for a section header."""
     return getattr(row, "diff_key", None)
 
 
 async def _sync_cells(row, cells: list[Cell]) -> None:
     """Bring one row's cells in line with ``cells``: update the survivors,
-    mount the new ones in place and drop the gone ones, so a refresh never
-    rebuilds the row."""
+    mount the new ones in place, drop the gone ones."""
     existing = {
         getattr(cell, "diff_cell", None): cell for cell in row.children
     }

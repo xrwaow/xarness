@@ -16,7 +16,7 @@ When a filesystem sandbox is available, the model gets:
 | `write_file` | write | Create or overwrite a file |
 | `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
 | `run_bash` | plan + write | Run a shell command in a persistent sandboxed shell (cwd and env vars survive across calls). In plan mode the workspace is mounted read-only |
-| `ask_user` | plan + write | Ask you a clarifying question in the TUI |
+| `ask_user` | plan + write | Ask you a clarifying question in the TUI — with the choices to pick from (press a number) or your own written answer |
 | `subagent` | plan + write | Run a fresh agent on one self-contained task in the same workspace and return its final answer (see below) |
 
 Each tool's description names only the environment it runs in — the
@@ -197,11 +197,14 @@ clone/fetch/push.
 **What is recorded.** Every successful `write_file`/`edit_file` records the
 path it wrote **and the provenance of that write**: the blob shas of the
 file just before the call and just after it (either one absent when the path
-did not exist). Every successful `run_bash` snapshots the workspace before
-the command and again after it, and records the paths that differ plus the
-ignored directories the command created (the two snapshots are the only
-part serialized: two agents' commands can run at once). Nothing else is
-recorded, and a command that changes nothing records nothing.
+did not exist). Every `run_bash` snapshots the workspace before the command
+and again after it, and records the paths that differ plus the ignored
+directories the command created (the two snapshots are the only part
+serialized: two agents' commands can run at once). A command's changes are
+recorded whatever its exit status — a failing command (or one that times
+out) still leaves its writes on disk, so they are the agent's work, not
+drift. Nothing else is recorded, and a command that changes nothing records
+nothing.
 
 The pending diff is the real worktree measured against the baseline. Its
 rows are labelled by who the change came from — for the agent looking at
@@ -211,21 +214,36 @@ it:
 | --- | --- |
 | `mine` | the path was written by one of *this* agent's `write_file`/`edit_file` calls |
 | `agent` | another agent's explicit write, or any `run_bash` change |
-| `auto` | an ignored directory an agent's command created (build output, `node_modules/`, …) |
+| `auto` | an ignored path an agent's command created: a build-output/cache directory, or a content-detected binary (compiled artifacts, media, archives, …) |
 | `drift` | anything no recorded call covers: your own edits, or changes that happened while no agent ran |
 
-`mine` and `agent` rows both display the badge `agent`; the session's own
-work is accent-colored and another agent's is dimmed.
+`mine` and `agent` rows both read `agent` — the row never says "mine" —
+with the session's own work accent-colored and another agent's dimmed. The
+badge always credits one session, so the colour alone tells whose work a
+row counts (see below).
 
 **One file, several agents.** A path written explicitly reports *one
-author's delta*, not the whole file's pending change: the row's `+A -D`, the
-summary totals and the per-file diff all count the change between the blob
-that author found and the blob it left, so two sessions on one file are
-never credited with each other's hunks. The row that is not the viewer's
-shows the last author's delta, and a file more than one session wrote
-carries a count badge (the number of authors) so its totals read as shared.
-A path with only `run_bash` or drift changes has no author and keeps the
-whole pending delta.
+author's delta* per row: the row's `+A -D` and the diff it opens both count
+the change between the blob that author found and the blob it left, so two
+sessions on one file are never credited with each other's hunks. How a
+shared file is split follows the summary line's scope chip (see
+[The pending-changes panel](#the-pending-changes-panel)):
+
+- **every session** (`agent`, tail dimmed): one row per path counting the
+  file's whole pending change — every agent's edits, plus any `run_bash`
+  and drift in it. The badge credits the session that wrote the path last
+  (the file is now as they left it), and a file more than one session wrote
+  says so with a count badge.
+- **this session** (`agent`, whole word accent-colored): one row per author,
+  each badge crediting its own author. This session's own delta leads the
+  list; every other session's is a row of its own in the folded `agent`
+  section, so the rest of a shared file's change is a click away rather
+  than counted into yours.
+
+Either way the row's numbers are exactly the patch it opens, and the
+summary totals stay the workspace's whole pending change. A path with only
+`run_bash` or drift changes has no author and keeps the whole pending delta
+in one row.
 
 The blob shas live in the same object store as the snapshots, so authorship
 survives a restart; if a store is pruned under it the rows fall back to
@@ -236,8 +254,14 @@ Explicit writes win over bash: if this agent edited a file and another
 agent's `run_bash` then touched it, it stays `mine` here. Another session's
 (or a subagent's) events are never drift — they are that agent's work,
 `agent` to everyone else, including their parent. Because the before
-snapshot is taken fresh for each command, an edit you made *before* it
-stays `drift`: earlier changes are never credited to a later command.
+snapshot is taken fresh for each call, an edit you made *before* it stays
+`drift`: earlier changes are never credited to a later call.
+
+**Two processes, one log.** The event log belongs to the workspace, so a
+second window (or a `xarness -p` run) appends to the same table, and each
+session re-reads it before computing a diff — one agent's write is never
+invisible to another host. The table assigns the sequence numbers, so two
+hosts cannot claim the same one and lose a write.
 
 **A bash window.** The before/after snapshots bracket the whole `run_bash`
 call, so an edit *you* make while a command is running lands in that event
@@ -246,60 +270,77 @@ deliberate: no markers, no timestamps, no heuristics.
 
 **Ignored paths never enter a snapshot.** Benchmarks showed that tracking
 build output adds hundreds of MB of objects to your `.git` and makes
-`/diff` about a thousand times slower, so ignored paths are read separately
-(`git ls-files -o -i … --directory`, about a millisecond) and reported as
-one row per directory (`target/: 412 files`, counted from one full listing
-only when there are groups), never per file. A file *modified* inside an
-already-ignored directory is not reported — that is intentional.
+`/diff` about a thousand times slower, so ignored *directories* are pruned
+without being read and listed separately (`git ls-files -o -i …
+--directory`, about a millisecond), reported as one row per directory
+(`target/: 412 files`, counted from one full listing only when there are
+groups). A file *modified* inside an already-ignored directory is not
+reported — that is intentional. Binaries detected by content are not
+pattern-ignored, so they appear as one row each rather than per directory.
 
-**Which paths are ignored** is resolved again on every snapshot, in three
-layers: xarness's own defaults (build output and caches: `target/`, the
-sandbox's `target-sandbox/` and `Cargo.lock` in a project with a `Cargo.toml`,
-`node_modules/`, `dist/`, `build/`, `__pycache__/`, `.venv/`, `.next/`, plus
-media/binary file types and `.xarness/`), then your repo's own ignore rules
-(`.gitignore` including nested ones, `.git/info/exclude`, global excludes),
-then the workspace's `.xarness/ignore` (gitignore syntax, ignore-only, no
-re-includes). Because they are resolved per snapshot, a mid-session edit to
-any of them takes effect at the next snapshot — and a path you *stop*
-ignoring can therefore show up as `drift`, even though nothing changed on
-disk.
+**Which paths are ignored** is resolved again on every snapshot, in four
+layers: xarness's own directory defaults (build output and caches: `target/`,
+the sandbox's `target-sandbox/` and `Cargo.lock` in a project with a
+`Cargo.toml`, `node_modules/`, `dist/`, `build/`, `__pycache__/`, `.venv/`,
+`.next/`, and `.xarness/`), then **content detection** for binaries, then
+your repo's own ignore rules (`.gitignore` including nested ones,
+`.git/info/exclude`, global excludes), then the workspace's `.xarness/ignore`
+(gitignore syntax, ignore-only, no re-includes).
+
+The content check inspects the head of every changed or untracked file (at
+most 8 KB, git's own window): a known magic number (PNG, PDF, ZIP, gzip,
+ELF, SQLite, …), an ISO-BMFF/RIFF container, or a NUL byte makes it binary;
+UTF-16 with a BOM and an empty file are text. Extension is never consulted,
+so `notes.png` full of text is tracked and a headerless `blob` is not.
+Results are cached per path by size and mtime, so an excluded binary is not
+re-read on every snapshot. The 1 MB size cap applies too: anything over it
+is excluded whatever its content.
+
+Because the layers are resolved per snapshot, a mid-session edit to any of
+them takes effect at the next snapshot — and a path you *stop* ignoring can
+therefore show up as `drift`, even though nothing changed on disk. The same
+goes for content: a file that turns from binary to text shows up as drift
+against the baseline.
 
 While the agent works, a one-line summary above the input shows what it
 changed (`Edited 2 files +26 -0`); click it to expand a per-file list
 (`name  [new]  [2]  agent  +N -M`), and click a row to read that
-file's unified diff. The numbers are the shown author's own delta and the
-count between the name and the badge is how many sessions wrote the file
-(see "One file, several agents" above).
+file's unified diff. A row's numbers are always the patch it opens. The
+count between the name and the badge is how many sessions wrote the file,
+and the `agent` badge credits one of them — the last writer on a row that
+adds every session's edits up (see "One file, several agents" above).
 
 The agent's own files lead, then a full-width rule separates them from the
-three sections below — a dimmed `agent` (another session's work, and the
-ignored groups agents created), `auto` (ignored directories agents created,
-with their file count) and `drift` (changes no recorded call covers). All
-three headers are always there, each reading label, `▸`/`▾` fold arrow, then
-its own `+A -D` totals on the right. Clicking a header unfolds its rows
-(indented below it), where a file row opens that file's unified diff; the
-sections start folded, so the diff view shows only the agent's diffs by
-default. An ignored group is a click target too: it has no baseline copy to
-diff against, so it opens what is under it as added files (one `+++` per
-file, read-only).
+sections below — `auto` (ignored directories agents created, with their
+file count) and `drift` (changes no recorded call covers), plus an `agent`
+section while the scope is this session only, for the other sessions' rows.
+With every session included there is no `agent` section: those rows (and
+the ignored groups agents created) already lead the list. Each header reads
+label, `▸`/`▾` fold arrow, then its own `+A -D` totals on the right, and is
+there even when empty. Clicking a header unfolds its rows, which sit flush
+with the list — the fold arrow carries the nesting — and a file row opens
+that file's unified diff. The sections start folded, so the diff view
+shows only the agent's diffs by default. An ignored group is a click
+target too: it has no baseline copy to diff against, so it opens what is
+under it as added files (one `+++` per file, read-only).
 
 The right of the summary line carries one chip reading `agent`; clicking
 it cycles the scope. With every session included the `age` is
 accent-colored and the `nt` dimmed; scoped to this session the whole word
-is accent-colored, and another session's (or a subagent's) files fold into
-the `agent` section between this session's files and `auto`. The selection
-is saved with the session (not in the config file), so reopening it —
-later in this run or after a restart — shows the same scope, with a chip
-clicked in a draft carrying over to the session it starts. The chip stays
-a view filter: `/diff <path>`, `/accept`, `/reject` and the panel label's
-file count still see everything pending.
+is accent-colored (see "One file, several agents" above for what each scope
+reports). The host builds the rows for the saved scope, so flipping the
+chip refetches the summary. The selection is saved with the session (not in
+the config file), so reopening it — later in this run or after a restart —
+shows the same scope, with a chip clicked in a draft carrying over to the
+session it starts. The chip stays a view filter: `/diff <path>`, `/accept`,
+`/reject` and the panel label's file count still see everything pending.
 
 | Command | Action |
 | --- | --- |
 | `/diff` | Show the pending-changes panel; `/diff` again hides it |
 | `/diff <path>` | Show one file's unified diff (an ignored path or group reads as added) |
-| `/accept` | Re-baseline the workspace at what the agents changed (leaving your own drift pending): `/diff` resets and `/undo` can no longer revert past this point |
-| `/reject` | Restore the workspace to the baseline — including your own drift — and remove ignored directories the agents created |
+| `/accept` | Re-baseline the workspace at its current state, locking in every pending change (your own drift included): `/diff` resets and `/undo` can no longer revert past this point |
+| `/reject` | Restore the workspace to the baseline — including your own drift — and remove ignored paths the agents created |
 | `/undo` | Drop the last turn: reverse its own file edits, put your message back in the input |
 | `/retry` | Reverse the last turn's file edits and resend your message |
 
@@ -312,23 +353,22 @@ without undoing. Messages the last compaction summarized away can be clicked
 too (the pre-compaction history is restored first).
 
 `/accept` is how you follow change-per-feature: let the agent build one
-feature, `/accept` it, move on to the next. The new baseline is the old one
-with every pending path that an agent changed (anything not `drift`)
-replaced by its current content — one new tree sha, no per-file bookkeeping
-— so your own unrecorded edits stay pending and are never absorbed.
-Everything before the last accept is out of `/diff`'s and `/undo`'s reach —
+feature, `/accept` it, move on to the next. The new baseline is the current
+worktree — every pending change, your own drift included, is locked in as
+one new tree sha. Nothing is left pending, so `/diff` resets to empty and
+everything before the last accept is out of `/diff`'s and `/undo`'s reach —
 use git itself (a repo you control) for history beyond that. `/accept`
-never asks: your own drift is never absorbed, so there is nothing to warn
-about, and the command's notice reports how many of the locked-in files
-weren't this agent's work and how many more than one agent wrote.
+never asks, and the command's notice reports how many of the locked-in
+files weren't this agent's work and how many more than one agent wrote.
 
 `/reject` restores tracked paths to the baseline, discarding everything
 since the last `/accept` — **including changes you made yourself**, which is
 why the TUI confirms first when there is drift — while keeping the
 conversation going so the agent sees the reverted files on its next turn.
-It also removes the ignored directories a recorded command created, but
-never one that already existed (a `node_modules/` you installed yourself
-survives). Ignored files an agent edited explicitly cannot be restored,
+It also removes the ignored paths a recorded command created (build
+directories, and detected binaries), but never one that already existed (a
+`node_modules/` you installed yourself survives). Ignored files an agent
+edited explicitly cannot be restored,
 since no baseline copy exists; the notice lists them.
 
 ### Undo and retry
@@ -373,7 +413,7 @@ attach/load by name at startup:
 ```sh
 xarness --session my-session   # attach to an active session or load a saved one
 xarness --sessions             # print active sessions and exit
-xarness --kill                 # close every active session (each stays saved)
+xarness --kill                 # close every active session and stop the host (each stays saved)
 ```
 
 `/sessions` lists only the sessions of the workspace you are in: first the
@@ -505,7 +545,7 @@ xarness --network false --gpu false  # fully offline, no device access
 xarness --enable_tracking false      # no checkpoints/diff bar/undo
 xarness --session my-session         # attach/load a saved session
 xarness --sessions                   # list active sessions
-xarness --kill                       # close all active sessions (stays saved)
+xarness --kill                       # close all active sessions and stop the host (sessions stay saved)
 xarness --server                     # run the host in the foreground
 ```
 
@@ -597,7 +637,6 @@ src/xarness/
   config.py       pydantic config models, JSON loading, profile selection
   client.py       async httpx SSE client, reasoning-effort mapping
   compaction.py   context handoff: token estimates + summarizer round
-  controller.py   one-round runner: stream events, wire history, usage totals
   host.py         session host: FastAPI over a unix socket, lifecycle, config resolution
   api.py          HTTP/SSE endpoints used by the TUI and other clients
   clientlib.py    async client used by the TUI (host spawn + API calls)
@@ -630,3 +669,11 @@ unavailable. Everything else fakes `bwrap` and inspects the argv instead.
 When xarness runs against its own repo, the sandbox exposes this env at
 `.venv` (see “The project venv” above), so `.venv/bin/pytest` works inside
 `run_bash` too.
+
+The host is a long-lived detached process: `/new`, `/delete` and
+restarting the TUI all reuse the one already running, with the code it
+loaded when it was spawned. After editing xarness itself, reset with
+`xarness --kill` (it closes the sessions and stops the host), so the next
+`xarness` starts one with the new code. If the host is wedged, the same
+end is a `pkill -f 'xarness.host'` or Ctrl-C on the foreground `xarness
+--server`.

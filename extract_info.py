@@ -23,7 +23,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 
 # Running from a checkout: use the local package even if it is not installed.
@@ -43,7 +42,7 @@ from xarness.prompts import system_prompt  # noqa: E402
 from xarness.sandbox import SandboxRuntime, SandboxUnavailable  # noqa: E402
 from xarness.session_store import load_metas  # noqa: E402
 from xarness.tools import build_registry  # noqa: E402
-from xarness.workspace import load_workspace_refs  # noqa: E402
+from xarness.workspace import WorkspaceState, load_workspace_refs  # noqa: E402
 
 
 async def _ask_user(questions: list[str]) -> list[str] | None:
@@ -60,21 +59,20 @@ async def _spawn_subagent(prompt: str, mode: str) -> str:
 
 def _workspace_last_sandbox(workspace: Path) -> str | None:
     """The sandbox profile the workspace last used, as ``xarness`` resolves it
-    from saved sessions. Read-only: no database file means no sessions."""
-    best: tuple[str, str] | None = None
+    from saved sessions (Host._workspace_last_used). Read-only: no database
+    file means no sessions."""
+    best = None
     for meta in load_metas().values():
-        saved_ws = meta.get("workspace")
-        if not saved_ws:
+        if not meta.workspace:
             continue
         try:
-            if Path(saved_ws).resolve() != workspace.resolve():
+            if Path(meta.workspace).resolve() != workspace.resolve():
                 continue
         except OSError:
             continue
-        stamp = meta.get("updated_at") or ""
-        if best is None or stamp > best[0]:
-            best = (stamp, meta.get("sandbox_name"))
-    return best[1] if best else None
+        if best is None or (meta.updated_at or "") > (best.updated_at or ""):
+            best = meta
+    return best.sandbox if best else None
 
 
 def _detect_repo(workspace: Path):
@@ -148,9 +146,9 @@ def _render(args: argparse.Namespace) -> tuple[str, list[dict]]:
         repo = _detect_repo(workspace)
         tracked = repo is not None or not args.no_init_repo
 
-    # SandboxConfig only needs the repo's git dir and external flag from it.
+    # SandboxConfig only needs the repo's root, git dir and external flag.
     repo_state = (
-        SimpleNamespace(
+        WorkspaceState(
             root=repo.root, git_dir=repo.git_common_dir, external=repo.external,
         )
         if repo is not None else None
@@ -177,6 +175,7 @@ def _render(args: argparse.Namespace) -> tuple[str, list[dict]]:
         runtime.config, args.mode,
         tracked=tracked,
         git_write=runtime.allow_git_write,
+        default_timeout=settings.default_timeout,
     )
     return prompt, registry.schema()
 

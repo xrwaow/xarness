@@ -357,11 +357,10 @@ class Transcript:
     def load(self, snap) -> list:
         self.items = []
         self.start_round()
-        # ``history`` holds epochs hidden from the model by compaction. The
-        # human still sees them: fold them first, exactly like the current
-        # epoch, so a resumed session shows everything before the handoff.
-        history = list(getattr(snap, "history", None) or [])
-        messages = [*history, *snap.messages]
+        # ``messages`` is the whole append-only history: the client renders
+        # the compacted-away prefix too, so a resumed session shows
+        # everything before the handoff.
+        messages = list(snap.messages)
         results = {
             m.tool_call_id: m for m in messages
             if m.role == "tool" and m.tool_call_id
@@ -519,15 +518,11 @@ class Transcript:
             if self.cancelled:
                 return []
             changed = self.cancel()
-            total = event.total
-            if total is None and event.outcome == "finished":
-                # An older host sends no stamped total: its wall clock is the
-                # only number there is, so keep drawing the footer.
-                total = event.elapsed
-            if total is not None:
+            if event.stats is not None:
+                stats = event.stats
                 changed.append(self._add(TurnSummaryItem(
-                    total=total, busy=event.busy, idle=event.idle,
-                    usage=event.usage,
+                    total=stats.total, busy=stats.busy, idle=stats.idle,
+                    usage=stats.usage,
                 )))
             return changed
         if self.cancelled:

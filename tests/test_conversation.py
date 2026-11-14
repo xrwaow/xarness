@@ -76,7 +76,7 @@ def test_the_last_summary_defines_the_visible_slice() -> None:
     conversation.add(user_message("summary", is_summary=True))
 
     assert [m.content for m in conversation.visible_messages()] == ["summary"]
-    assert [m.content for m in conversation.history_messages()] == ["old"]
+    assert [m.content for m in conversation.messages[:conversation.visible_index()]] == ["old"]
     # Undoing a compaction pops the summary: the old messages come back.
     conversation.apply_rollback(
         conversation.rollback_plan()

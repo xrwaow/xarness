@@ -496,11 +496,11 @@ class ContainerMountsTest(SandboxArgvTest):
                          [str(self.project_venv_dir()), str(other)])
         self.assertEqual(binds[-1][0], "--bind")
 
-    def test_project_venv_joins_mount_key(self):
+    def test_project_venv_joins_the_container_argv(self):
         config = self.config()
-        key = config.mount_key
+        before = config.build_argv(["/bin/sh"])
         (self.workspace / "pyproject.toml").write_text("[project]\n")
-        self.assertNotEqual(config.mount_key, key,
+        self.assertNotEqual(config.build_argv(["/bin/sh"]), before,
                             "a project venv appearing must restart the shell")
 
     # --------------------------------------------------------------
@@ -606,15 +606,16 @@ class ContainerMountsTest(SandboxArgvTest):
         self.assertNotIn(caps, argv)
 
     # --------------------------------------------------------------
-    # mount_key (Part 3, parametrized)
+    # argv identity (Part 3, parametrized)
 
-    def test_mount_key_changes_iff_relevant_setting_changes(self):
+    def test_argv_changes_iff_a_mount_input_changes(self):
         base = dict(
             external_refs=SandboxConfig.resolve_auto_refs(
                 self.workspace, ["docs/spec.md"]),
         )
         (self.workspace / "docs").mkdir()
         (self.workspace / "docs" / "spec.md").write_text("x\n")
+        (self.workspace / "x").write_text("x\n")
         cases = [
             ("read_only", dict(read_only=True)),
             ("allow_network", dict(allow_network=True)),
@@ -625,21 +626,23 @@ class ContainerMountsTest(SandboxArgvTest):
         for name, change in cases:
             with self.subTest(field=name):
                 config = self.config(**base)
-                key = config.mount_key
+                argv = config.build_argv(["/bin/sh"])
                 config2 = self.config(**base, **change)
-                self.assertNotEqual(config2.mount_key, key)
+                self.assertNotEqual(
+                    config2.build_argv(["/bin/sh"]), argv,
+                    "a mount input change must restart the shell")
         # External refs changes matter too.
         config = self.config(**base)
-        key = config.mount_key
+        argv = config.build_argv(["/bin/sh"])
         (Path(self._tmp.name) / "docs2").mkdir()
         bind_ref(config.workspace, config.external_refs,
                  Path(self._tmp.name) / "docs2", alias="d2")
-        self.assertNotEqual(config.mount_key, key)
-        # And irrelevant fields do NOT change it (fresh config).
-        config2 = self.config(**base)
-        key2 = config2.mount_key
-        config2.git_dir = Path("/elsewhere/.git")  # not a mount input
-        self.assertEqual(config2.mount_key, key2)
+        self.assertNotEqual(config.build_argv(["/bin/sh"]), argv)
+        # And two fresh configs with the same inputs build the same argv.
+        self.assertEqual(
+            self.config(**base).build_argv(["/bin/sh"]),
+            self.config(**base).build_argv(["/bin/sh"]),
+        )
 
 
 # ----------------------------------------------------------------------

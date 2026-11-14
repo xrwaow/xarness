@@ -18,7 +18,7 @@ from xarness.conversation import user_message
 from xarness.host import Host
 from xarness.protocol import ContentDelta, SendMessage, Snapshot, RoundComplete, Usage
 from xarness.session import SessionError
-from xarness.workspace import WorkspaceState, open_workspace
+from xarness.workspace import WorkspaceState
 
 
 class FakeClient:
@@ -85,7 +85,7 @@ async def _make_session(host: Host, tmp_path, script) -> str:
     (tmp_path / "ws").mkdir(exist_ok=True)
     summary = await host.create_session(protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")))
     session = host.sessions[summary.name]
-    session.controller._client = FakeClient(script)
+    session._client = FakeClient(script)
     return session.name
 
 
@@ -127,13 +127,13 @@ def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
             # diff and give the session a tracked workspace.
             from xarness.protocol import DiffFileInfo, DiffInfo
 
-            async def fake_diff(viewer=None, current=None, path=None):
+            async def fake_diff(viewer=None, current=None, path=None, scope="all"):
                 return DiffInfo(files=[DiffFileInfo(
                     path="a.txt", additions=1, deletions=0, is_new=True,
                     kind="agent",
                 )], additions=1, deletions=0)
 
-            async def fake_text(viewer, path, current=None):
+            async def fake_text(path, current=None, author=None):
                 return f"diff for {path}"
 
             session.workspace_state = WorkspaceState(
@@ -215,15 +215,13 @@ def test_view_state_round_trips_through_the_session(tmp_path) -> None:
             name = summary.name
             assert host.sessions[name].status().view.diff_scope == "mine"
             async with _unix_http(host.unix_socket) as http:
-                result = (await http.post(
+                await http.post(
                     f"/v1/sessions/{name}/commands",
-                    json={"cmd_id": "f1", "command": {
+                    json={
                         "type": "set_view_state",
                         "view": {"diff_scope": "all"},
-                    }},
-                )).json()
-                assert result["ok"], result
-                assert result["view"]["diff_scope"] == "all"
+                    },
+                )
                 snap = (await http.get(f"/v1/sessions/{name}")).json()
                 assert snap["status"]["view"]["diff_scope"] == "all"
 
@@ -250,15 +248,14 @@ def test_host_survives_client_disconnect(tmp_path) -> None:
             )
             # A client sends and disconnects immediately after.
             async with _unix_http(host.unix_socket) as http:
-                result = (await http.post(
+                await http.post(
                     f"/v1/sessions/{name}/commands",
-                    json={"cmd_id": "x1", "command": {"type": "send_message", "text": "hi"}},
-                )).json()
-                assert result["ok"], result
+                    json={"type": "send_message", "text": "hi"},
+                )
             # No client attached now; the turn still completes in the host.
             session = host.sessions[name]
             await asyncio.wait_for(session._turn_task, timeout=5)
-            assert session._state == "idle"
+            assert session.state == "idle"
             assert session.conversation.messages[-1].content == "late answer"
             # A second client attaches afterwards and sees the result.
             async with _unix_http(host.unix_socket) as http:
@@ -312,8 +309,8 @@ def test_host_stays_alive_while_turn_runs(tmp_path) -> None:
             registry = ToolRegistry()
             registry.register(blocker)
             session.tool_registry = registry
-            session.controller.tools = registry
-            await session.execute("x", SendMessage(text="hi"))
+            session.tool_registry = registry
+            await session.execute(SendMessage(text="hi"))
             # The turn is running; the host must not exit during the grace window.
             await asyncio.sleep(host_mod.GRACE_SECONDS * 0.6)
             assert not task.done()
@@ -414,7 +411,6 @@ def test_no_false_drift_after_clean_exit(tmp_path) -> None:
         name = summary.name
         session = host.sessions[name]
         assert session.workspace_state is not None
-        from xarness.gitwork import snapshot_tree
         current = await session.workspace_state.refresh()
         user = session.conversation.add(user_message("edit"))
         session.conversation.begin_turn(user, current)
@@ -441,7 +437,6 @@ def test_load_session_finalizes_turn_left_open_by_a_crash(tmp_path) -> None:
         name = summary.name
         session = host.sessions[name]
         assert session.workspace_state is not None
-        from xarness.gitwork import snapshot_tree
         current = await session.workspace_state.refresh()
         # A turn with a checkpoint but no after-tree: finish_turn never ran.
         user = session.conversation.add(user_message("still working"))
@@ -493,10 +488,7 @@ def test_load_session_without_git_block_falls_back_to_fresh_tracking(tmp_path) -
 
 
 def test_protocol_models_tolerate_unknown_fields() -> None:
-    """Host and client can be different builds across a restart: a snapshot
-    carrying fields the validating model doesn't know must parse, not crash
-    with extra_forbidden (e.g. a message-level timing field added by a
-    newer host while the TUI still runs an older clientlib)."""
+    """A newer host's extra fields must parse, not crash with extra_forbidden."""
     raw = {
         "seq": 7,
         "status": {"state": "idle"},
@@ -582,6 +574,45 @@ def test_clientlib_refuses_a_host_that_speaks_another_protocol(
             await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(go())
+
+
+def test_kill_sessions_stops_the_host_too(tmp_path, monkeypatch, capsys) -> None:
+    """``--kill`` must not leave the old host running: a reset that only
+    unloaded sessions would reconnect to the code that host imported."""
+    from xarness import cli
+    from xarness.clientlib import XarnessClient
+
+    stopped: list[int] = []
+
+    class FakeClient:
+        async def health(self):
+            return type("Info", (), {"pid": 4242})()
+
+        async def sessions(self, active=False):
+            return [type("S", (), {"name": "one"})(),
+                    type("S", (), {"name": "two"})()]
+
+        async def unload_session(self, name):
+            return True
+
+        async def aclose(self):
+            pass
+
+    async def fake_connect(cls, **kwargs):
+        return FakeClient()
+
+    def fake_stop(pid, path):
+        stopped.append(pid)
+
+    monkeypatch.setattr(XarnessClient, "connect_unix", classmethod(fake_connect))
+    monkeypatch.setattr(host_mod, "stop_host", fake_stop)
+
+    cli._kill_sessions()
+
+    assert stopped == [4242]
+    out = capsys.readouterr().out
+    assert "closed one" in out and "closed two" in out
+    assert "host stopped" in out
 
 
 def test_clientlib_replaces_a_stale_host_with_no_work(
@@ -671,10 +702,8 @@ def test_quit_verdict_route_counts_the_other_streams(tmp_path) -> None:
 
 
 def test_headless_turn_runs_like_any_other_and_reattach_sees_it_done(tmp_path) -> None:
-    """The model behind the quit menu: a turn is the host's, not the
-    client's. With zero subscribers it runs to completion, and the attach
-    that comes later just sees the finished transcript and an idle status —
-    no "finished while you were away" flag, no per-client special case."""
+    """A turn is the host's, not the client's: it runs with zero subscribers,
+    and a later attach sees the finished transcript and an idle status."""
     from xarness.clientlib import XarnessClient
 
     async def go():
@@ -686,7 +715,7 @@ def test_headless_turn_runs_like_any_other_and_reattach_sees_it_done(tmp_path) -
             )
             session = host.sessions[name]
             assert session.clients_attached == 0
-            await session.execute("x", SendMessage(text="hi"))
+            await session.execute(SendMessage(text="hi"))
             await asyncio.wait_for(session._turn_task, timeout=5)
             assert session.state == "idle"
 
@@ -728,11 +757,7 @@ def test_default_preset_resolves_model(tmp_path) -> None:
 
 
 def test_tui_end_to_end_draft_flow(tmp_path) -> None:
-    """The full stack: TUI (pilot) -> clientlib -> host API -> Session turn.
-
-    Regression: the event pump died on the first MessageAdded (a sync
-    handler was awaited), killing the TUI's view while the turn kept
-    running in the host."""
+    """The full stack: TUI (pilot) -> clientlib -> host API -> Session turn."""
     from xarness.clientlib import XarnessClient
     from xarness.tui.app import AgentApp
 
@@ -748,7 +773,7 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
 
             async def create_session(request):
                 summary = await orig_create(request)
-                host.sessions[summary.name].controller._client = FakeClient(
+                host.sessions[summary.name]._client = FakeClient(
                     [[ContentDelta(text="Hello!"), RoundComplete(usage=Usage(input_tokens=10, output_tokens=2))]]
                 )
                 return summary
@@ -1051,9 +1076,7 @@ def test_config_defaults_endpoint_is_host_owned(tmp_path) -> None:
 
 def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> None:
     """Send a message, let the turn finish, close the stream: the session
-    leaves host.sessions (its sandbox shell released), is not listed as
-    active, and /sessions lists it as saved. (Idle sessions stay hosted for
-    a TTL by default; the test disables it.)"""
+    leaves host.sessions and /sessions lists it as saved."""
     monkeypatch.setenv("XARNESS_IDLE_TTL_SECONDS", "0")
 
     async def go():
@@ -1065,7 +1088,7 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> 
             )
             session = host.sessions[name]
             snapshot, queue = session.subscribe()  # a client attaches
-            await session.execute("x1", SendMessage(text="hi"))
+            await session.execute(SendMessage(text="hi"))
             await asyncio.wait_for(session._turn_task, timeout=5)
             assert session.summary().active
             # The client closes the stream.
@@ -1207,10 +1230,8 @@ def test_session_listing_counts_a_subagents_work_as_its_parents() -> None:
 
 
 def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -> None:
-    """list_sessions_with_stats stamps each row with the session's own
-    ``mine`` (+/-) totals from the hosted git info — not the whole
-    workspace's pending changes — and degrades to zeroed totals instead of
-    failing when a stat cannot be computed."""
+    """A listing row's totals are its own ``mine`` delta, not the workspace's,
+    and zero rather than an error when a stat cannot be computed."""
 
     from xarness import gitwork
     from xarness.gitwork import DiffFile, DiffStat
@@ -1320,10 +1341,8 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
 
 
 def test_system_prompt_matches_tracking_status(tmp_path) -> None:
-    """End-to-end: a real session's system prompt must state exactly the
-    facts its status payload claims — the snapshot clause when (and only
-    when) the header says tracking is on, git read-only unless
-    allow_git_write, and PLAN (not READ) as the plan-mode label."""
+    """End-to-end: the system prompt states exactly the facts the status
+    payload claims — the snapshot clause, git read-only, the PLAN label."""
 
     async def go():
         host = make_host(tmp_path)
@@ -1333,7 +1352,7 @@ def test_system_prompt_matches_tracking_status(tmp_path) -> None:
             session = await host.create_session(protocol.CreateSessionRequest(
                 workspace=str(tmp_path / "ws")))
             status = session.status()
-            prompt = session.controller.system_prompt
+            prompt = session.system_prompt
             assert status.enable_tracking is (session.workspace_state is not None)
             if status.enable_tracking:
                 assert "Changes are snapshotted" in prompt
@@ -1347,3 +1366,47 @@ def test_system_prompt_matches_tracking_status(tmp_path) -> None:
             task.cancel()
 
     asyncio.run(go())
+
+
+def test_tracking_failure_does_not_block_session_start(tmp_path) -> None:
+    """A workspace that cannot be snapshotted must not block session start."""
+    from unittest import mock
+
+    async def go():
+        host = make_host(tmp_path)
+        (tmp_path / "ws").mkdir()
+        with mock.patch.object(
+            host_mod, "open_workspace",
+            side_effect=OSError(7, "Argument list too long"),
+        ):
+            session = await host.create_session(
+                protocol.CreateSessionRequest(workspace=str(tmp_path / "ws")),
+            )
+        assert session.workspace_state is None
+        assert session.status().enable_tracking is False
+
+    asyncio.run(go())
+
+
+def test_unexpected_errors_name_themselves() -> None:
+    """An unhandled exception must name itself, not a bare 500."""
+    from xarness.api import create_app
+
+    class ExplodingHost:
+        async def create_session(self, request):
+            raise MemoryError("out of memory")
+
+    app = create_app(ExplodingHost())
+
+    async def go():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+        ) as client:
+            return await client.post("/v1/sessions", json={})
+
+    response = asyncio.run(go())
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "MemoryError" in detail
+    assert "out of memory" in detail

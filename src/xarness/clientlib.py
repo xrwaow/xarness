@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,7 +28,6 @@ from pydantic import ValidationError
 from . import protocol
 from .protocol import (
     Command,
-    CommandEnvelope,
     CommandResult,
     Event,
     ServerInfo,
@@ -239,10 +237,15 @@ class XarnessClient:
             f"/v1/sessions/{_session_path(name)}/load", {}, model=SessionSummary,
         )
 
-    async def diff(self, name: str, path: str | None = None) -> protocol.DiffInfo:
-        params = {"path": path} if path else None
+    async def diff(
+        self, name: str, path: str | None = None, author: str | None = None,
+    ) -> protocol.DiffInfo:
+        params = {
+            key: value for key, value in (("path", path), ("author", author))
+            if value
+        }
         return await self._get(
-            f"/v1/sessions/{_session_path(name)}/diff", params=params,
+            f"/v1/sessions/{_session_path(name)}/diff", params=params or None,
             model=protocol.DiffInfo,
         )
 
@@ -293,14 +296,11 @@ class XarnessClient:
 
     async def command(self, name: str, command: Command) -> CommandResult:
         """Send one command; the reply goes only to this client."""
-        envelope = CommandEnvelope(cmd_id=uuid.uuid4().hex, command=command)
-        result = await self._post(
-            f"/v1/sessions/{_session_path(name)}/commands", envelope.model_dump(),
+        return await self._post(
+            f"/v1/sessions/{_session_path(name)}/commands",
+            command.model_dump(),
             model=CommandResult,
         )
-        if not result.ok:
-            raise ClientError(result.error or "command failed")
-        return result
 
     # ------------------------------------------------------------------
     # attach: SSE with reconnect

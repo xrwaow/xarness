@@ -4,8 +4,8 @@
 until the first message is sent). ``xarness --session <name>`` attaches to
 an active session or loads a saved one; ``xarness --sessions`` prints the
 active sessions and exits; ``xarness --kill`` closes every active session
-(each stays saved on disk); ``xarness --server`` runs the host in the
-foreground (persistent) and prints the stats.
+(each stays saved on disk) and stops the host; ``xarness --server`` runs
+the host in the foreground (persistent) and prints the stats.
 """
 
 from __future__ import annotations
@@ -193,15 +193,18 @@ def _print_sessions() -> None:
 
 
 def _kill_sessions() -> None:
-    """Unload every active session, then exit.
+    """Unload every active session and stop the host, then exit.
 
-    Connects with the protocol-version check disabled: a host from an older
-    build is exactly the situation this flag exists for."""
+    Leaving the host up means the next ``xarness`` reconnects to the modules
+    it loaded when it was spawned. Connects with the protocol-version check
+    disabled: an older host is exactly what this flag exists for."""
     from .clientlib import ClientError, XarnessClient
 
     async def _go() -> list[str]:
         client = await XarnessClient.connect_unix(check_version=False)
+        info = None
         try:
+            info = await client.health()
             names = [s.name for s in await client.sessions(active=True)]
             closed: list[str] = []
             for name in names:
@@ -210,16 +213,16 @@ def _kill_sessions() -> None:
                         closed.append(name)
                 except ClientError as exc:
                     # An older host has no /unload route (404). It cannot
-                    # release them one by one, so stop it outright.
+                    # release them one by one, so stopping it closes all.
                     if exc.status != 404:
                         raise
-                    from .host import SOCKET_PATH, stop_host
-                    pid = (await client.health()).pid
-                    await asyncio.to_thread(stop_host, pid, SOCKET_PATH)
                     return names
             return closed
         finally:
             await client.aclose()
+            if info is not None:
+                from .host import SOCKET_PATH, stop_host
+                await asyncio.to_thread(stop_host, info.pid, SOCKET_PATH)
 
     try:
         closed = asyncio.run(_go())
@@ -227,10 +230,11 @@ def _kill_sessions() -> None:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
     if not closed:
-        print("no active sessions")
+        print("no active sessions (host stopped)")
         return
     for name in closed:
         print(f"closed {name}")
+    print("host stopped")
 
 
 def _run_chat(args: argparse.Namespace) -> None:

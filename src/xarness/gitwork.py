@@ -6,10 +6,11 @@ and no accept/reject copy. Git is used purely as a change record:
 
   - opening a workspace snapshots it as a tree object (the workspace's
     ``baseline_tree``) — the base /diff measures against
-  - every successful tool call is recorded as an event in
-    :mod:`xarness.workspace`; labels (mine/agent/auto/drift) are derived
-    from those events, never stored, and an explicit write's before/after
-    blob shas are recorded with it so each agent's own delta can be diffed
+  - every mutating tool call is recorded as an event in
+    :mod:`xarness.workspace` (a command's writes are credited whatever its
+    exit status); labels (mine/agent/auto/drift) are derived from those
+    events, never stored, and an explicit write's before/after blob shas are
+    recorded with it so each agent's own delta can be diffed
   - /undo and /retry reverse only the paths a turn's events touched: an
     untouched path is restored from the turn's before tree, and a path that
     changed since is three-way merged (see :func:`merge_texts`) so another
@@ -25,8 +26,9 @@ objects — and which object store they land in depends on the workspace
   - **the workspace is a repo**: the user's own object store, i.e. their
     ``.git``. Nothing else in it changes, and because objects are
     content-addressed a blob git already holds is shared rather than
-    duplicated (files over 1 MB are never tracked at all). The trade-off is
-    that the harness's data then lives in a store whose pruning schedule is
+    duplicated (files over 1 MB and files whose content sniffs as binary are
+    never tracked at all). The trade-off is that the harness's data then
+    lives in a store whose pruning schedule is
     the user's, not ours: no ref points at these objects, so ``git gc
     --prune=now``, ``git repack -ad`` or any aggressive prune discards
     them — taking an open session's checkpoints with it. ``/diff`` and
@@ -64,6 +66,7 @@ import asyncio
 import hashlib
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -101,13 +104,16 @@ class RepoInfo:
 class RepoStore(Protocol):
     """What the tree helpers here need from a tracked workspace: the repo
     root, the env that reaches its object store, its persistent snapshot
-    index, and the oversized exclusion set.
+    index, and the oversized/binary exclusion sets.
 
     :class:`xarness.workspace.WorkspaceState` is the only implementation;
     the protocol keeps this module free of a circular import."""
 
     root: Path
     oversized: tuple[str, ...]
+    # Content-detected binaries (path -> size, mtime_ns), maintained by the
+    # workspace and shared by every snapshot of it.
+    binary: dict[str, tuple[int, int]]
 
     @property
     def index_path(self) -> Path: ...
@@ -160,15 +166,23 @@ async def _run_git(
     input_bytes: bytes | None = None, *, text: bool = True,
 ) -> tuple[int, Any, Any]:
     """One git subprocess; output decoded unless ``text=False`` (blob
-    contents and merge output are bytes, not text)."""
-    proc = await asyncio.create_subprocess_exec(
-        "git", *args,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    contents and merge output are bytes, not text).
+
+    A failed spawn (git missing, or an argv the kernel refuses with E2BIG) is
+    a git failure like any other: callers that can degrade (tracking) catch
+    :class:`GitWorktreeError`, so it must never surface as a raw ``OSError``.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise GitWorktreeError(f"could not run git {args[0]}: {exc}") from exc
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input_bytes), timeout=_GIT_TIMEOUT,
@@ -276,8 +290,8 @@ def _temp_index():
 def index_path(workspace: Path) -> Path:
     """The workspace's persistent snapshot index.
 
-    A fresh index per snapshot would re-hash every file in the worktree; git's
-    stat cache makes a persistent one incremental."""
+    A fresh index per snapshot would re-hash every file in the worktree;
+    git's stat cache makes a persistent one incremental."""
     state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     key = hashlib.sha1(str(workspace).encode()).hexdigest()[:16]
     directory = Path(state) / "xarness" / "indexes"
@@ -289,35 +303,26 @@ def index_path(workspace: Path) -> Path:
 # ignore rules
 
 # Ignore rules the harness applies on top of the repo's own, in gitignore
-# syntax. ``target/``/``target-sandbox/`` are cargo's build trees and are
-# gated on Cargo.toml (see :func:`harness_ignores`); everything listed here
-# is ignored everywhere. Media/binary types are never tracked: their diffs
-# are meaningless and their blobs bloat the object store. Ignored paths never
-# enter a snapshot tree (see /diff's auto groups for how they are reported).
+# syntax. Only *directories* are listed: a build tree is pruned before
+# anything is read, which a content check cannot do cheaply (tracking build
+# output adds hundreds of MB of objects and makes /diff about a thousand
+# times slower). Binaries are detected by content instead (see
+# :func:`probe_binary_path`), so no extension belongs here: an extension is
+# only a guess, and a wrong guess either bloats the store or hides a file.
+# Ignored paths never enter a snapshot tree (see /diff's auto groups).
 HARNESS_IGNORES: tuple[str, ...] = (
     "node_modules/", "dist/", "build/", "__pycache__/", ".venv/", ".next/",
-    "*.pyc", "*.o", "*.class",
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.bmp", "*.tiff",
-    "*.ico", "*.icns", "*.mp4", "*.mov", "*.avi", "*.mkv", "*.webm",
-    "*.mp3", "*.wav", "*.flac", "*.ogg", "*.pdf", "*.zip", "*.tar",
-    "*.gz", "*.tgz", "*.bz2", "*.xz", "*.7z", "*.rar", "*.iso", "*.exe",
-    "*.dll", "*.so", "*.dylib", "*.bin", "*.jar", "*.a", "*.woff",
-    "*.woff2", "*.ttf", "*.otf", "*.eot", "*.db", "*.sqlite", "*.sqlite3",
-    "*.psd", "*.blend",
     ".xarness/",
 )
 
 # Cargo's own ``target/`` and the sandbox's redirected ``target-sandbox/``
-# (the sandbox sets CARGO_TARGET_DIR) are build output, not source; so is
-# ``Cargo.lock`` (a binary crate's is not source, and a lockfile diff across
-# a dependency fetch is noise).
+# (it sets CARGO_TARGET_DIR) are build output, not source; so is
+# ``Cargo.lock`` — text, so content sniffing cannot catch it.
 _CARGO_IGNORES: tuple[str, ...] = ("target/", "target-sandbox/", "Cargo.lock")
 
 # Files larger than this are excluded from tracking (snapshots/diffs/undo).
 _MAX_TRACKED_SIZE = 1024 * 1024
 
-# The all-zero sha diff-tree reports for a path deleted between two trees.
-_DELETED_SHA = "0" * 40
 
 # The user's own ignore file, in gitignore syntax (ignore-only: no
 # re-include), resolved on every snapshot.
@@ -333,6 +338,71 @@ def harness_ignores(root: Path) -> tuple[str, ...]:
     if (root / "Cargo.toml").is_file():
         return (*_CARGO_IGNORES, *HARNESS_IGNORES)
     return HARNESS_IGNORES
+
+
+# ----------------------------------------------------------------------
+# binary detection
+
+# How much of a file's head is inspected: git's own ``buffer_is_binary``
+# window. A magic prefix (for formats whose head may be NUL-free) or a NUL
+# byte means binary, except a UTF-16 BOM (its NULs are structural) and an
+# empty file. The NUL scan catches everything the list misses.
+_TEXT_PROBE = 8000
+_BINARY_MAGIC = (
+    b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"%PDF-", b"PK\x03\x04",
+    b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ", b"7z\xbc\xaf", b"Rar!",
+    b"\x28\xb5\x2f\xfd", b"\x7fELF", b"MZ", b"\xfe\xed\xfa", b"\xcf\xfa\xed",
+    b"\xca\xfe\xba\xbe", b"SQLite format 3\0", b"OggS", b"fLaC", b"ID3",
+    b"II*\0", b"MM\0*", b"8BPS", b"wOFF", b"wOF2", b"OTTO", b"\x1aE\xdf\xa3",
+)
+
+
+def probe_binary_path(target: Path) -> bool:
+    """Whether ``target`` is binary: a magic prefix or a NUL in the first
+    :data:`_TEXT_PROBE` bytes, unless it is a UTF-16 BOM file (see above).
+    Symlinks and non-files are not: git stores a link as text."""
+    try:
+        if not stat.S_ISREG(os.lstat(target).st_mode):
+            return False
+        with open(target, "rb") as fh:
+            data = fh.read(_TEXT_PROBE)
+    except OSError:
+        return False
+    return bool(data) and not data.startswith((b"\xff\xfe", b"\xfe\xff")) and (
+        data.startswith(_BINARY_MAGIC)
+        or (data[:4] == b"RIFF" and data[8:12] in (b"WEBP", b"AVI ", b"WAVE"))
+        or data[4:8] == b"ftyp"
+        or b"\0" in data
+    )
+
+
+def _classify_binary(
+    root: Path, candidates: Iterable[str], cache: dict[str, tuple[int, int]],
+) -> tuple[str, ...]:
+    """Probe ``candidates``, reusing ``cache`` (path -> size, mtime_ns) so
+    an unchanged path costs one lstat and no read. Fills ``cache`` in place."""
+    binary: list[str] = []
+    candidates = tuple(candidates)
+    for rel in candidates:
+        try:
+            info = os.lstat(root / rel)
+            key = (info.st_size, info.st_mtime_ns)
+            is_binary = stat.S_ISREG(info.st_mode) and (
+                cache.get(rel) == key or probe_binary_path(root / rel)
+            )
+        except OSError:
+            is_binary = False
+        if is_binary:
+            cache[rel] = key
+            binary.append(rel)
+        else:
+            cache.pop(rel, None)
+    # An unchanged binary may not be a candidate (a frozen tracked file is
+    # skipped by ``ls-files -m``), so only a path that is gone is dropped.
+    for rel in set(cache) - set(candidates):
+        if not (root / rel).exists():
+            del cache[rel]
+    return tuple(binary)
 
 
 _harness_ignore_file: Path | None = None
@@ -471,105 +541,132 @@ def oversized_paths(root: Path, limit: int = _MAX_TRACKED_SIZE) -> tuple[str, ..
     return tuple(sorted(oversized))
 
 
-async def _oversized_in_tree(
-    root: Path, tree: str, env: dict[str, str],
-    previous: str | None = None, limit: int = _MAX_TRACKED_SIZE,
-) -> list[tuple[str, str, str | None]]:
-    """Oversized entries in ``tree``, over ``limit`` bytes.
-
-    Each entry is ``(path, mode, previous_blob_sha)``: the mode and blob of
-    the same path in ``previous`` (None when the path is new there), which
-    is what lets the caller put a grown file *back* to the state it had
-    before it ballooned — see :func:`snapshot_tree`.
-
-    Sizes come from the tree itself, so this costs no file reads. With
-    ``previous`` (the prior snapshot's tree) only the changed blobs are
-    stat'ed — ``diff-tree`` finds them, ``cat-file --batch-check`` sizes
-    them — so the per-snapshot cost scales with the edit, not the tree.
-    Without it the whole tree is listed once (workspace open). The walk in
-    :func:`oversized_paths` still catches files that were already big (so
-    they are never written to the object store); this catches the ones that
-    grew past the limit mid-session."""
-    by_sha: dict[str, list[tuple[str, str, str | None]]] = {}
-    if previous == tree:
-        # Nothing changed since the previous snapshot, so nothing can have
-        # grown past the limit: skip the whole ls-tree/cat-file pass (this
-        # is the common case for the diff loop and read-only run_bash).
-        return []
-    if previous is not None:
-        # --raw carries both blob shas per entry (NUL-separated, one meta
-        # record plus one path record), so a path containing a newline cannot
-        # corrupt the stream: no path ever feeds the batch-check input.
-        rc, out, _ = await _run_git(
-            ["diff-tree", "-r", "--raw", "--no-renames", "-z", previous, tree],
-            cwd=root, env=env,
-        )
-        if rc != 0:
-            return []
-        fields = out.split("\0")
-        for i in range(0, len(fields) - 1, 2):
-            meta = fields[i]
-            path = fields[i + 1]
-            if not meta.startswith(":"):
-                continue
-            parts = meta[1:].split()
-            if len(parts) >= 4 and parts[3] != _DELETED_SHA:
-                old_sha = None if parts[2] == _DELETED_SHA else parts[2]
-                by_sha.setdefault(parts[3], []).append(
-                    (path, parts[0], old_sha)
-                )
-    else:
-        rc, out, _ = await _run_git(
-            ["ls-tree", "-r", "-z", tree], cwd=root, env=env,
-        )
-        if rc != 0:
-            return []
-        for entry in out.split("\0"):
-            parts = entry.split() if entry else []
-            if len(parts) >= 3 and parts[1] == "blob":
-                # ls-tree -z separates path from metadata with a TAB; the
-                # split() above keeps the metadata fields intact.
-                by_sha.setdefault(parts[2], []).append(
-                    (entry.split("\t", 1)[1], parts[0], None)
-                )
-    if not by_sha:
-        return []
-    # batch-check prints newline-separated lines keyed by the input sha.
+async def _changed_paths(root: Path, env: dict[str, str]) -> list[str]:
+    """Changed/untracked, non-ignored paths (git's stat cache does it)."""
     rc, out, _ = await _run_git(
-        ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-         "--buffer"],
+        ["ls-files", "-m", "-o", "--exclude-standard", "-z"],
         cwd=root, env=env,
-        input_bytes="".join(f"{sha}\n" for sha in by_sha).encode(),
+    )
+    return [rel for rel in out.split("\0") if rel] if rc == 0 else []
+
+
+def _is_regular(path: Path) -> bool:
+    """A regular file itself — a symlink is a link, not its target."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _grown_paths(
+    root: Path, paths: Iterable[str], limit: int = _MAX_TRACKED_SIZE,
+) -> tuple[str, ...]:
+    """The ``paths`` that are regular files over ``limit`` bytes; keeping
+    them out of ``git add`` stops a huge artifact entering the snapshot."""
+    grown = []
+    for rel in paths:
+        try:
+            info = os.lstat(root / rel)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_size > limit:
+            grown.append(rel)
+    return tuple(grown)
+
+
+async def _git_run(
+    root: Path, env: dict[str, str], args: list[str], payload: bytes = b"",
+) -> str:
+    """One git command, ``payload`` on stdin; a failure raises."""
+    rc, out, err = await _run_git(
+        args, cwd=root, env=env, input_bytes=payload or None,
     )
     if rc != 0:
-        return []
-    oversized: list[tuple[str, str, str | None]] = []
-    seen: set[str] = set()
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3 or parts[1] != "blob":
+        raise GitWorktreeError(f"git {args[0]} failed: {err.strip()}")
+    return out
+
+
+async def _index_state(
+    root: Path, env: dict[str, str],
+) -> tuple[set[str], list[str]]:
+    """The snapshot index's paths and those marked assume-unchanged: one
+    listing serves both recognising a new path and lifting last snapshot's
+    freeze before looking for changes."""
+    out = await _git_run(root, env, ["ls-files", "-v", "-z"])
+    indexed: set[str] = set()
+    frozen: list[str] = []
+    for entry in out.split("\0"):
+        if not entry:
             continue
-        size = _safe_size(parts[2])
-        if size is not None and size > limit:
-            for path, mode, old_sha in by_sha.get(parts[0], ()):
-                if path not in seen:
-                    seen.add(path)
-                    oversized.append((path, mode, old_sha))
-    return sorted(oversized)
+        indexed.add(entry[2:])
+        if entry[0].islower():  # a lowercase tag means assume-unchanged
+            frozen.append(entry[2:])
+    return indexed, frozen
 
 
-def _safe_size(text: str) -> int | None:
-    try:
-        return int(text)
-    except ValueError:
-        return None
+async def _unfreeze(
+    root: Path, env: dict[str, str], paths: Iterable[str],
+) -> None:
+    """Lift last snapshot's assume-unchanged flags before scanning."""
+    paths = list(paths)
+    if paths:
+        await _git_run(
+            root, env,
+            ["update-index", "--no-assume-unchanged", "-z", "--stdin"],
+            "".join(f"{path}\0" for path in paths).encode(),
+        )
+
+
+async def _freeze(
+    root: Path, env: dict[str, str], paths: Iterable[str], indexed: set[str],
+) -> tuple[tuple[str, ...], str]:
+    """Pin ``paths`` in the index so ``git add`` neither reads nor hashes them.
+
+    Pathspecs cannot do this: git matches each one against every file in the
+    worktree (minutes for thousands) and thousands do not fit in argv
+    (``execve`` fails with E2BIG). The index can. An indexed path — a tracked
+    file that grew past the limit — is marked assume-unchanged and keeps its
+    previous blob, which is what /undo needs; a new one is seeded with the
+    empty blob and dropped again by the caller. Returns the seeded paths and
+    the null sha to drop them with."""
+    live = [p for p in dict.fromkeys(paths) if _is_regular(root / p)]
+    if not live:
+        return (), ""
+    seeded = [p for p in live if p not in indexed]
+    empty = ""
+    if seeded:
+        empty = (await _git_run(root, env, ["hash-object", "-w", "--stdin"])).strip()
+        await _git_run(
+            root, env, ["update-index", "-z", "--add", "--index-info"],
+            b"".join(f"100644 {empty} 0\t{p}\0".encode() for p in seeded),
+        )
+    await _git_run(
+        root, env, ["update-index", "--assume-unchanged", "-z", "--stdin"],
+        "".join(f"{p}\0" for p in live).encode(),
+    )
+    return tuple(seeded), "0" * len(empty)
+
+
+async def _add_all(
+    root: Path, env: dict[str, str], pathspecs: list[str],
+) -> None:
+    """``git add -A`` with the pathspecs on stdin, never in argv."""
+    payload = b"".join(spec.encode() + b"\0" for spec in pathspecs)
+    rc, _, err = await _run_git(
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        cwd=root, env=env, input_bytes=payload,
+    )
+    if rc != 0 and "unknown option" in err:  # git < 2.25
+        rc, _, err = await _run_git(["add", "-A", "--", *pathspecs], cwd=root, env=env)
+    if rc != 0:
+        raise GitWorktreeError(f"could not snapshot the workspace: {err.strip()}")
 
 
 async def snapshot_tree(
     root: Path, exclude: Iterable[str] = (),
     env_base: dict[str, str] | None = None, index: Path | None = None,
-    previous: str | None = None,
     oversized_out: list[str] | None = None,
+    binary_cache: dict[str, tuple[int, int]] | None = None,
 ) -> str:
     """Tree sha capturing the workspace's *current* state.
 
@@ -579,21 +676,23 @@ async def snapshot_tree(
     ``write-tree`` records it as a tree object. Ignored files are excluded —
     they are not reverted by /undo and don't show in /diff.
 
-    Exclusion is resolved on every snapshot (nothing is frozen per
-    session): git's own ignore rules (``git add -A`` already honours
-    ``.gitignore``, ``.git/info/exclude`` and global excludes), the harness
-    defaults as :func:`_harness_pathspecs`, ``.xarness/ignore`` resolved to
-    concrete paths, and ``exclude`` (paths the caller must keep out —
-    oversized files, and whatever grew past the limit mid-session).
+    Exclusion is resolved on every snapshot (nothing is frozen per session):
+    git's own ignore rules, the harness defaults, ``.xarness/ignore``
+    resolved to concrete paths, ``exclude``, and any changed/untracked file
+    that has grown past the size limit or sniffs as binary (see
+    :func:`probe_binary_path`). Content matches no pathspec, so those last
+    two groups are pinned in the index instead (see :func:`_freeze`).
 
     ``env_base`` carries GIT_DIR/GIT_WORK_TREE for external snapshot stores.
-
-    ``oversized_out``, when given, collects the repo-root-relative paths
-    that grew past the size limit and were left out of the snapshot — the
-    caller adds them to the workspace's exclusion set so the next ``git
-    add`` does not re-hash the same huge blob all over again.
+    ``oversized_out`` collects the paths newly found over the limit.
+    ``binary_cache`` is filled in place (path -> size, mtime_ns) so the
+    caller can persist it and skip re-probing unchanged binaries.
     """
     root = Path(root).resolve()
+    if binary_cache is None:
+        # Callers that do not persist tracking state (tests, one-off
+        # snapshots) still get content-based exclusion; they just re-probe.
+        binary_cache = {}
 
     @contextmanager
     def _reusable_index():
@@ -608,63 +707,40 @@ async def snapshot_tree(
 
     async def _capture(index_file: str) -> str:
         env = {**(env_base if env_base is not None else os.environ), "GIT_INDEX_FILE": index_file}
-        # Harness rules and .xarness/ignore are resolved now, not pinned: an
-        # edit to either takes effect on this snapshot.
-        pathspecs = [
-            *_harness_pathspecs(root),
-            *(
-                spec
-                for p in (*exclude, *await xarness_ignored_paths(root, env_base))
-                for spec in _exclude_pathspecs(p)
-            ),
-        ]
-        args = ["add", "-A", "--", *pathspecs]
-        rc, _, err = await _run_git(args, cwd=root, env=env)
-        if rc != 0:
-            raise GitWorktreeError(f"could not snapshot the workspace: {err.strip()}")
-        rc, out, err = await _run_git(["write-tree"], cwd=root, env=env)
-        if rc != 0:
-            raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
-        tree = out.strip()
-        oversized = await _oversized_in_tree(root, tree, env, previous)
-        if oversized and oversized_out is not None:
-            oversized_out.extend(path for path, _, _ in oversized)
-        if oversized:
-            # Files that grew past the size limit mid-session: keep them out
-            # of the snapshot rather than tracking (and diffing, and
-            # reverting) a multi-hundred-megabyte artifact every turn.
-            #
-            # They are *rewound* to their previous snapshot entry, not
-            # deleted: plain ``git rm --cached`` would make /diff report a
-            # deletion the agent never made, and pin the path as ignored with
-            # the baseline still holding it. A path that is new since
-            # ``previous`` is un-indexed instead (mode 0).
-            #
-            # ``update-index --index-info`` takes NUL-terminated
-            # ``<mode> <sha> <stage>\t<path>`` records, so paths are never
-            # parsed as pathspecs — no globbing (``x[1].txt`` must not match
-            # ``x1.txt``), no quoting, and newlines in a name are harmless.
-            # (``git rm`` has no ``-z``/``--stdin`` at all; only
-            # ``checkout-index`` does.)
-            records = [
-                (f"{mode} {old_sha} 0\t{path}" if old_sha is not None
-                 else f"0 {_DELETED_SHA} 0\t{path}")
-                for path, mode, old_sha in oversized
-            ]
-            payload = b"".join(r.encode() + b"\0" for r in records)
-            rc, _, err = await _run_git(
-                ["update-index", "--add", "-z", "--index-info"],
-                cwd=root, env=env, input_bytes=payload,
-            )
-            if rc != 0:
-                raise GitWorktreeError(
-                    f"could not drop oversized files from the snapshot: {err.strip()}"
+        indexed, frozen = await _index_state(root, env)
+        await _unfreeze(root, env, frozen)
+        # One stat-only scan serves both exclusions below (oversized and
+        # binary): cost follows the number of *changed* files, not the tree.
+        changed = await _changed_paths(root, env)
+        grown = _grown_paths(root, changed)
+        if grown and oversized_out is not None:
+            oversized_out.extend(grown)
+        # .xarness/ignore is resolved now, not pinned: an edit to it takes
+        # effect on this snapshot. Its file entries are pinned with the
+        # oversized files; only directories stay pathspecs (a directory
+        # cannot be an index entry, and each one costs a single pathspec).
+        ignored = set(await xarness_ignored_paths(root, env_base))
+        files = {p for p in ignored if _is_regular(root / p)}
+        binary = await asyncio.to_thread(
+            _classify_binary, root, changed, binary_cache,
+        )
+        seeded, null_sha = await _freeze(
+            root, env, (*exclude, *grown, *files, *binary), indexed,
+        )
+        try:
+            await _add_all(root, env, [
+                *_harness_pathspecs(root),
+                *(s for p in ignored - files for s in _exclude_pathspecs(p)),
+            ])
+        finally:
+            # A placeholder left behind would look like an empty file in
+            # every later snapshot.
+            if seeded:
+                await _git_run(
+                    root, env, ["update-index", "-z", "--index-info"],
+                    "".join(f"0 {null_sha} 0\t{p}\0" for p in seeded).encode(),
                 )
-            rc, out, err = await _run_git(["write-tree"], cwd=root, env=env)
-            if rc != 0:
-                raise GitWorktreeError(f"could not write the snapshot tree: {err.strip()}")
-            tree = out.strip()
-        return tree
+        return (await _git_run(root, env, ["write-tree"])).strip()
 
     with _reusable_index() as index_file:
         # A persistent index is shared by every snapshot of the workspace:
@@ -742,75 +818,6 @@ async def restore_paths(repo: RepoStore, tree: str, paths: list[str]) -> None:
             )
 
 
-async def splice_tree(
-    repo: RepoStore, base_tree: str, other_tree: str, paths: list[str],
-) -> str:
-    """``base_tree`` with ``paths`` replaced by their ``other_tree`` content.
-
-    One tree sha, no per-path override structure: read the baseline into a
-    scratch index, take the accepted paths from ``other_tree`` in batches,
-    drop the ones it no longer has, and write the tree back. Paths not in
-    ``paths`` (drift) keep their baseline entry."""
-    if not paths:
-        return base_tree
-    env = repo.git_env()
-    with _temp_index() as index:
-        env = {**env, "GIT_INDEX_FILE": index}
-        rc, _, err = await _run_git(
-            ["read-tree", base_tree], cwd=repo.root, env=env,
-        )
-        if rc != 0:
-            raise GitWorktreeError(
-                f"could not read the baseline {base_tree[:8]}: {err.strip()}"
-            )
-        found: dict[str, tuple[str, str]] = {}
-        in_base: set[str] = set()
-        batch = 100
-        for start in range(0, len(paths), batch):
-            specs = [f":(literal){p}" for p in paths[start:start + batch]]
-            for tree, into in ((other_tree, found), (base_tree, None)):
-                rc, out, err = await _run_git(
-                    ["ls-tree", "-z", tree, "--", *specs],
-                    cwd=repo.root, env=env,
-                )
-                if rc != 0:
-                    raise GitWorktreeError(
-                        f"could not read tree {tree[:8]}: {err.strip()}"
-                    )
-                for record in out.split("\0"):
-                    if not record:
-                        continue
-                    meta, _, path = record.partition("\t")
-                    mode, kind, sha = meta.split()
-                    if kind != "blob":
-                        continue
-                    if into is None:
-                        in_base.add(path)
-                    else:
-                        into[path] = (mode, sha)
-        records = []
-        for path in paths:
-            entry = found.get(path)
-            if entry is None:
-                if path in in_base:
-                    records.append(f"0 {_DELETED_SHA} 0\t{path}")
-            else:
-                records.append(f"{entry[0]} {entry[1]} 0\t{path}")
-        payload = b"".join(r.encode() + b"\0" for r in records)
-        rc, _, err = await _run_git(
-            ["update-index", "--add", "-z", "--index-info"],
-            cwd=repo.root, env=env, input_bytes=payload,
-        )
-        if rc != 0:
-            raise GitWorktreeError(
-                f"could not splice the accepted tree: {err.strip()}"
-            )
-        rc, out, err = await _run_git(["write-tree"], cwd=repo.root, env=env)
-        if rc != 0:
-            raise GitWorktreeError(f"could not write the tree: {err.strip()}")
-        return out.strip()
-
-
 async def revert_to_tree(repo: RepoStore, tree: str, current: str | None = None) -> None:
     """Restore the workspace to a snapshot tree, discarding every file change
     made since it: modifications, deletions, and newly created files.
@@ -828,7 +835,7 @@ async def revert_to_tree(repo: RepoStore, tree: str, current: str | None = None)
     if current is None:
         current = await snapshot_tree(
             root, exclude=repo.oversized, env_base=repo.git_env(),
-            index=repo.index_path,
+            index=repo.index_path, binary_cache=repo.binary,
         )
     if current == tree:
         return

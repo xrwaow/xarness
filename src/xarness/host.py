@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import logging
 import os
 import signal
 import socket
@@ -28,9 +29,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from . import __version__, gitwork, protocol, session_store
+from . import __version__, protocol, session_store
 from .config import (
     DEFAULT_CONFIG_PATH,
     ConfigError,
@@ -53,6 +53,8 @@ from .workspace import (
     open_workspace,
 )
 from .util import utcnow_iso as _utcnow
+
+LOG = logging.getLogger(__name__)
 
 HOST_DIR = Path("~/.local/share/xarness").expanduser()
 SOCKET_PATH = HOST_DIR / "host.sock"
@@ -144,21 +146,19 @@ class Host:
         """The most recently used (model, sandbox) among the saved sessions
         of this directory — the workspace's last choice. Reads only the
         small meta block, never the full conversation."""
-        best: tuple[str | None, str | None, str] | None = None
+        best = None
         for meta in session_store.load_metas().values():
-            saved_ws = meta.get("workspace")
-            if not saved_ws:
+            if not meta.workspace:
                 continue
             try:
-                same = Path(saved_ws).resolve() == workspace.resolve()
+                same = Path(meta.workspace).resolve() == workspace.resolve()
             except OSError:
                 continue
             if not same:
                 continue
-            stamp = meta.get("updated_at") or ""
-            if best is None or stamp > best[2]:
-                best = (meta.get("profile"), meta.get("sandbox_name"), stamp)
-        return (best[0], best[1]) if best else (None, None)
+            if best is None or (meta.updated_at or "") > (best.updated_at or ""):
+                best = meta
+        return (best.model, best.sandbox) if best else (None, None)
 
     async def _build_parts(
         self,
@@ -252,7 +252,12 @@ class Host:
                     ws, allow_init=not request.no_init_repo,
                     persist=not request.no_session,
                 )
-            except GitWorktreeError:
+            except (GitWorktreeError, OSError) as exc:
+                # Tracking is best-effort: a workspace that cannot be
+                # snapshotted (too big, git missing, index refused) must never
+                # stop the session from starting — the chat works without
+                # /diff and /undo.
+                LOG.warning("change tracking off for %s: %s", ws, exc)
                 workspace_state = None
 
         try:
@@ -303,7 +308,6 @@ class Host:
             session._persist()
         if request.first_message:
             await session.execute(
-                f"boot-{name}",
                 protocol.SendMessage(text=request.first_message),
             )
         return session
@@ -328,9 +332,6 @@ class Host:
         count += 1
         self._sub_counts[parent_name] = count
         return f"{prefix}{count}"
-
-    # Kept for callers that still use the old (subagent-based) method name.
-    _next_sub_name = _next_agent_name
 
     async def spawn_subagent(
         self, parent: Session, prompt: str, mode: str,
@@ -392,7 +393,7 @@ class Host:
             f"subagent {session_store.display_name(name)} ({mode}) started, "
             "/sessions to watch")
         try:
-            await child.execute(f"subagent-{name}", protocol.SendMessage(text=prompt))
+            await child.execute(protocol.SendMessage(text=prompt))
             await child.wait_idle()
             return next(
                 (m.content for m in reversed(child.conversation.messages)
@@ -517,9 +518,9 @@ class Host:
             for name, meta in session_store.load_metas().items():
                 if name in hosted_names:
                     continue
-                if workspace is not None and meta.get("workspace") != workspace:
+                if workspace is not None and meta.workspace != workspace:
                     continue
-                summaries.append(self.saved_summary(name, meta))
+                summaries.append(meta)
         if active is True:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
@@ -542,6 +543,9 @@ class Host:
                     info = await state.diff(
                         self._subtree(summary.name, children),
                         current=snapshots[id(state)],
+                        # One row per author, so a file this session and a
+                        # sibling both wrote reports both sides.
+                        scope="mine",
                     )
                 except Exception:
                     continue
@@ -569,23 +573,6 @@ class Host:
                     subtree.add(child)
                     pending.append(child)
         return subtree
-
-    def saved_summary(
-        self, name: str, meta: dict[str, Any] | None = None,
-    ) -> SessionSummary:
-        """The list row for a session that is only on disk."""
-        if meta is None:
-            meta = session_store.load_meta(name)
-        if meta is None:
-            return SessionSummary(name=name, state="saved")
-        return SessionSummary(
-            name=name, workspace=meta.get("workspace"), state="saved",
-            active=False, model=meta.get("profile"),
-            sandbox=meta.get("sandbox_name"),
-            last_user_message_at=meta.get("last_user_message_at"),
-            message_count=meta.get("message_count", 0),
-            parent_id=meta.get("parent_id"),
-        )
 
     @staticmethod
     def _workspace_ref_infos(
@@ -647,10 +634,10 @@ class Host:
             started_at=self._started_at_wall,
             clients_attached=sum(s.clients_attached for s in sessions),
             total_input_tokens=sum(
-                s.controller.usage_total.input_tokens for s in self.sessions.values()
+                s.usage_total.input_tokens for s in self.sessions.values()
             ),
             total_output_tokens=sum(
-                s.controller.usage_total.output_tokens for s in self.sessions.values()
+                s.usage_total.output_tokens for s in self.sessions.values()
             ),
             sessions=sessions,
         )
@@ -707,8 +694,8 @@ class Host:
             # aren't double-counted (as list_sessions already does).
             if name in hosted_names:
                 continue
-            if meta.get("workspace"):
-                ws = meta["workspace"]
+            if meta.workspace:
+                ws = meta.workspace
                 counts[ws] = counts.get(ws, 0) + 1
         return [
             protocol.WorkspaceInfo(

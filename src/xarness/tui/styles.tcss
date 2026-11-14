@@ -221,8 +221,8 @@ DiffSummary.expanded #diff-body {
     text-style: italic;
 }
 
-/* How many sessions explicitly wrote this path: more than one means the
-   file is shared and the row's +A/-D count only this author's delta. */
+/* How many sessions explicitly wrote this path (a combined row only, when
+   several did): the row's +A/-D then count all of them together. */
 .diff-file-shared {
     width: auto;
     margin-left: 1;
@@ -231,7 +231,11 @@ DiffSummary.expanded #diff-body {
 }
 
 .diff-file-source {
-    width: auto;
+    /* Fixed 5-cell badge column (``agent``, ``drift``, ``auto``) so the
+       badge and the +/- columns line up on every row, whatever the row's
+       own mix of badges. The word is always ``agent``: the class carries
+       whether it is this session (accent) or another (dimmed). */
+    width: 5;
     margin-left: 1;
     text-style: italic;
 }
@@ -299,11 +303,6 @@ DiffSummary.expanded #diff-body {
     width: 1fr;
     height: 1;
     border-top: solid $c-border;
-}
-
-/* Rows inside a section are indented so the fold structure reads. */
-.diff-row.nested {
-    padding-left: 2;
 }
 
 .diff-group-row {

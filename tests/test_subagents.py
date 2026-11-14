@@ -1,7 +1,7 @@
 """Subagent tests: the tool, the child session, cancellation and the model key.
 
 The child is a real session in a real (temporary) workspace; only the
-provider is faked, by replacing the client the controller would build.
+provider is faked, by replacing the client the session would build.
 """
 
 import asyncio
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from xarness import controller as controller_mod
 from xarness import host as host_mod
+from xarness import session as session_mod
 from xarness import protocol, session_store
 from xarness.config import ConfigError, load_sectioned
 from xarness.errors import SessionError
@@ -57,14 +57,14 @@ class GatedClient(FakeClient):
 
 
 def _patch_clients(monkeypatch, *scripts) -> list[FakeClient]:
-    """Hand the next scripted client to every controller built from now on
+    """Hand the next scripted client to every session built from now on
     (the parent's first, then the child's)."""
     queue = [FakeClient(script) for script in scripts]
 
     def factory(profile, api_key):
         return queue.pop(0) if queue else FakeClient([])
 
-    monkeypatch.setattr(controller_mod, "ChatClient", factory)
+    monkeypatch.setattr(session_mod, "ChatClient", factory)
     return queue
 
 
@@ -165,7 +165,7 @@ def test_write_parent_gets_the_childs_last_non_empty_reply(
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await parent.wait_idle()
         assert _tool_result(parent).status == "ok"
         assert _tool_result(parent).content == "child answer"
@@ -190,14 +190,14 @@ def test_child_session_shape(tmp_path, monkeypatch) -> None:
     # first script).
     queue = [FakeClient([_subagent_round(mode="plan")]), GatedClient([], gate)]
     monkeypatch.setattr(
-        controller_mod, "ChatClient",
+        session_mod, "ChatClient",
         lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
     )
 
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child = next(s for s in host.sessions.values() if s is not parent)
         assert child.name == f"{parent.name}/agent-1"
@@ -230,8 +230,8 @@ def test_plan_parent_cannot_spawn_a_write_child(tmp_path, monkeypatch) -> None:
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("m1", protocol.SetMode(mode="plan"))
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SetMode(mode="plan"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await parent.wait_idle()
         result = _tool_result(parent)
         assert result.status == "parse_error"
@@ -255,14 +255,14 @@ def test_child_inherits_no_session(tmp_path, monkeypatch) -> None:
         GatedClient([_round("child answer")], gate),
     ]
     monkeypatch.setattr(
-        controller_mod, "ChatClient",
+        session_mod, "ChatClient",
         lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
     )
 
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path, no_session=True)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child_name = next(
             name for name in host.sessions if name != parent.name
@@ -301,20 +301,17 @@ def test_a_message_to_a_running_child_is_steering(
     )
     queue = [FakeClient([_subagent_round()]), child_client]
     monkeypatch.setattr(
-        controller_mod, "ChatClient",
+        session_mod, "ChatClient",
         lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
     )
 
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child = next(s for s in host.sessions.values() if s is not parent)
-        sent = await child.execute(
-            "u1", protocol.SendMessage(text="also this"),
-        )
-        assert sent.ok and sent.queued
+        await child.execute(protocol.SendMessage(text="also this"))
         assert child.state == "running"
         gate.set()
         await parent.wait_idle()
@@ -344,7 +341,7 @@ def test_a_finished_child_reopens_as_an_ordinary_session(
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await parent.wait_idle()
         assert [s.name for s in host.sessions.values()] == [parent.name]
         child_name = next(
@@ -365,7 +362,7 @@ def test_a_finished_child_reopens_as_an_ordinary_session(
         diff = await reopened.diff_info(None)
         assert {f.path: f.kind for f in diff.files} == {"a.txt": "mine"}
         # And it can be driven: a turn the user sends happens normally.
-        await reopened.execute("u1", protocol.SendMessage(text="continue"))
+        await reopened.execute(protocol.SendMessage(text="continue"))
         await reopened.wait_idle()
         assert reopened.conversation.messages[-1].content \
             == "driven by the user"
@@ -382,17 +379,17 @@ def test_cancelling_the_parent_cancels_and_closes_the_child(
     child_client = GatedClient([], gate)
     queue = [FakeClient([_subagent_round()]), child_client]
     monkeypatch.setattr(
-        controller_mod, "ChatClient",
+        session_mod, "ChatClient",
         lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
     )
 
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child = next(s for s in host.sessions.values() if s is not parent)
-        await parent.execute("c1", protocol.Cancel())
+        await parent.execute(protocol.Cancel())
         await parent.wait_idle()
         assert child.state == "idle"
         assert child_client.closed, "the child's provider client was not closed"
@@ -442,14 +439,14 @@ def test_subagent_uses_the_configured_model(tmp_path, monkeypatch) -> None:
     child_client = GatedClient([], gate)
     queue = [FakeClient([_subagent_round()]), child_client]
     monkeypatch.setattr(
-        controller_mod, "ChatClient",
+        session_mod, "ChatClient",
         lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
     )
 
     async def go():
         host = _host(tmp_path)
         parent = await _parent(host, tmp_path)
-        await parent.execute("s1", protocol.SendMessage(text="go"))
+        await parent.execute(protocol.SendMessage(text="go"))
         await _until(lambda: len(host.sessions) == 2)
         child = next(s for s in host.sessions.values() if s is not parent)
         assert child.profile_name == "small"

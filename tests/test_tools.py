@@ -52,6 +52,12 @@ def _registry_for(tmp_path, mode: str = "write") -> ToolRegistry:
     return build_registry(_sandbox(tmp_path), None, mode=mode)
 
 
+def _fake_session(sandbox: SandboxConfig) -> SimpleNamespace:
+    """Stand-in for a SandboxSession: build_registry reads the config and the
+    per-session tool timeout only."""
+    return SimpleNamespace(config=sandbox, default_timeout=120.0)
+
+
 def test_schema_matches_openai_tools_format() -> None:
     registry = ToolRegistry()
     registry.register(
@@ -131,6 +137,13 @@ def _descriptions(registry: ToolRegistry) -> dict[str, str]:
     }
 
 
+def _schema_of(registry: ToolRegistry, name: str) -> dict:
+    return next(
+        t["function"]["parameters"] for t in registry.schema()
+        if t["function"]["name"] == name
+    )
+
+
 def test_refs_do_not_vary_the_tool_descriptions(tmp_path) -> None:
     """Tool descriptions are stable regardless of refs (a stable schema keeps
     the provider's prompt cache warm); refs are described in the system
@@ -140,14 +153,14 @@ def test_refs_do_not_vary_the_tool_descriptions(tmp_path) -> None:
     notes.write_text("x")
 
     before = _descriptions(build_registry(
-        sandbox, SimpleNamespace(config=sandbox), mode="write"))
+        sandbox, _fake_session(sandbox), mode="write"))
     assert "/tmp/refs" not in before["read_file"]
     assert "/tmp/refs" not in before["run_bash"]
     assert "git in the shell is read-only" not in before["run_bash"]
 
     bind_ref(sandbox.workspace, sandbox.external_refs, notes, alias="notes")
     after = _descriptions(build_registry(
-        sandbox, SimpleNamespace(config=sandbox), mode="write"))
+        sandbox, _fake_session(sandbox), mode="write"))
     assert after == before
 
 
@@ -159,9 +172,9 @@ def test_descriptions_split_on_host_vs_container(tmp_path) -> None:
     host = SandboxConfig(workspace=tmp_path, use_sandbox=False)
 
     in_container = _descriptions(build_registry(
-        container, SimpleNamespace(config=container), mode="write"))
+        container, _fake_session(container), mode="write"))
     on_host = _descriptions(build_registry(
-        host, SimpleNamespace(config=host), mode="write"))
+        host, _fake_session(host), mode="write"))
 
     assert set(in_container) == set(on_host)
     assert "inside the sandboxed workspace" in in_container["run_bash"]
@@ -184,6 +197,30 @@ def test_descriptions_split_on_host_vs_container(tmp_path) -> None:
     }
     for name in ("write_file", "edit_file"):
         assert in_container[name] == on_host[name]
+
+
+def test_run_bash_description_states_the_real_timeout(tmp_path) -> None:
+    """The timeout default is quoted as a number: the model cannot see the
+    session's value anywhere else."""
+    sandbox = _sandbox(tmp_path)
+    session = SimpleNamespace(config=sandbox, default_timeout=45.0)
+    registry = build_registry(sandbox, session, mode="write")
+    description = _descriptions(registry)["run_bash"]
+    assert "45s" in description
+    assert "120s" not in description
+
+
+def test_run_bash_description_states_the_starting_cwd(tmp_path) -> None:
+    """The description names the starting cwd, so no command needs a ``cd``."""
+    container = _sandbox(tmp_path)
+    in_container = _descriptions(build_registry(
+        container, _fake_session(container), mode="write"))["run_bash"]
+    assert "starts in /workspace and keeps its cwd between calls" in in_container
+
+    host = SandboxConfig(workspace=tmp_path, use_sandbox=False)
+    on_host = _descriptions(build_registry(
+        host, _fake_session(host), mode="write"))["run_bash"]
+    assert f"starts in {tmp_path} and keeps its cwd between calls" in on_host
 
 
 # ---------------------------------------------------------------------------
@@ -646,3 +683,89 @@ def test_edit_file_requires_old_string(tmp_path) -> None:
     assert not result.ok
     assert result.status == "parse_error"
     assert "old_string" in result.content
+
+# ---------------------------------------------------------------------------
+# ask_user
+
+
+def _ask_registry(tmp_path, answer: list[str] | None):
+    """A registry whose ask callback records the questions it was handed and
+    replies with ``answer`` (None = the user skipped)."""
+    seen: dict = {}
+
+    async def ask(questions):
+        seen["questions"] = questions
+        return answer
+
+    sandbox = SandboxConfig(workspace=tmp_path, use_sandbox=False)
+    return build_registry(
+        sandbox, _fake_session(sandbox), mode="write", ask_callback=ask,
+    ), seen
+
+
+def _ask_payload(*questions) -> str:
+    return json.dumps({"questions": list(questions)})
+
+
+def test_ask_accepts_plain_string_questions(tmp_path) -> None:
+    """A bare string parses as a free-text question: an older model is not
+    punished for the pre-``options`` shape."""
+    registry, seen = _ask_registry(tmp_path, ["ship it"])
+    result = asyncio.run(registry.call("ask_user", _ask_payload("what next?")))
+    assert result.ok
+    assert result.content == "Q: what next?\nA: ship it"
+    assert [q.question for q in seen["questions"]] == ["what next?"]
+
+
+def test_ask_resolves_a_picked_number_and_keeps_a_write_in(tmp_path) -> None:
+    """The client sends the key typed; the tool returns the choice's label."""
+    payload = _ask_payload(
+        {"question": "Which storage?", "options": ["sqlite", "postgres"]},
+    )
+    registry, seen = _ask_registry(tmp_path, ["2"])
+    result = asyncio.run(registry.call("ask_user", payload))
+    assert result.content == "Q: Which storage?\nA: postgres"
+    assert seen["questions"][0].options == ["sqlite", "postgres"]
+
+    for typed in ("2", "2)", "2.", "2:"):
+        registry, _ = _ask_registry(tmp_path, [typed])
+        result = asyncio.run(registry.call("ask_user", payload))
+        assert result.content.endswith("A: postgres"), typed
+
+    for typed in ("duckdb", "7", "2 but keep the old one"):
+        registry, _ = _ask_registry(tmp_path, [typed])
+        result = asyncio.run(registry.call("ask_user", payload))
+        assert result.content.endswith(f"A: {typed}")
+
+
+def test_ask_reports_unanswered_questions_instead_of_dropping_them(tmp_path) -> None:
+    """A client that answers fewer questions than it was asked must not make
+    the tail vanish: the model would read a short pairing as "all answered"."""
+    registry, _ = _ask_registry(tmp_path, ["sqlite"])
+    result = asyncio.run(registry.call("ask_user", _ask_payload(
+        {"question": "Which storage?", "options": ["sqlite", "postgres"]},
+        {"question": "Project name?"},
+    )))
+    assert "A: sqlite" in result.content
+    assert "Q: Project name?\nA: (no answer given)" in result.content
+
+
+def test_ask_skip_and_blank_questions_do_not_error(tmp_path) -> None:
+    """Skipping is a notice, not a failure; a blank question never reaches
+    the user."""
+    registry, _ = _ask_registry(tmp_path, None)
+    skipped = asyncio.run(registry.call("ask_user", _ask_payload("what next?")))
+    assert skipped.ok and "user skipped" in skipped.content
+
+    registry, _ = _ask_registry(tmp_path, ["x"])
+    blank = asyncio.run(registry.call("ask_user", _ask_payload("   ")))
+    assert blank.status == "parse_error" and "non-empty" in blank.content
+
+
+def test_ask_schema_offers_options_per_question(tmp_path) -> None:
+    """The choices live inside each question: a separate flat list is what
+    made models send options as if they were questions."""
+    registry, _ = _ask_registry(tmp_path, None)
+    items = _schema_of(registry, "ask_user")["properties"]["questions"]["items"]
+    assert set(items["properties"]) == {"question", "options"}
+    assert "choices" in items["properties"]["options"]["description"]

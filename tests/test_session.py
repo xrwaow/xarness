@@ -33,6 +33,7 @@ from xarness.protocol import (
     Rollback,
     Usage,
 )
+from xarness.errors import SessionError
 from xarness.session import Session
 from xarness.workspace import WorkspaceState, open_workspace
 from pydantic import BaseModel as _PydanticBase
@@ -70,13 +71,20 @@ def make_session(script, tmp_path, tools=None) -> Session:
     )
     if tools is not None:
         session.tool_registry = tools
-        session.controller.tools = tools
+        session.tool_registry = tools
     return session
 
 
 async def wait_idle(session: Session, timeout: float = 10.0) -> None:
     """Session.wait_idle with a test timeout, so a stuck turn fails loudly."""
     await asyncio.wait_for(session.wait_idle(), timeout=timeout)
+
+
+def mark_running(session: Session) -> asyncio.Task[None]:
+    """Make ``session`` look mid-turn without running one (then cancel)."""
+    task = asyncio.get_running_loop().create_task(asyncio.sleep(3600))
+    session._turn_task = task
+    return task
 
 
 def _image() -> ImageAttachment:
@@ -96,17 +104,17 @@ def test_undo_and_retry_keep_images(tmp_path) -> None:
 
     async def go():
         session.images.save(_image())
-        await session.execute("s1", SendMessage(
+        await session.execute(SendMessage(
             text="look [x]", images=[_image()],
         ))
         await wait_idle(session)
-        await session.execute("r1", Rollback(resend=True))
+        await session.execute(Rollback(resend=True))
         await wait_idle(session)
-        return await session.execute("u1", Rollback())
+        return await session.execute(Rollback())
 
     undone = asyncio.run(go())
     assert undone.images[0].name == "cat.png"
-    wire = session.controller._client.received_wire[-1]
+    wire = session._client.received_wire[-1]
     assert any(
         isinstance(m["content"], list)
         and any(p.get("type") == "image_url" for p in m["content"])
@@ -121,9 +129,10 @@ def test_rebuilds_preserve_output_limit_and_reject_bad_filters(tmp_path) -> None
     )
 
     async def go():
-        await session.execute("m1", SetMode(mode="plan"))
-        for i, bad in enumerate((".", "..", "/etc")):
-            assert not (await session.execute(f"f{i}", Filter(path=bad, add=True))).ok
+        await session.execute(SetMode(mode="plan"))
+        for bad in (".", "..", "/etc"):
+            with pytest.raises(SessionError):
+                await session.execute(Filter(path=bad, add=True))
         assert session.tool_registry.max_output_chars == 4096
 
     asyncio.run(go())
@@ -137,7 +146,7 @@ def test_send_runs_turn_and_fans_out_no_gap(tmp_path) -> None:
 
     async def go():
         snapshot, queue = session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         events = []
         while not queue.empty():
@@ -178,7 +187,7 @@ def test_status_refresh_per_round_during_streaming(tmp_path) -> None:
 
     async def go():
         snapshot, queue = session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         events = []
         while not queue.empty():
@@ -201,10 +210,9 @@ def test_history_replaced_keeps_live_partial_round(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        session._set_state("running")
-        session.controller.partial_round.content = "before"
+        session.partial_round.content = "before"
         assert session.snapshot().partial_round.content == "before"
-        session._commit_history('accept')
+        session._commit_history('rollback')
         assert session.snapshot().partial_round.content == "before"
 
     asyncio.run(go())
@@ -234,9 +242,8 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="go"))
-        result = await session.execute("c2", SendMessage(text="steer me"))
-        assert result.ok and result.queued is True
+        await session.execute(SendMessage(text="go"))
+        await session.execute(SendMessage(text="steer me"))
         assert session._queued, "message should be queued while running"
         release.set()
         await wait_idle(session)
@@ -272,9 +279,9 @@ def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
-        result = await session.execute("c2", Rollback(message_id="whatever"))
-        assert not result.ok and "wait for" in (result.error or "")
+        await session.execute(SendMessage(text="hi"))
+        with pytest.raises(SessionError, match="wait for"):
+            await session.execute(Rollback(message_id="whatever"))
         release.set()
         await wait_idle(session)
 
@@ -286,11 +293,10 @@ def test_cancel_interrupts_turn(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
-        result = await session.execute("c2", Cancel())
-        assert result.ok
+        await session.execute(SendMessage(text="hi"))
+        await session.execute(Cancel())
         await wait_idle(session)
-        assert session._state == "idle"
+        assert session.state == "idle"
 
     asyncio.run(go())
 
@@ -354,10 +360,10 @@ def test_cancel_while_turn_is_finishing_does_not_strand_running(
 
     async def go():
         queue = session.subscribe()[1]
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(gate.wait(), 5)
-        assert session._state == "running"  # teardown has not flipped yet
-        await session.execute("c2", Cancel())
+        assert session.state == "running"  # teardown has not flipped yet
+        await session.execute(Cancel())
         await wait_idle(session)
         assert session._turn_task is None
         events = []
@@ -381,13 +387,13 @@ def test_repeated_cancel_during_unwind_does_not_strand_running(
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
-        await session.execute("c2", Cancel())
+        await session.execute(Cancel())
         await asyncio.wait_for(gate.wait(), 5)
         # The user, still seeing "running", cancels again — and again.
         for i in range(3):
-            await session.execute(f"again-{i}", Cancel())
+            await session.execute(Cancel())
         await wait_idle(session)
         assert session._turn_task is None
 
@@ -411,7 +417,7 @@ def test_teardown_failure_still_flips_idle(tmp_path, monkeypatch) -> None:
 
     async def go():
         queue = session.subscribe()[1]
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         assert session._turn_task is None
         events = []
@@ -422,10 +428,10 @@ def test_teardown_failure_still_flips_idle(tmp_path, monkeypatch) -> None:
     asyncio.run(go())
 
 
-def test_a_turn_that_dies_before_teardown_is_healed(tmp_path, monkeypatch) -> None:
-    """Belt and braces: a task that ends without reaching the state flip is
-    healed by its done-callback, and the attach-time check heals a state
-    stranded by any other path — neither can leave a phantom "running"."""
+def test_a_turn_that_dies_before_teardown_still_reports_its_end(
+    tmp_path, monkeypatch,
+) -> None:
+    """A task that dies in its own teardown still reports the turn ended."""
     session = make_session([_round("done")], tmp_path)
 
     async def boom(outcome, turn_start) -> None:
@@ -435,7 +441,7 @@ def test_a_turn_that_dies_before_teardown_is_healed(tmp_path, monkeypatch) -> No
 
     async def go():
         queue = session.subscribe()[1]
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.sleep(0.05)
         await wait_idle(session)
         assert session._turn_task is None
@@ -443,14 +449,11 @@ def test_a_turn_that_dies_before_teardown_is_healed(tmp_path, monkeypatch) -> No
         while not queue.empty():
             events.append(queue.get_nowait())
         assert any(isinstance(e, protocol.TurnEnded) for e in events)
-
-        # A state stranded with no task at all (any path that missed the
-        # callback) is healed by the next attach, before the snapshot.
-        session._set_state("running")
-        assert session.is_active  # a phantom turn keeps the host alive
-        snapshot, _queue = session.subscribe()
-        assert snapshot.status.state == "idle"
+        # Nothing to heal: a dead task simply is not running any more.
         assert session.state == "idle"
+        await session.execute(Cancel())
+        session.unsubscribe(queue)
+        assert not session.is_active
 
     asyncio.run(go())
 
@@ -463,11 +466,11 @@ def test_attach_does_not_touch_a_real_running_turn(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
         snapshot, _queue = session.subscribe()
         assert snapshot.status.state == "running"
-        await session.execute("c2", Cancel())
+        await session.execute(Cancel())
         await wait_idle(session)
 
     asyncio.run(go())
@@ -484,7 +487,7 @@ def test_quit_verdict_asks_only_for_the_last_viewer_of_work_in_flight(tmp_path) 
         second = session.subscribe()[1]
         # Work in flight, but another client is still streaming it: quitting
         # is just one viewer leaving.
-        session._state = "running"
+        task = mark_running(session)
         verdict = session.quit_verdict()
         assert verdict.ask is False and verdict.other_clients == 1
         assert verdict.state == "running"
@@ -493,26 +496,11 @@ def test_quit_verdict_asks_only_for_the_last_viewer_of_work_in_flight(tmp_path) 
         verdict = session.quit_verdict()
         assert verdict.ask is True and verdict.other_clients == 0
         # A pending question counts as work in flight, even when idle.
-        session._state = "idle"
+        task.cancel()
         session._pending_ask = protocol.PendingAsk(ask_id="a1", questions=["q?"])
         verdict = session.quit_verdict()
         assert verdict.ask is True and verdict.pending_ask is True
         session.unsubscribe(first)
-
-    asyncio.run(go())
-
-
-def test_cmd_id_dedupe(tmp_path) -> None:
-    session = make_session([[ContentDelta(text="x"), RoundComplete()]], tmp_path)
-
-    async def go():
-        first = await session.execute("same-id", SendMessage(text="hi"))
-        await wait_idle(session)
-        # A retry with the same cmd_id returns the cached result without
-        # starting another turn.
-        second = await session.execute("same-id", SendMessage(text="hi"))
-        assert first.ok and second.ok
-        assert session._turn_task is None
 
     asyncio.run(go())
 
@@ -522,7 +510,9 @@ def test_ask_first_answer_wins(tmp_path) -> None:
 
     async def go():
         queue = session.subscribe()[1]
-        ask_task = asyncio.get_running_loop().create_task(session._ask_user(["what next?"]))
+        ask_task = asyncio.get_running_loop().create_task(
+            session._ask_user([protocol.AskQuestion(question="what next?")]),
+        )
         await asyncio.sleep(0)
         events = []
         while not queue.empty():
@@ -531,12 +521,20 @@ def test_ask_first_answer_wins(tmp_path) -> None:
                  and e.status.pending_ask is not None]
         assert len(asked) == 1
         ask_id = asked[0].status.pending_ask.ask_id
-        first = await session.execute("a1", AnswerAsk(ask_id=ask_id, answers=["do it"]))
-        second = await session.execute("a2", AnswerAsk(ask_id=ask_id, answers=["no"]))
-        assert first.ok and not second.ok  # first answer wins
+        await session.execute(AnswerAsk(ask_id=ask_id, answers=["do it"]))
+        with pytest.raises(SessionError):  # first answer wins
+            await session.execute(AnswerAsk(ask_id=ask_id, answers=["no"]))
         assert await ask_task == ["do it"]
 
     asyncio.run(go())
+
+
+def test_pending_ask_still_parses_plain_string_questions() -> None:
+    """Bare-string questions from an older client parse as free text."""
+    ask = protocol.PendingAsk(ask_id="a1", questions=["q?", {"question": "r?"}])
+    assert [(q.question, q.options) for q in ask.questions] == [
+        ("q?", []), ("r?", []),
+    ]
 
 
 def test_tool_call_repair_after_cancel(tmp_path) -> None:
@@ -558,8 +556,8 @@ def test_tool_call_repair_after_cancel(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
-        await session.execute("c2", Cancel())
+        await session.execute(SendMessage(text="hi"))
+        await session.execute(Cancel())
         await wait_idle(session, timeout=15)
 
     asyncio.run(go())
@@ -581,13 +579,12 @@ def test_undo_to_by_message_id(tmp_path) -> None:
     )
 
     async def go():
-        await session.execute("c1", SendMessage(text="first question"))
+        await session.execute(SendMessage(text="first question"))
         await wait_idle(session)
         user = next(m for m in session.conversation.messages if m.role == "user")
-        return await session.execute("u1", Rollback(message_id=user.id))
+        return await session.execute(Rollback(message_id=user.id))
 
     result = asyncio.run(go())
-    assert result.ok
     assert result.user_text == "first question"
     # The turn was dropped: nothing remains.
     assert session.conversation.messages == []
@@ -599,7 +596,7 @@ def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
     )
 
     async def go():
-        await session.execute("c1", SendMessage(text="hello"))
+        await session.execute(SendMessage(text="hello"))
         await wait_idle(session)
 
     asyncio.run(go())
@@ -611,9 +608,9 @@ def test_atomic_save_and_timestamps(tmp_path, monkeypatch) -> None:
     user = state.conversation.messages[0]
     assistant = state.conversation.messages[1]
     assert user.timing.send is not None
-    assert assistant.timing.start is not None and assistant.timing.end is not None
+    assert assistant.timing.stats is not None  # the turn's measured numbers
     # Timestamps are never sent to the provider.
-    wire = session.controller._client.received_wire[-1]
+    wire = session._client.received_wire[-1]
     for message in wire:
         assert set(message) <= {
             "role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content",
@@ -628,7 +625,7 @@ def test_user_message_is_on_disk_while_the_turn_runs(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hello there"))
+        await session.execute(SendMessage(text="hello there"))
         await asyncio.wait_for(started.wait(), 5)
         await session._flush_persist()
         assert session.state == "running"  # the turn has not finished
@@ -652,12 +649,11 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
     async def go():
         # /undo: drops the last turn, hands the user text back.
         session = make_session([list(s) for s in script[:2]], tmp_path)
-        await session.execute("c1", SendMessage(text="first question"))
+        await session.execute(SendMessage(text="first question"))
         await wait_idle(session)
-        await session.execute("c2", SendMessage(text="second question"))
+        await session.execute(SendMessage(text="second question"))
         await wait_idle(session)
-        undo = await session.execute("u1", Rollback())
-        assert undo.ok, undo.error
+        undo = await session.execute(Rollback())
         assert undo.user_text == "second question"
         return session
 
@@ -669,16 +665,15 @@ def test_undo_and_retry_commands_happy_path(tmp_path) -> None:
     async def go2():
         # /retry: drops the last turn and resends its user message.
         session = make_session(script, tmp_path)
-        await session.execute("c1", SendMessage(text="first question"))
+        await session.execute(SendMessage(text="first question"))
         await wait_idle(session)
-        await session.execute("c2", SendMessage(text="second question"))
+        await session.execute(SendMessage(text="second question"))
         await wait_idle(session)
-        retry = await session.execute("r1", Rollback(resend=True))
-        assert retry.ok, retry.error
+        await session.execute(Rollback(resend=True))
         async def _wait_answers():
             # The retry replaces the turn: the resent question gets a fresh
             # answer (assistant messages after the resend are stamped anew).
-            while session._turn_task is not None or session._state != "idle":
+            while session._turn_task is not None or session.state != "idle":
                 await asyncio.sleep(0.005)
         await asyncio.wait_for(_wait_answers(), timeout=5)
         return session
@@ -714,17 +709,16 @@ def test_send_during_finish_turn_is_queued_not_started(tmp_path) -> None:
         finish_started.set()
         await finish_gate.wait()
 
-    session.controller.compact = fake_compact
+    session.compact = fake_compact
     session._finish_turn = fake_finish_turn
 
     async def go():
         session.subscribe()
-        first = asyncio.create_task(session.execute("c1", SendMessage(text="hi")))
+        first = asyncio.create_task(session.execute(SendMessage(text="hi")))
         await asyncio.wait_for(finish_started.wait(), timeout=5)
         # Auto-compact ran; the session is NOT idle while finish_turn blocks.
-        assert session._state != "idle"
-        second = await session.execute("c2", SendMessage(text="go again"))
-        assert second.ok and second.queued is True
+        assert session.state != "idle"
+        await session.execute(SendMessage(text="go again"))
         assert session._queued and session._queued[0].text == "go again"
         finish_gate.set()
         await first
@@ -746,22 +740,19 @@ def test_manual_compact_does_not_block_inbox_and_drains_queue(tmp_path) -> None:
         await gate.wait()
         return None  # nothing to compact
 
-    session.controller.compact = fake_compact
+    session.compact = fake_compact
 
     async def go():
         session.subscribe()
         # Returns immediately instead of awaiting the compaction.
-        result = await asyncio.wait_for(
-            session.execute("c1", Compact()), timeout=2,
-        )
-        assert result.ok and result.started is True
-        assert session._state == "compacting"
+        await asyncio.wait_for(session.execute(Compact()), timeout=2)
+        assert session.state == "compacting"
         assert session._compact_task is not None
         # The inbox is still responsive while compaction runs.
-        sent = await asyncio.wait_for(
-            session.execute("c2", SendMessage(text="after compact")), timeout=2,
+        await asyncio.wait_for(
+            session.execute(SendMessage(text="after compact")), timeout=2,
         )
-        assert sent.ok and sent.queued is True
+        assert session._queued
         gate.set()
         await wait_idle(session)
 
@@ -779,11 +770,11 @@ def test_compaction_emits_typed_outcome_event(tmp_path) -> None:
         return CompactionResult(summary="handoff summary", usage=None,
                                 before_tokens=100, after_tokens=30)
 
-    session.controller.compact = fake_compact
+    session.compact = fake_compact
 
     async def go():
         queue = session.subscribe()[1]
-        assert (await session.execute("c1", Compact())).ok
+        await session.execute(Compact())
         await wait_idle(session)
         events = []
         while not queue.empty():
@@ -804,10 +795,10 @@ def test_undo_emits_typed_rollback_event(tmp_path) -> None:
     )
 
     async def go():
-        await session.execute("c1", SendMessage(text="question"))
+        await session.execute(SendMessage(text="question"))
         await wait_idle(session)
         queue = session.subscribe()[1]
-        assert (await session.execute("u1", Rollback())).ok
+        await session.execute(Rollback())
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
@@ -839,11 +830,12 @@ def test_summary_reports_a_pending_ask_as_ask(tmp_path) -> None:
         _, queue = session.subscribe()
         session._pending_ask = protocol.PendingAsk(ask_id="ask-1", questions=["q?"])
 
-        session._state = "running"
+        task = mark_running(session)
         assert session.summary().state == "ask"
-        session._state = "compacting"
+        session._compacting = True
         assert session.summary().state == "ask"
-        session._state = "idle"
+        task.cancel()
+        session._compacting = False
         assert session.summary().state == "ask"
         session.unsubscribe(queue)
 
@@ -856,12 +848,13 @@ def test_summary_reports_a_running_tool_as_waiting(tmp_path) -> None:
 
     async def go():
         session = make_session([], tmp_path)
-        session._state = "running"
+        task = mark_running(session)
         assert session.summary().state == "running"
         session._executing_tool = "subagent"
         assert session.summary().state == "waiting"
         session._executing_tool = None
         assert session.summary().state == "running"
+        task.cancel()
 
     asyncio.run(go())
 
@@ -876,8 +869,7 @@ def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
     ))
 
     snap = session.snapshot()
-    assert [m.id for m in snap.history] == [old.id]
-    assert [m.id for m in snap.messages] == [summary.id]
+    assert [m.id for m in snap.messages] == [old.id, summary.id]
 
 
 def test_stream_events_are_protocol_models() -> None:
@@ -923,10 +915,9 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
     async def go():
         snapshot, queue = session.subscribe()
         # Back-to-back: no awaiting of turn progress between the two sends.
-        first = await session.execute("c1", SendMessage(text="one"))
-        second = await session.execute("c2", SendMessage(text="two"))
-        assert first.ok and first.started is True
-        assert second.ok and second.queued is True, (
+        await session.execute(SendMessage(text="one"))
+        await session.execute(SendMessage(text="two"))
+        assert session._queued, (
             "back-to-back send must steer, not start a second turn"
         )
         release.set()
@@ -938,9 +929,9 @@ def test_back_to_back_sends_one_turn_one_steering(tmp_path) -> None:
         assert len(finished) == 1, f"expected one turn, got {len(finished)}"
         # The steered text was injected inside the SAME turn (the second LLM
         # round saw it), not replayed as a fresh turn afterwards.
-        assert session.controller._client.received_wire[1] and any(
+        assert session._client.received_wire[1] and any(
             m.get("role") == "user" and m.get("content") == "two"
-            for m in session.controller._client.received_wire[1]
+            for m in session._client.received_wire[1]
         )
 
     asyncio.run(go())
@@ -951,7 +942,7 @@ def test_partial_round_is_none_when_idle(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         assert session.snapshot().partial_round is None
 
@@ -963,13 +954,13 @@ def test_only_round_content_updates_partial_round(tmp_path) -> None:
     session = make_session([], tmp_path)
 
     async def go():
-        session._set_state("running")
+        mark_running(session)
         session._emit(protocol.Notice(text="stale notice"))
         session._emit(protocol.StatusChanged(status=session.status()))
         assert session.snapshot().partial_round is None
-        # The controller fills the model-stream half (status/notice events
-        # never create a partial round).
-        session.controller.partial_round.content = "live"
+        # The round runner fills the model-stream half (status/notice
+        # events never create a partial round).
+        session.partial_round.content = "live"
         partial = session.snapshot().partial_round
         assert partial is not None and partial.content == "live"
 
@@ -980,16 +971,16 @@ def test_partial_round_tracks_a_running_tool_call(tmp_path) -> None:
     session = make_session([], tmp_path)
 
     async def go():
-        session._set_state("running")
-        # What the controller's stream accumulates: answer text, then the
-        # call it started with its parsed arguments.
-        partial = session.controller.partial_round
+        mark_running(session)
+        # What _stream_round accumulates: answer text, then the call it
+        # started with its parsed arguments.
+        partial = session.partial_round
         partial.content = "answer"
         partial.tool_calls.append(protocol.PartialToolCall(
             call_id="c1", name="read_file", arguments='{"path": "a"}',
         ))
         session._emit(protocol.ToolOutputDelta(call_id="c1", text="body"))
-        partial.content = ""  # what the controller does on RoundComplete
+        partial.content = ""  # what _stream_round does on RoundComplete
         session._emit(protocol.RoundComplete())
         partial = session.snapshot().partial_round
         assert partial is not None
@@ -1018,7 +1009,7 @@ def test_a_running_tool_stays_in_the_live_round(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="go"))
+        await session.execute(SendMessage(text="go"))
         await asyncio.wait_for(started.wait(), 5)
         snap = session.snapshot()
         assert snap.status.state == "running"
@@ -1037,10 +1028,10 @@ def test_partial_round_never_truncates_a_long_answer(tmp_path) -> None:
     session = make_session([], tmp_path)
 
     async def go():
-        session._set_state("running")
-        # The live content is the controller's, verbatim: the session must
-        # never truncate or re-copy it when building the snapshot.
-        session.controller.partial_round.content = "x" * 600
+        mark_running(session)
+        # The live content is the round runner's, verbatim: the snapshot
+        # must never truncate or re-copy it.
+        session.partial_round.content = "x" * 600
         partial = session.snapshot().partial_round
         assert partial is not None and len(partial.content) == 600
 
@@ -1057,11 +1048,10 @@ def test_filter_add_rejects_missing_path(tmp_path) -> None:
     (tmp_path / "real.txt").write_text("x")
 
     async def go():
-        result = await session.execute("f1", protocol.Filter(path="ghost.txt", add=True))
-        assert not result.ok and "no such path" in (result.error or "")
+        with pytest.raises(SessionError, match="no such path"):
+            await session.execute(protocol.Filter(path="ghost.txt", add=True))
         assert not (tmp_path / "ghost.txt").exists()
-        ok = await session.execute("f2", protocol.Filter(path="real.txt", add=True))
-        assert ok.ok
+        await session.execute(protocol.Filter(path="real.txt", add=True))
         assert session.sandbox.settings.filter_list == ["real.txt"]
 
     asyncio.run(go())
@@ -1081,22 +1071,20 @@ def test_ref_add_remove_is_per_workspace(tmp_path, monkeypatch) -> None:
     expected = str((tmp_path / "spec.md").resolve())
 
     async def go():
-        bad = await session.execute("r0", protocol.Ref(path="ghost.md", add=True))
-        assert not bad.ok and "no such path" in (bad.error or "")
+        with pytest.raises(SessionError, match="no such path"):
+            await session.execute(protocol.Ref(path="ghost.md", add=True))
         # Never mkdir a reference (and never create the container anchor).
         assert not (tmp_path / "ghost.md").exists()
         assert not (tmp_path / ".refs").exists()
 
-        added = await session.execute("r1", protocol.Ref(path="spec.md", add=True))
-        assert added.ok
+        await session.execute(protocol.Ref(path="spec.md", add=True))
         assert session.workspace_refs == [expected]
         refs = session.status().refs
         assert [(r.path, r.mount) for r in refs] == [
             (expected, f"{REFS_ANCHOR}/spec.md")]
         assert workspace.load_workspace_refs(tmp_path) == [expected]
 
-        removed = await session.execute("r2", protocol.Ref(path="spec.md", add=False))
-        assert removed.ok
+        await session.execute(protocol.Ref(path="spec.md", add=False))
         assert session.workspace_refs == []
         assert workspace.load_workspace_refs(tmp_path) == []
 
@@ -1110,10 +1098,9 @@ def test_undo_history_replaced_renders_once_on_attach(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
-        result = await session.execute("c2", Rollback())
-        assert result.ok
+        await session.execute(Rollback())
         assert session.snapshot().partial_round is None
         # A client attaching now sees the rewritten history exactly once.
         snapshot, _queue = session.subscribe()
@@ -1148,9 +1135,9 @@ def test_cancel_saves_partial_cot_reasoning_only(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        task = asyncio.create_task(session.execute("c1", SendMessage(text="hi")))
+        task = asyncio.create_task(session.execute(SendMessage(text="hi")))
         await asyncio.wait_for(started.wait(), timeout=5)
-        await session.execute("c2", Cancel())
+        await session.execute(Cancel())
         release.set()
         await task
         await wait_idle(session)
@@ -1188,11 +1175,10 @@ def test_forced_steer_saves_partial_cot(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="first"))
+        await session.execute(SendMessage(text="first"))
         await asyncio.wait_for(started.wait(), timeout=5)
-        await session.execute("c2", SendMessage(text="second"))  # queued
-        result = await session.execute("c3", protocol.FlushQueued())
-        assert result.ok and result.flushed is True
+        await session.execute(SendMessage(text="second"))  # queued
+        await session.execute(protocol.FlushQueued())
         release.set()
         await wait_idle(session)
 
@@ -1215,12 +1201,12 @@ def test_stop_cancels_a_running_compaction(tmp_path) -> None:
         await gate.wait()
         return None  # nothing to compact
 
-    session.controller.compact = fake_compact
+    session.compact = fake_compact
 
     async def go():
         session.subscribe()
-        await asyncio.wait_for(session.execute("c1", Compact()), timeout=2)
-        assert session._state == "compacting"
+        await asyncio.wait_for(session.execute(Compact()), timeout=2)
+        assert session.state == "compacting"
         await session.stop()
         assert session._compact_task is None
 
@@ -1228,7 +1214,7 @@ def test_stop_cancels_a_running_compaction(tmp_path) -> None:
     # The compact task was cancelled (stop() cleared the reference); the
     # session state never came back to idle via the cancelled task's except
     # path — stop() owns the teardown.
-    assert session._state == "compacting" or session._state == "idle"
+    assert session.state == "compacting" or session.state == "idle"
 
 
 def test_no_save_disables_persistence(tmp_path) -> None:
@@ -1244,39 +1230,17 @@ def test_no_save_disables_persistence(tmp_path) -> None:
 
 
 def test_stamp_turn_end_records_the_turn_stats(tmp_path) -> None:
-    """The host records a finished turn's numbers on its last answer:
+    """The host writes the numbers it measured onto the turn's last answer:
     total | busy | idle, busy being streaming + tools."""
-    from datetime import datetime, timedelta, timezone
-
     session = make_session([], tmp_path)
-    base = datetime.now(timezone.utc)
-    iso = base.isoformat
-
-    def plus(seconds: float) -> str:
-        return (base + timedelta(seconds=seconds)).isoformat()
-
-    opening = session.conversation.add(
-        user_message("hi", timing=Timing(send=iso())))
+    opening = session.conversation.add(user_message("hi"))
     session.conversation.begin_turn(opening, before_tree=None)
-    session.conversation.add(AssistantMessage(content="thinking about it",
-        timing=Timing(
-            start=iso(), end=plus(2), reasoning_seconds=1.7,
-        ),
-    ))
-    session.conversation.add(ToolMessage(tool_call_id="c1",
-        timing=Timing(start=plus(2), end=plus(5)),
-    ))
-    last = session.conversation.add(AssistantMessage(content="done",
-        timing=Timing(start=plus(5), end=plus(8)),
-    ))
-    stats = session.conversation.stamp_turn_end()
+    session.conversation.add(AssistantMessage(content="thinking about it"))
+    session.conversation.add(ToolMessage(tool_call_id="c1"))
+    last = session.conversation.add(AssistantMessage(content="done"))
+    stats = session.conversation.stamp_turn_end(total=8.0, busy=7.7)
     assert stats is not None
-    assert round(stats.total, 1) == 8.0
-    # busy = streaming (round 1: 1.7s + round 2: 3s, no reasoning)
-    #        + tools (3.0s).
-    assert round(stats.busy, 1) == 7.7
-    # total - busy: the 0.3s pre-first-token latency.
-    assert round(stats.idle, 1) == 0.3
+    assert (stats.total, stats.busy, round(stats.idle, 1)) == (8.0, 7.7, 0.3)
     # Stored where a reload (and any other client) reads it back from.
     assert last.timing.stats == stats
 
@@ -1288,17 +1252,11 @@ def test_stamp_turn_end_sums_round_usage(tmp_path) -> None:
         user_message("hi", timing=Timing(send="2025-01-01T00:00:00+00:00")))
     session.conversation.add(AssistantMessage(
         content="a", usage=Usage(input_tokens=1_234, output_tokens=56),
-        timing=Timing(
-            start="2025-01-01T00:00:00+00:00",
-            end="2025-01-01T00:00:02+00:00"),
     ))
     session.conversation.add(AssistantMessage(
         content="b", usage=Usage(input_tokens=2_000, output_tokens=400),
-        timing=Timing(
-            start="2025-01-01T00:00:02+00:00",
-            end="2025-01-01T00:00:05+00:00"),
     ))
-    stats = session.conversation.stamp_turn_end()
+    stats = session.conversation.stamp_turn_end(total=5.0, busy=4.0)
     assert stats is not None and stats.usage is not None
     assert (stats.usage.input_tokens, stats.usage.output_tokens) == (3_234, 456)
     # Local estimates are flagged, never passed off as exact counts.
@@ -1306,13 +1264,12 @@ def test_stamp_turn_end_sums_round_usage(tmp_path) -> None:
     assert (estimated + Usage(input_tokens=1, output_tokens=3)).approximate
 
 
-def test_stamp_turn_end_needs_a_completed_round(tmp_path) -> None:
-    """A turn with no timed answer (nothing streamed, or a session from
-    before timing was recorded) leaves no stamp — and so no footer."""
+def test_stamp_turn_end_needs_an_answer(tmp_path) -> None:
+    """A turn that never produced an answer leaves no stamp — and so no
+    footer."""
     session = make_session([], tmp_path)
     session.conversation.add(user_message("hi"))
-    session.conversation.add(AssistantMessage(content="hello"))
-    assert session.conversation.stamp_turn_end() is None
+    assert session.conversation.stamp_turn_end(1.0, 1.0) is None
 
 
 def test_turn_ended_carries_the_stamped_breakdown(tmp_path) -> None:
@@ -1326,7 +1283,7 @@ def test_turn_ended_carries_the_stamped_breakdown(tmp_path) -> None:
 
     async def go():
         _, queue = session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         finished = None
         while not queue.empty():
@@ -1340,8 +1297,10 @@ def test_turn_ended_carries_the_stamped_breakdown(tmp_path) -> None:
     assert last_assistant.role == "assistant"
     stats = last_assistant.timing.stats
     assert finished is not None and stats is not None
-    assert finished.total == stats.total
-    assert (finished.busy, finished.idle) == (stats.busy, stats.idle)
+    assert finished.stats == stats
+    # The split is measured, not reconstructed: it closes on the total.
+    assert stats.busy is not None and stats.idle is not None
+    assert stats.busy + stats.idle == stats.total
     assert stats.usage is not None and stats.usage.input_tokens == 10
 
     # Persisted, so a reload renders the same footer instead of deriving one.
@@ -1367,16 +1326,16 @@ def test_cancelled_turn_is_stamped_without_a_split(tmp_path) -> None:
 
     async def go():
         session.subscribe()
-        await session.execute("c1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), timeout=5)
-        await session.execute("c2", Cancel())
+        await session.execute(Cancel())
         await wait_idle(session)
 
     asyncio.run(go())
     assistants = [
         m for m in session.conversation.messages if m.role == "assistant"
     ]
-    assert assistants and assistants[0].timing.start  # a measured round exists
+    assert assistants  # the round that reached the tool exists
     stats = assistants[-1].timing.stats
     assert stats is not None and stats.total >= 0
     assert stats.busy is None and stats.idle is None
@@ -1392,22 +1351,15 @@ def test_a_steered_turn_is_one_turn_for_the_stamp(tmp_path) -> None:
     conversation.begin_turn(opening, before_tree=None)
     conversation.add(AssistantMessage(
         content="a", usage=Usage(input_tokens=10, output_tokens=1),
-        timing=Timing(
-            start="2025-01-01T00:00:00+00:00",
-            end="2025-01-01T00:00:01+00:00"),
     ))
-    conversation.add(user_message(
-        "also this", timing=Timing(send="2025-01-01T00:00:01+00:00")))
+    conversation.add(user_message("also this"))
     last = conversation.add(AssistantMessage(
         content="b", usage=Usage(input_tokens=20, output_tokens=2),
-        timing=Timing(
-            start="2025-01-01T00:00:01+00:00",
-            end="2025-01-01T00:00:04+00:00"),
     ))
-    stats = conversation.stamp_turn_end()
+    stats = conversation.stamp_turn_end(total=4.0, busy=3.0)
     assert stats is not None and stats.usage is not None
     assert (stats.usage.input_tokens, stats.usage.output_tokens) == (30, 3)
-    assert round(stats.total, 1) == 4.0
+    assert stats.total == 4.0
     assert last.timing.stats == stats
 
 
@@ -1434,7 +1386,7 @@ async def _tracked_session(tmp_path, script, registry=None, files=None):
     )
     if registry is not None:
         session.tool_registry = registry
-        session.controller.tools = registry
+        session.tool_registry = registry
     session.workspace_state = state
     return session, state
 
@@ -1487,7 +1439,7 @@ def test_an_explicit_write_records_its_own_provenance(tmp_path, monkeypatch) -> 
             tmp_path, [_tool_round()], registry, files={"a.txt": "before\n"},
         )
         session.subscribe()
-        await session.execute("s1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
 
         event = state.events[0]
@@ -1533,7 +1485,7 @@ def test_mutating_tool_and_turn_end_emit_diff_changed(tmp_path, monkeypatch) -> 
             [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         queue = session.subscribe()[1]
-        await session.execute("s1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
         # The turn-end DiffChanged is emitted after the state flips to idle
         # (the emit itself snapshots the workspace), so give it a moment.
@@ -1557,7 +1509,6 @@ def test_diff_info_path_snapshots_workspace_once(tmp_path, monkeypatch) -> None:
     """`/diff <path>` needs the stat rows and the text; both must share a
     single workspace snapshot instead of running two full snapshots."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    import xarness.session as session_mod
 
     async def go():
         session, state = await _tracked_session(tmp_path, [])
@@ -1580,9 +1531,7 @@ def test_diff_info_path_snapshots_workspace_once(tmp_path, monkeypatch) -> None:
 
 
 def test_accept_rebaselines_mid_turn_edits(tmp_path, monkeypatch) -> None:
-    """A mid-turn /accept moves the baseline; edits recorded by tools after
-    it are still this viewer's (``mine``), while files written outside the
-    harness are drift."""
+    """A mid-turn /accept absorbs the in-flight write into the new baseline."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
@@ -1592,7 +1541,7 @@ def test_accept_rebaselines_mid_turn_edits(tmp_path, monkeypatch) -> None:
             [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
-        await session.execute("s1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
         stat = await session.diff_info(None)
@@ -1600,25 +1549,24 @@ def test_accept_rebaselines_mid_turn_edits(tmp_path, monkeypatch) -> None:
         # write: an in-flight edit is indistinguishable from drift.
         assert {f.path: f.kind for f in stat.files} == {"a.txt": "drift"}
 
-        result = await session.execute("acc", Accept())
-        assert result.ok
-        assert session._state == "running"
+        await session.execute(Accept())
+        assert session.state == "running"
 
-        # Accept keeps drift (the in-flight a.txt write) out of the new
-        # baseline; the raw b.txt write is drift too.
+        # Accept absorbs the in-flight a.txt write into the new baseline.
+        # The raw b.txt write made after it is drift.
         (tmp_path / "ws" / "b.txt").write_text("later edit\n")
         stat = await session.diff_info(None)
         by_path = {f.path: f.kind for f in stat.files}
-        assert by_path == {"a.txt": "drift", "b.txt": "drift"}, by_path
+        assert by_path == {"b.txt": "drift"}, by_path
 
         release.set()
         await wait_idle(session)
 
-        # The tool's event now labels its a.txt write as this viewer's, but
-        # the path stayed drift out of the baseline; the raw write is drift.
+        # The tool's event lands after the accept, but its a.txt write is
+        # already in the baseline, so it adds nothing pending.
         stat = await session.diff_info(None)
         by_path = {f.path: f.kind for f in stat.files}
-        assert by_path == {"a.txt": "mine", "b.txt": "drift"}, by_path
+        assert by_path == {"b.txt": "drift"}, by_path
         # The turn spans the accept, so it is no longer revertible.
         assert session.turn_checkpoints() == []
 
@@ -1667,7 +1615,7 @@ def test_event_recording_is_atomic_with_accept(tmp_path, monkeypatch) -> None:
             return tree
 
         state.snapshot = gated
-        await session.execute("s1", SendMessage(text="go"))
+        await session.execute(SendMessage(text="go"))
         await asyncio.wait_for(started.wait(), 5)
         release.set()
         await asyncio.wait_for(inside.wait(), 5)
@@ -1691,6 +1639,72 @@ def test_event_recording_is_atomic_with_accept(tmp_path, monkeypatch) -> None:
     asyncio.run(go())
 
 
+def test_a_failing_bash_command_owns_what_it_wrote(
+    tmp_path, monkeypatch,
+) -> None:
+    """A command that writes a file and then fails is still credited with it."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        @tool("run_bash", "run a command", _NoArgs)
+        async def bash(args) -> ToolResult:
+            (tmp_path / "ws" / "new.txt").write_text("written\n")
+            return ToolResult(status="error", content="boom\n[exit 1]")
+
+        registry = ToolRegistry()
+        registry.register(bash)
+        session, state = await _tracked_session(tmp_path, [
+            [
+                ToolCallStarted(call_id="c1", name="run_bash"),
+                ToolCallArgumentsDone(
+                    call_id="c1", name="run_bash", arguments_json="{}",
+                ),
+                RoundComplete(has_tool_calls=True),
+            ],
+            [ContentDelta(text="done"), RoundComplete()],
+        ], registry)
+        await session.execute(SendMessage(text="go"))
+        await wait_idle(session)
+
+        stat = await session.diff_info(None)
+        assert {f.path: f.kind for f in stat.files} == {"new.txt": "agent"}
+        assert [(e.tool, e.changed) for e in state.events] == [
+            ("run_bash", ("new.txt",)),
+        ]
+
+    asyncio.run(go())
+
+
+def test_a_failed_explicit_write_is_not_credited(
+    tmp_path, monkeypatch,
+) -> None:
+    """A failed ``edit_file`` wrote nothing through the tool: the path it
+    named stays drift, so a dead call cannot claim the user's own change."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    async def go():
+        @tool("edit_file", "edit a file", _NoArgs)
+        async def edit(args) -> ToolResult:
+            return ToolResult(status="error", content="path is not a file")
+
+        registry = ToolRegistry()
+        registry.register(edit)
+        session, state = await _tracked_session(tmp_path, [
+            _tool_round(),
+            [ContentDelta(text="done"), RoundComplete()],
+        ], registry)
+        # The user's own write while the tool runs is drift, unclaimed.
+        (tmp_path / "ws" / "a.txt").write_text("mine\n")
+        await session.execute(SendMessage(text="go"))
+        await wait_idle(session)
+
+        stat = await session.diff_info(None)
+        assert {f.path: f.kind for f in stat.files} == {"a.txt": "drift"}
+        assert state.events == []
+
+    asyncio.run(go())
+
+
 def test_reject_restores_the_baseline_mid_turn(tmp_path, monkeypatch) -> None:
     """A mid-turn /reject restores the baseline; a later raw write is drift
     while the turn's tool edits were already reverted."""
@@ -1703,11 +1717,10 @@ def test_reject_restores_the_baseline_mid_turn(tmp_path, monkeypatch) -> None:
             [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
-        await session.execute("s1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
-        result = await session.execute("rej", Reject())
-        assert result.ok
+        await session.execute(Reject())
         assert not (tmp_path / "ws" / "a.txt").exists()
 
         (tmp_path / "ws" / "b.txt").write_text("later edit\n")
@@ -1736,7 +1749,7 @@ def test_compaction_keeps_open_turn_attribution_and_undo(tmp_path, monkeypatch) 
             [ContentDelta(text="done"), RoundComplete()],
         ], registry)
         session.subscribe()
-        await session.execute("s1", SendMessage(text="hi"))
+        await session.execute(SendMessage(text="hi"))
         await asyncio.wait_for(started.wait(), 5)
 
         from unittest import mock
@@ -1746,7 +1759,7 @@ def test_compaction_keeps_open_turn_attribution_and_undo(tmp_path, monkeypatch) 
             return "handoff summary", None
 
         with mock.patch.object(compaction_mod, "summarize", fake_summarize):
-            await session.controller.compact()
+            await session.compact()
         assert session._open_turn_before() is not None
 
         (tmp_path / "ws" / "b.txt").write_text("later edit\n")
@@ -1785,7 +1798,7 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
         ], registry)
         session.subscribe()
 
-        await session.execute("s1", SendMessage(text="first"))
+        await session.execute(SendMessage(text="first"))
         await wait_idle(session)
         user_messages = [
             m for m in session.conversation.messages if m.role == "user"
@@ -1798,7 +1811,7 @@ def test_checkpoint_failure_does_not_restamp_previous_turn(tmp_path, monkeypatch
             return None
 
         session._take_checkpoint = fail_checkpoint
-        await session.execute("s2", SendMessage(text="second"))
+        await session.execute(SendMessage(text="second"))
         await asyncio.wait_for(started.wait(), 5)
 
         # The failing checkpoint means this turn cannot be attributed yet,
@@ -1832,11 +1845,10 @@ def test_compaction_undo_does_not_resend_an_empty_turn(tmp_path) -> None:
         conversation.begin_turn(user, None)
         conversation.add(AssistantMessage(content="answer"))
         conversation.add(user_message("summary", is_summary=True))
-        result = await session.execute("r1", Rollback(resend=True))
-        assert result.ok, result.error
+        await session.execute(Rollback(resend=True))
         # The summary was popped, but no turn started (the state went idle
         # and no empty user message landed in the history).
-        assert session._state == "idle"
+        assert session.state == "idle"
         assert session._turn_task is None
         assert [m.content for m in conversation.visible_messages()] == [
             "real question", "answer",
@@ -1856,41 +1868,29 @@ def test_send_rejects_image_refs_missing_from_the_store(tmp_path) -> None:
         ghost = ImageRef(
             id="f" * 64, name="ghost.png", mime="image/png", width=1, height=1,
         )
-        result = await session.execute(
-            "c1", SendMessage(text="look", images=[ghost]),
-        )
-        assert not result.ok and "never uploaded" in (result.error or "")
+        with pytest.raises(SessionError, match="never uploaded"):
+            await session.execute(SendMessage(text="look", images=[ghost]))
         # The known-good path still works.
         session.images.store(b"cat")
         real = ImageRef(
             id=session.images.store(b"cat"), name="cat.png",
             mime="image/png", width=1, height=1,
         )
-        result = await session.execute(
-            "c2", SendMessage(text="look", images=[real]),
-        )
-        assert result.ok, result.error
+        await session.execute(SendMessage(text="look", images=[real]))
 
     asyncio.run(go())
 
 
-def test_patch_settings_validates_before_applying(tmp_path) -> None:
-    """PATCH validates the whole request first: a bad sandbox name must not
-    leave a switched model behind, and it answers ok=False like a command."""
+def test_set_mode_is_allowed_mid_turn(tmp_path) -> None:
+    """Mode is a flag (no history/sandbox rewrite), so it flips mid-turn;
+    the model/sandbox commands stay idle-only."""
     async def go():
         session = make_session([], tmp_path)  # no config path known
-        result = await session.update_settings(protocol.SessionUpdate(
-            model="other-model", sandbox="other-sandbox",
-        ))
-        assert result.ok is False and result.error
-        # Nothing was applied.
-        assert session.profile_name == "test"
-        # Mode-only PATCH is allowed mid-turn (like SetMode).
-        session._set_state("running")
-        result = await session.update_settings(
-            protocol.SessionUpdate(mode="plan"))
-        assert result.ok, result.error
+        mark_running(session)
+        await session.execute(protocol.SetMode(mode="plan"))
         assert session.mode == "plan"
+        with pytest.raises(SessionError, match="wait for"):
+            await session.execute(protocol.SwitchModel(name="other-model"))
 
     asyncio.run(go())
 
@@ -1913,8 +1913,7 @@ def test_accept_emits_checkpoints_changed_not_history_replaced(tmp_path, monkeyp
 
     async def go():
         queue = session.subscribe()[1]
-        result = await session.execute("a1", protocol.Accept())
-        assert result.ok
+        await session.execute(protocol.Accept())
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
@@ -1988,14 +1987,16 @@ def test_no_message_is_mutated_after_first_persist(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(session_store, "serialize_state", spy)
 
     async def go():
-        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await session.execute(protocol.SendMessage(text="hi"))
         await wait_idle(session)
         # Accept rewrites checkpoints (not messages); a second turn then a
-        # rollback exercises truncation too.
-        await session.execute("a1", protocol.Accept())
-        await session.execute("s2", protocol.SendMessage(text="again"))
+        # rollback exercises truncation too. (No tracking here, so Accept
+        # would refuse; the rollback alone still exercises the tail.)
+        if session.workspace_state is not None:
+            await session.execute(protocol.Accept())
+        await session.execute(protocol.SendMessage(text="again"))
         await wait_idle(session)
-        await session.execute("u1", protocol.Rollback())
+        await session.execute(protocol.Rollback())
 
     asyncio.run(go())
     assert seen, "expected at least one persist"
@@ -2036,11 +2037,9 @@ def test_view_state_is_saved_with_the_session(tmp_path) -> None:
         session = make_session([], tmp_path)
         assert session.status().view.diff_scope == "all"
 
-        result = await session.execute(
-            "f1", protocol.SetViewState(view=protocol.ViewState(diff_scope="mine")),
-        )
-        assert result.ok
-        assert result.view.diff_scope == "mine"
+        await session.execute(protocol.SetViewState(
+            view=protocol.ViewState(diff_scope="mine")))
+        assert session.view.diff_scope == "mine"
         assert session.status().view.diff_scope == "mine"
 
         await session._flush_persist()
@@ -2097,14 +2096,12 @@ def test_persist_watermark_advances_across_writes(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(session_store, "serialize_state", spy)
 
     async def go():
-        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await session.execute(protocol.SendMessage(text="hi"))
         await wait_idle(session)
-        first_end = len(session.conversation.messages)
-        await session.execute("s2", protocol.SendMessage(text="again"))
+        await session.execute(protocol.SendMessage(text="again"))
         await wait_idle(session)
-        return first_end
 
-    first_end = asyncio.run(go())
+    asyncio.run(go())
     assert from_seqs, "no persist happened"
     assert from_seqs[-1] >= 1, from_seqs
     # Fully written: nothing left to rewrite next time.
@@ -2124,12 +2121,12 @@ def test_persist_failure_does_not_stall_the_turn(tmp_path, monkeypatch) -> None:
 
     async def go():
         queue = session.subscribe()[1]
-        await session.execute("s1", protocol.SendMessage(text="hi"))
+        await session.execute(protocol.SendMessage(text="hi"))
         await wait_idle(session)
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        assert session._state == "idle"
+        assert session.state == "idle"
         assert any(isinstance(e, protocol.TurnEnded) for e in events)
         assert session.conversation._dirty_from == 0  # rewound
 

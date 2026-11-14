@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .config import SandboxSettings
 from .conversation import MESSAGE_ADAPTER, Conversation, Message, Usage
 from .gitwork import TurnCheckpoint
-from .protocol.views import ViewState
+from .protocol.views import SessionSummary, ViewState
 from .images import ImageAttachment, ImageRef
 from .util import utcnow_iso as _utcnow_iso
 
@@ -222,20 +222,21 @@ class StoredSession(BaseModel):
     view: ViewState = Field(default_factory=ViewState)
 
 
-def _meta_block(stored: StoredSession) -> dict[str, Any]:
-    """The small summary block listing and last-used lookups read: no
-    conversation parsing needed on those paths.
+# Meta blocks written before it was a summary: old key -> field name.
+_LEGACY_META_KEYS = {"profile": "model", "sandbox_name": "sandbox"}
 
-    ``updated_at``/``schema`` are NOT duplicated here: the sessions table
-    has a column for each, and the loaders inject them back."""
-    visible = stored.conversation.visible_messages()
+
+def _meta_block(stored: StoredSession) -> dict[str, Any]:
+    """The small listing block, built without parsing a conversation on the
+    read path. ``name``/``updated_at`` live in their own columns."""
+    conversation = stored.conversation
     return {
-        "profile": stored.profile,
         "workspace": stored.workspace,
+        "model": stored.profile,
+        "sandbox": stored.sandbox_name,
         "parent_id": stored.parent_id,
-        "sandbox_name": stored.sandbox_name,
-        "message_count": len(visible),
-        "last_user_message_at": stored.conversation.last_user_message_at(),
+        "message_count": len(conversation.visible_messages()),
+        "last_user_message_at": conversation.last_user_message_at(),
     }
 
 
@@ -492,8 +493,8 @@ def load_state(name: str) -> StoredSession:
     return stored
 
 
-def load_meta(name: str) -> dict[str, Any] | None:
-    """One saved session's small meta block."""
+def load_meta(name: str) -> SessionSummary | None:
+    """One saved session's listing row."""
     try:
         with read_connection() as db:
             if db is None:
@@ -503,15 +504,12 @@ def load_meta(name: str) -> dict[str, Any] | None:
             ).fetchone()
     except sqlite3.Error:
         return None
-    return _meta_row(row)
+    return _meta_row(name, row)
 
 
-def load_metas() -> dict[str, dict[str, Any]]:
-    """Every saved session's meta block, in one query (listing hot path:
-    never parses conversations).
-
-    Side-effect free: no database file means no sessions, and the query runs
-    read-only — a ``--no-session`` host may call this at any time."""
+def load_metas() -> dict[str, SessionSummary]:
+    """Every saved session's listing row, in one query that never parses a
+    conversation. Side-effect free: a ``--no-session`` host may call it."""
     _warn_legacy_json_sessions()
     try:
         with read_connection() as db:
@@ -522,20 +520,19 @@ def load_metas() -> dict[str, dict[str, Any]]:
             ).fetchall()
     except sqlite3.Error:
         return {}
-    metas: dict[str, dict[str, Any]] = {}
+    metas: dict[str, SessionSummary] = {}
     for name, meta_json, updated_at in rows:
-        try:
-            meta = json.loads(meta_json)
-        except json.JSONDecodeError:
-            continue
-        meta["updated_at"] = updated_at
-        metas[name] = meta
+        meta = _meta_row(name, (meta_json, updated_at))
+        if meta is not None:
+            metas[name] = meta
     return metas
 
 
-def _meta_row(row: "tuple[str, str] | None") -> dict[str, Any] | None:
-    """Decode one (meta JSON, updated_at column) row, injecting the column
-    value the meta block deliberately does not duplicate."""
+def _meta_row(
+    name: str, row: "tuple[str, str] | None",
+) -> SessionSummary | None:
+    """Decode one (meta JSON, updated_at column) row, injecting the name and
+    the column value the meta block deliberately does not duplicate."""
     if row is None:
         return None
     meta_json, updated_at = row
@@ -543,8 +540,13 @@ def _meta_row(row: "tuple[str, str] | None") -> dict[str, Any] | None:
         meta = json.loads(meta_json)
     except json.JSONDecodeError:
         return None
-    meta["updated_at"] = updated_at
-    return meta
+    # A meta block written before the summary shape owned these names.
+    meta = {
+        _LEGACY_META_KEYS.get(key, key): value for key, value in meta.items()
+    }
+    return SessionSummary.model_validate(
+        {**meta, "name": name, "updated_at": updated_at},
+    )
 
 
 def delete_session(name: str) -> bool:

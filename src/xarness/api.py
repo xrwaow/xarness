@@ -5,7 +5,7 @@ so FastAPI generates the OpenAPI docs (``/docs``, ``/redoc``,
 ``/openapi.json``) straight from the same shapes the clients use.
 
 Handlers run commands through the session's serialized ``execute`` and
-await the result — they never touch the controller. Pure read-only queries
+await the result — they never touch session internals. Pure read-only queries
 (snapshots, diffs, lists) bypass that lock; they are safe because only the
 session mutates that state.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -26,7 +27,6 @@ from .config import ConfigError
 from .host import Host
 from .images import sniff_mime
 from .protocol import (
-    CommandEnvelope,
     CommandResult,
     ServerInfo,
     ServerStats,
@@ -38,6 +38,8 @@ from .session import Session, SessionError
 # Cap on one uploaded image blob (base64 inflation happens client-side; this
 # bounds the raw bytes the host buffers).
 MAX_IMAGE_UPLOAD = 20 * 1024 * 1024
+
+LOG = logging.getLogger(__name__)
 
 
 def create_app(host: Host) -> FastAPI:
@@ -58,6 +60,19 @@ def create_app(host: Host) -> FastAPI:
         violations) maps to one 400 with the message — handlers don't need
         their own try/except."""
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(Exception)
+    async def _unexpected_handler(request: Request, exc: Exception):
+        """An unexpected failure still names itself to the client, and the log
+    keeps the traceback: an auto-spawned host's stderr is /dev/null."""
+        LOG.error(
+            "unhandled error on %s %s", request.method, request.url.path,
+            exc_info=exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"{type(exc).__name__}: {exc}"},
+        )
 
     app.include_router(sessions_router(host))
     app.include_router(meta_router(host))
@@ -148,11 +163,11 @@ def sessions_router(host: Host) -> APIRouter:
     @router.post(
         "/sessions/{name:path}/commands",
         response_model=CommandResult,
-        summary="Send one command (CommandEnvelope); the reply goes only to the issuer",
+        summary="Send one command; the reply goes only to the issuer",
     )
-    async def post_command(name: str, envelope: CommandEnvelope) -> CommandResult:
+    async def post_command(name: str, command: protocol.Command) -> CommandResult:
         session = await _session_or_load(host, name)
-        return await session.execute(envelope.cmd_id, envelope.command)
+        return await session.execute(command)
 
     @router.get(
         "/sessions/{name:path}/images/{image_id}",
@@ -207,15 +222,6 @@ def sessions_router(host: Host) -> APIRouter:
         await asyncio.to_thread(session.images.store, data)
         return Response(status_code=201)
 
-    @router.patch(
-        "/sessions/{name:path}",
-        response_model=protocol.CommandResult,
-        summary="Update session settings (mode, model, sandbox, filters, refs)",
-    )
-    async def patch_session(name: str, body: protocol.SessionUpdate) -> protocol.CommandResult:
-        session = await _session_or_load(host, name)
-        return await session.update_settings(body)
-
     @router.get(
         "/sessions/{name:path}/quit",
         response_model=protocol.QuitVerdict,
@@ -234,9 +240,11 @@ def sessions_router(host: Host) -> APIRouter:
         response_model=protocol.DiffInfo,
         summary="Pending changes: summary and per-file diffs",
     )
-    async def diff(name: str, path: str | None = None) -> protocol.DiffInfo:
+    async def diff(
+        name: str, path: str | None = None, author: str | None = None,
+    ) -> protocol.DiffInfo:
         session = await _session_or_load(host, name)
-        return await session.diff_info(path)
+        return await session.diff_info(path, author)
 
     @router.get(
         "/sessions/{name:path}",

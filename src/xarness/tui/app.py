@@ -4,8 +4,8 @@ Owns the widget tree and renders the event stream of one headless
 :class:`~xarness.session.Session` running in the host process. All state
 and logic — the turn loop, tool execution, steering, undo/retry,
 accept/reject, compaction, persistence — live in the session; this process
-only renders events and sends commands. It never imports the controller,
-session, tools, gitwork or sandbox modules.
+only renders events and sends commands. It never imports the session, tools, gitwork or
+sandbox modules.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from ..images import ImageAttachment, ImageRef
 from ..protocol import (
     Accept,
     AnswerAsk,
+    AskQuestion,
     AskResolved,
     Cancel,
     CheckpointsChanged,
@@ -99,6 +100,7 @@ INPUT_PLACEHOLDER = (
     "Send a message…  (Enter: send · Shift+Enter: newline · Tab: mode)"
 )
 ASK_PLACEHOLDER = "Type your answer…  (Enter: send · Esc: skip)"
+
 
 # Shown while a session has no messages yet (notices such as /new's hint do
 # not count). Kept as lines so the view can centre it on either axis.
@@ -634,23 +636,19 @@ class AgentApp(App[None]):
     def _history_text(event: HistoryReplaced) -> str:
         """Render a history rewrite's outcome (compaction or rollback)."""
         if event.reason == "compaction":
+            prefix = "auto-compacted" if event.automatic else "compacted"
             if not event.before_tokens:
-                prefix = "auto-compacted" if event.automatic else "compacted"
                 return f"{prefix}: nothing to compact yet"
             counts = (
                 f"{event.before_tokens:,} → {event.after_tokens:,} tokens "
                 f"(freed {max(0, event.before_tokens - event.after_tokens):,})"
             )
-            prefix = "auto-compacted" if event.automatic else "compacted"
             # The handoff text itself is already rendered as a divider in the
             # rebuilt transcript; don't repeat it in a transient notice line.
             return f"{prefix}: {counts}"
         # rollback
         if not event.scope and not event.resend:
-            text = "compaction undone: pre-compaction history restored"
-            if event.resend:
-                text += " — nothing to retry (the turn is still in the conversation)"
-            return text
+            return "compaction undone: pre-compaction history restored"
         note = {
             "reverted": "file edits reverted",
             "no_edits": "no file edits to revert",
@@ -920,8 +918,12 @@ class AgentApp(App[None]):
         # answer — never a chat message or slash command. Empty text is
         # ignored so the "send now" Enter can't submit a blank answer.
         if self._ask_future is not None and not self._ask_future.done():
-            if event.text.strip():
+            answer = event.text.strip()
+            if answer:
                 self._ask_future.set_result(event.text)
+            elif (choice := self.query_one("#ask-bar", AskBar).selected()) is not None:
+                # Enter on an empty input takes the highlighted choice.
+                self._ask_future.set_result(choice)
             return
         text = event.text.strip()
         if not text:
@@ -988,6 +990,7 @@ class AgentApp(App[None]):
         # Draft chat: the session comes into existence on the server with
         # the first message.
         if self.session_name is None and not await self._ensure_session():
+            self._restore_unsent(text, images)
             return
         # Images travel as content-addressed references: the bytes are
         # uploaded once (PUT /images/{sha}), the command carries only the
@@ -1013,15 +1016,49 @@ class AgentApp(App[None]):
                 id=image.id, name=image.name, mime=image.mime,
                 width=image.width, height=image.height,
             ))
-        await self._send_command(SendMessage(text=text, images=refs or None))
+        result = await self._send_command(SendMessage(text=text, images=refs or None))
+        if result is None:
+            # The command never landed (transport failure, rejected send):
+            # the message is not in the conversation, so give it back.
+            self._restore_unsent(text, images)
+
+    def _restore_unsent(
+        self,
+        text: str,
+        images: list[ImageAttachment | ImageRef] | None = None,
+    ) -> None:
+        """Put an unsent message back in the input after a failed send.
+
+        The input was cleared on submit, so a failed round trip would
+        otherwise lose what the user wrote. Anything typed since is left
+        untouched: a draft is never clobbered."""
+        try:
+            chat_input = self.query_one("#chat-input", ChatInput)
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
+        if chat_input.text.strip():
+            return
+        self._show_in_input(text, images)
+
+    def _show_in_input(
+        self,
+        text: str,
+        images: list[ImageAttachment | ImageRef] | None = None,
+    ) -> None:
+        """Put a message (text and attachments) back in the input box."""
+        chat_input = self.query_one("#chat-input", ChatInput)
+        chat_input.restore(text, list(images or ()))
+        chat_input.focus()
 
     # ------------------------------------------------------------------
     # Ask tool (event-driven)
 
     @work(group="ask", exclusive=True)
-    async def _ask_flow(self, ask_id: str, questions: list[str]) -> None:
+    async def _ask_flow(self, ask_id: str, questions: list[AskQuestion]) -> None:
         """Show the questions one at a time in the AskBar; the user answers
-        through the normal chat input (Enter submits, Esc skips all). The
+        through the normal chat input (Enter submits, Esc skips all). A
+        question with choices takes its bare number or any other answer as a
+        write-in — the ask tool resolves the number into the choice. The
         collected answers go back as one ``answer_ask`` command — any client
         may answer; first answer wins."""
         self._set_title_state("ask")
@@ -1031,7 +1068,8 @@ class AgentApp(App[None]):
         answers: list[str] = []
         try:
             for index, question in enumerate(questions):
-                ask_bar.show_question(f"Question {index + 1}/{len(questions)}: {question}")
+                ask_bar.show_question(index + 1, len(questions), question)
+                chat_input.picker_active = bool(question.options)
                 chat_input.placeholder = ASK_PLACEHOLDER
                 chat_input.focus()
                 future: asyncio.Future[str | None] = (
@@ -1048,8 +1086,14 @@ class AgentApp(App[None]):
             self._ask_future = None
             self._ask_id = None
             ask_bar.hide()
+            chat_input.picker_active = False
             chat_input.placeholder = INPUT_PLACEHOLDER
             self._set_default_title()
+
+    def on_chat_input_picker_nav(self, event: ChatInput.PickerNav) -> None:
+        """Up/down while choices are on screen move the highlight, not the
+        caret — the input keeps focus for a write-in."""
+        self.query_one("#ask-bar", AskBar).move_selection(event.direction)
 
     def _on_ask_resolved(self, event: AskResolved) -> None:
         """Another client answered first: close this client's prompt.
@@ -1084,9 +1128,9 @@ class AgentApp(App[None]):
     def _accept(self) -> None:
         """Accept the pending changes directly, without a confirmation.
 
-        Accepting never discards your own drift (it stays pending), so there
-        is nothing to warn about when some rows came from another agent or
-        from bash: the host's notice reports that breakdown instead."""
+        Accepting locks in everything pending, drift included, so there is
+        nothing to warn about: the host's notice reports how much of it
+        wasn't this agent's work."""
         self._post_command(Accept())
 
     @work(group="confirm", exclusive=True)
@@ -1140,11 +1184,8 @@ class AgentApp(App[None]):
 
     def _put_back_user_text(self, result: CommandResult | None) -> None:
         """Restore an undone message's text and images to the input box."""
-        if result is None or not result.user_text:
-            return
-        chat_input = self.query_one("#chat-input", ChatInput)
-        chat_input.restore(result.user_text, list(result.images or ()))
-        chat_input.focus()
+        if result is not None and result.user_text:
+            self._show_in_input(result.user_text, result.images)
 
     def on_flow_view_clicked(self, event: FlowView.Clicked) -> None:
         """In-transcript clicks: expand/collapse tool calls and thinking
@@ -1296,13 +1337,14 @@ class AgentApp(App[None]):
             self.model = name
             self._sync_vision_from_config(name)
             self._refresh_status()
-            # No session yet: the host still owns the config file.
-            try:
-                await self.client.set_default_profile(name)
-            except ClientError as exc:
-                self._error(f"could not save default model: {exc}")
         else:
-            self._post_command(SwitchModel(name=name, persist_default=True))
+            self._post_command(SwitchModel(name=name))
+        # The host owns the config file; the default is one PUT for draft and
+        # live sessions alike.
+        try:
+            await self.client.set_default_profile(name)
+        except ClientError as exc:
+            self._error(f"could not save default model: {exc}")
         # The choice is now the config's default for the next session, so
         # keep the cached config in step: a later /new (which drops back to
         # a draft) read its status from here.
@@ -1585,8 +1627,8 @@ class AgentApp(App[None]):
         self._refresh_status()
 
     async def _on_history_replaced(self, event: HistoryReplaced) -> None:
-        """The conversation was rewritten (undo, retry, accept, compaction):
-        re-render from the new snapshot. A data-only rebuild
+        """The conversation was rewritten (undo, retry, compaction): re-render
+        from the new snapshot. A data-only rebuild
         is cheap under FlowView, so there is no incremental trim path."""
         # The snapshot also carries the fresh status (e.g. a cleared
         # pending_ask); adopt it so local prompts/bars don't keep showing
@@ -1594,8 +1636,7 @@ class AgentApp(App[None]):
         self._status = event.snapshot.status
         self._refresh_bars()
         await self._render_history(event.snapshot)
-        if event.reason in ("compaction", "rollback"):
-            self._notice(self._history_text(event))
+        self._notice(self._history_text(event))
         self._refresh_status()
         self.call_later(self.refresh_diff_summary)
 
@@ -1886,43 +1927,68 @@ class AgentApp(App[None]):
             )
             return
         widget = self.query_one("#diff-summary", DiffSummary)
-        try:
-            if not arg:
-                # Toggle: fully shown file list (no diff open) → hide the panel.
-                if widget.has_class("visible") and widget.has_class("expanded") and not widget.diff_shown:
-                    await widget.clear()
-                    return
-                await self.refresh_diff_summary()
-                if not widget.has_class("visible"):
-                    self._notice("no pending changes to diff")
-                    return
-                widget.add_class("expanded")
+        if not arg:
+            # Toggle: fully shown file list (no diff open) → hide the panel.
+            if widget.has_class("visible") and widget.has_class("expanded") and not widget.diff_shown:
+                await widget.clear()
                 return
-            text = (await self.client.diff(self.session_name, path=arg)).text or ""
-            if not text.strip():
-                self._notice(f"no pending changes for {arg}")
-                return
-            # Rebuild the row list first (a previous /diff toggle may have
-            # cleared it) so the active-row highlight has something to attach to.
             await self.refresh_diff_summary()
-            widget.show_diff(arg, text)
+            if not widget.has_class("visible"):
+                self._notice("no pending changes to diff")
+                return
+            widget.add_class("expanded")
+            return
+        # Rebuild the row list first when a previous /diff toggle cleared it,
+        # so a typed path can resolve to the row it names rather than to the
+        # whole file: the pane always shows the row's patch.
+        await self._open_diff(arg, None, reload_rows=True, prefix="/diff")
+
+    async def _open_diff(
+        self, path: str, author: str | None, *,
+        reload_rows: bool = False, prefix: str = "diff",
+    ) -> None:
+        """Fetch and show one row's patch; ``path`` may name a file alone."""
+        widget = self.query_one("#diff-summary", DiffSummary)
+        if reload_rows:
+            await self.refresh_diff_summary()
+        key = widget.resolve_key((path, author))
+        try:
+            text = (await self.client.diff(
+                self.session_name, path=key[0], author=key[1],
+            )).text or ""
         except ClientError as exc:
             widget.hide_diff()
-            self._error(f"/diff failed: {exc}")
+            self._error(f"{prefix} failed: {exc}")
+            return
+        if not text.strip():
+            self._notice(f"no pending changes for {path}")
+            return
+        widget.show_diff(key, text)
 
     async def on_diff_summary_scope_changed(
         self, event: DiffSummary.ScopeChanged,
     ) -> None:
-        """The chip flipped: save the scope on the session.
+        """The chip flipped: save the scope on the session and refetch.
 
-        The widget already applied it locally (so the list, the totals and
-        the open diff react immediately); this makes it session state, which
-        is what a reattach reads back. A draft chat has no session yet — the
-        selection goes out with the create request instead."""
+        The host builds the rows in the chosen granularity, so the panel is
+        reloaded from the saved choice rather than re-partitioning rows it
+        already has. A draft chat goes out with the create request instead."""
         if self.session_name is None:
             return
         self._diff_scope_pending = event.scope
-        self._post_command(SetViewState(view=ViewState(diff_scope=event.scope)))
+        result = await self._send_command(
+            SetViewState(view=ViewState(diff_scope=event.scope)),
+        )
+        if result is None:
+            # The host never took the choice: put the chip back where the
+            # session's saved scope says it belongs, or the list and the chip
+            # would disagree until the next reattach.
+            self._diff_scope_pending = None
+            await self.query_one("#diff-summary", DiffSummary).set_scope(
+                self.view_status.view.diff_scope,
+            )
+            return
+        await self.refresh_diff_summary()
 
     def _selected_diff_scope(self) -> DiffScope:
         """The scope the panel shows, for a session this app is creating."""
@@ -1935,22 +2001,12 @@ class AgentApp(App[None]):
         if self.session_name is None:
             return
         widget = self.query_one("#diff-summary", DiffSummary)
-        if widget.active_diff_key == event.key:
+        if widget.active_diff_key == (event.path, event.author):
             # Same affordance again: close the diff pane only — the file
             # list stays up with the row still highlighted (same state as
             # esc-minimize), so keyboard navigation keeps its context.
             widget.minimize_diff()
             return
-        try:
-            text = (await self.client.diff(
-                self.session_name, path=event.key)).text or ""
-        except ClientError as exc:
-            widget.hide_diff()
-            self._error(f"diff failed: {exc}")
-            return
-        if not text.strip():
-            self._notice(f"no pending changes for {event.key}")
-            return
-        widget.show_diff(event.key, text)
+        await self._open_diff(event.path, event.author)
 
     # ------------------------------------------------------------------

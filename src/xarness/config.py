@@ -197,8 +197,8 @@ class SandboxSettings(BaseModel):
     allow_git_write: bool = False
     auto_include_refs: list[RefSpec] = Field(default_factory=list)
     # Paths not mounted into the container (a mount exclusion, not a
-    # gitignore). Part of SandboxConfig.mount_key, so the persistent shell
-    # restarts when it changes.
+    # gitignore). Changing it changes the container argv, so the persistent
+    # shell restarts.
     filter_list: list[str] = Field(default_factory=list)
     # False = tools run as a user-level stateful bash on the host (an
     # unsandboxed mode; the TUI shows a visible marker). Formerly named

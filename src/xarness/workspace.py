@@ -11,6 +11,8 @@ tracked state is per workspace, not per session:
     rebaseline stop being revertible
   - ``auto``: the collapsed ignored-path listing as of the baseline
   - ``oversized``: paths over the size limit, which never enter a tree
+  - ``binary``: content-detected binaries (path -> size, mtime_ns), which
+    never enter a tree either and are not re-probed while unchanged
 
 It also owns the one persistent snapshot index and the lock that serializes
 snapshots, accept, reject and undo (a second ``git add`` on the same index
@@ -29,14 +31,14 @@ import json
 import os
 import shutil
 import sqlite3
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import gitwork, session_store
 from .errors import RefError
-from .protocol.views import DiffFileInfo, DiffGroup, DiffInfo
+from .protocol.views import DiffFileInfo, DiffGroup, DiffInfo, DiffScope
 from .util import utcnow_iso
 
 # Tools whose successful call is recorded as a workspace event.
@@ -60,7 +62,6 @@ class Event:
     diff would credit it with earlier agents' hunks in the same file. A
     ``run_bash`` event records none: its changes are never one agent's."""
 
-    seq: int
     session: str
     tool: str
     turn: str | None
@@ -90,9 +91,12 @@ class WorkspaceState:
     epoch: int = 0
     auto: tuple[str, ...] = ()
     oversized: tuple[str, ...] = ()
+    # Content-detected binaries: path -> (size, mtime_ns), a stat cache so an
+    # unchanged binary is never probed again. Persisted with the rest of the
+    # workspace state (an excluded binary stays untracked forever).
+    binary: dict[str, tuple[int, int]] = field(default_factory=dict)
     # Append-only per-workspace event log (pending until accept/reject).
     events: list[Event] = field(default_factory=list)
-    next_seq: int = 1
     # One lock per workspace: snapshots, accept, reject and undo must never
     # run ``git add -A`` on the same index file at once.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -131,14 +135,14 @@ class WorkspaceState:
     async def _snapshot(self) -> str:
         """Snapshot the worktree (the caller holds the lock).
 
-        Files that grew past the size limit are dropped from the snapshot AND
-        added to the exclusion set, or the next ``git add -A`` would re-hash
-        the same huge blob every time."""
+        A changed file that has grown past the size limit is dropped from the
+        snapshot AND added to the exclusion set, or the next ``git add -A``
+        would re-hash the same huge blob every time."""
         grown: list[str] = []
         tree = await gitwork.snapshot_tree(
             self.root, exclude=self.oversized, env_base=self.git_env(),
-            index=self.index_path, previous=self.head_tree or None,
-            oversized_out=grown,
+            index=self.index_path, oversized_out=grown,
+            binary_cache=self.binary,
         )
         if grown:
             known = set(self.oversized)
@@ -147,8 +151,10 @@ class WorkspaceState:
         return tree
 
     async def ignored(self) -> tuple[str, ...]:
-        """The workspace's ignored paths right now, collapsed per directory."""
-        return await gitwork.ignored_listing(self.root, self.git_env())
+        """The workspace's ignored paths right now, collapsed per directory:
+        git's pattern rules plus the binaries content sniffing found."""
+        listing = await gitwork.ignored_listing(self.root, self.git_env())
+        return _collapse_ignored((*listing, *self.binary))
 
     # -- event log ------------------------------------------------------
 
@@ -167,14 +173,25 @@ class WorkspaceState:
         if writes:
             paths = ()
         event = Event(
-            seq=self.next_seq, session=session, tool=tool, turn=turn,
+            session=session, tool=tool, turn=turn,
             changed=paths, auto=auto, writes=writes,
         )
-        self.next_seq += 1
-        self.events.append(event)
         if self.persist:
             with session_store.connection() as db:
                 _write_event(db, self.root, event)
+        self.events.append(event)
+
+    def _sync_events(self) -> None:
+        """Re-read the persisted log before using it: it belongs to the
+        workspace, not to this process, so a second window (or a ``xarness
+        -p`` run) appends to the same table and a stale copy would report an
+        older author's delta. A ``--no-session`` run has no table to read."""
+        if not self.persist:
+            return
+        events = _read_events(self.root)
+        if events is None:
+            return
+        self.events = events
 
     def clear_events(self) -> None:
         """Accept/reject acknowledged every pending event."""
@@ -198,15 +215,21 @@ class WorkspaceState:
 
     # -- diff, labelled per viewer --------------------------------------
 
-    def provenance(self) -> dict[str, dict[str, tuple[str | None, str | None]]]:
-        """``path -> {session: (before sha, after sha)}``, in event order.
+    def provenance(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, tuple[str | None, str | None]]],
+        dict[str, str],
+    ]:
+        """``path -> {session: (before sha, after sha)}``, in event order, and
+        ``path -> the session that wrote it last``.
 
         Each session's entry spans its own writes to the path — the blob it
         found before its first write and the blob it left after its last — so
-        its diff is that session's delta, not the whole file's pending change.
-        A session that writes twice with another agent in between absorbs the
-        interleaved change; the log has no per-line attribution to do better."""
+        its diff is that session's delta. A session that writes twice with
+        another agent in between absorbs the interleaved change."""
         chains: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+        last_writer: dict[str, str] = {}
         for event in self.events:
             for path, before, after in event.writes:
                 by_session = chains.setdefault(path, {})
@@ -214,13 +237,15 @@ class WorkspaceState:
                 by_session[event.session] = (
                     first[0] if first is not None else before, after,
                 )
-        return chains
+                last_writer[path] = event.session
+        return chains, last_writer
 
     async def diff(
         self,
         viewer: str | Collection[str] | None = None,
         current: str | None = None,
         path: str | None = None,
+        scope: DiffScope = "all",
     ) -> DiffInfo:
         """Every pending change since the baseline, labelled for ``viewer``.
 
@@ -231,14 +256,18 @@ class WorkspaceState:
         another session's events are never drift, and any path no event
         covers is drift.
 
-        A path with recorded provenance reports **one author's delta**: the
-        viewer's when it wrote the path, otherwise the last session that did,
-        with ``authors`` naming everyone (the file is shared). Paths with only
-        bash/drift changes have no author and keep the whole pending delta.
+        ``scope`` picks the granularity a shared file is reported in:
+        ``"all"`` is one row per path counting its whole pending change,
+        ``"mine"`` one row per author (the viewer's own delta leading, every
+        other session's in the foldable ``agent`` section). Either way a
+        row's counts are exactly the patch ``file_diff(path, author)``
+        returns for it; ``additions``/``deletions`` stay the workspace's
+        whole pending change.
 
-        With ``path``, only that path's row is built and no groups are
+        With ``path``, only that path's rows are built and no groups are
         listed: /diff <path> wants one row next to one diff, not the tree."""
         current = current or await self.snapshot()
+        self._sync_events()
         stat = await gitwork.tree_diff_stat(self, self.baseline_tree, current)
         # Pending path -> the sessions that wrote it explicitly. Only
         # write_file/edit_file count: bash changes and drift have no author.
@@ -256,48 +285,74 @@ class WorkspaceState:
         def is_mine(editors: Collection[str]) -> bool:
             if viewer is None:
                 return False
-            if isinstance(viewer, str):
-                return viewer in editors
-            return any(name in editors for name in viewer)
+            names = (viewer,) if isinstance(viewer, str) else viewer
+            return any(name in editors for name in names)
 
-        chains = self.provenance()
+        chains, last_writer = self.provenance()
 
-        async def file_row(
-            path: str, is_new: bool, pending: tuple[int, int] | None = None,
-        ) -> DiffFileInfo:
-            """One path's row: the shown author's own delta when the log has
-            provenance for it, else ``pending`` (the file's whole change)."""
+        def kind_of(editors: Collection[str] | None, bash_touched: bool) -> str:
+            if editors:
+                return "mine" if is_mine(editors) else "agent"
+            return "agent" if bash_touched else "drift"
+
+        async def path_rows(
+            path: str, is_new: bool, pending: tuple[int, int] | None,
+        ) -> tuple[list[DiffFileInfo], tuple[int, int]]:
+            """The rows one path contributes, and its whole pending delta.
+
+            ``pending`` is its change against the baseline, None for a path no
+            tree holds (an ignored one): then the span of the recorded writes
+            is the whole change."""
             by_session = chains.get(path)
             if by_session:
-                author, mine = _pick_author(by_session, viewer)
-                additions, deletions = await gitwork.blob_diff_stat(
-                    self, *by_session[author],
-                )
-                if pending and not (additions or deletions):
-                    # The path also changed outside that agent's writes (a
-                    # bash touch, or the user): the whole pending delta is
-                    # the honest count, and the explicit author the label.
-                    additions, deletions = pending
-                return DiffFileInfo(
-                    path=path, additions=additions, deletions=deletions,
-                    is_new=is_new, kind="mine" if mine else "agent",
-                    authors=tuple(by_session),
-                )
+                names = tuple(by_session)
+                whole = pending
+                if whole is None:
+                    whole = await gitwork.blob_diff_stat(
+                        self, by_session[names[0]][0], by_session[names[-1]][1],
+                    )
+                if scope == "all":
+                    # Every agent's edits (and anything else pending in the
+                    # file) in one row: what git reports for the path. The
+                    # badge names no single delta, so it follows the last
+                    # writer — the one the file is now as they left it.
+                    return [DiffFileInfo(
+                        path=path, additions=whole[0], deletions=whole[1],
+                        is_new=is_new,
+                        kind=kind_of((last_writer[path],), path in bash),
+                        authors=names,
+                    )], whole
+                rows = []
+                for name in names:
+                    before, after = by_session[name]
+                    additions, deletions = await gitwork.blob_diff_stat(
+                        self, before, after,
+                    )
+                    rows.append(DiffFileInfo(
+                        path=path, additions=additions, deletions=deletions,
+                        # Only the write that created the path is "new".
+                        is_new=is_new and before is None,
+                        kind="mine" if is_mine((name,)) else "agent",
+                        author=name, authors=names,
+                    ))
+                return rows, whole
             editors = explicit.get(path)
-            if editors:
-                kind = "mine" if is_mine(editors) else "agent"
-            else:
-                kind = "agent" if path in bash else "drift"
             additions, deletions = pending or (0, 0)
-            return DiffFileInfo(
+            return [DiffFileInfo(
                 path=path, additions=additions, deletions=deletions,
-                is_new=is_new, kind=kind, authors=tuple(sorted(editors or ())),
-            )
+                is_new=is_new, kind=kind_of(editors, path in bash),
+                authors=tuple(sorted(editors or ())),
+            )], (additions, deletions)
 
-        files = list(await asyncio.gather(*(
-            file_row(f.path, f.is_new, (f.additions, f.deletions))
+        built = await asyncio.gather(*(
+            path_rows(f.path, f.is_new, (f.additions, f.deletions))
             for f in stat.files if path is None or f.path == path
-        )))
+        ))
+        files = [row for rows, _ in built for row in rows]
+        # The header totals count the workspace, not the rows: per-author
+        # spans can overlap when agents interleave their writes.
+        additions = sum(whole[0] for _, whole in built)
+        deletions = sum(whole[1] for _, whole in built)
         current_ignored = await self.ignored()
         tracked = {f.path for f in files}
         for candidate in explicit:
@@ -309,7 +364,10 @@ class WorkspaceState:
             if candidate in tracked or (path is not None and candidate != path):
                 continue
             if _is_ignored(candidate, current_ignored):
-                files.append(await file_row(candidate, True))
+                rows, (adds, dels) = await path_rows(candidate, True, None)
+                files.extend(rows)
+                additions += adds
+                deletions += dels
         groups: list[DiffGroup] = []
         ignored_files = 0
         known = set(self.auto)
@@ -340,56 +398,59 @@ class WorkspaceState:
                 groups.append(DiffGroup(prefix=prefix, files=count, kind=kind))
         return DiffInfo(
             files=files, groups=groups,
-            additions=sum(row.additions for row in files),
-            deletions=sum(row.deletions for row in files),
+            additions=additions, deletions=deletions,
             ignored_files=ignored_files,
         )
 
     async def file_diff(
         self,
-        viewer: str | Collection[str] | None,
         path: str,
         current: str | None = None,
+        author: str | None = None,
     ) -> str:
-        """One file's unified diff for ``viewer``.
+        """One file's unified diff: the patch one row counts.
 
-        With recorded provenance the text is the shown author's own delta — the
-        same hunks its +A/-D row counts — so a shared file never displays an
-        earlier agent's lines as this one's work. Paths with no author (bash,
-        drift) keep the whole pending diff; an ignored path or group has no
-        baseline copy at all, so it reads as added."""
-        by_session = self.provenance().get(path)
-        if by_session:
-            author, _ = _pick_author(by_session, viewer)
-            return await gitwork.blob_diff_text(self, path, *by_session[author])
+        ``author`` names the session whose own delta the row shows (the blob
+        pair of its first-to-last write), so a shared file never displays an
+        earlier agent's lines as this one's. None means the path's whole
+        pending change; an ignored path has no baseline copy, so it reads as
+        added."""
+        self._sync_events()
+        by_session = self.provenance()[0].get(path) or {}
+        span = by_session.get(author) if author is not None else None
+        if span is not None:
+            return await gitwork.blob_diff_text(self, path, *span)
         if _is_ignored(path.rstrip("/"), await self.ignored()):
+            if by_session and author is None:
+                # An ignored path has no baseline copy, so its whole pending
+                # change is the log's own span (what its combined row counts)
+                # rather than "everything, added from nothing".
+                names = tuple(by_session)
+                return await gitwork.blob_diff_text(
+                    self, path, by_session[names[0]][0], by_session[names[-1]][1],
+                )
             return await gitwork.ignored_diff(self, path)
         return await gitwork.git_diff(self, path, current=current)
 
     # -- rebaselining ---------------------------------------------------
 
     async def accept(self) -> str:
-        """Lock in every non-drift change: the worktree becomes the new
-        baseline, but paths no event covers keep their old entry. Returns the
-        new baseline tree."""
+        """Lock in the worktree as it stands: every pending change, drift
+        included, becomes the new baseline. Returns the new baseline tree."""
         async with self.lock:
             current = await self._snapshot()
-            summary = await self.diff(current=current)
-            paths = [row.path for row in summary.files if row.kind != "drift"]
-            baseline = await gitwork.splice_tree(
-                self, self.baseline_tree, current, paths,
-            )
             self.auto = await self.ignored()
-            self.reset_to(baseline, current)
+            self.reset_to(current, current)
             self.clear_events()
             self.save()
-            return baseline
+            return current
 
     async def reject(self) -> tuple[str, ...]:
         """Discard every change since the baseline (drift included), remove
         the ignored groups events created, and reset. Returns the ignored
         files agents edited, which cannot be restored."""
         async with self.lock:
+            self._sync_events()
             ignored = await self.ignored()
             unrestorable = sorted({
                 path for event in self.events
@@ -402,7 +463,9 @@ class WorkspaceState:
             for group in sorted(
                 {g for event in self.events for g in event.auto} - known
             ):
-                _remove_path(self.root / group)
+                target = self.root / group
+                _remove_path(target)
+                _prune_empty_parents(self.root, target)
             self.reset_to(self.baseline_tree, self.baseline_tree)
             self.clear_events()
             self.save()
@@ -421,6 +484,7 @@ class WorkspaceState:
         content to merge into) conflict. Returns the conflicting paths, and
         touches nothing when any path conflicts."""
         async with self.lock:
+            self._sync_events()
             # path -> ("bytes", content) | ("absent", None) | ("tree", sha).
             # A tree is the untouched-file fast path: restoring it through
             # git keeps the mode (the exec bit) without reading it back.
@@ -482,15 +546,7 @@ class WorkspaceState:
                     target_path.write_bytes(value)
                     continue
                 _remove_path(target_path)
-                # Drop the directories the deletion left empty, up to (not
-                # including) the repo root.
-                parent = target_path.parent
-                while parent != self.root and self.root in parent.parents:
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        break
-                    parent = parent.parent
+                _prune_empty_parents(self.root, target_path)
             for tree, paths in by_tree.items():
                 await gitwork.restore_paths(self, tree, paths)
             self.drop_events(session, {turn_id for turn_id, _ in turns})
@@ -519,6 +575,7 @@ class WorkspaceState:
             "epoch": self.epoch,
             "auto": list(self.auto),
             "oversized": list(self.oversized),
+            "binary": {path: list(key) for path, key in self.binary.items()},
         }, separators=(",", ":"))
 
     def enable_persistence(self) -> None:
@@ -553,6 +610,32 @@ def _parse_writes(
     return tuple(writes)
 
 
+def _parse_binary(raw: Any) -> dict[str, tuple[int, int]]:
+    """The persisted binary cache (path -> size, mtime_ns); bad entries drop."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        path: (key[0], key[1]) for path, key in raw.items()
+        if isinstance(path, str) and path
+        and isinstance(key, (list, tuple)) and len(key) == 2
+        and all(isinstance(value, int) for value in key)
+    }
+
+
+def _collapse_ignored(paths: Iterable[str]) -> tuple[str, ...]:
+    """Drop entries already covered by a parent entry. Walks each path's
+    ancestors against the kept set: a sibling (``a/b!x``) can sort between a
+    parent (``a/b``) and its child (``a/b/c``), so sorting is not enough."""
+    kept: set[str] = set()
+    out: list[str] = []
+    for path in sorted(set(paths)):
+        parts = path.split("/")
+        if not any("/".join(parts[:i]) in kept for i in range(1, len(parts))):
+            kept.add(path)
+            out.append(path)
+    return tuple(out)
+
+
 def _write(
     db: sqlite3.Connection, root: Path, *,
     state: str | None = None, refs: str | None = None,
@@ -568,26 +651,6 @@ def _write(
         "refs = COALESCE(?, refs), updated_at = excluded.updated_at",
         (str(root), state or "", refs or "", utcnow_iso(), state, refs),
     )
-
-
-def _pick_author(
-    by_session: dict[str, tuple[str | None, str | None]],
-    viewer: str | Collection[str] | None,
-) -> tuple[str, bool]:
-    """The author whose delta a row shows, and whether it is the viewer's.
-
-    The viewer's own latest write wins (so a row it touched reads ``mine`` and
-    counts its hunks); otherwise the session that wrote the path last.
-    ``by_session`` preserves event order."""
-    if viewer is not None:
-        names = {viewer} if isinstance(viewer, str) else set(viewer)
-        mine = None
-        for name in by_session:
-            if name in names:
-                mine = name
-        if mine is not None:
-            return mine, True
-    return next(reversed(by_session)), False
 
 
 async def _tree_content(
@@ -636,12 +699,44 @@ def _row(root: Path) -> tuple[str, str] | None:
         return None
 
 
+def _read_events(root: Path) -> list[Event] | None:
+    """The workspace's persisted event log, oldest first (None when the
+    database cannot be read, so a transient failure never looks like an empty
+    log). An unreadable row is dropped, not fatal: its path still shows,
+    counted as the file's whole pending change."""
+    try:
+        with session_store.read_connection() as db:
+            rows = [] if db is None else db.execute(
+                "SELECT data FROM workspace_events WHERE root = ? "
+                "ORDER BY seq", (str(root),),
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    events = []
+    for (data,) in rows:
+        try:
+            raw = json.loads(data)
+            events.append(Event(
+                session=raw["session"], tool=raw["tool"],
+                turn=raw.get("turn"),
+                changed=tuple(raw.get("paths", ())),
+                auto=tuple(raw.get("auto", ())),
+                writes=_parse_writes(raw.get("writes")),
+            ))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return events
+
+
 def _write_event(db: sqlite3.Connection, root: Path, event: Event) -> None:
-    """Append one event row."""
+    """Append one event row. The sequence number comes from the table, not
+    from this process: two hosts would both claim ``seq=1`` and the primary
+    key would let the second write replace the first."""
     db.execute(
-        "INSERT OR REPLACE INTO workspace_events (root, seq, data) "
-        "VALUES (?, ?, ?)",
-        (str(root), event.seq, json.dumps({
+        "INSERT INTO workspace_events (root, seq, data) VALUES (?, "
+        "(SELECT COALESCE(MAX(seq), 0) + 1 FROM workspace_events "
+        "WHERE root = ?), ?)",
+        (str(root), str(root), json.dumps({
             "session": event.session, "tool": event.tool, "turn": event.turn,
             "paths": list(event.changed), "auto": list(event.auto),
             "writes": [list(write) for write in event.writes],
@@ -678,6 +773,17 @@ def _remove_path(target: Path) -> None:
         pass
 
 
+def _prune_empty_parents(root: Path, target: Path) -> None:
+    """Drop the directories a deletion left empty, up to the workspace root."""
+    for parent in target.parents:
+        if parent == root or root not in parent.parents:
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
 async def open_workspace(
     root: Path, *, persist: bool = True, allow_init: bool = True,
 ) -> "WorkspaceState | None":
@@ -700,28 +806,7 @@ async def open_workspace(
     )
     row = _row(state.root) if persist else None
     if persist:
-        # The persisted event log, oldest first (unreadable rows are dropped).
-        try:
-            with session_store.read_connection() as db:
-                rows = [] if db is None else db.execute(
-                    "SELECT seq, data FROM workspace_events WHERE root = ? "
-                    "ORDER BY seq", (str(state.root),),
-                ).fetchall()
-        except sqlite3.Error:
-            rows = []
-        for seq, data in rows:
-            try:
-                raw = json.loads(data)
-                state.events.append(Event(
-                    seq=seq, session=raw["session"], tool=raw["tool"],
-                    turn=raw.get("turn"),
-                    changed=tuple(raw.get("paths", ())),
-                    auto=tuple(raw.get("auto", ())),
-                    writes=_parse_writes(raw.get("writes")),
-                ))
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
-        state.next_seq = max((e.seq for e in state.events), default=0) + 1
+        state._sync_events()
     saved = {}
     if row is not None:
         try:
@@ -734,6 +819,7 @@ async def open_workspace(
         state.epoch = int(saved.get("epoch", 0))
         state.auto = tuple(saved.get("auto", ()))
         state.oversized = tuple(saved.get("oversized", ()))
+        state.binary = _parse_binary(saved.get("binary"))
         return state
     state.oversized = gitwork.oversized_paths(state.root)
     async with state.lock:

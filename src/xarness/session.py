@@ -1,10 +1,16 @@
 """Headless chat session: all conversation state and logic, no UI.
 
-One :class:`Session` owns the :class:`~xarness.controller.ChatController`,
-the tool registry, the sandbox, git tracking, the steering queue and the
-run state. It runs in a host process and outlives every client: a turn
-keeps going after the TUI that started it closes, and any number of
-clients attach to the same event stream.
+One :class:`Session` owns the conversation, the provider client, the tool
+registry, the sandbox, git tracking, the steering queue and the run state.
+It runs in a host process and outlives every client: a turn keeps going
+after the TUI that started it closes, and any number of clients attach to
+the same event stream.
+
+**One round, one home.** :meth:`_stream_round` streams exactly one model
+response and folds it into the history; :meth:`_run_turn` is the loop
+around it (execute the tool calls, inject steering, compact, repeat). Both
+live here rather than in a separate controller object, so the profile, the
+tools and the live-round state have exactly one owner.
 
 **Single writer.** All mutation flows through one per-session command lock:
 HTTP handlers ``await session.execute(...)`` — the asyncio.Lock (FIFO)
@@ -12,11 +18,10 @@ serializes commands, and the result goes only to the issuer. Pure
 read-only queries (snapshots, diffs) bypass the lock; they are safe
 because only the session mutates that state.
 
-**Fan-out.** :meth:`_emit` pushes every event to every subscriber queue.
-A client attaches through :meth:`subscribe`,
-which builds the snapshot synchronously (no await between building it
-and registering the subscriber, so no event can slip between the two)
-and then replays the live stream.
+**Fan-out.** :meth:`_emit` pushes every event to every subscriber queue. A
+client attaches through :meth:`subscribe`, which builds the snapshot
+synchronously (no await between building it and registering the subscriber,
+so no event can slip between the two) and then replays the live stream.
 """
 
 from __future__ import annotations
@@ -27,31 +32,35 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 from . import compaction, protocol, session_store
+from .client import ChatClient, StreamClient
+from .compaction import CHARS_PER_TOKEN
 from .config import (
     ConfigError,
     ProviderProfile,
     SandboxSettings,
     load_sectioned,
     resolve_api_key,
-    save_preferences,
     validate_filter_path,
 )
-from .controller import ChatController
 from .errors import RefError, SessionError
 from .conversation import (
+    AssistantMessage,
     Conversation,
     Message,
     RollbackPlan,
+    Timing,
     ToolCall,
+    ToolMessage,
     TurnStats,
+    Usage,
+    user_message,
 )
 from .gitwork import (
     GitWorktreeError,
@@ -65,12 +74,20 @@ from .prompts import system_prompt
 from .protocol import (
     Command,
     CommandResult,
+    ContentDelta,
     Event,
     HistoryReason,
     Mode,
+    PartialRound,
+    ReasoningDelta,
+    RoundComplete,
     SessionSummary,
     Snapshot,
     State,
+    StreamEvent,
+    ToolCallArgumentsDelta,
+    ToolCallArgumentsDone,
+    ToolCallStarted,
 )
 from .sandbox import (
     SandboxConfig,
@@ -92,10 +109,6 @@ from .workspace import (
 # Tools that can change the workspace; only these trigger a DiffChanged
 # event (read_file/search tools cannot).
 MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_bash"})
-
-# How many recent cmd_ids are remembered for dedupe (client retries must
-# not double-send a command).
-CMD_DEDUPE_LIMIT = 128
 
 # Trailing debounce for DiffChanged after a mutating tool (one in flight).
 DIFF_DEBOUNCE_SECONDS = 0.25
@@ -124,11 +137,6 @@ class _QueuedSteer:
 
 
 LOG = logging.getLogger(__name__)
-
-
-def _ok(**fields: Any) -> CommandResult:
-    """A successful command result (``cmd_id`` set by the caller)."""
-    return CommandResult(cmd_id="", ok=True, **fields)
 
 
 def _alive(task: asyncio.Task[None] | None) -> bool:
@@ -187,7 +195,7 @@ class Session:
         workspace_state: WorkspaceState | None = None,
         mode: Mode = "write",
         tool_output_limit: int | None = None,
-        client: Any = None,
+        client: StreamClient | None = None,
         config_path: Path | None = None,
         no_save: bool = False,
         parent_id: str | None = None,
@@ -231,20 +239,30 @@ class Session:
         )
         if tool_output_limit is not None:
             self.tool_registry.max_output_chars = tool_output_limit
-        self.controller = ChatController(
-            profile, api_key, tool_registry=self.tool_registry,
-            client=client,
-        )
-        self.controller.on_user_message = self._on_user_message
-        self._refresh_system_prompt()
-        if conversation is not None:
-            self.controller.conversation = conversation
 
-        # Run state (replaces the TUI's _turn_busy/_compacting flags). The
-        # event flips with it, so wait_idle() needs no polling.
-        self._state: State = "idle"
-        self._idle = asyncio.Event()
-        self._idle.set()
+        # The conversation, its provider client and the live-round state are
+        # the session's own: one owner, no second copy to keep in step.
+        self.conversation = conversation or Conversation()
+        self._client = client or ChatClient(profile, api_key)
+        # Cumulative session spend, folded together from every round's usage
+        # — including compaction's own summarization round and everything an
+        # /undo later removes. Monotonic: it counts everything ever spent.
+        self.usage_total = Usage(input_tokens=0, output_tokens=0)
+        # Usage of the most recent round, kept for the status payload
+        # (instead of re-scanning the message list on every status emit).
+        self.last_usage = Usage(input_tokens=0, output_tokens=0)
+        # The live round currently streaming — ONE accumulator for its
+        # reasoning, answer text and tool calls, read by the snapshot, the
+        # cancel path and the persist path.
+        self.partial_round = PartialRound()
+        # The system prompt is derived at request time (never persisted).
+        self.system_prompt: str | None = None
+        self._refresh_system_prompt()
+
+        # Run state. Nothing stores "running"/"idle": the tasks below are
+        # the state (see the property), so a task that dies without running
+        # its teardown can never leave a session claiming work it stopped.
+        self._compacting = False
         self._turn_task: asyncio.Task[None] | None = None
         self._compact_task: asyncio.Task[None] | None = None
         # The turn task currently inside its end-of-turn teardown. It is
@@ -270,7 +288,6 @@ class Session:
         self.images = session_store.SessionImageStore(
             self.name, persist=not no_save,
         )
-        self.controller.image_store = self.images
 
         # Debounced background persistence (see _persist). Appends are the
         # common case; a full rewrite happens after anything mutated the
@@ -287,9 +304,8 @@ class Session:
         # Fan-out.
         self._subscribers: list[asyncio.Queue[Event]] = []
 
-        # Command serialization (FIFO) + dedupe of client retries.
+        # Command serialization (FIFO).
         self._cmd_lock = asyncio.Lock()
-        self._recent_cmds: OrderedDict[str, CommandResult] = OrderedDict()
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -316,8 +332,8 @@ class Session:
         )
         # Restore the persisted token counters so the client's footer shows
         # real in/out/ctx immediately instead of 0 until the next round.
-        session.controller.usage_total = state.usage_total
-        session.controller.last_usage = state.last_usage
+        session.usage_total = state.usage_total
+        session.last_usage = state.last_usage
         # A loaded session can never have a running turn: a crash (or a
         # kill) left any open ones behind. Close them all — a turn left
         # "open" forever makes open_turn() return stale results. Tracked
@@ -341,6 +357,7 @@ class Session:
         await self._cancel_and_wait(self._turn_task)
         await self._cancel_and_wait(self._compact_task)
         self._compact_task = None
+        self._compacting = False
         await self._cancel_and_wait(self._diff_task)
         self._diff_task = None
         await self._flush_persist()
@@ -348,7 +365,7 @@ class Session:
         # path — explicit unload, delete, eviction, shutdown — releases it.
         await self.sandbox.close()
         # Release the provider connection pool.
-        client = getattr(self.controller, "_client", None)
+        client = self._client
         if client is not None and hasattr(client, "aclose"):
             await client.aclose()
 
@@ -357,7 +374,7 @@ class Session:
         """True while running, compacting, waiting on an ask, or holding an
         open event stream. Attached clients alone do not keep the host up."""
         return (
-            self._state != "idle"
+            self.state != "idle"
             or self._pending_ask is not None
             or bool(self._subscribers)
         )
@@ -376,7 +393,11 @@ class Session:
 
     @property
     def state(self) -> "State":
-        return self._state
+        """The activity state, derived from the work that causes it: a
+        session can never claim a turn nobody is running."""
+        if self._compacting:
+            return "compacting"
+        return "running" if _alive(self._turn_task) else "idle"
 
     @property
     def pending_ask(self) -> "protocol.PendingAsk | None":
@@ -384,7 +405,7 @@ class Session:
 
     def summary(self) -> SessionSummary:
         """The list row for this hosted session."""
-        state = self._state
+        state = self.state
         # A pending ask (the user owes it an answer) and a tool call in
         # flight both block the turn itself, so they read as their own
         # state in every activity state: "ask" for the first, "waiting"
@@ -408,10 +429,6 @@ class Session:
             tracking=self.workspace_state is not None,
         )
 
-    @property
-    def conversation(self) -> Conversation:
-        return self.controller.conversation
-
     # ------------------------------------------------------------------
     # fan-out
 
@@ -423,24 +440,17 @@ class Session:
         return event
 
     def _reset_partial(self) -> None:
-        self.controller.reset_partial()
+        """Drop the live round state (turn start, turn end, round boundary)."""
+        self.partial_round = PartialRound()
 
     def _track_partial(self, event: Event) -> None:
         """Fold the tool-execution events the session itself emits into the
-        live round state (the controller owns the model-stream half).
+        live round state (the model-stream half is folded in _stream_round).
 
         This is what lets an attach mid-tool-call render the call and its
         output so far without replaying an unbounded event log."""
-        partial = self.controller.partial_round
-        if isinstance(event, protocol.ToolOutputDelta):
-            call = partial.find_call(event.call_id)
-            if call is not None:
-                call.content += event.text
-        elif isinstance(event, protocol.ToolFinished):
-            call = partial.find_call(event.call_id)
-            if call is not None:
-                call.status = event.status
-                call.content = event.content
+        if event.type in ("tool_output_delta", "tool_finished"):
+            self.partial_round.apply(event)
 
     def subscribe(self) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
@@ -448,10 +458,6 @@ class Session:
         Synchronous on purpose: no await between building the snapshot and
         registering the queue, so the stream cannot move in between (no
         gap, no duplicate)."""
-        # Last line of defence before the snapshot: whatever stranded the
-        # state (see _heal_stranded), the attaching client must never be
-        # shown a live turn nobody is running.
-        self._heal_stranded()
         snapshot = self.snapshot()
         queue: asyncio.Queue[Event] = asyncio.Queue()
         self._subscribers.append(queue)
@@ -490,9 +496,9 @@ class Session:
             enable_tracking=self.workspace_state is not None,
             supports_vision=self.profile.supports_vision,
             tools=[tool.name for tool in self.tool_registry.tools()],
-            state=self._state,
-            usage_total=self.controller.usage_total,
-            last_usage=self.controller.last_usage,
+            state=self.state,
+            usage_total=self.usage_total,
+            last_usage=self.last_usage,
             queued=[
                 protocol.QueuedMessage(text=item.text, images=item.images)
                 for item in self._queued
@@ -512,9 +518,9 @@ class Session:
         is subtracted from the count."""
         others = max(0, self.clients_attached - 1)
         return protocol.QuitVerdict(
-            ask=(self._state in ("running", "compacting")
+            ask=(self.state in ("running", "compacting")
                  or self._pending_ask is not None) and others == 0,
-            state=self._state,
+            state=self.state,
             pending_ask=self._pending_ask is not None,
             other_clients=others,
         )
@@ -524,13 +530,9 @@ class Session:
         Messages are pydantic models, so they go over the wire as-is."""
         conversation = self.conversation
         return Snapshot(
-            messages=list(conversation.visible_messages()),
-            # The compacted-away prefix is history for the human, not the
-            # model: the client renders it so a resumed/compacted session
-            # still shows everything that happened before the handoff.
-            history=conversation.history_messages(),
+            messages=list(conversation.messages),
             status=self.status(),
-            partial_round=self.controller.partial_round or None,
+            partial_round=self.partial_round or None,
         )
 
     def last_user_message_at(self) -> str | None:
@@ -540,102 +542,21 @@ class Session:
     # ------------------------------------------------------------------
     # commands: serialized by the per-session lock
 
-    async def execute(self, cmd_id: str, command: Command) -> CommandResult:
+    async def execute(self, command: Command) -> CommandResult:
         """Run one command under the session lock and return its result.
 
-        Duplicate ``cmd_id``s return the cached result, so a client retry
-        never double-sends."""
-        if (cached := self._recent_cmds.get(cmd_id)) is not None:
-            return cached
+        A rejected command raises :class:`SessionError` (the API's 400); the
+        client only retries on a transport error, where the request was never
+        delivered, so there is nothing to dedupe."""
         if isinstance(command, LOCK_FREE):
             # Only touches a flag or a future: no lock, so a slow /accept
             # (seconds of git) can never delay a cancel or an answer.
-            result = await self._run_command(command)
-        else:
-            async with self._cmd_lock:
-                if (cached := self._recent_cmds.get(cmd_id)) is not None:
-                    return cached
-                result = await self._run_command(command)
-        result.cmd_id = cmd_id
-        self._recent_cmds[cmd_id] = result
-        while len(self._recent_cmds) > CMD_DEDUPE_LIMIT:
-            self._recent_cmds.popitem(last=False)
-        return result
-
-    async def update_settings(self, update: "protocol.SessionUpdate") -> CommandResult:
-        """PATCH /sessions/{name}: the settings commands on one typed body.
-
-        One path for settings: this builds the same commands the slash
-        commands use and runs them under the session lock, so a PATCH cannot
-        interleave with an /accept or a compaction. Everything is validated
-        BEFORE anything is applied, so a bad sandbox name never leaves a
-        half-applied request behind (the model switched, the sandbox
-        rejected). Errors come back as ``ok=False`` results, like every
-        command's."""
-        async with self._cmd_lock:
-            # Mode flips mid-turn are fine (SetMode allows it too); the
-            # history/sandbox-rewriting ones are idle-only.
-            if self._state != "idle" and (
-                update.model or update.sandbox
-                or update.filter_path or update.ref_path
-            ):
-                return CommandResult(
-                    cmd_id="", ok=False,
-                    error="wait for the current turn or compaction to finish first",
-                )
-            # Omitted flags default to ADD: a PATCH body that names a path
-            # but leaves the flag out must not silently become a removal.
-            filter_add = True if update.filter_add is None else update.filter_add
-            ref_add = True if update.ref_add is None else update.ref_add
-            # ---- validate everything first ----------------------------
-            try:
-                if update.model is not None:
-                    self._validate_model(update.model)
-                if update.sandbox is not None:
-                    self._resolve_sandbox_profile(update.sandbox)
-                if update.filter_path is not None:
-                    self._validate_filter(update.filter_path, add=filter_add)
-                if update.ref_path is not None:
-                    self._validate_ref(update.ref_path, add=ref_add)
-            except SessionError as exc:
-                return CommandResult(cmd_id="", ok=False, error=str(exc))
-            except Exception as exc:
-                return CommandResult(
-                    cmd_id="", ok=False, error=f"{type(exc).__name__}: {exc}",
-                )
-            # ---- apply, stopping at the first failure -----------------
-            result = _ok()
-            if update.mode is not None:
-                result = await self._run_command(
-                    protocol.SetMode(mode=update.mode))
-            if result.ok and update.model is not None:
-                result = await self._run_command(
-                    protocol.SwitchModel(name=update.model))
-            if result.ok and update.sandbox is not None:
-                result = await self._run_command(
-                    protocol.SetSandbox(name=update.sandbox))
-            if result.ok and update.filter_path is not None:
-                result = await self._run_command(
-                    protocol.Filter(path=update.filter_path, add=filter_add))
-            if result.ok and update.ref_path is not None:
-                result = await self._run_command(
-                    protocol.Ref(path=update.ref_path, add=ref_add))
-            return result
-
-    async def _run_command(self, command: Command) -> CommandResult:
-        try:
             return await self._dispatch(command)
-        except SessionError as exc:
-            return CommandResult(cmd_id="", ok=False, error=str(exc))
-        except (GitWorktreeError, RevertConflict) as exc:
-            return CommandResult(cmd_id="", ok=False, error=str(exc))
-        except Exception as exc:
-            return CommandResult(
-                cmd_id="", ok=False, error=f"{type(exc).__name__}: {exc}",
-            )
+        async with self._cmd_lock:
+            return await self._dispatch(command)
 
     async def _dispatch(self, command: Command) -> CommandResult:
-        if isinstance(command, IDLE_ONLY) and self._state != "idle":
+        if isinstance(command, IDLE_ONLY) and self.state != "idle":
             raise SessionError(
                 "wait for the current turn or compaction to finish first"
             )
@@ -676,42 +597,38 @@ class Session:
     # ------------------------------------------------------------------
     # state
 
-    def _set_state(self, state: State) -> None:
-        """Flip the state, wake wait_idle() and push the new status. Purely
-        local: the host's reaper polls for inactivity, so nothing here can
-        trigger an eviction and there is no callback ordering to respect."""
-        if self._state == state:
+    def _set_compacting(self, compacting: bool) -> None:
+        """Enter/leave the compacting state (a flag: the tasks are the rest
+        of the state) and push the new status."""
+        if self._compacting == compacting:
             return
-        self._state = state
-        if state == "idle":
-            self._idle.set()
-        else:
-            self._idle.clear()
+        self._compacting = compacting
         self._emit_status()
 
     async def wait_idle(self) -> None:
-        """Wait for the running turn (if any) to finish, including its
-        teardown. Returns at once when the session is already idle."""
-        await self._idle.wait()
+        """Wait for the running turn and compaction (if any) to finish,
+        including their teardown and the queued message it starts."""
+        while alive := {
+            task for task in (self._turn_task, self._compact_task)
+            if _alive(task)
+        }:
+            await asyncio.wait(alive)
 
     def _emit_status(self) -> None:
         """Push the current status to every client."""
         self._emit(protocol.StatusChanged(status=self.status()))
 
-    def _emit_notice(self, text: str, level: str = "info") -> None:
-        self._emit(protocol.Notice(text=text, level=level))  # type: ignore[arg-type]
-
-    def _history_event(
-        self, reason: HistoryReason = "rollback", **fields: Any,
-    ) -> protocol.HistoryReplaced:
-        return protocol.HistoryReplaced(snapshot=self.snapshot(), reason=reason, **fields)
+    def _emit_notice(self, text: str, level: protocol.Level = "info") -> None:
+        self._emit(protocol.Notice(text=text, level=level))
 
     def _commit_history(
         self, reason: HistoryReason = "rollback", **fields: Any,
     ) -> None:
         """Persist and broadcast the rewritten history in one step."""
         self._persist()
-        self._emit(self._history_event(reason, **fields))
+        self._emit(protocol.HistoryReplaced(
+            snapshot=self.snapshot(), reason=reason, **fields,
+        ))
 
     def _schedule_diff_changed(self) -> None:
         """Coalesce DiffChanged emissions: a dirty flag plus one loop task —
@@ -760,34 +677,29 @@ class Session:
                     f"image {ref.id[:12]}… ({ref.name!r}) was never uploaded "
                     "— PUT it to /sessions/{name}/images/{id} first"
                 )
-        if self._state != "idle":
+        if self.state != "idle":
             # Steering: queued until the next round boundary (or turn end).
             self._queued.append(_QueuedSteer(
                 command.text, command.images or None, _utcnow(),
             ))
             self._emit_status()
-            return _ok(queued=True)
+            return CommandResult()
         await self._start_turn(command.text, command.images or None)
-        return _ok(started=True)
+        return CommandResult()
 
     async def _start_turn(self, text: str, images: list[ImageRef] | None) -> None:
-        # Set synchronously, BEFORE create_task: the lock can dispatch the
-        # next queued command before the turn task gets its first slot, and
-        # a still-"idle" state would let a back-to-back send start a second
-        # turn instead of steering the first.
-        self._set_state("running")
         task = asyncio.get_running_loop().create_task(
             self._run_turn(text, images)
         )
-        # Safety net: if the task ever ends without reaching the teardown's
-        # state flip (an unexpected exception, a cancellation that slipped
-        # past the guards), heal the session instead of reporting a turn
-        # nobody is running any more.
-        task.add_done_callback(self._on_turn_done)
+        # Set synchronously, BEFORE the task can run: the lock can dispatch
+        # the next queued command before the turn task gets its first slot,
+        # and an idle state would let a back-to-back send start a second turn
+        # instead of steering the first.
         self._turn_task = task
+        task.add_done_callback(self._on_turn_done)
+        self._emit_status()
         # Yield once so the turn task actually starts: a task cancelled
-        # before its first step never runs its cleanup (state would stick
-        # at "running" forever).
+        # before its first step never runs its cleanup.
         await asyncio.sleep(0)
 
     def _cancellable(self, task: asyncio.Task[None] | None) -> bool:
@@ -823,42 +735,29 @@ class Session:
                 task.cancel()
 
     def _on_turn_done(self, task: asyncio.Task[None]) -> None:
-        """Heal a turn whose task ended without reaching the state flip."""
-        if self._turn_task is task:
-            self._turn_task = None
-            self._heal_stranded()
+        """Report a turn whose task died inside its own teardown (an
+        exception, or a cancel before its first step): nothing else would
+        announce an end the clients are still waiting for."""
+        if self._turn_task is not task:
+            return  # the normal teardown already ended the turn
+        self._turn_task = None
+        self._reset_partial()
+        self._emit_status()
+        self._emit(protocol.TurnEnded(outcome="failed"))
+        self._emit_notice(
+            "the turn ended unexpectedly and was reset to idle", "error",
+        )
 
     def _on_compact_done(self, task: asyncio.Task[None]) -> None:
-        """Same safety net for a detached compaction."""
+        """Clear the compacting flag a task that died before its first step
+        never cleared — a stuck session is never idle again."""
         if self._compact_task is task:
             self._compact_task = None
-            self._heal_stranded()
-
-    def _heal_stranded(self) -> None:
-        """End a "running"/"compacting" state whose task is gone.
-
-        Whatever stranded it — a task killed before its teardown, a path not
-        found yet — a session must never claim a turn it is not running:
-        every attach would render a live bar that never finishes, and
-        ``is_active`` would keep the host from ever evicting it."""
-        if self._state == "running" and not _alive(self._turn_task):
-            self._turn_task = None
-            self._reset_partial()
-            self._set_state("idle")
-            self._emit(protocol.TurnEnded(outcome="failed", elapsed=0.0))
-            self._emit_notice(
-                "the turn ended unexpectedly and was reset to idle", "error",
-            )
-        elif self._state == "compacting" and not _alive(self._compact_task):
-            self._compact_task = None
-            self._set_state("idle")
-            self._emit_notice("compaction ended unexpectedly", "error")
+            self._set_compacting(False)
 
     def _cmd_cancel(self) -> CommandResult:
-        if self._state == "idle":
-            return _ok(cancelled=False)
         self._cancel_work()
-        return _ok(cancelled=True)
+        return CommandResult()
 
     def _cmd_answer_ask(self, command: protocol.AnswerAsk) -> CommandResult:
         pending = self._pending_ask
@@ -872,15 +771,22 @@ class Session:
         self._emit(protocol.AskResolved(
             ask_id=command.ask_id, answers=command.answers,
         ))
-        return _ok()
+        return CommandResult()
 
     def _cmd_flush_queued(self) -> CommandResult:
         """Send the oldest queued message now: cancel the running turn or
         compaction; the cleanup starts the queued message immediately."""
-        if self._state == "idle" or not self._queued:
-            return _ok(flushed=False)
+        if self.state == "idle" or not self._queued:
+            return CommandResult()
         self._cancel_work()
-        return _ok(flushed=True)
+        return CommandResult()
+
+    def _cmd_discard_queued(self) -> CommandResult:
+        """Drop every steering message waiting for a round boundary."""
+        if self._queued:
+            self._queued.clear()
+            self._emit_status()
+        return CommandResult()
 
     async def _cmd_rollback(self, command: protocol.Rollback) -> CommandResult:
         """/undo (drop the last turn, put its user message back in the
@@ -898,7 +804,7 @@ class Session:
             scope = "last turn"
         if plan is None:
             self._emit_notice(f"nothing to {label}")
-            return _ok()
+            return CommandResult()
         return await self._apply_rollback(plan, resend=command.resend, scope=scope)
 
     async def _apply_rollback(
@@ -941,32 +847,32 @@ class Session:
             # A compaction undo has no user message to resend: starting a
             # turn with empty text would send a blank message to the model.
             await self._start_turn(plan.user_text, plan.images)
-            return _ok()
-        return _ok(user_text=plan.user_text or None, images=plan.images)
+            return CommandResult()
+        return CommandResult(user_text=plan.user_text or None, images=plan.images)
 
     async def _cmd_compact(self) -> CommandResult:
         """Start a manual compaction as a task: commands stay free (cancel
         works, commands keep flowing); the task drains the steering queue
         when it finishes."""
-        self._set_state("compacting")
+        self._set_compacting(True)
         task = asyncio.get_running_loop().create_task(self._run_compact())
-        task.add_done_callback(self._on_compact_done)
         self._compact_task = task
-        return _ok(started=True)
+        task.add_done_callback(self._on_compact_done)
+        return CommandResult()
 
     async def _run_compact(self) -> None:
         try:
-            result = await self.controller.compact()
+            result = await self.compact()
         except asyncio.CancelledError:
-            self._set_state("idle")
+            self._set_compacting(False)
             await self._start_queued()
             raise
         except Exception as exc:
-            self._set_state("idle")
+            self._set_compacting(False)
             self._emit_notice(f"compaction failed: {exc}", "error")
             await self._start_queued()
             return
-        self._set_state("idle")
+        self._set_compacting(False)
         if result is None:
             # Nothing to compact: a notice, not a history rewrite.
             self._persist()
@@ -989,14 +895,14 @@ class Session:
         return True
 
     async def _cmd_accept(self) -> CommandResult:
-        """Lock in the non-drift changes made so far (allowed mid-turn)."""
+        """Lock in every pending change, drift included (allowed mid-turn)."""
         ws = self.workspace_state
         if ws is None:
             raise SessionError(
                 "/accept: no change tracking for this session (the workspace "
                 "isn't a git repo, or tracking setup failed)"
             )
-        mid_turn = self._state != "idle"
+        mid_turn = self.state != "idle"
         try:
             summary = await ws.diff(self.name)
             await ws.accept()
@@ -1008,7 +914,7 @@ class Session:
                 "note: the current turn is still generating — it may keep "
                 "editing files on top of the accepted state", "warn",
             )
-        accepted = [row for row in summary.files if row.kind != "drift"]
+        accepted = summary.files
         foreign = [row for row in accepted if row.kind != "mine"]
         shared = [row for row in accepted if len(row.authors) > 1]
         if not summary.files:
@@ -1034,7 +940,7 @@ class Session:
                 f"-{summary.deletions} locked in{detail}; /diff is reset and "
                 "/undo can no longer revert them"
             )
-        return _ok()
+        return CommandResult()
 
     async def _cmd_reject(self) -> CommandResult:
         """Discard every change made since the last /accept (allowed
@@ -1045,7 +951,7 @@ class Session:
                 "/reject: no change tracking for this session (the workspace "
                 "isn't a git repo, or tracking setup failed)"
             )
-        mid_turn = self._state != "idle"
+        mid_turn = self.state != "idle"
         try:
             summary = await ws.diff(self.name)
             unrestorable = await ws.reject()
@@ -1072,13 +978,13 @@ class Session:
                 f"{len(unrestorable)} ignored file(s) edited by agents were "
                 "not restored: " + ", ".join(unrestorable[:5]), "warn",
             )
-        return _ok()
+        return CommandResult()
 
     def _cmd_set_mode(self, command: protocol.SetMode) -> CommandResult:
         self.mode = command.mode
         self._rebuild_tools()
         self._emit_status()
-        return _ok(mode=self.mode)
+        return CommandResult()
 
     def _cmd_set_view_state(self, command: protocol.SetViewState) -> CommandResult:
         """Remember the client's view choices with the session.
@@ -1089,19 +995,21 @@ class Session:
         self.view = command.view
         self._persist()
         self._emit_status()
-        return _ok(view=command.view)
+        return CommandResult()
 
     async def _cmd_switch_model(self, command: protocol.SwitchModel) -> CommandResult:
         profile = self._validate_model(command.name)
         api_key = resolve_api_key(profile)
-        self.controller.switch_profile(profile, api_key)
+        # Only the endpoint/key change; the conversation carries over.
+        switch = getattr(self._client, "switch_profile", None)
+        if switch is not None:
+            switch(profile, api_key)
         self.profile = profile
+        self.api_key = api_key
         self.profile_name = command.name
         self._persist()
-        if command.persist_default:
-            save_preferences(self.config_path, default_profile=command.name)
         self._emit_status()
-        return _ok(model=command.name)
+        return CommandResult()
 
     async def _cmd_set_sandbox(self, command: protocol.SetSandbox) -> CommandResult:
         """Switch this session's sandbox profile (idle only): the shell
@@ -1112,10 +1020,10 @@ class Session:
         self._emit_notice(
             f"sandbox switched to {name!r} — the persistent shell restarted"
         )
-        return _ok(sandbox=name)
+        return CommandResult()
 
     def _validate_model(self, name: str) -> "ProviderProfile":
-        """Shared validation for /model and PATCH: the resolved profile
+        """Shared validation for /model: the resolved profile
         (with its API key already checked), or SessionError."""
         if self.config_path is None:
             raise SessionError("/model unavailable: no config path known")
@@ -1129,17 +1037,16 @@ class Session:
             raise SessionError(f"could not switch model: {exc}") from exc
         return profile
 
-    def _validate_ref(self, path: str, add: bool) -> str:
-        """Shared validation for /ref and PATCH: the normalized path (or
-        SessionError). Existence is checked by change_workspace_ref, the one
-        place that also applies the change."""
+    def _validate_ref(self, path: str) -> str:
+        """The normalized /ref path, or SessionError. Existence is checked
+        by change_workspace_ref, the one place that also applies it."""
         raw = path.strip()
         if not raw or self.sandbox.settings is None:
             raise SessionError("references need a path and a sandbox")
         return raw
 
     def _validate_filter(self, path: str, add: bool) -> str:
-        """Shared validation for /filter (and PATCH): the normalized
+        """Shared validation for /filter: the normalized
         workspace-relative path, or SessionError."""
         try:
             rel = validate_filter_path(path).strip("/")
@@ -1176,23 +1083,19 @@ class Session:
             f"{rel} {verb} the sandbox mount exclusions — the persistent "
             "shell restarted"
         )
-        return _ok(filter_list=filters)
+        return CommandResult()
 
     # ------------------------------------------------------------------
     # External references
 
-    def _profile_refs(self) -> list:
-        """The sandbox profile's own refs (never touched by /ref)."""
-        settings = self.sandbox.settings
-        return list(settings.auto_include_refs) if settings is not None else []
-
-    def _ref_specs(self) -> list:
-        """The effective ref list: the profile's refs plus this workspace's."""
-        return [*self._profile_refs(), *self.workspace_refs]
-
     def _ref_infos(self) -> list[protocol.RefInfo]:
-        """The refs currently bound, for the client's status payload."""
-        specs = self._ref_specs()
+        """The refs currently bound, for the client's status payload: the
+        profile's own refs plus this workspace's."""
+        settings = self.sandbox.settings
+        specs = [
+            *(settings.auto_include_refs if settings is not None else ()),
+            *self.workspace_refs,
+        ]
         if self.sandbox.config is not None:
             return ref_infos(self.sandbox.config.external_refs)
         return ref_infos(
@@ -1207,7 +1110,7 @@ class Session:
         created in the worktree (or at any ref path). The add/remove logic
         is the workspace store's (:func:`change_workspace_ref`), shared with
         the host's workspace-level endpoint."""
-        raw = self._validate_ref(path, add)
+        raw = self._validate_ref(path)
         try:
             specs, host = change_workspace_ref(
                 self.workspace, raw, add, save=False,
@@ -1230,7 +1133,7 @@ class Session:
             + (" — the persistent shell restarted"
                if self.sandbox.shell is not None else "")
         )
-        return _ok(refs=self._ref_infos())
+        return CommandResult()
 
     async def apply_ref_specs(self, specs: list[str]) -> None:
         """Apply a workspace's canonical ref list to this live session.
@@ -1264,11 +1167,10 @@ class Session:
     async def _apply_sandbox_settings(
         self, name: str | None, settings: SandboxSettings, save: bool = True,
     ) -> None:
-        """Apply new sandbox settings (idle only). The existing runtime is
-        mutated in place where possible: the persistent shell restarts
-        itself on the next command when the mount key changed, so only an
-        unsandboxed<->container switch (or a failed build) needs a new
-        SandboxSession.
+        """Apply new sandbox settings (idle only). The persistent shell is
+        adopted in place: it restarts itself on the next command when its
+        argv changed, so only an unsandboxed<->container switch (or a failed
+        build) needs a new SandboxSession.
 
         ``save=False`` for a workspace-refs-only change: the profile's own
         settings stay what the session was saved with, and the workspace refs
@@ -1282,25 +1184,21 @@ class Session:
         except SandboxUnavailable as exc:
             config = None
             self._emit_notice(f"warning: filesystem/bash tools disabled: {exc}", "warn")
-        if config is None or old.config is None:
-            # Unavailable (tools disabled) or leaving container mode: a
-            # fresh runtime, without a shell when config is None.
-            runtime = SandboxRuntime(
-                config=config,
-                shell=(SandboxSession(
-                    config, default_timeout=settings.default_timeout,
-                ) if config is not None else None),
-                name=name, settings=settings,
-            )
-            runtime.set_mode(self.mode)
-            await old.close()
-            self.sandbox = runtime
-        else:
-            old.config = config
+        if config is not None and old.shell is not None:
+            # Same container mode: the persistent shell adopts the new config
+            # and restarts itself on the next command if its argv changed.
             old.shell.adopt(config, default_timeout=settings.default_timeout)
-            old.name = name
-            old.settings = settings
-            old.set_mode(self.mode)
+            shell = old.shell
+        else:
+            # Entering or leaving container mode (or a failed build): the old
+            # shell cannot follow the config, so start over without one.
+            await old.close()
+            shell = None if config is None else SandboxSession(
+                config, default_timeout=settings.default_timeout,
+            )
+        self.sandbox = SandboxRuntime(
+            config=config, shell=shell, name=name, settings=settings,
+        )
         self._rebuild_tools()
         if save:
             self._persist()
@@ -1309,9 +1207,9 @@ class Session:
     # ------------------------------------------------------------------
     # turn loop
 
-    def _on_user_message(self, message: Message) -> None:
-        """Controller hook: a user message landed in the history. This is
-        the only way any client learns about it (no local echo)."""
+    def _emit_user_message(self, message: Message) -> None:
+        """A user message landed in the history. This is the only way any
+        client learns about it (no local echo)."""
         if message.timing.send is None:
             message.timing.send = _utcnow()
         # On disk before the turn does any work: a host killed mid-turn (a
@@ -1320,6 +1218,162 @@ class Session:
         # it shows an empty transcript instead of the interrupted turn.
         self._persist()
         self._emit(protocol.MessageAdded(message=message))
+
+    def _begin_turn(
+        self, text: str, images: list[ImageRef] | None, before_tree: str | None,
+    ) -> None:
+        """Add the user message and open the turn's checkpoint.
+
+        The checkpoint is ALWAYS attached — with ``before_tree=None`` when
+        there is no tracking or the snapshot failed — so every turn has an
+        entry and a rollback never guesses its scope."""
+        message = user_message(text, images, self.images)
+        self.conversation.add(message)
+        self.conversation.begin_turn(
+            message, before_tree,
+            self.workspace_state.epoch if self.workspace_state else 0,
+        )
+        self._emit_user_message(message)
+
+    async def _stream_round(self) -> AsyncIterator[StreamEvent]:
+        """Stream one round — one full model response — into the history.
+
+        If the round made tool calls (``RoundComplete.has_tool_calls``),
+        :meth:`_run_turn` executes them, records the results and calls this
+        again; the loop lives there."""
+        partial = self.partial_round = PartialRound()
+        done_calls: list[ToolCall] = []
+        first_reasoning_at: float | None = None
+        # The cot block ends where the answer or the first tool call starts —
+        # tool-argument streaming counts as call time, not thinking time.
+        first_answer_at: float | None = None
+
+        async for event in self._client.stream(
+            self.conversation.to_wire(
+                keep_reasoning=self.profile.keep_reasoning,
+                system=self.system_prompt,
+                image_loader=self._image_url,
+            ),
+            tools=self.tool_registry.schema(),
+        ):
+            if isinstance(event, (
+                ReasoningDelta, ContentDelta, ToolCallStarted,
+                ToolCallArgumentsDelta, ToolCallArgumentsDone,
+            )):
+                if isinstance(event, ReasoningDelta) and first_reasoning_at is None:
+                    first_reasoning_at = time.monotonic()
+                if isinstance(event, (ContentDelta, ToolCallStarted)) \
+                        and first_answer_at is None:
+                    first_answer_at = time.monotonic()
+                partial.apply(event)
+                if isinstance(event, ToolCallArgumentsDone):
+                    # Authoritative once the stream is done parsing; the
+                    # client has already assembled the full arguments.
+                    done_calls.append(ToolCall(
+                        call_id=event.call_id, name=event.name,
+                        arguments_json=event.arguments_json,
+                    ))
+            elif isinstance(event, RoundComplete):
+                reasoning = partial.reasoning or None
+                content = partial.content
+                # The message is in the history now: only the tool calls
+                # still executing remain live.
+                partial.reasoning = ""
+                partial.content = ""
+                reasoning_seconds: float | None = None
+                if first_reasoning_at is not None:
+                    end = first_answer_at or time.monotonic()
+                    reasoning_seconds = end - first_reasoning_at
+                usage = event.usage or self._estimate_usage(content)
+                self._fold_usage(usage)
+                self.conversation.add(AssistantMessage(
+                    content=content,
+                    reasoning=reasoning,
+                    tool_calls=done_calls or None,
+                    usage=usage,
+                    # Measured while the round streamed, never reconstructed
+                    # from stamps afterwards.
+                    timing=Timing(reasoning_seconds=reasoning_seconds),
+                ))
+                event = RoundComplete(
+                    usage=usage,
+                    has_tool_calls=bool(done_calls),
+                )
+            yield event
+
+    def record_tool_result(self, call_id: str, result: Any) -> None:
+        """Append a ``tool`` message with the outcome of one call.
+
+        ``content`` is stored as-is — a failing call keeps its real output,
+        so failing test output reaches the model."""
+        self.conversation.add(ToolMessage(
+            tool_call_id=call_id, content=result.content, status=result.status,
+        ))
+
+    def _save_interrupted_round(self) -> bool:
+        """Persist the partial round a turn was streaming when it ended early.
+
+        Called both when the user interrupts a turn (cancel, or a forced
+        steer that cancels it) and when a round ends without completing (a
+        provider or transport error). Keeps the assistant text and the
+        partial chain of thought that had arrived — including a
+        reasoning-only segment. Returns True when a message was added; a round
+        with neither text nor reasoning leaves the history untouched.
+
+        Only the model-stream half is consumed: the tool calls stay live so
+        the session can fold the tool-execution events into them, and an
+        attach during those tools renders them."""
+        partial = self.partial_round
+        content = partial.content
+        reasoning = partial.reasoning or None
+        partial.content = ""
+        partial.reasoning = ""
+        if not content and not reasoning:
+            return False
+        self.conversation.add(AssistantMessage(
+            content=content, reasoning=reasoning, interrupted=True,
+        ))
+        return True
+
+    def _image_url(self, ref: ImageRef) -> str | None:
+        """A data URL for one stored image (from the blob store's cache);
+        None when the blob is gone."""
+        return self.images.data_url(ref)
+
+    def _fold_usage(self, usage: Usage) -> None:
+        """Add one round's usage to the cumulative session total. Copies, so
+        already-emitted status payloads keep their point-in-time values."""
+        self.usage_total = self.usage_total + usage
+        self.last_usage = usage.model_copy()
+
+    def _estimate_usage(self, content: str) -> Usage:
+        prompt_chars = sum(
+            len(message.content or "")
+            for message in self.conversation.visible_messages()
+        )
+        return Usage(
+            input_tokens=prompt_chars // CHARS_PER_TOKEN,
+            output_tokens=len(content) // CHARS_PER_TOKEN,
+            approximate=True,
+        )
+
+    async def compact(self) -> "compaction.CompactionResult | None":
+        """Summarize the conversation and shrink the visible slice to the
+        summary message (old messages stay in the append-only list and come
+        back if the summary is popped). Returns the
+        :class:`~xarness.compaction.CompactionResult`, or None when there was
+        nothing to do."""
+        result = await compaction.compact(
+            self.conversation, self._client,
+            system=self.system_prompt,
+            keep_reasoning=self.profile.keep_reasoning,
+            image_loader=self._image_url,
+        )
+        if result is None:
+            return None
+        if result.usage is not None:
+            self._fold_usage(result.usage)
+        return result
 
     async def _run_turn(self, text: str, images: list[ImageRef] | None) -> None:
         """Drive the full exchange: rounds of (thinking → answer → tools).
@@ -1330,33 +1384,37 @@ class Session:
         _start_turn, synchronously before the task existed."""
         self._reset_partial()
         turn_start = time.monotonic()
+        # Streaming + tool time, measured as it happens (see _close_out_turn).
+        busy = 0.0
         outcome = "finished"
         try:
             # Start-of-turn auto-compaction: the threshold may have been
             # crossed right at the previous turn's end, where compacting
             # would only produce a handoff the model answers redundantly.
             await self._maybe_auto_compact()
-            stream = self.controller.begin_turn(
-                text, images, await self._take_checkpoint(),
-                self.workspace_state.epoch if self.workspace_state else 0,
-            )
+            self._begin_turn(text, images, await self._take_checkpoint())
+            stream = self._stream_round()
             saw_stream_error = False
             while True:
+                round_start = time.monotonic()
                 async for event in stream:
                     if isinstance(event, protocol.StreamError):
                         saw_stream_error = True
                     self._emit(event)
+                # A round is busy from its request to its last event (the
+                # same span the old per-message stamps covered); whatever is
+                # left of the turn is queueing and teardown, i.e. idle.
+                busy += time.monotonic() - round_start
                 # A round that ended without finishing — a provider or
-                # transport error, say — still streamed something. Keep the
-                # partial answer (the controller decides what counts).
-                if self.controller.save_interrupted_round():
+                # transport error, say — still streamed something: keep the
+                # partial answer (see _save_interrupted_round).
+                if self._save_interrupted_round():
                     self._persist()
                 # The round folded its usage into the totals: push a fresh
                 # status so clients update in/out/ctx per round while the
-                # turn keeps streaming (the state is unchanged, so
-                # _set_state would not emit).
+                # turn keeps streaming.
                 self._emit_status()
-                # The controller stamped this round's tool calls onto the
+                # The provider stamped this round's tool calls onto the
                 # assistant message at RoundComplete; read them from there
                 # instead of accumulating a second list.
                 last = self.conversation.messages[-1] if self.conversation.messages else None
@@ -1371,8 +1429,10 @@ class Session:
                     # start instead (see the top of this method).
                     break
                 # Execute the calls this round requested, in stream order.
+                tool_start = time.monotonic()
                 for call in done_calls:
                     await self._execute_call(call)
+                busy += time.monotonic() - tool_start
                 self._persist()
                 # Steering: anything queued while this round streamed is
                 # injected here — after the tool answers, before the next
@@ -1388,7 +1448,7 @@ class Session:
                 # not only when the whole turn ends — a long tool loop must
                 # not overshoot the context window.
                 await self._maybe_auto_compact()
-                stream = self.controller.stream_round()
+                stream = self._stream_round()
             # A provider error ended the last stream: the round produced no
             # final answer, so the turn did not finish.
             if saw_stream_error:
@@ -1401,13 +1461,13 @@ class Session:
         except asyncio.CancelledError:
             outcome = "cancelled"
             # Keep whatever the model had produced before the interruption.
-            if self.controller.save_interrupted_round():
+            if self._save_interrupted_round():
                 self._persist()
             self._repair_tool_calls()
             self._emit_notice("interrupted", "error")
         except Exception as exc:
             outcome = "failed"
-            if self.controller.save_interrupted_round():
+            if self._save_interrupted_round():
                 self._persist()
             self._repair_tool_calls()
             self._emit_notice(f"turn failed: {type(exc).__name__}: {exc}", "error")
@@ -1419,11 +1479,15 @@ class Session:
             # (see _cancellable).
             self._finishing_turn = asyncio.current_task()
             try:
-                await self._close_out_turn(outcome, turn_start)
+                await self._close_out_turn(
+                    outcome, time.monotonic() - turn_start, busy,
+                )
             finally:
                 self._finishing_turn = None
 
-    async def _close_out_turn(self, outcome: str, turn_start: float) -> None:
+    async def _close_out_turn(
+        self, outcome: str, total: float, busy: float,
+    ) -> None:
         """End-of-turn teardown: snapshot the workspace, persist, flip to
         idle, announce.
 
@@ -1440,11 +1504,10 @@ class Session:
             # The turn's numbers are the host's to record (see
             # Conversation.stamp_turn_end): stamped onto the turn's last
             # answer before the write, so a reload and a live client read the
-            # same figures. A turn cut short reports how long it ran — it
-            # ended too, just not on its own terms.
+            # same figures. A turn cut short reports how long it ran but no
+            # busy/idle split — its rounds were not measured to an end.
             stats = self.conversation.stamp_turn_end(
-                None if outcome == "finished"
-                else time.monotonic() - turn_start,
+                total, busy if outcome == "finished" else None,
             )
             self._persist()
             await self._flush_persist()
@@ -1456,20 +1519,14 @@ class Session:
             )
         finally:
             self._reset_partial()
-            self._set_state("idle")
-            # After the state flip: TurnEnded describes the end and must not
-            # be buffered as a live turn event for the next attach. The
-            # numbers are the ones just stamped on the turn's last answer, so
-            # a live footer and a replayed one are identical.
-            stamped = {} if stats is None else {
-                "total": stats.total, "busy": stats.busy,
-                "idle": stats.idle, "usage": stats.usage,
-            }
-            self._emit(protocol.TurnEnded(
-                outcome=outcome, elapsed=time.monotonic() - turn_start,
-                **stamped,
-            ))
+            # Clearing the task IS the flip to idle (see the state property):
+            # the status goes out before TurnEnded, which describes the end
+            # and must not be buffered as a live turn event for the next
+            # attach. The numbers are the ones just stamped on the turn's
+            # last answer, so a live footer and a replayed one are identical.
             self._turn_task = None
+            self._emit_status()
+            self._emit(protocol.TurnEnded(outcome=outcome, stats=stats))
         await self._emit_diff_changed()
         # A queued message sent at the exact end of the turn (or a
         # "send queued now" cancel) starts immediately.
@@ -1478,7 +1535,6 @@ class Session:
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
         self._emit(protocol.ToolExecStarted(call_id=call.call_id))
-        start = _utcnow()
         call_id = call.call_id
         remaining = self.tool_registry.max_output_chars
 
@@ -1505,9 +1561,14 @@ class Session:
             )
         finally:
             self._executing_tool = None
-        if record is not None and result.status == "ok":
+        # A command's change is measured from its before/after snapshots, so
+        # it is recorded whatever the exit status: a failing command still
+        # leaves its writes on disk. Explicit writes keep the success gate.
+        if record is not None and (
+            result.status == "ok"
+            or (call.name == "run_bash" and result.status != "parse_error")
+        ):
             await record()
-        end = _utcnow()
         self._emit(protocol.ToolFinished(
             call_id=call_id, status=result.status, content=result.content,
         ))
@@ -1515,11 +1576,7 @@ class Session:
             # Coalesced: a burst of run_bash calls must not trigger a git
             # snapshot each; one trailing debounce covers them all.
             self._workspace_changed()
-        # Refresh the footer's in/out/ctx per message, not just per round.
-        self._emit_status()
-        self.controller.record_tool_result(
-            call_id, result, start_time=start, end_time=end,
-        )  # Timing wraps the two stamps inside the controller
+        self.record_tool_result(call_id, result)
 
     def _write_target(
         self, ws: WorkspaceState, call: ToolCall,
@@ -1552,12 +1609,9 @@ class Session:
     async def _observe(
         self, ws: WorkspaceState, call: ToolCall,
     ) -> Callable[[], Awaitable[None]] | None:
-        """The log step for one tool call, with its "before" state read now.
-
-        A mutating tool is observed *before* it runs, so the event it records
-        describes this call's own change and never credits it with drift that
-        happened earlier. None for a call that never logs (read-only tools,
-        or arguments that name no file inside the workspace)."""
+        """The log step for one tool call, with its "before" state read now,
+        so the event describes this call's own change. None for a call that
+        never logs (read-only tools, or no file inside the workspace)."""
         if call.name in _EXPLICIT_WRITES:
             target = self._write_target(ws, call)
             if target is None:
@@ -1626,14 +1680,18 @@ class Session:
 
     def _inject_queued(self) -> None:
         """Inject the steering queue at a round boundary: the messages land
-        in the history (with their original send_time) and fire the
-        on_user_message hook, so the next LLM call sees them."""
+        in the history (with their original send_time) so the next LLM call
+        sees them. No checkpoint of their own: they belong to the turn that
+        is already running."""
         if not self._queued:
             return
         for item in self._queued:
-            self.controller.inject_user_message(
-                item.text, item.images, send_time=item.send_time,
+            message = user_message(
+                item.text, item.images, self.images,
+                timing=Timing(send=item.send_time),
             )
+            self.conversation.add(message)
+            self._emit_user_message(message)
         self._queued.clear()
         self._emit_status()
 
@@ -1646,7 +1704,7 @@ class Session:
     # ------------------------------------------------------------------
     # ask tool
 
-    async def _ask_user(self, questions: list[str]) -> list[str] | None:
+    async def _ask_user(self, questions: list[protocol.AskQuestion]) -> list[str] | None:
         """Callback for the ask tool: surface pending_ask and wait for an
         ``answer_ask`` command from any attached client. If nobody is
         attached it waits indefinitely — the session is headless and the
@@ -1747,10 +1805,11 @@ class Session:
     def _refresh_system_prompt(self) -> None:
         """Derive the mode-aware system prompt for the next request. It is
         never persisted in the conversation."""
-        self.controller.system_prompt = system_prompt(
+        self.system_prompt = system_prompt(
             self.sandbox.config, self.mode,
             tracked=self.workspace_state is not None,
             git_write=self.sandbox.allow_git_write,
+            default_timeout=self._tool_timeout(),
         )
 
     def _tool_timeout(self) -> float:
@@ -1770,7 +1829,6 @@ class Session:
             spawn_subagent=self._spawn_subagent,
         )
         self.tool_registry.max_output_chars = limit
-        self.controller.tools = self.tool_registry
         self._refresh_system_prompt()
 
     def _persist(self) -> None:
@@ -1811,8 +1869,8 @@ class Session:
             parent_id=self.parent_id,
             sandbox_name=self.sandbox.name,
             sandbox_settings=self.sandbox.settings,
-            usage_total=self.controller.usage_total,
-            last_usage=self.controller.last_usage,
+            usage_total=self.usage_total,
+            last_usage=self.last_usage,
             view=self.view,
         )
         from_seq = self.conversation.take_dirty_from()
@@ -1833,8 +1891,8 @@ class Session:
                 # A failed write must not leave the watermark ahead of disk:
                 # reset to the serialize-time point so the next _persist()
                 # rewrites from there. Swallowing keeps the turn alive — a
-                # persist failure must not skip _set_state("idle")/
-                # TurnEnded in _run_turn's finally.
+                # persist failure must not skip the teardown that reports
+                # the end of the turn.
                 LOG.exception("persist failed for session %s", self.name)
                 self.conversation._mark_dirty(payload["from_seq"])
                 return
@@ -1848,77 +1906,78 @@ class Session:
                 pass
             self._persist_task = None
 
-    async def _maybe_auto_compact(self) -> bool:
+    async def _maybe_auto_compact(self) -> None:
         """Compact when the context nears the window.
 
-        Called at every round boundary (and on the turn's final round), so a
-        long multi-round turn cannot overshoot ``max_context``. Returns True
-        when a compaction happened — the caller keeps the turn going, so the
-        model continues from the handoff summary without a user send.
-        """
+        Called at the turn's start and at each round boundary that leads to
+        another round (never on the final round: the model would answer the
+        handoff redundantly), so a long multi-round turn cannot overshoot
+        ``max_context``."""
         if not self.profile.auto_compact:
-            return False
+            return
         # The summary message a compaction appends carries no usage (the
         # summarization round's usage is folded into the totals instead), so
-        # right after a compaction the estimate is 0 and this returns False —
+        # right after a compaction the estimate is 0 and this does nothing —
         # no loop guard needed.
         used = compaction.context_tokens(
             self.conversation.visible_messages(), self.profile.keep_reasoning,
         )
         if used < self.profile.auto_compact_threshold * self.profile.max_context:
-            return False
-        # Stay in a non-idle state: only the turn's finally sets idle, so a
-        # send arriving during the compaction (or the finish_turn unwind) is
+            return
+        # A send arriving during the compaction (or the teardown unwind) is
         # queued, never started mid-teardown.
-        self._set_state("compacting")
+        self._set_compacting(True)
         try:
-            result = await self.controller.compact()
+            result = await self.compact()
         except RuntimeError as exc:
             self._emit_notice(f"auto-compact failed: {exc}", "warn")
-            self._set_state("running")
-            return False
-        # Mid-turn compaction goes back to streaming; the turn's finally
-        # still owns the transition to idle.
-        self._set_state("running")
+            return
+        finally:
+            # Mid-turn compaction goes back to streaming; the turn's teardown
+            # still owns the transition to idle.
+            self._set_compacting(False)
         if result is None:
             # Nothing to compact (e.g. the threshold was crossed between the
             # estimate and the run, or the summarizer refused).
-            return False
+            return
         self._commit_history(
             "compaction", automatic=True,
             before_tokens=result.before_tokens,
             after_tokens=result.after_tokens,
         )
         await self._flush_persist()
-        return True
 
     # ------------------------------------------------------------------
     # stats row
 
-    async def diff_info(self, path: str | None) -> protocol.DiffInfo:
-        """The /diff payload: per-file stat rows (+ the unified diff text
-        for a per-file click-through; the summary poll stays cheap)."""
+    async def diff_info(
+        self, path: str | None, author: str | None = None,
+    ) -> protocol.DiffInfo:
+        """The /diff payload: per-file stat rows (+ the unified diff text for
+        a row click-through; the summary poll stays cheap).
+
+        Rows follow the session's saved scope, so a shared file is one
+        combined row or one row per author; ``author`` asks for the exact
+        patch one of those rows counted."""
         ws = self.workspace_state
         if ws is None:
             return protocol.DiffInfo(tracking=False)
         try:
-            # A per-file click-through needs both the stat row and the text;
+            # A row click-through needs both the stat row and the text;
             # snapshot the workspace once and share the sha between them.
             current = await ws.observe()
-            info = await ws.diff(self.name, current=current, path=path)
+            info = await ws.diff(
+                self.name, current=current, path=path,
+                scope=self.view.diff_scope,
+            )
             if path is not None:
-                # The shown author's own delta, matching the row's counts:
-                # a file another session also edited never displays their
-                # hunks as this session's work.
                 info.text = await ws.file_diff(
-                    self.name, path, current=current,
+                    path, current=current, author=author,
                 )
         except GitWorktreeError as exc:
             # Git failures raise instead of reporting tracking=False: a
             # transient index.lock (concurrent snapshots) must not make
             # clients believe tracking disappeared.
             raise SessionError(f"diff failed: {exc}") from exc
-        info.additions = sum(row.additions for row in info.files)
-        info.deletions = sum(row.deletions for row in info.files)
         info.tracking = True
         return info

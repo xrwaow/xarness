@@ -28,11 +28,15 @@ def system_prompt(
     *,
     tracked: bool = False,
     git_write: bool = False,
+    default_timeout: float | None = None,
 ) -> str:
     """Render the whole system prompt for one session.
 
-    ``tracked`` and ``git_write`` are session facts the sandbox config does
-    not carry (tracking can fail after the config was built)."""
+    ``tracked``, ``git_write`` and ``default_timeout`` are session facts the
+    sandbox config does not carry (tracking can fail after the config was
+    built; the tool timeout lives on the session that enforces it).
+    ``default_timeout`` of None means the number is unknown, so the prompt
+    says nothing rather than promising a timeout that is not the real one."""
     modename = "PLAN" if mode == "plan" else "WRITE"
     if sandbox is None:
         # No tools at all: the plain fallback, mode still named.
@@ -60,11 +64,18 @@ def system_prompt(
     if container:
         lines.append(
             "- /tmp is a tmpfs wiped when the shell restarts; the host home "
-            "and the rest of the host filesystem are not mounted."
+            "and the rest of the host filesystem are not mounted. /cache is "
+            "the exception: shared, writable toolchain state (uv, pip, cargo, "
+            "npm caches) that persists across sessions."
         )
     else:
         lines.append("- No container: tools run directly on the host.")
     lines.append("- Tool paths are relative to the workspace root.")
+    if default_timeout is not None:
+        lines.append(
+            f"- Tool commands are killed after {int(default_timeout)}s by "
+            "default; pass timeout_seconds to run_bash for slower work."
+        )
     if container:
         # Unsandboxed mode has no network isolation, so no claim either way.
         if sandbox.allow_network:

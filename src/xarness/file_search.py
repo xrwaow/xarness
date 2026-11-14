@@ -16,15 +16,16 @@ import heapq
 import os
 import subprocess
 import time
-from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 
 _MAX_WALK = 20_000
 _MAX_RESULTS = 50
+# Ranking is cheap, probing is not: over-fetch this many matches and drop the
+# binaries after ranking, so a directory full of images cannot empty the list.
+_FILTER_FETCH = _MAX_RESULTS * 3
 _GIT_TIMEOUT = 5.0
 _CANDIDATE_TTL = 2.0
-_CACHE_LIMIT = 32
-_candidate_cache: OrderedDict[Path, tuple[float, list[str]]] = OrderedDict()
 
 
 def _git_candidates(root: Path) -> list[str] | None:
@@ -61,34 +62,57 @@ def _walk_bounded(root: Path) -> list[str]:
     return results
 
 
-def _candidates(root: Path) -> list[str]:
-    root = Path(root).resolve()
-    now = time.monotonic()
-    cached = _candidate_cache.get(root)
-    if cached is None or now - cached[0] >= _CANDIDATE_TTL:
-        tracked = _git_candidates(root)
-        cached = (now, tracked if tracked is not None else _walk_bounded(root))
-        _candidate_cache[root] = cached
-        _candidate_cache.move_to_end(root)
-        while len(_candidate_cache) > _CACHE_LIMIT:
-            _candidate_cache.popitem(last=False)
-    return cached[1]
+@lru_cache(maxsize=32)
+def _candidates(root: Path, _bucket: int) -> list[str]:
+    """The workspace's candidate paths, cached for one TTL bucket."""
+    tracked = _git_candidates(root)
+    return tracked if tracked is not None else _walk_bounded(root)
 
 
-def _best(paths: list[str], query: str) -> list[str]:
-    """The _MAX_RESULTS shortest paths matching ``query`` (shortest first —
-    a bare-bones but effective relevance order for @-mention)."""
+def _cached_candidates(root: Path) -> list[str]:
+    return _candidates(
+        Path(root).resolve(), int(time.monotonic() // _CANDIDATE_TTL),
+    )
+
+
+def _best(paths: list[str], query: str, limit: int = _MAX_RESULTS) -> list[str]:
+    """The ``limit`` shortest paths matching ``query`` (shortest first — a
+    bare-bones but effective relevance order for @-mention)."""
     if not query:
-        return heapq.nsmallest(_MAX_RESULTS, paths, key=len)
+        return heapq.nsmallest(limit, paths, key=len)
     q = query.lower()
     matching = (p for p in paths if q in p.lower())
-    return heapq.nsmallest(_MAX_RESULTS, matching, key=len)
+    return heapq.nsmallest(limit, matching, key=len)
+
+
+@lru_cache(maxsize=4096)
+def _binary(path: str, _size: int, _mtime_ns: int) -> bool:
+    """Content sniff, cached by the stat signature. Git's excludes no longer
+    hide media files, so the ranked matches must be filtered here."""
+    from .gitwork import probe_binary_path
+    return probe_binary_path(Path(path))
+
+
+def _visible(root: Path, matches: list[str]) -> list[str]:
+    """``matches`` minus the binaries, capped at :data:`_MAX_RESULTS`."""
+    out: list[str] = []
+    for rel in matches:
+        try:
+            info = os.lstat(root / rel)
+        except OSError:
+            continue
+        if not _binary(str(root / rel), info.st_size, info.st_mtime_ns):
+            out.append(rel)
+            if len(out) == _MAX_RESULTS:
+                break
+    return out
 
 
 def _search(root: Path, query: str) -> list[str]:
-    """The whole blocking pipeline (git ls-files + ranking), run in one
-    executor job — nothing here may touch the event loop."""
-    return _best(_candidates(root), query)
+    """The whole blocking pipeline (git ls-files + ranking + probing), run in
+    one executor job — nothing here may touch the event loop."""
+    ranked = _best(_cached_candidates(root), query, _FILTER_FETCH)
+    return _visible(root, ranked)
 
 
 async def search_files(root: Path, query: str) -> list[str]:

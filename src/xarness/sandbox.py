@@ -386,12 +386,11 @@ class SandboxConfig:
     # the whole command string being vetoed before it runs. Set by
     # from_settings when git tracking is active and allow_git_write is off;
     # unsandboxed sessions prepend the same shim to the host PATH (see
-    # SandboxSession._ensure_started).
-    # Part of mount_key, so enabling it restarts the persistent shell.
+    # SandboxSession._ensure_started). Restarts the persistent shell.
     git_shim: bool = False
     # Workspace-root-relative paths excluded from the container's mounts
-    # (a mount exclusion, not a gitignore). Part of mount_key, so changing
-    # it restarts the persistent shell.
+    # (a mount exclusion, not a gitignore). Changing it changes build_argv,
+    # so the persistent shell restarts under the new mounts.
     filter_list: list[str] = field(default_factory=list)
     # Host path of the repo's .git dir. Bound into the sandbox at its real
     # path so git reads (status/diff/log) work inside the sandbox. Bound
@@ -404,7 +403,6 @@ class SandboxConfig:
     # subtree of a real repo also has its git_dir outside the workspace,
     # but there it stays unbound — useless to the agent.)
     git_external: bool = False
-    _argv_prefix_cache: tuple[tuple, list[str]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.use_sandbox and shutil.which("bwrap") is None:
@@ -419,44 +417,13 @@ class SandboxConfig:
         if self.git_dir is not None:
             self.git_dir = self.git_dir.resolve()
 
-    @property
-    def mount_key(self) -> tuple:
-        """Identity of everything that changes the container's mounts. A
-        persistent SandboxSession compares this before each command and
-        restarts its shell when it differs, so runtime changes (mode flips,
-        ref edits) take effect without losing the shell more often than
-        necessary."""
-        home = Path.home()
-        return (
-            self.read_only,
-            self.allow_network,
-            self.gpu_access,
-            self.use_sandbox,
-            self.git_shim,
-            tuple(sorted(self.filter_list)),
-            self.uses_project_venv(),
-            # Inputs of _cache_binds_and_env's mounts and env, which can
-            # appear after session start (a first `uv lock`, a first
-            # `cargo install`).
-            (self.workspace / "uv.lock").is_file(),
-            (home / ".cargo" / "bin").is_dir(),
-            (home / ".local" / "bin").is_dir(),
-            (home / ".rustup").is_dir(),
-            (home / ".local" / "share" / "uv" / "python").is_dir(),
-            _host_venv_python(self.workspace, home / ".local" / "share" / "uv" / "python"),
-            tuple(sorted(
-                (alias, str(ref.host), ref.mount, ref.read_only)
-                for alias, ref in self.external_refs.items()
-            )),
-        )
-
     def uses_project_venv(self) -> bool:
         """True when the workspace is a Python project whose venv the agent
         should reach at ``.venv`` (see ``_cache_binds_and_env``).
 
         Deliberately decided from marker files only: the mountpoint itself
         may be created by the sandbox, and a decision that flipped once that
-        directory existed would change ``mount_key`` and restart the shell
+        directory existed would change build_argv and restart the shell
         for nothing. ``.venv`` in ``filter_list`` means the user wants it
         hidden, so it is not exposed.
         """
@@ -808,15 +775,6 @@ class SandboxConfig:
             # no bwrap, no mount isolation. The persistent shell starts in
             # the workspace (see SandboxSession._ensure_started).
             return list(command)
-        proxies = tuple(
-            os.environ.get(var)
-            for var in ("http_proxy", "https_proxy", "no_proxy",
-                        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
-        )
-        cache_key = (self.mount_key, proxies)
-        cached = self._argv_prefix_cache
-        if cached is not None and cached[0] == cache_key:
-            return [*cached[1], "--", *command]
         argv = ["bwrap"]
         # Clear the host environment before anything else: everything the
         # toolchain needs is set explicitly below (see
@@ -883,7 +841,6 @@ class SandboxConfig:
                     argv += ["--setenv", var, os.environ[var]]
             argv += ["--share-net"]
         argv += ["--die-with-parent"]
-        self._argv_prefix_cache = (cache_key, list(argv))
         return [*argv, "--", *command]
 
 
@@ -964,7 +921,9 @@ class SandboxSession:
         # sandbox profile's default_timeout, and the config would otherwise
         # duplicate it.
         self.default_timeout = default_timeout
-        self._mount_key: tuple | None = None
+        # The argv the running shell was started with. Any change (a mode
+        # flip, a ref edit, a toolchain dir appearing) restarts it.
+        self._argv: tuple[list[str], bool] | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
 
@@ -976,26 +935,27 @@ class SandboxSession:
         self, config: "SandboxConfig",
         default_timeout: float | None = None,
     ) -> None:
-        """Swap in a new config for the same shell: the next ``run`` sees
-        the changed ``mount_key`` and restarts itself under the new mounts
-        (a settings/refs/mode change needs no new process, just a new
-        argv)."""
+        """Swap in a new config for the same shell: the next ``run`` builds
+        a new argv and restarts itself when it differs."""
         self._config = config
         if default_timeout is not None:
             self.default_timeout = default_timeout
 
     async def _ensure_started(self) -> None:
-        if self._proc is not None and self._proc.returncode is None:
-            # Any change to the container's mounts (plan/write flip, ref
-            # changes) alters the mount
-            # argv; the running shell was started under the old mounts, so
-            # restart it to pick up the new view.
-            key = self._config.mount_key
-            if self._mount_key == key:
-                return
-            await self.close()
-        self._mount_key = self._config.mount_key
         argv = self._config.build_argv(["/bin/sh"])
+        # The shim only affects the unsandboxed shell's env, not its argv.
+        key = (argv, self._config.use_sandbox and self._config.git_shim)
+        if self._proc is not None and self._proc.returncode is None:
+            if self._argv == key:
+                return
+            # A change to the container's mounts (plan/write flip, refs)
+            # alters argv: restart so the shell picks up the new view.
+            await self.close()
+            # close() drops the empty mountpoint dirs it created in the
+            # worktree, so the argv has to be rebuilt after it.
+            argv = self._config.build_argv(["/bin/sh"])
+            key = (argv, self._config.use_sandbox and self._config.git_shim)
+        self._argv = key
         # Container mode sets PYTHONUNBUFFERED via --setenv (--clearenv drops
         # an inherited value); unsandboxed mode has no bwrap, so hand it to
         # the shell's own environment.

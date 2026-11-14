@@ -22,7 +22,7 @@ from textual.widgets import TextArea
 from textual.widgets.text_area import Location, Selection, TextAreaTheme
 
 from .. import images, theme
-from ..images import ImageAttachment, ImageError, token_text
+from ..images import ImageAttachment, ImageError, ImageRef, token_text
 
 _SLASH_RE = re.compile(r"^/(\w*)$")
 _AT_RE = re.compile(r"(?:^|\s)@(\S*)$")
@@ -62,6 +62,14 @@ class ChatInput(TextArea):
     class ModeToggle(Message):
         """Tab pressed with no popup active — toggle plan/write mode."""
 
+    class PickerNav(Message):
+        """Up/down while choices are on screen: move the highlight, not the
+        caret."""
+
+        def __init__(self, direction: int) -> None:
+            self.direction = direction
+            super().__init__()
+
     class ImageRefused(Message):
         """The active model does not accept image input."""
 
@@ -81,6 +89,9 @@ class ChatInput(TextArea):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.popup_active: str | None = None
+        # The ask tool's choices are live: up/down drive its highlight while
+        # the box is empty (typing is the write-in).
+        self.picker_active = False
         self.supports_vision = True
         # Attached images, kept in token order (the editor's image segments).
         # Synced against the document on every edit: deleting a token drops
@@ -196,6 +207,11 @@ class ChatInput(TextArea):
             self.post_message(self.PopupDismiss())
 
     def _on_key(self, event: events.Key) -> None:
+        if self.picker_active and not self.text.strip() and event.key in ("up", "down"):
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.PickerNav(-1 if event.key == "up" else 1))
+            return
         if self.popup_active is not None and event.key in ("up", "down", "enter", "tab", "escape"):
             event.prevent_default()
             event.stop()
@@ -270,8 +286,10 @@ class ChatInput(TextArea):
         self.insert(token_text(attachment))
         return True
 
-    def restore(self, text: str, images: list[ImageAttachment] | None = None) -> None:
-        """Put an undone message (text and attachments) back in the input."""
+    def restore(self, text: str, images: list[ImageRef] | None = None) -> None:
+        """Put an undone or unsent message (text and attachments) back in
+        the input. Attachments may be plain refs: their bytes are already on
+        the host."""
         self.load_text(text)
         self.attachments = list(images or [])
         self._refresh_token_highlights()

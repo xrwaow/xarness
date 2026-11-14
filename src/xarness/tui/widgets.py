@@ -3,7 +3,7 @@
 Widgets are dumb views: they render what the app feeds them from stream
 events and hold no conversation state of their own (the reasoning text inside
 ``ThinkingBlock`` is display state only; the authoritative copy lives in
-``ChatController.conversation``).
+``Session.conversation``).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from .. import theme
+from ..protocol import AskQuestion
 from ..theme import blend_hex
 from ..util import format_tokens as _fmt_tokens
 
@@ -323,16 +324,59 @@ class GeneratingBar(Static):
 class AskBar(Static):
     """The ask tool's current question, shown above the input while pending.
 
-    Hidden until a question is active; the user answers through the normal
-    chat input. Content wraps to the terminal width (unlike the old modal's
-    auto-width labels, which clipped long questions).
+    Hidden until a question is active. A question with choices is a picker:
+    up/down move the highlight and enter takes it, while the chat input stays
+    focused so typing is the write-in (enter with text sends that instead).
     """
 
-    def show_question(self, text: str) -> None:
-        self.update(Text(text))
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._question: AskQuestion | None = None
+        self._header = ""
+        self._selected = 0
+
+    def show_question(self, position: int, total: int, question: AskQuestion) -> None:
+        """Show one question, its numbered choices, and how to answer."""
+        self._question = question
+        self._header = f"Question {position}/{total}: "
+        self._selected = 0
+        self._paint()
         self.add_class("visible")
 
+    def move_selection(self, direction: int) -> None:
+        """Move the highlight by ±1, wrapping — the arrows never dead-end."""
+        if len(self._options) > 1:
+            self._selected = (self._selected + direction) % len(self._options)
+            self._paint()
+
+    def selected(self) -> str | None:
+        """The highlighted choice, or None for free text: Enter's answer."""
+        return self._options[self._selected] if self._options else None
+
+    @property
+    def _options(self) -> list[str]:
+        return self._question.options if self._question else []
+
+    def _paint(self) -> None:
+        question = self._question
+        if question is None:
+            return
+        muted, accent = theme.PALETTE.get("muted", ""), theme.PALETTE.get("accent", "")
+        text = Text(self._header + question.question.strip())
+        for number, option in enumerate(question.options, 1):
+            chosen = number - 1 == self._selected
+            text.append(f"\n  {'❯' if chosen else ' '} {number}) {option}",
+                        style=f"bold {accent}" if chosen else muted)
+        if question.options:
+            text.append("\n  · ↑/↓ choose · enter picks · or type your own answer",
+                        style=muted)
+        self.update(text)
+
     def hide(self) -> None:
+        """Hide the question and forget it, so ``selected`` can never answer
+        from a dismissed prompt."""
+        self._question = None
+        self._selected = 0
         self.remove_class("visible")
 
 

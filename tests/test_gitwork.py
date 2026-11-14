@@ -118,33 +118,123 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert not (workspace / "new.txt").exists()
         assert not (workspace / ".git").exists()
 
-    async def test_snapshots_skip_media_and_oversized_files(self):
-        """Binary/media types and files over 1 MB never enter snapshots:
-        not in /diff, not reverted by /undo."""
+    async def test_snapshots_skip_binary_and_oversized_files(self):
+        """Binaries (detected by content, not by extension) and files over
+        1 MB never enter snapshots: not in /diff, not reverted by /undo."""
         repo = self.make_repo()
-        (repo / "pic.png").write_bytes(b"\x89PNG\r\n")
-        (repo / "clip.mp4").write_bytes(b"0" * 16)
-        (repo / "big.bin").write_bytes(b"0" * (1024 * 1024 + 1))
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+        (repo / "pic.png").write_bytes(png)
+        (repo / "clip.mp4").write_bytes(b"\0\0\0\x18ftypmp42" + b"\0" * 8)
+        # A text file with a media extension is text: the extension is not
+        # consulted, only the content.
+        (repo / "notes.png").write_text("not an image\n")
+        # .dat with text content: this one tests the *size* rule, which only
+        # applies to paths the content check leaves tracked.
+        (repo / "big.dat").write_bytes(b"0" * (1024 * 1024 + 1))
         (repo / "small.txt").write_text("tracked\n")
 
         state = await open_state(repo)
         (repo / "small.txt").write_text("edited\n")
-        (repo / "pic.png").write_bytes(b"changed")
-        (repo / "big.bin").write_bytes(b"1" * (1024 * 1024 + 1))
+        (repo / "notes.png").write_text("still text\n")
+        (repo / "pic.png").write_bytes(png + b"changed\0")
+        (repo / "big.dat").write_bytes(b"1" * (1024 * 1024 + 1))
 
         stat = await diff(state)
-        assert [f.path for f in stat.files] == ["small.txt"]
+        assert [f.path for f in stat.files] == ["notes.png", "small.txt"]
         # The oversized file was found under the size limit at workspace open.
-        assert "big.bin" in state.oversized
+        assert "big.dat" in state.oversized
+        # Binaries are detected by content whether or not they are large.
+        assert {"pic.png", "clip.mp4"} <= set(state.binary)
+        assert "pic.png" not in state.oversized
+        assert "clip.mp4" not in state.oversized
+
+    async def test_content_decides_what_is_binary(self):
+        """The head decides, never the extension: a NUL or magic number is binary."""
+        repo = self.make_repo()
+        (repo / "diagram.png").write_text("<svg>one</svg>\n")
+        state = await open_state(repo)
+
+        (repo / "blob.dat").write_bytes(b"head\0tail")
+        (repo / "blob.unknown").write_bytes(b"head\0tail")
+        (repo / "text.dat").write_text("plain text\n")
+        # An archive header with no NUL in it depends on the magic check.
+        (repo / "archive.zip").write_bytes(b"PK\x03\x04" + b"x" * 8)
+        (repo / "wide.txt").write_bytes("hello\n".encode("utf-16"))
+        (repo / "diagram.png").write_text("<svg>two</svg>\n")
+
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == [
+            "diagram.png", "text.dat", "wide.txt",
+        ]
+        assert set(state.binary) == {"blob.dat", "blob.unknown", "archive.zip"}
+
+    async def test_binary_probe_is_cached_until_the_file_changes(self):
+        """An excluded binary stays untracked forever, so it must not be
+        re-read on every snapshot; a change reclassifies it."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+        (repo / "blob.bin").write_bytes(b"\0binary")
+        await state.observe()
+        assert "blob.bin" in state.binary
+
+        with mock.patch.object(
+            gitwork, "probe_binary_path", wraps=gitwork.probe_binary_path,
+        ) as probe:
+            await state.observe()
+            assert probe.call_count == 0  # cache hit: only stat'ed
+            (repo / "blob.bin").write_text("now text\n")
+            await state.observe()
+
+        assert "blob.bin" not in state.binary
+        stat = await diff(state)
+        assert "blob.bin" in {f.path for f in stat.files}
+
+    async def test_binary_and_oversized_edge_cases(self):
+        """A tracked file frozen as binary is unfrozen once text again, and a
+        symlink is stored as its tiny target path, never as the target's size."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+
+        (repo / "app.py").write_bytes(b"\0binary")
+        await state.observe()
+        assert "app.py" in state.binary
+        (repo / "app.py").write_text("line1\nline2\nchanged\n")
+        stat = await diff(state)
+        assert [f.path for f in stat.files] == ["app.py"]
+        assert "app.py" not in state.binary
+
+        (repo / "big.dat").write_bytes(b"x" * (2 * 1024 * 1024))
+        (repo / "link.dat").symlink_to("big.dat")
+        await state.observe()
+        assert "link.dat" not in state.oversized
+        stat = await diff(state)
+        assert {f.path for f in stat.files} == {"app.py", "link.dat"}
+
+    async def test_sniffed_binary_is_a_diff_group(self):
+        """Detected binaries are a group per file: git has no pattern for them."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+
+        (repo / "out").mkdir()
+        (repo / "out" / "app.bin").write_bytes(b"\0bin")
+
+        info = await state.diff("A")
+        assert info.files == []
+        groups = {group.prefix: group for group in info.groups}
+        assert groups["out/app.bin"].kind == "drift"
+
+        # A recorded command that created it labels it `auto`.
+        state.record(
+            session="A", tool="run_bash", turn="t1", paths=(),
+            auto=("out/app.bin",),
+        )
+        info = await state.diff("A")
+        groups = {group.prefix: group for group in info.groups}
+        assert groups["out/app.bin"].kind == "auto"
 
     async def test_mid_session_oversized_file_is_dropped(self):
-        """A file that is small at session start but grows past 1 MB later is
-        dropped from the snapshot instead of being diffed/reverted forever.
-
-        The drop runs ``git rm`` over the growing path; git rm has no
-        ``-z``/``--stdin``, so this covers the pathspec-from-file form — and
-        a glob-looking name (``odd[1].dat``) must not take ``odd1.dat`` with it.
-        """
+        """A file that grows past 1 MB mid-session is dropped from the
+        snapshot instead of being diffed/reverted forever."""
         repo = self.make_repo()
         (repo / "data.dat").write_text("small\n")
         (repo / "odd[1].dat").write_text("small\n")
@@ -492,6 +582,69 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         await state.refresh()
         assert state.index_path.is_file()
         assert repo not in state.index_path.parents  # never inside the repo
+
+    # ------------------------------------------------------------------
+    # keeping a workspace's big files out of argv
+
+    async def test_many_exclusions_never_reach_the_command_line(self):
+        """Oversized paths are pinned in the index: thousands blow ARG_MAX."""
+        repo = self.make_repo()
+        (repo / "data").mkdir()
+        paths = []
+        for i in range(3000):
+            paths.append(f"data/f{i}.dat")
+            (repo / paths[-1]).write_text("x")
+
+        seen: list[list[str]] = []
+        real = gitwork._run_git
+
+        async def recording(args, *a, **kw):
+            seen.append(list(args))
+            return await real(args, *a, **kw)
+
+        with mock.patch.object(gitwork, "_run_git", recording):
+            tree = await snapshot_tree(repo, exclude=paths)
+
+        assert seen
+        # No command line carries the exclusion list...
+        assert max(sum(len(arg) + 1 for arg in args) for args in seen) < 64 * 1024
+        assert not any(
+            "f2999.dat" in arg for args in seen for arg in args
+        )
+        # ...git reads the pathspecs from stdin instead...
+        assert any("--pathspec-from-file=-" in args for args in seen)
+        # ...and none of the excluded paths entered the snapshot.
+        names = _git(repo, "ls-tree", "-r", "--name-only", tree).splitlines()
+        assert "app.py" in names
+        assert not [n for n in names if n.startswith("data/")]
+
+    async def test_add_falls_back_to_argv_on_old_git(self):
+        """git < 2.25 has no --pathspec-from-file: hand the (short) pathspec
+        list over as argv instead."""
+        seen: list[list[str]] = []
+
+        async def fake(args, *a, **kw):
+            seen.append(list(args))
+            if "--pathspec-from-file=-" in args:
+                return 129, "", "error: unknown option `pathspec-from-file'"
+            return 0, "", ""
+
+        specs = [f":(exclude,glob)**/d{i}/**" for i in range(3)]
+        with mock.patch.object(gitwork, "_run_git", fake):
+            await gitwork._add_all(Path("/does-not-matter"), {}, specs)
+
+        adds = [args for args in seen if args[0] == "add"]
+        assert [args[0] for args in adds] == ["add", "add"]
+        assert adds[1] == ["add", "-A", "--", *specs]
+
+    async def test_a_git_spawn_failure_is_a_git_error(self):
+        """A refused exec must be a GitWorktreeError, so tracking can degrade."""
+        with mock.patch.object(
+            gitwork.asyncio, "create_subprocess_exec",
+            side_effect=OSError(7, "Argument list too long"),
+        ), self.assertRaises(gitwork.GitWorktreeError) as caught:
+            await gitwork._run_git(["add", "-A"])
+        assert "Argument list too long" in str(caught.exception)
 
     # ------------------------------------------------------------------
     # diff

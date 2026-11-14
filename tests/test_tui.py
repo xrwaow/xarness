@@ -84,7 +84,7 @@ class FakeClient:
     async def command(self, name: str, command) -> CommandResult:
         self.commands.append((name, command))
         return self.command_results.get(
-            command.type, CommandResult(cmd_id="t", ok=True, user_text="put back"),
+            command.type, CommandResult(user_text="put back"),
         )
 
     async def upload_image(self, name: str, data: bytes, image_id: str) -> None:
@@ -131,7 +131,7 @@ class FakeClient:
         return ConfigInfo(default_model=name)
 
     async def delete_session(self, name: str) -> CommandResult:
-        return CommandResult(cmd_id="t", ok=True)
+        return CommandResult()
 
     async def unload_session(self, name: str) -> bool:
         # Quitting must not unload anything: a session is the host's, and the
@@ -268,9 +268,7 @@ class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
         await self._run(make_snapshot(), script)
 
     async def test_unreachable_host_quits_without_a_modal(self) -> None:
-        """No verdict (host gone, timeout, older host): quit, don't block.
-        The turn lives in the host, so an unanswered question costs nothing
-        but a headless run."""
+        """No verdict (host gone, timeout, older host): quit, don't block."""
         async def script(pilot: Pilot, client: FakeClient, app):
             client.quit_verdict_error = ClientError("connection refused")
             client.queue.put_nowait(running_status_event())
@@ -384,6 +382,78 @@ class ImageUploadTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([i.id for i in (sends[0].images or [])], [ref.id])
 
 
+class FailedSendRestoresInputTest(unittest.IsolatedAsyncioTestCase):
+    """A message that never reached the session goes back in the input, so
+    a rejected/failed send does not lose what the user wrote."""
+
+    @staticmethod
+    def _input(app):
+        from xarness.tui.chat_input import ChatInput
+
+        return app.query_one("#chat-input", ChatInput)
+
+    @staticmethod
+    def _fail_command(client):
+        async def command(name, cmd):
+            client.commands.append((name, cmd))
+            raise ClientError("send rejected")
+
+        client.command = command
+
+    async def test_text_is_put_back_when_the_send_fails(self) -> None:
+        client = FakeClient(make_snapshot())
+        app = make_app(client)
+        self._fail_command(client)
+        async with run_app(app) as pilot:
+            # The input is cleared on submit, as by a real Enter press.
+            self._input(app).load_text("")
+            app._submit("hello there")
+            await pilot.pause()
+            self.assertEqual(self._input(app).text, "hello there")
+
+    async def test_attachments_come_back_with_the_text(self) -> None:
+        from xarness.images import token_text
+
+        attachment = ImageUploadTest._attachment()
+        client = FakeClient(make_snapshot())
+        app = make_app(client)
+        self._fail_command(client)
+        async with run_app(app) as pilot:
+            app._submit(f"look {token_text(attachment)}", [attachment])
+            await pilot.pause()
+            chat_input = self._input(app)
+            self.assertEqual(chat_input.text, f"look {token_text(attachment)}")
+            self.assertEqual([a.id for a in chat_input.attachments], [attachment.id])
+
+    async def test_a_new_draft_is_not_clobbered(self) -> None:
+        client = FakeClient(make_snapshot())
+        app = make_app(client)
+
+        async def command(name, cmd):
+            # Typed after submitting but before the failure lands.
+            self._input(app).load_text("next thought")
+            raise ClientError("send rejected")
+
+        client.command = command
+        async with run_app(app) as pilot:
+            app._submit("hello there")
+            await pilot.pause()
+            self.assertEqual(self._input(app).text, "next thought")
+
+    async def test_failed_session_creation_puts_the_text_back(self) -> None:
+        client = FakeClient(make_snapshot())
+        app = make_app(client, session_name=None)
+
+        async def create_session(request):
+            raise ClientError("no host")
+
+        client.create_session = create_session
+        async with run_app(app) as pilot:
+            app._submit("hello there")
+            await pilot.pause()
+            self.assertEqual(self._input(app).text, "hello there")
+
+
 class WordmarkTest(unittest.IsolatedAsyncioTestCase):
     """The wordmark marks an empty session and yields to the first message."""
 
@@ -429,10 +499,10 @@ class WordmarkTest(unittest.IsolatedAsyncioTestCase):
 
 class ImportBoundaryTest(unittest.TestCase):
     """The TUI package imports only clientlib, protocol and pure helpers —
-    never the controller, session, tools, gitwork, sandbox or host modules."""
+    never the session, tools, gitwork, sandbox or host modules."""
 
     BANNED = (
-        "xarness.controller", "xarness.session", "xarness.tools",
+        "xarness.session", "xarness.tools",
         "xarness.sandbox", "xarness.gitwork", "xarness.host", "xarness.api",
         "xarness.client",
     )
@@ -454,10 +524,8 @@ class ImportBoundaryTest(unittest.TestCase):
 
 
 class ReconnectTest(unittest.IsolatedAsyncioTestCase):
-    """On connection loss the TUI re-attaches: a reconnect always delivers a
-    fresh snapshot, and the client respawns a dead host on the next request
-    (``clientlib.ensure_host`` on ``ConnectError``) — so the stream loop only
-    retries."""
+    """On connection loss the TUI re-attaches: a reconnect delivers a fresh
+    snapshot, and the client respawns a dead host on the next request."""
 
     async def test_connection_loss_reattaches(self) -> None:
         from xarness.tui import app as app_module
@@ -568,10 +636,8 @@ class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.commands, [])
 
     async def test_ctrl_c_skips_headless_prompt_when_streamed_elsewhere(self) -> None:
-        """The host reports the turn also streams to another client: this
-        quit is one viewer leaving, so there is nothing to decide — and
-        "Stop and quit" must not be offered, because the other client's
-        turn would be interrupted."""
+        """The turn also streams to another client, so this quit has nothing
+        to decide and must not offer "Stop and quit"."""
         from xarness.tui.confirm_screen import ConfirmScreen
 
         client = FakeClient(make_snapshot("running"))
@@ -1039,10 +1105,8 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("+ new", text)
 
 class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
-    """Session popup rows: {title} {age} {dir} {diff}, with a right-aligned
-    state word (padded to the longest state word) for loaded sessions —
-    ask=warning, waiting=accent, running/compacting=success, idle=muted;
-    saved (not loaded) rows show no state word at all."""
+    """Session popup rows: {title} {age} {dir} {diff} and a right-aligned
+    state word for loaded sessions (none for saved ones)."""
 
     def _summaries(self):
         def s(name, state, active, attached=0):
@@ -1511,7 +1575,7 @@ class TerminalTitleTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(written[-1], "xarness xarness")
 
-            await app._handle_event(protocol.TurnEnded(outcome="finished", elapsed=1.0))
+            await app._handle_event(protocol.TurnEnded(outcome="finished"))
             self.assertEqual(written[-1], "xarness xarness - finished")
 
             # A new round/turn clears the stale suffix.
@@ -1535,9 +1599,7 @@ class TerminalTitlePathTest(unittest.IsolatedAsyncioTestCase):
 
 
 class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
-    """An interrupt ends the turn without a RoundComplete for this client:
-    the Thinking shimmer (or a half-streamed tool's writing shimmer) must
-    settle when the explicit TurnEnded arrives, not shimmer forever."""
+    """An interrupt ends the turn without a RoundComplete for this client:"""
 
     async def test_turn_end_settles_thinking_shimmer(self) -> None:
 
@@ -1603,12 +1665,7 @@ class InterruptSettleTest(unittest.IsolatedAsyncioTestCase):
             await script(pilot, client, app)
 
     async def test_pending_strip_only_while_waiting_on_provider(self) -> None:
-        """The strip means "waiting on the LLM", not "the turn is busy".
-
-        A round that ends with tool calls goes idle (the tools execute with no
-        strip); the strip only comes back when the *next* round's
-        ``ProcessingStarted`` opens a provider request, then goes away on the
-        first delta."""
+        """The strip means "waiting on the LLM", not "the turn is busy"."""
 
         async def script(pilot: Pilot, client: FakeClient, app):
             q = client.queue
@@ -1728,7 +1785,7 @@ class DiffClickMinimizeTest(unittest.IsolatedAsyncioTestCase):
             summary = app.query_one("#diff-summary", DiffSummary)
             await summary.set_summary(make_diff_stat())
             summary.add_class("expanded")
-            summary.show_diff("a.py", "--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n")
+            summary.show_diff(("a.py", None), "--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n")
             await pilot.pause()
             self.assertTrue(summary.diff_shown)
             self.assertTrue(summary.has_class("expanded"))
@@ -1877,20 +1934,18 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
         return snap
 
     async def test_hidden_epochs_from_compaction_still_render(self) -> None:
-        """The snapshot's ``history`` (older compaction epochs) is folded
-        before the current messages, so resuming shows the whole session."""
+        """The snapshot's whole message list is rendered, including the
+        pre-compaction epochs, so resuming shows the whole session."""
         from xarness.conversation import SUMMARY_PREFIX
         from xarness.tui.transcript import DividerItem, UserItem
 
         snap = make_snapshot()
-        snap.history = [
+        snap.messages = [
             UserMessage(parts=[TextPart(text="first question")], id="u0"),
             UserMessage(
                 parts=[TextPart(text=f"{SUMMARY_PREFIX}\n\nthe handoff")],
                 id="s0", is_summary=True,
             ),
-        ]
-        snap.messages = [
             AssistantMessage(content="after", id="a0"),
         ]
         app = make_app(FakeClient(snap))
@@ -1960,9 +2015,7 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_mid_tool_shows_it_running_not_interrupted(self) -> None:
         """A turn whose tools are still executing has no result for those
-        calls yet. Drawn from the history alone the call reads as failed
-        ("interrupted") and the round's stamp as a finished turn; the live
-        round in the snapshot must win."""
+        calls yet: the live round in the snapshot must win over the history."""
 
         snap = make_snapshot("running")
         snap.messages = [
@@ -2023,10 +2076,8 @@ class ReplayShimmerAndTimingTest(unittest.IsolatedAsyncioTestCase):
 
 
 class FlowViewTest(unittest.IsolatedAsyncioTestCase):
-    """The virtualized transcript: the WHOLE history lives in the FlowModel
-    (one FlowView widget regardless of length — that is the point); only the
-    visible rows are painted, so a 1k+-message session costs the same as a
-    fresh one."""
+    """The virtualized transcript: the WHOLE history lives in one FlowModel
+    widget regardless of length, and only the visible rows are painted."""
 
     @staticmethod
     def _big_snapshot(count: int = 1200) -> Snapshot:
@@ -2068,13 +2119,7 @@ class FlowViewTest(unittest.IsolatedAsyncioTestCase):
 
 
 class PresenterWidthTest(unittest.IsolatedAsyncioTestCase):
-    """Non-user rows reserve the one-cell left inset before wrapping.
-
-    The presenter prepends that inset to every non-user strip, so rendering
-    at the full width and cropping the joined row back to the widget width
-    sliced the last glyph off any line that reached the right edge — read as
-    a word losing its final letter ("sometimes", because padded lines hid
-    it)."""
+    """Non-user rows reserve the one-cell left inset before wrapping."""
 
     class _Entry:
         def __init__(self, item) -> None:
@@ -2114,13 +2159,7 @@ class PresenterWidthTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
-    """Mouse drag over the transcript must both highlight and extract text.
-
-    The presenter bakes an explicit palette bg into every cell (bg-less
-    cells would fall through to the terminal's default colors), and rich's
-    style merge lets cell styles win over the lib's own ``_decorate_line``
-    selection pass — so ChatFlowView.render_line re-applies the selection
-    span with cell styles overridden. This test guards that override."""
+    """Mouse drag over the transcript must both highlight and extract text."""
 
     async def test_drag_selects_and_highlights_transcript_text(self) -> None:
         from xarness import theme
@@ -2161,8 +2200,8 @@ class TextSelectionTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
-    """The pending-changes panel leads with the agent's own files and always
-    shows one foldable section per other kind below them."""
+    """The pending-changes panel leads with the agent's own files and shows
+    one foldable section per other kind below them."""
 
     async def test_agent_files_lead_and_other_kinds_fold(self) -> None:
         from textual.widgets import Static
@@ -2184,13 +2223,16 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             ))
             summary.add_class("expanded")
             await pilot.pause()
-            # Default view: only the agent's file (and the section headers).
+            # Default view: only the agent's file (and the section headers;
+            # every session's rows already lead the list, so there is no
+            # "agent" section to fold them into).
             self.assertEqual(
-                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                [("own.py", None)],
             )
             self.assertEqual(
                 [r.diff_section for r in summary.query(".diff-section-row")],
-                ["agent", "auto", "drift"],
+                ["auto", "drift"],
             )
             drift = summary.query_one(".diff-section-row.drift")
             self.assertEqual(
@@ -2209,8 +2251,9 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             await pilot.click(drift)
             await pilot.pause()
             rows = list(summary.query(".diff-file-row"))
-            self.assertEqual([r.diff_key for r in rows], ["own.py", "a.py"])
-            self.assertTrue(rows[1].has_class("nested"))
+            self.assertEqual(
+                [r.diff_key for r in rows], [("own.py", None), ("a.py", None)]
+            )
             self.assertEqual(
                 rows[1].query_one(".diff-file-source", Static).render().plain,
                 "drift",
@@ -2222,9 +2265,35 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             await pilot.click(drift)
             await pilot.pause()
             self.assertEqual(
-                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                [("own.py", None)],
             )
             self.assertEqual(toggle.render().plain, "\u25b8")
+
+    async def test_an_agent_created_group_leads_with_every_session(self) -> None:
+        """An ignored file agents edited leads the list, or folds into ``agent``."""
+        from xarness.protocol import DiffFileInfo, DiffGroup, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            summary.add_class("expanded")
+            await summary.set_summary(DiffInfo(
+                files=[
+                    DiffFileInfo(path="own.py", additions=1, deletions=0,
+                                 kind="mine"),
+                ],
+                groups=[DiffGroup(prefix="dist/bundle.js", files=1, kind="agent")],
+            ))
+            await pilot.pause()
+            group = summary.query_one(".diff-group-row")
+            self.assertEqual(group.diff_key, ("dist/bundle.js", None))
+
+            await summary.set_scope("mine")
+            await pilot.pause()
+            self.assertFalse(summary.query(".diff-group-row"))
+            self.assertTrue(summary.query_one(".diff-section-row.agent"))
 
     async def test_a_shared_file_shows_its_author_count(self) -> None:
         """A path written by more than one session carries a count badge, so
@@ -2249,19 +2318,19 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
 
             rows = {r.diff_key: r for r in summary.query(".diff-file-row")}
             self.assertEqual(
-                [cell.classes for cell in rows["shared.py"].children], [
+                [cell.classes for cell in rows[("shared.py", None)].children], [
                     {"diff-file-name"}, {"diff-file-shared"},
                     {"diff-file-source", "mine"}, {"diff-file-add"},
                     {"diff-file-del"},
                 ],
             )
             self.assertEqual(
-                rows["shared.py"].query_one(
+                rows[("shared.py", None)].query_one(
                     ".diff-file-shared", Static,
                 ).render().plain,
                 "2",
             )
-            self.assertFalse(rows["solo.py"].query(".diff-file-shared"))
+            self.assertFalse(rows[("solo.py", None)].query(".diff-file-shared"))
 
             # A row that becomes shared after the fact gains the badge in the
             # right column, without remounting the row.
@@ -2281,6 +2350,48 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
                 [badge.render().plain for badge in badges], ["3", "2"],
             )
 
+    async def test_a_combined_row_credits_the_last_writer(self) -> None:
+        """A combined row adds several sessions' edits up, so the badge
+        credits the one that wrote the path last."""
+        from textual.widgets import Static
+
+        from xarness.protocol import DiffFileInfo, DiffInfo
+        from xarness.tui.widgets import DiffSummary
+
+        app = make_app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            summary.add_class("expanded")
+            await summary.set_summary(DiffInfo(files=[
+                DiffFileInfo(path="a.py", additions=3, deletions=1, kind="agent",
+                             authors=("s1", "s2")),
+                DiffFileInfo(path="b.py", additions=3, deletions=1, kind="mine",
+                             authors=("s2", "s1")),
+                DiffFileInfo(path="c.py", additions=1, deletions=0, kind="agent",
+                             author="s2", authors=("s1", "s2")),
+            ]))
+            await pilot.pause()
+
+            def badge(key) -> Static:
+                rows = {r.diff_key: r for r in summary.query(".diff-row")}
+                return rows[key].query_one(".diff-file-source", Static)
+
+            # Another session wrote the path last: dimmed ``agent``.
+            self.assertEqual(
+                (badge(("a.py", None)).render().plain,
+                 badge(("a.py", None)).has_class("agent")),
+                ("agent", True),
+            )
+            # This session did: the same word, accent-colored.
+            self.assertEqual(
+                (badge(("b.py", None)).render().plain,
+                 badge(("b.py", None)).has_class("mine")),
+                ("agent", True),
+            )
+            # A per-author row credits its own author, not the last writer.
+            self.assertEqual(badge(("c.py", "s2")).render().plain, "agent")
+            self.assertTrue(badge(("c.py", "s2")).has_class("agent"))
+
     async def test_clicking_an_ignored_group_requests_its_diff(self) -> None:
         """A group row is a click target like a file row: it asks the app for
         the group's own patch (files added from nothing) instead of
@@ -2291,8 +2402,8 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient(make_snapshot())
         requested: list[str | None] = []
 
-        async def diff(name, path=None):
-            requested.append(path)
+        async def diff(name, path=None, author=None):
+            requested.append((path, author))
             return DiffInfo(
                 text="diff --git a/build/ b/build/\n+++ b/build/out.o\n+obj\n",
             )
@@ -2312,8 +2423,8 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
             group = summary.query_one(".diff-group-row")
             await pilot.click(group)
             await pilot.pause()
-            self.assertEqual([p for p in requested if p], ["build/"])
-            self.assertEqual(summary.active_diff_key, "build/")
+            self.assertEqual([p for p in requested if p[0]], [("build/", None)])
+            self.assertEqual(summary.active_diff_key, ("build/", None))
             self.assertTrue(summary.diff_shown)
             # The list stays up, with the group row highlighted.
             self.assertTrue(summary.has_class("expanded"))
@@ -2414,7 +2525,7 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
                 DiffFileInfo(path="b.py", additions=2, deletions=0, kind="mine"),
             ]))
             first = list(summary.query(".diff-file-row"))
-            summary.show_diff("a.py", "--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n")
+            summary.show_diff(("a.py", None), "--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n")
 
             await summary.set_summary(DiffInfo(files=[
                 DiffFileInfo(path="a.py", additions=5, deletions=1, kind="agent"),
@@ -2427,7 +2538,7 @@ class DiffSummaryListTest(unittest.IsolatedAsyncioTestCase):
                 after[0].query_one(".diff-file-add", Static).render().plain, "+5"
             )
             self.assertTrue(after[0].has_class("active"))
-            # Own work is labelled ``agent`` too; its class keeps the accent.
+            # A combined row carries the badge too: own work in the accent.
             own = after[1].query_one(".diff-file-source", Static)
             self.assertEqual(own.render().plain, "agent")
             self.assertTrue(own.has_class("mine"))
@@ -2499,6 +2610,13 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
     async def _summary(self, pilot, app):
         from xarness.tui.widgets import DiffSummary
 
+        # The host builds the rows for the session's scope; these rows are
+        # already one per author, so both scopes can be served from the same
+        # payload (nothing here is a shared file).
+        async def diff(name, path=None, author=None):
+            return self._stat()
+
+        app.client.diff = diff
         summary = app.query_one("#diff-summary", DiffSummary)
         await summary.set_summary(self._stat())
         await pilot.pause()
@@ -2544,7 +2662,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 [r.diff_key for r in summary.query(".diff-file-row")],
-                ["own.py", "other.py"],
+                [("own.py", None), ("other.py", None)],
             )
 
             def loc() -> tuple[str, str]:
@@ -2562,7 +2680,8 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             # Only this session's file leads; the other session's work has
             # moved into the (still folded) dimmed "agent" section.
             self.assertEqual(
-                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                [("own.py", None)],
             )
             self.assertEqual(
                 [r.diff_section for r in summary.query(".diff-section-row")],
@@ -2584,17 +2703,17 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 [r.diff_key for r in summary.query(".diff-file-row")],
-                ["own.py", "other.py"],
+                [("own.py", None), ("other.py", None)],
             )
 
-            # Clicking again includes every session inline and drops the
-            # section.
+            # Clicking again includes every session inline, which leaves the
+            # "agent" section with nothing to hold: it goes away.
             await pilot.click(chip)
             await pilot.pause()
             self.assertEqual(summary.scope, "all")
             self.assertEqual(
                 [r.diff_section for r in summary.query(".diff-section-row")],
-                ["agent", "auto", "drift"],
+                ["auto", "drift"],
             )
             self.assertEqual(loc(), ("+3", "-2"))
 
@@ -2604,13 +2723,13 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
         async with run_app(app, size=(120, 40)) as pilot:
             summary = await self._summary(pilot, app)
             summary.add_class("expanded")
-            summary.show_diff("yours.py", "--- a/yours.py\n+++ b/yours.py\n@@\n-x\n+y\n")
+            summary.show_diff(("yours.py", None), "--- a/yours.py\n+++ b/yours.py\n@@\n-x\n+y\n")
             await pilot.pause()
             self.assertTrue(summary.diff_shown)
             # show_diff unfolded the drift section for it.
             self.assertEqual(
                 [r.diff_key for r in summary.query(".diff-file-row")],
-                ["own.py", "other.py", "yours.py"],
+                [("own.py", None), ("other.py", None), ("yours.py", None)],
             )
 
             await summary.toggle_section("drift")
@@ -2619,7 +2738,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(summary.diff_shown)
             self.assertFalse(summary.query_one("#diff-content").has_class("show"))
 
-    async def test_sections_are_always_visible_even_when_empty(self) -> None:
+    async def test_sections_are_visible_even_when_empty(self) -> None:
         from xarness.protocol import DiffFileInfo, DiffInfo
         from xarness.tui.widgets import DiffSummary
 
@@ -2632,7 +2751,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 [r.diff_section for r in summary.query(".diff-section-row")],
-                ["agent", "auto", "drift"],
+                ["auto", "drift"],
             )
             self.assertTrue(summary.query_one(".diff-section-row.drift").has_class("empty"))
 
@@ -2643,15 +2762,18 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             summary = await self._summary(pilot, app)
             summary.add_class("expanded")
             await pilot.pause()
-            self.assertEqual(summary._visible_paths(), ["own.py", "other.py"])
-            self.assertFalse(summary._request_neighbour("other.py", 1))
+            self.assertEqual(
+                summary._visible_keys(), [("own.py", None), ("other.py", None)]
+            )
+            self.assertFalse(summary._request_neighbour(("other.py", None), 1))
 
             await summary.toggle_section("drift")
             await pilot.pause()
             self.assertEqual(
-                summary._visible_paths(), ["own.py", "other.py", "yours.py"]
+                summary._visible_keys(),
+                [("own.py", None), ("other.py", None), ("yours.py", None)],
             )
-            self.assertTrue(summary._request_neighbour("other.py", 1))
+            self.assertTrue(summary._request_neighbour(("other.py", None), 1))
 
     async def test_narrowing_the_scope_keeps_the_open_diff(self) -> None:
         """Switching to this session moves another session's open diff into
@@ -2662,7 +2784,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
         async with run_app(app, size=(120, 40)) as pilot:
             summary = await self._summary(pilot, app)
             summary.add_class("expanded")
-            summary.show_diff("other.py", "--- a/other.py\n+++ b/other.py\n@@\n-x\n+y\n")
+            summary.show_diff(("other.py", None), "--- a/other.py\n+++ b/other.py\n@@\n-x\n+y\n")
             await pilot.pause()
             self.assertTrue(summary.diff_shown)
 
@@ -2672,7 +2794,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("agent", summary._expanded)
             self.assertEqual(
                 [r.diff_key for r in summary.query(".diff-file-row")],
-                ["own.py", "other.py"],
+                [("own.py", None), ("other.py", None)],
             )
 
     async def test_a_chip_click_is_saved_on_the_session(self) -> None:
@@ -2705,7 +2827,8 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(summary.scope, "mine")
             self.assertEqual(
-                [r.diff_key for r in summary.query(".diff-file-row")], ["own.py"]
+                [r.diff_key for r in summary.query(".diff-file-row")],
+                [("own.py", None)],
             )
             self.assertEqual(
                 [r.diff_section for r in summary.query(".diff-section-row")],
@@ -2768,10 +2891,7 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ShimmerDirectionTest(unittest.TestCase):
-    """The sweep must start at the base color and peak at the highlight.
-
-    The lerp helper the refactor reused weights its *first* argument, so
-    passing (base, peak) here silently inverted every shimmer."""
+    """The sweep must start at the base color and peak at the highlight."""
 
     def test_peak_band_is_the_highlight_not_the_base(self) -> None:
         from xarness import theme
@@ -3021,3 +3141,92 @@ class ImageTokenSelectedStyleTest(unittest.IsolatedAsyncioTestCase):
             chat_input.selection = Selection(end, end)
             await pilot.pause()
             self.assertEqual(highlight_names(), ["image-token"])
+
+
+class AskFlowTest(unittest.IsolatedAsyncioTestCase):
+    """The ask bar is a picker: up/down move the highlight, enter takes it,
+    and typing in the input is always the write-in."""
+
+    @staticmethod
+    def _status(*questions) -> Status:
+        return Status(
+            state="idle",
+            session_name="s1", workspace="/tmp/ws", mode="write",
+            model_name="m", model_display_name="m", model_id="m",
+            pending_ask=protocol.PendingAsk(ask_id="a1", questions=list(questions)),
+        )
+
+    async def _pending(self, pilot, client, app, *questions):
+        client.queue.put_nowait(protocol.StatusChanged(status=self._status(*questions)))
+        await pilot.pause()
+
+    async def test_choices_render_as_a_picker(self) -> None:
+        from xarness.tui.widgets import AskBar
+
+        client = FakeClient(make_snapshot())
+        async with run_app(make_app(client)) as pilot:
+            app = pilot.app
+            await self._pending(pilot, client, app, protocol.AskQuestion(
+                question="Which storage?", options=["sqlite", "postgres"]))
+            bar = app.query_one("#ask-bar", AskBar)
+            self.assertTrue(bar.has_class("visible"))
+            shown = bar.render().plain
+            self.assertIn("Question 1/1: Which storage?", shown)
+            self.assertIn("❯ 1) sqlite", shown)  # first choice highlighted
+            self.assertIn("\n    2) postgres", shown)
+            self.assertIn("↑/↓ choose · enter picks · or type your own answer", shown)
+
+    async def test_arrows_move_the_highlight_and_enter_takes_it(self) -> None:
+        from xarness.tui.widgets import AskBar
+
+        client = FakeClient(make_snapshot())
+        async with run_app(make_app(client)) as pilot:
+            app = pilot.app
+            await self._pending(pilot, client, app, protocol.AskQuestion(
+                question="Which storage?", options=["sqlite", "postgres"]))
+            await pilot.press("down")
+            await pilot.pause()
+            shown = app.query_one("#ask-bar", AskBar).render().plain
+            self.assertIn("❯ 2) postgres", shown)
+            self.assertIn("\n    1) sqlite", shown)
+
+            await pilot.press("enter")  # empty input: take the highlight
+            await pilot.pause()
+            sent = [c for _, c in client.commands if c.type == "answer_ask"]
+            self.assertEqual([c.answers for c in sent], [["postgres"]])
+
+    async def test_typing_is_the_write_in(self) -> None:
+        from xarness.tui.widgets import ChatInput
+
+        client = FakeClient(make_snapshot())
+        async with run_app(make_app(client)) as pilot:
+            app = pilot.app
+            await self._pending(pilot, client, app, protocol.AskQuestion(
+                question="Which storage?", options=["sqlite", "postgres"]))
+            app.query_one("#chat-input", ChatInput).text = "duckdb"
+            await pilot.press("enter")
+            await pilot.pause()
+            sent = [c for _, c in client.commands if c.type == "answer_ask"]
+            self.assertEqual([c.answers for c in sent], [["duckdb"]])
+
+    async def test_a_free_text_question_shows_no_choices(self) -> None:
+        from xarness.tui.widgets import AskBar, ChatInput
+
+        client = FakeClient(make_snapshot())
+        async with run_app(make_app(client)) as pilot:
+            app = pilot.app
+            await self._pending(pilot, client, app,
+                                protocol.AskQuestion(question="Project name?"))
+            self.assertEqual(
+                app.query_one("#ask-bar", AskBar).render().plain,
+                "Question 1/1: Project name?",
+            )
+            chat_input = app.query_one("#chat-input", ChatInput)
+            self.assertFalse(chat_input.picker_active)
+
+            # Enter on empty input has nothing to take: no answer is sent.
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "answer_ask"], [],
+            )

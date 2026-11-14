@@ -71,8 +71,7 @@ class TranscriptTest(unittest.TestCase):
         new_answer = AssistantMessage(content="after", id="a2")
         snap = Snapshot(
             status=Status(state="idle"),
-            history=[old_user, old_answer],
-            messages=[summary, new_answer],
+            messages=[old_user, old_answer, summary, new_answer],
         )
         items = tr.Transcript().load(snap)
         self.assertEqual(
@@ -89,8 +88,7 @@ class TranscriptTest(unittest.TestCase):
         result = ToolMessage(tool_call_id="c1", content="body", id="t1")
         snap = Snapshot(
             status=Status(state="idle"),
-            history=[_user("hi"), assistant, result],
-            messages=[],
+            messages=[_user("hi"), assistant, result],
         )
         items = tr.Transcript().load(snap)
         tool = next(item for item in items if isinstance(item, tr.ToolItem))
@@ -292,21 +290,15 @@ class TranscriptTest(unittest.TestCase):
             AssistantMessage(
                 content="a", id="a1", usage=Usage(
                     input_tokens=1_234, output_tokens=56),
-                timing=Timing(
-                    start="2025-01-01T00:00:00+00:00",
-                    end="2025-01-01T00:00:01+00:00"),
             ),
             AssistantMessage(
                 content="b", id="a2", usage=Usage(
                     input_tokens=2_000, output_tokens=400),
-                timing=Timing(
-                    start="2025-01-01T00:00:01+00:00",
-                    end="2025-01-01T00:00:05+00:00"),
             ),
         ]
         conversation = Conversation(messages=messages)
         conversation.begin_turn(opening, before_tree=None)
-        self.assertIsNotNone(conversation.stamp_turn_end())
+        self.assertIsNotNone(conversation.stamp_turn_end(5.0, 4.0))
         items = tr.Transcript().load(_snap(conversation.messages))
         footer = next(i for i in items if isinstance(i, tr.TurnSummaryItem))
         assert footer.usage is not None
@@ -323,13 +315,7 @@ class TranscriptTest(unittest.TestCase):
         user = user_message(
             "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
         call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
-        assistant = AssistantMessage(
-            content="", tool_calls=[call],
-            timing=Timing(
-                start="2025-01-01T00:00:00+00:00",
-                end="2025-01-01T00:00:01+00:00",
-            ),
-        )
+        assistant = AssistantMessage(content="", tool_calls=[call])
         result = ToolMessage(tool_call_id="c1", content="body", status="ok")
         items = tr.Transcript().load(_snap([user, assistant, result]))
         self.assertFalse(
@@ -337,18 +323,14 @@ class TranscriptTest(unittest.TestCase):
 
     def test_cancelled_turn_reports_how_long_it_ran(self):
         """A turn cut short has ended too: it gets a footer with the wall
-        clock it spent and no busy/idle split (the stamps only reach its last
-        completed round, so a split would lie)."""
+        clock it spent and no busy/idle split (its rounds were not measured
+        to an end, so a split would lie)."""
         user = user_message(
             "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
         done = AssistantMessage(
             content="",
             tool_calls=[ToolCall(call_id="c1", name="read_file",
                                  arguments_json="{}")],
-            timing=Timing(
-                start="2025-01-01T00:00:00+00:00",
-                end="2025-01-01T00:00:01+00:00",
-            ),
         )
         result = ToolMessage(tool_call_id="c1", content="body", status="ok")
         partial = AssistantMessage(
@@ -374,8 +356,8 @@ class TranscriptTest(unittest.TestCase):
         live.apply(ContentDelta(text="hello"))
         live.apply(RoundComplete(usage=usage))
         changed = live.apply(TurnEnded(
-            outcome="finished", elapsed=5.0, total=5.0,
-            busy=4.0, idle=1.0, usage=usage,
+            outcome="finished", stats=TurnStats(
+                total=5.0, busy=4.0, idle=1.0, usage=usage),
         ))
         footers = [i for i in changed if isinstance(i, tr.TurnSummaryItem)]
         self.assertEqual(len(footers), 1)
@@ -385,23 +367,16 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(footers[0].usage, usage)
         # Settling a second time never duplicates the footer.
         self.assertEqual(
-            live.apply(TurnEnded(outcome="finished", elapsed=5.0)), [])
+            live.apply(TurnEnded(outcome="finished", stats=TurnStats(
+                total=5.0, busy=4.0, idle=1.0, usage=usage))), [])
 
-        # The same turn as the host persists it (5s answer, 4s of it
-        # thinking) replays to the same four numbers.
-        opening = user_message(
-            "hi", id="u", timing=Timing(send="2025-01-01T00:00:00+00:00"))
-        answer = AssistantMessage(
-            content="hello", usage=usage,
-            timing=Timing(
-                start="2025-01-01T00:00:00+00:00",
-                end="2025-01-01T00:00:05+00:00",
-                reasoning_seconds=4.0,
-            ),
-        )
+        # The same turn as the host persists it replays to the same four
+        # numbers: the footer reads the stamped stats, it derives nothing.
+        opening = user_message("hi", id="u")
+        answer = AssistantMessage(content="hello", usage=usage)
         conversation = Conversation(messages=[opening, answer])
         conversation.begin_turn(opening, before_tree=None)
-        self.assertIsNotNone(conversation.stamp_turn_end())
+        self.assertIsNotNone(conversation.stamp_turn_end(5.0, 4.0))
         replayed = [
             i for i in tr.Transcript().load(_snap(conversation.messages))
             if isinstance(i, tr.TurnSummaryItem)

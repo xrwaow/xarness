@@ -1,4 +1,4 @@
-"""Context compaction, independent of the controller/UI.
+"""Context compaction, independent of the UI.
 
 A compaction appends one summary user message to the append-only history;
 the visible slice (everything after the last summary) shrinks to that

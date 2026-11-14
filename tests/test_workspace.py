@@ -133,45 +133,109 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
     # per-author attribution
 
-    async def test_a_second_session_counts_only_its_own_delta(self) -> None:
-        """Two agents edited app.py: each session's row is its own patch, not
-        the whole file's pending diff, and ``authors`` marks it shared."""
+    async def test_a_shared_file_is_one_row_per_author(self) -> None:
+        """Two agents edited app.py: each author's delta is a row of its own."""
         repo = self.make_repo()
         state = await open_state(repo)
         await self.write_path(state, "A", "t1", "app.py", "line1\nA\n")
         await self.write_path(state, "B", "t2", "app.py", "line1\nA\nB\n")
 
-        first = await state.diff("A")
+        rows = (await state.diff("A", scope="mine")).files
         assert [
-            (row.path, row.kind, row.additions, row.deletions)
-            for row in first.files
-        ] == [("app.py", "mine", 1, 1)]
-        assert first.files[0].authors == ("A", "B")
-        assert (first.additions, first.deletions) == (1, 1)
+            (row.path, row.author, row.kind, row.additions, row.deletions)
+            for row in rows
+        ] == [
+            ("app.py", "A", "mine", 1, 1),
+            ("app.py", "B", "agent", 1, 0),
+        ]
 
-        # The session that only appended a line is not credited with A's.
-        second = await state.diff("B")
-        assert [
-            (row.kind, row.additions, row.deletions) for row in second.files
-        ] == [("mine", 1, 0)]
+        # A third session has no delta of its own: both rows are another
+        # agent's work, each with its own counts.
+        rows = (await state.diff("C", scope="mine")).files
+        assert [(row.author, row.kind) for row in rows] == [
+            ("A", "agent"), ("B", "agent"),
+        ]
 
-        # A third session sees the last author's delta, labelled agent.
-        third = await state.diff("C")
-        assert [
-            (row.kind, row.additions, row.deletions) for row in third.files
-        ] == [("agent", 1, 0)]
+        # Either way the workspace totals are the file's pending change.
+        info = await state.diff("A", scope="mine")
+        assert (info.additions, info.deletions) == (2, 1)
+        assert info.files[0].authors == ("A", "B")
 
-    async def test_a_shared_files_diff_text_is_the_authors_own_delta(self) -> None:
+    async def test_all_scope_reports_the_files_whole_pending_change(self) -> None:
+        """Scoped to every session, a shared file is one combined row, credited
+        to its last writer."""
         repo = self.make_repo()
         state = await open_state(repo)
         await self.write_path(state, "A", "t1", "app.py", "line1\nA\n")
         await self.write_path(state, "B", "t2", "app.py", "line1\nA\nB\n")
 
-        a_text = await state.file_diff("A", "app.py")
+        info = await state.diff("A")
+        assert [
+            (row.path, row.author, row.kind, row.additions, row.deletions)
+            for row in info.files
+        ] == [("app.py", None, "agent", 2, 1)]
+        assert info.files[0].authors == ("A", "B")
+        # The badge follows the last write, not the viewer: B wrote the file
+        # as it now stands, so A sees an ``agent`` row and B its own.
+        assert [row.kind for row in (await state.diff("C")).files] == ["agent"]
+        assert [row.kind for row in (await state.diff("B")).files] == ["mine"]
+
+    async def test_a_new_sessions_edit_is_not_counted_as_the_first_ones(
+        self,
+    ) -> None:
+        """A session writes a one-line file, a new one edits it: two rows."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+        await self.write_path(state, "s1", "t1", "test.py", "meow\n")
+        await self.write_path(state, "s2", "t2", "test.py", "meow1\n")
+
+        def rows(rows):
+            return [
+                (row.author, row.kind, row.additions, row.deletions, row.is_new)
+                for row in rows
+            ]
+
+        first = (await state.diff("s1", scope="mine")).files
+        assert rows(first) == [
+            ("s1", "mine", 1, 0, True),
+            ("s2", "agent", 1, 1, False),
+        ]
+        second = (await state.diff("s2", scope="mine")).files
+        assert rows(second) == [
+            ("s1", "agent", 1, 0, True),
+            ("s2", "mine", 1, 1, False),
+        ]
+        # The combined row is the file against the baseline — a new one-line
+        # path — and credits the session that wrote it last: for s1 that is
+        # s2's work, for s2 its own.
+        assert rows((await state.diff("s1")).files) == [
+            (None, "agent", 1, 0, True),
+        ]
+        assert rows((await state.diff("s2")).files) == [
+            (None, "mine", 1, 0, True),
+        ]
+        whole = await state.file_diff("test.py")
+        assert "-meow" not in whole and "+meow1" in whole
+        first_text = await state.file_diff("test.py", author="s1")
+        assert "+meow\n" in first_text and "meow1" not in first_text
+        second_text = await state.file_diff("test.py", author="s2")
+        assert "-meow\n+meow1" in second_text
+
+    async def test_a_shared_files_diff_text_is_the_row_it_opened(self) -> None:
+        repo = self.make_repo()
+        state = await open_state(repo)
+        await self.write_path(state, "A", "t1", "app.py", "line1\nA\n")
+        await self.write_path(state, "B", "t2", "app.py", "line1\nA\nB\n")
+
+        a_text = await state.file_diff("app.py", author="A")
         assert a_text.startswith("diff --git a/app.py b/app.py")
         assert "+A" in a_text and "+B" not in a_text
-        b_text = await state.file_diff("B", "app.py")
+        b_text = await state.file_diff("app.py", author="B")
         assert "+B" in b_text and "+A" not in b_text
+        # No author: the whole pending change, which is what the combined
+        # row counts.
+        whole = await state.file_diff("app.py")
+        assert "+A" in whole and "+B" in whole
 
     async def test_a_created_file_is_one_line_of_provenance(self) -> None:
         repo = self.make_repo()
@@ -187,17 +251,20 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
     async def _rows(self, state: WorkspaceState, viewer):
         return (await state.diff(viewer)).files
 
-    async def test_a_viewer_set_picks_its_own_latest_write(self) -> None:
-        """A parent's row for a file its subagent wrote last counts the
-        child's delta but stays ``mine``."""
+    async def test_a_viewer_set_gets_a_row_per_member(self) -> None:
+        """A parent and its subagent both wrote the file: both deltas are
+        ``mine`` to the set, so each member gets its own row."""
         repo = self.make_repo()
         state = await open_state(repo)
         await self.write_path(state, "parent", "t1", "app.py", "P\n")
         await self.write_path(state, "child", "t2", "app.py", "P\nC\n")
 
-        rows = await self._rows(state, {"parent", "child"})
-        assert [(r.kind, r.additions, r.deletions) for r in rows] == [
-            ("mine", 1, 0),
+        rows = (await state.diff({"parent", "child"}, scope="mine")).files
+        assert [
+            (r.author, r.kind, r.additions, r.deletions) for r in rows
+        ] == [
+            ("parent", "mine", 1, 2),
+            ("child", "mine", 1, 0),
         ]
         assert rows[0].authors == ("parent", "child")
 
@@ -321,25 +388,23 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
             "build/", "notes.log",
         }
 
-        group = await state.file_diff("A", "build/")
+        group = await state.file_diff("build/")
         assert group.startswith("diff --git a/build/ b/build/\n")
         assert "+++ b/build/out.o" in group and "+obj" in group
         # A symlink is skipped: reading one would print its target's bytes.
         assert "hostname" not in group
 
-        single = await state.file_diff("A", "notes.log")
+        single = await state.file_diff("notes.log")
         assert single.startswith("diff --git a/notes.log b/notes.log\n")
         assert "--- /dev/null" in single and "+hello" in single
 
         # A tracked path keeps the baseline diff, ignored siblings or not.
         (repo / "app.py").write_text("line1\nline2\nline3\n")
-        assert "+line3" in await state.file_diff("A", "app.py")
+        assert "+line3" in await state.file_diff("app.py")
 
     async def test_explicit_edit_to_an_ignored_path_is_a_pending_row(self) -> None:
-        """An ignored path never enters a tree, so it has no stat row; the
-        event alone makes it that agent's pending edit — even when its
-        directory was already ignored before the baseline (no fresh group to
-        hang the row off)."""
+        """An ignored path never enters a tree, so it has no stat row: the
+        event's own write is its pending row."""
         repo = self.make_repo()
         (repo / "dist").mkdir()
         (repo / "dist" / "bundle.js").write_text("built\n")
@@ -366,6 +431,28 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         assert await self.kinds(state, "B") == {}
         assert (repo / "dist" / "bundle.js").read_text() == "agent\n"
         assert state.events == []
+
+    async def test_a_shared_ignored_paths_row_counts_the_logs_span(self) -> None:
+        """An ignored file has no baseline copy, so its combined row counts the
+        log's span, and the diff it opens says the same."""
+        repo = self.make_repo()
+        (repo / "dist").mkdir()
+        (repo / "dist" / "bundle.js").write_text("old\n")
+        state = await open_state(repo)
+        assert state.auto == ("dist",)
+        await self.write_path(state, "A", "t1", "dist/bundle.js", "A\n")
+        await self.write_path(state, "B", "t2", "dist/bundle.js", "A\nB\n")
+
+        rows = (await state.diff("A")).files
+        assert [
+            (row.author, row.kind, row.additions, row.deletions) for row in rows
+        ] == [(None, "agent", 2, 1)]
+        text = await state.file_diff("dist/bundle.js")
+        assert "-old" in text and "+A" in text and "+B" in text
+        # Each author's row opens exactly its own span.
+        assert "+B" not in await state.file_diff(
+            "dist/bundle.js", author="A",
+        )
 
     async def test_reject_lists_an_ignored_explicit_write_as_unrestorable(
         self,
@@ -409,7 +496,7 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
             before_tree=before, after_tree=after, epoch=state.epoch,
         )
 
-    async def test_accept_splices_only_non_drift_paths(self) -> None:
+    async def test_accept_absorbs_drift(self) -> None:
         repo = self.make_repo()
         state = await open_state(repo)
         baseline = state.baseline_tree
@@ -422,12 +509,13 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         )
         await state.accept()
 
-        # Both files are still pending, but only the agent's path advanced.
+        # The current worktree is the baseline: nothing is pending, and the
+        # drift path advanced along with the agent's own write.
         summary = await state.diff("A")
-        assert {r.path: r.kind for r in summary.files} == {"drift.txt": "drift"}
+        assert summary.files == []
         assert state.baseline_tree != baseline
         assert await gitwork.tree_entry(state, state.baseline_tree, "agent.txt")
-        assert await gitwork.tree_entry(state, state.baseline_tree, "drift.txt") is None
+        assert await gitwork.tree_entry(state, state.baseline_tree, "drift.txt")
         assert state.events == []
         assert state.epoch == 1
 
@@ -462,6 +550,23 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         assert (repo / "app.py").read_text() == "line1\nline2\n"
         assert (repo / "node_modules" / "keep.js").exists()
         assert not (repo / "build").exists()
+        assert state.events == []
+
+    async def test_reject_removes_a_binary_a_command_created(self) -> None:
+        """A content-detected binary is an auto group of its own; reject
+        removes it and the directory the deletion left empty."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+        (repo / "out").mkdir()
+        (repo / "out" / "app.bin").write_bytes(b"\0built")
+        state.record(
+            session="A", tool="run_bash", turn="t1",
+            paths=(), auto=("out/app.bin",),
+        )
+
+        await state.reject()
+
+        assert not (repo / "out").exists()
         assert state.events == []
 
     async def test_reject_lists_ignored_files_it_cannot_restore(self) -> None:
@@ -508,10 +613,8 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         assert len(state.events) == 1  # not dropped on refusal
 
     async def test_undo_merges_a_later_edit_elsewhere_in_the_file(self) -> None:
-        """Another session's edit to a *different* part of the file no longer
-        blocks the undo: the turn's own hunk is reversed and theirs kept.
-        (The hunks need a line of context between them: adjacent edits are a
-        conflict for git's merge, and for a human too.)"""
+        """Another session's edit elsewhere in the file no longer blocks the
+        undo: the turn's own hunk is reversed and theirs kept."""
         repo = self.make_repo()
         state = await open_state(repo)
         (repo / "big.txt").write_text(
@@ -625,6 +728,30 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
             await state.accept()
         assert not (self.base / "db" / "sessions.db").exists()
 
+    async def test_two_live_hosts_share_one_event_log(self) -> None:
+        """Two processes on one workspace: each sees the other's writes, and
+        neither overwrites the other's event."""
+        repo = self.make_repo()
+        db_dir = self.base / "db"
+        with mock.patch.object(session_store, "SESSIONS_DIR", db_dir):
+            first = await open_workspace(repo)
+            second = await open_workspace(repo)
+            assert first is not None and second is not None
+            await self.write_path(first, "s1", "t1", "test.py", "meow\n")
+            await self.write_path(second, "s2", "t2", "test.py", "meow1\n")
+
+            # Neither host's copy is authoritative: both re-read the log.
+            for state in (first, second):
+                rows = (await state.diff("s1", scope="mine")).files
+                assert [(row.author, row.kind, row.additions, row.deletions)
+                        for row in rows] == [
+                    ("s1", "mine", 1, 0),
+                    ("s2", "agent", 1, 1),
+                ]
+            reopened = await open_workspace(repo)
+        assert reopened is not None
+        assert [e.session for e in reopened.events] == ["s1", "s2"]
+
     async def test_event_provenance_survives_a_reopen(self) -> None:
         """A reopened workspace keeps the blob shas, so per-author deltas
         still work after a restart (the objects are in the same store)."""
@@ -636,16 +763,14 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
             writes = await self.write_path(state, "A", "t1", "app.py", "new\n")
             assert writes
             reopened = await open_workspace(repo)
-        assert reopened is not None
-        assert reopened.events[0].writes == writes
-        rows = (await reopened.diff("A")).files
+            assert reopened is not None
+            assert reopened.events[0].writes == writes
+            rows = (await reopened.diff("A")).files
         assert [(row.path, row.kind) for row in rows] == [("app.py", "mine")]
 
     async def test_enable_persistence_flushes_state_and_events(self) -> None:
         """A saved session joining a --no-session workspace flushes the
-        in-memory state and its events in one transaction, so a reopened
-        workspace gets both (a row without its events would turn pending
-        edits into authorless drift)."""
+        in-memory state and its events in one transaction."""
         repo = self.make_repo()
         db_dir = self.base / "db"
         with mock.patch.object(session_store, "SESSIONS_DIR", db_dir):
@@ -666,7 +791,15 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         assert [(e.session, e.tool, e.paths) for e in reopened.events] == [
             ("A", "edit_file", ("a.txt",)),
         ]
-        assert reopened.next_seq == 2
+
+
+def test_collapse_ignored_drops_descendants_of_a_kept_parent() -> None:
+    """A sibling sorting below ``/`` must not hide a parent's coverage."""
+    from xarness.workspace import _collapse_ignored
+
+    assert _collapse_ignored({"a/b", "a/b/c", "a/b!x", "a/b0", "z"}) == (
+        "a/b", "a/b!x", "a/b0", "z",
+    )
 
 
 if __name__ == "__main__":

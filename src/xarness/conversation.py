@@ -25,10 +25,10 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, NamedTuple, Union
 
 from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
+from pydantic import field_validator, model_validator
 
 from .gitwork import TurnCheckpoint
 from .images import IMAGE_TOKEN_RE, ImageAttachment, ImageRef, token_text
-from .util import parse_iso
 
 # Every state a tool result can be in. ``parse_error`` means the model's
 # arguments were invalid (it should retry with valid ones); ``interrupted``
@@ -47,6 +47,32 @@ class ToolResult(NamedTuple):
     @property
     def ok(self) -> bool:
         return self.status == "ok"
+
+
+class AskQuestion(BaseModel):
+    """One question the ask tool puts to the user.
+
+    A bare string is accepted as a free-text question: that is the shape
+    models send when they have no choices."""
+
+    question: str = Field(description="the question text")
+    options: list[str] = Field(
+        default_factory=list,
+        description="choices to offer; empty means free text",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_plain_text(cls, value: Any) -> Any:
+        return {"question": value} if isinstance(value, str) else value
+
+    @field_validator("options")
+    @classmethod
+    def _drop_blanks(cls, options: list[str]) -> list[str]:
+        """Blank choices would render as an empty numbered line and answer
+        as an empty string, so they are not choices at all."""
+        return [option.strip() for option in options if option.strip()]
+
 
 # The marker a compaction's summary message starts with (a rendering detail;
 # identification is the ``is_summary`` flag).
@@ -180,19 +206,15 @@ class TurnStats(BaseModel):
     """A finished turn's numbers, as the host measured them.
 
     Stamped on the turn's last answer (``Timing.stats``) when the turn ends,
-    so a reload renders the same footer a live client got on ``TurnEnded``
-    instead of each client deriving (and disagreeing about) its own. A turn
-    that is still running carries none: that absence is the only thing a
-    client needs to know to avoid claiming an end.
+    so a reload renders the same footer a live client got. A turn still
+    running carries none, so no client can claim it ended.
 
-    A turn cut short (cancelled, failed) has ``busy``/``idle`` None: the
-    stamps only reach its last *completed* round, so a split would claim a
-    measurement nobody took to the end. Its ``total`` is the wall clock the
-    host actually spent on it."""
+    A turn cut short (cancelled, failed) has ``busy``/``idle`` None: it did
+    not measure its rounds to an end, so ``total`` is the wall clock alone."""
 
-    total: float  # send → end of the turn, wall clock
+    total: float  # the turn's wall clock, as the host timed it
     busy: float | None = None  # streaming + tool time (finished turns only)
-    idle: float | None = None  # the rest: queueing, provider latency
+    idle: float | None = None  # the rest: queueing, teardown
     # The turn's whole token spend, summed over its rounds (None when the
     # provider reported none).
     usage: Usage | None = None
@@ -202,17 +224,12 @@ class Timing(BaseModel):
     """When a message happened, and — on a turn's last answer — how long it
     took.
 
-    One sub-model instead of six fields scattered on each message. Stamps are
-    wall-clock UTC ISO 8601. The derived numbers are written by the host on
-    the turn's last assistant message only: ``reasoning_seconds`` for that
-    answer's thinking time, and ``stats`` for the whole turn, stamped when the
-    turn ends (finished, cancelled or failed). A turn still running carries no
-    ``stats``, which is what keeps a client from drawing an end-of-turn footer
-    under a turn that has no end."""
+    ``send`` is when the client sent a user message (wall-clock UTC ISO
+    8601). The measured numbers are written by the host: ``reasoning_seconds``
+    on the answer they describe, ``stats`` for the whole turn on its last
+    answer."""
 
     send: str | None = None
-    start: str | None = None
-    end: str | None = None
     reasoning_seconds: float | None = None
     stats: TurnStats | None = None
 
@@ -438,10 +455,6 @@ class Conversation(BaseModel):
     def visible_messages(self) -> list[Message]:
         return self.messages[self.visible_index():]
 
-    def history_messages(self) -> list[Message]:
-        """Everything the visible slice hides (compacted-away transcript)."""
-        return self.messages[:self.visible_index()]
-
     @property
     def open_turn(self) -> TurnCheckpoint | None:
         """The still-open turn's checkpoint (``closed`` not yet set), or
@@ -463,27 +476,18 @@ class Conversation(BaseModel):
                 return message_id
         return None
 
-    def stamp_turn_end(self, ended_at: float | None = None) -> TurnStats | None:
+    def stamp_turn_end(
+        self, total: float, busy: float | None = None,
+    ) -> TurnStats | None:
         """Record a turn's numbers on its last answer.
 
-        The write-side half of the footer: the host owns both the turn's
-        boundary and its numbers, and stores them where a client already
-        looks for per-message timing (``Timing.stats``), the way
-        ``reasoning_seconds`` is stored. Every client and every reload then
-        renders the same footer without deriving one, and a turn that is
-        still running carries no stats, so no client can claim it ended.
-
-        ``ended_at`` is how long a turn that was cut short (cancelled,
-        failed) actually ran. Such a turn reports that wall clock with no
-        ``busy``/``idle`` split: its stamps only reach the last completed
-        round, so a split would claim a measurement nobody took to the end.
-        Left None for a turn that finished on its own, whose numbers come
-        from the stamps.
-
-        The turn starts at its opening user message: the last one with a
-        checkpoint, which distinguishes it from a steering message injected
-        mid-turn (those have none). Returns the stats for ``TurnEnded``, or
-        None when there is no answer to stamp (nothing streamed at all)."""
+        The host owns both the boundary and the numbers, and ``Timing.stats``
+        is where a client already looks, so every client and reload renders
+        the same footer. ``busy`` is the measured streaming + tool time,
+        omitted for a turn cut short. The turn starts at its opening user
+        message (the last one with a checkpoint, which a steering message
+        lacks). Returns the stats for ``TurnEnded``, or None when there is no
+        answer to stamp."""
         turn, turn_start = self._last_turn()
         # The turn's last answer, complete or interrupted: the message a
         # footer is drawn under, and the one a reload reads the numbers from.
@@ -498,16 +502,12 @@ class Conversation(BaseModel):
         for message in turn:
             if message.role == "assistant" and message.usage is not None:
                 usage = message.usage if usage is None else usage + message.usage
-        if ended_at is not None:
-            stats = TurnStats(total=max(0.0, ended_at), usage=usage)
-        else:
-            timings = turn_timings(turn)
-            if timings is None:
-                return None
-            total, busy, idle = timings
-            stats = TurnStats(
-                total=total, busy=busy, idle=idle, usage=usage,
-            )
+        total = max(0.0, total)
+        stats = TurnStats(
+            total=total, usage=usage,
+            busy=None if busy is None else max(0.0, busy),
+            idle=None if busy is None else max(0.0, total - busy),
+        )
         self.messages[index].timing = self.messages[index].timing.model_copy(
             update={"stats": stats},
         )
@@ -750,46 +750,3 @@ class Conversation(BaseModel):
                 )
             )
         return messages
-
-
-def turn_timings(turn: list[Message]) -> tuple[float, float, float] | None:
-    """``(total, busy, idle)`` for one turn's ``messages`` (the opening user
-    message first), or None when the turn has no completed assistant round to
-    measure.
-
-    ``total`` is send-to-last-answer; ``busy`` is streaming + tool time and
-    ``idle`` is the rest (queueing, provider latency). Derived once by the
-    host when a turn finishes, and stamped on the turn's last answer (see
-    :meth:`Conversation.stamp_turn_end`): clients render those numbers
-    instead of each deriving its own."""
-    user = next(
-        (m for m in turn if m.role == "user" and not m.is_summary), None,
-    )
-    assistants = [
-        m for m in turn
-        if m.role == "assistant" and m.timing.start and m.timing.end
-    ]
-    if not assistants:
-        return None
-    end = parse_iso(assistants[-1].timing.end)
-    start = parse_iso(
-        user.timing.send if user is not None and user.timing.send
-        else assistants[0].timing.start
-    )
-    if end is None or start is None:
-        return None
-    total = max(0.0, (end - start).total_seconds())
-
-    def duration(message: Message, *, reasoning: bool = False) -> float:
-        start = parse_iso(message.timing.start)
-        end = parse_iso(message.timing.end)
-        if start is None or end is None:
-            return 0.0
-        elapsed = max(0.0, (end - start).total_seconds())
-        if not reasoning or message.timing.reasoning_seconds is None:
-            return elapsed
-        return min(message.timing.reasoning_seconds, elapsed)
-
-    busy = sum(duration(m, reasoning=True) for m in assistants) + sum(
-        duration(m) for m in turn if m.role == "tool")
-    return total, busy, max(0.0, total - busy)

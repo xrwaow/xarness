@@ -1,15 +1,16 @@
 """Tests for session persistence: round-trip of local-only message fields."""
 
 import asyncio
+import json
+import tempfile
+import uuid
+from pathlib import Path
 
 import pytest
 
-import json
-import uuid
-
 from xarness import session_store
 from xarness.config import CotStrength, ProviderProfile
-from xarness.controller import ChatController
+from xarness.session import Session
 from xarness.conversation import (
     SUMMARY_PREFIX,
     AssistantMessage,
@@ -199,23 +200,32 @@ def test_resumed_session_undo_rolls_back(tmp_path, monkeypatch) -> None:
             for event in client_script:
                 yield event
 
-    controller = ChatController(PROFILE, "k", client=FakeClient())
-    asyncio.run(_send(controller, "hi"))
-    _save("s", session_store.StoredSession(profile="m", conversation=controller.conversation))
+    session = _session(FakeClient())
+    asyncio.run(_send(session, "hi"))
+    _save("s", session_store.StoredSession(profile="m", conversation=session.conversation))
 
     resumed = session_store.load_state("s").conversation
-    controller2 = ChatController(PROFILE, "k", client=FakeClient())
-    controller2.conversation = resumed
+    session2 = _session(FakeClient())
+    session2.conversation = resumed
 
-    plan = controller2.conversation.rollback_plan()
+    plan = session2.conversation.rollback_plan()
     assert plan is not None and plan.user_text == "hi"
-    controller2.conversation.apply_rollback(plan)
-    assert controller2.conversation.messages == []
-    assert controller2.usage_total == Usage(input_tokens=0, output_tokens=0)
+    session2.conversation.apply_rollback(plan)
+    assert session2.conversation.messages == []
+    assert session2.usage_total == Usage(input_tokens=0, output_tokens=0)
 
 
-async def _send(controller: ChatController, text: str) -> None:
-    async for _ in controller.begin_turn(text, None, None):
+def _session(client) -> Session:
+    """A non-persisting session: these tests own the store themselves."""
+    return Session(
+        name="test", workspace=Path(tempfile.mkdtemp()), profile=PROFILE,
+        profile_name="test", api_key="k", client=client, no_save=True,
+    )
+
+
+async def _send(session: Session, text: str) -> None:
+    session._begin_turn(text, None, None)
+    async for _ in session._stream_round():
         pass
 
 
@@ -231,12 +241,14 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
         sandbox_name="sb", conversation=conversation,
     ))
     meta = store.load_meta("s")
-    assert meta["workspace"] == "/w"
-    assert meta["message_count"] == 2
-    assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
-    assert meta["parent_id"] == "parent"
-    assert "tracking" not in meta
-    assert meta["profile"] == "p" and meta["sandbox_name"] == "sb"
+    # A saved session's meta block IS its listing row.
+    assert meta.name == "s" and meta.state == "saved" and not meta.active
+    assert meta.workspace == "/w"
+    assert meta.message_count == 2
+    assert meta.last_user_message_at == "2026-01-01T00:00:00+00:00"
+    assert meta.parent_id == "parent"
+    assert not meta.tracking
+    assert meta.model == "p" and meta.sandbox == "sb"
 
     # Reading the meta must not build Conversation objects (the whole point:
     # listing and last-used lookups stay cheap).
@@ -244,9 +256,9 @@ def test_meta_block_written_and_read_without_parsing_conversation(tmp_path, monk
         raise AssertionError("full conversation parsed")
     monkeypatch.setattr(store, "load_state", explode)
     meta = store.load_meta("s")
-    assert meta["workspace"] == "/w" and meta["message_count"] == 2
-    assert meta["last_user_message_at"] == "2026-01-01T00:00:00+00:00"
-    assert store.load_meta("s")["workspace"] == "/w"
+    assert meta.workspace == "/w" and meta.message_count == 2
+    assert meta.last_user_message_at == "2026-01-01T00:00:00+00:00"
+    assert store.load_metas()["s"].workspace == "/w"
 
 
 def test_saved_sessions_carry_a_schema_version(tmp_path, monkeypatch) -> None:
@@ -348,11 +360,28 @@ def test_meta_written_and_removed(tmp_path, monkeypatch) -> None:
     ))
 
     meta = session_store.load_meta("s")
-    assert meta["workspace"] == "/w" and meta["message_count"] == 1
+    assert meta.workspace == "/w" and meta.message_count == 1
     assert list(session_store.load_metas()) == ["s"]
 
     assert session_store.delete_session("s") is True
     assert session_store.load_metas() == {}
+
+
+def test_meta_block_written_before_the_summary_shape_still_loads(
+    tmp_path, monkeypatch,
+) -> None:
+    """A meta row from an older build names its fields profile/sandbox_name;
+    it must still list with its model and sandbox."""
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path)
+    _save("s", session_store.StoredSession(conversation=Conversation()))
+    with session_store.connection() as db:
+        db.execute(
+            "UPDATE sessions SET meta = ? WHERE name = 's'",
+            (json.dumps({"workspace": "/w", "profile": "p",
+                         "sandbox_name": "sb"}),),
+        )
+    meta = session_store.load_meta("s")
+    assert meta.workspace == "/w" and meta.model == "p" and meta.sandbox == "sb"
 
 
 def test_summary_message_round_trips(tmp_path, monkeypatch) -> None:
@@ -364,7 +393,7 @@ def test_summary_message_round_trips(tmp_path, monkeypatch) -> None:
     conversation.add(user_message(f"{SUMMARY_PREFIX}\n\nhandoff", is_summary=True))
     _save("s", session_store.StoredSession(profile="m", conversation=conversation))
     loaded = session_store.load_state("s").conversation
-    assert [m.role for m in loaded.history_messages()] == ["user", "assistant"]
+    assert [m.role for m in loaded.messages[:loaded.visible_index()]] == ["user", "assistant"]
     assert [m.role for m in loaded.visible_messages()] == ["user"]
     assert loaded.visible_messages()[0].is_summary is True
 

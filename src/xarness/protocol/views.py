@@ -8,11 +8,12 @@ object, with no mirrored copy to keep in sync.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from ..conversation import (
+    AskQuestion,
     Message,
     ToolStatus,
     Usage,
@@ -25,8 +26,9 @@ Mode = Literal["plan", "write"]
 # ``mine`` displays as ``agent`` with the accent color; it is kept separate
 # so the client can tell its own writes from another agent's.
 DiffKind = Literal["mine", "agent", "auto", "drift"]
-# Which sessions the /diff panel lists: every session's work, or this
-# session's own (the panel's scope chip).
+# Which sessions the /diff panel reports, and how a shared file is split:
+# every session one row per path, or this session's own delta with the rest
+# in the agent section. Named in the panel's scope chip.
 DiffScope = Literal["all", "mine"]
 
 
@@ -50,10 +52,14 @@ class QueuedMessage(BaseModel):
 
 
 class PendingAsk(BaseModel):
-    """A live ask-tool prompt (session state, answerable by any client)."""
+    """A live ask-tool prompt (session state, answerable by any client).
+
+    An empty ``options`` is the free-text fallback. With choices the answer is
+    still text — the picked option's label, or whatever the user typed — so a
+    pick list never refuses a write-in."""
 
     ask_id: str
-    questions: list[str]
+    questions: list[AskQuestion]
 
 
 class RefInfo(BaseModel):
@@ -147,9 +153,8 @@ class PartialRound(BaseModel):
     snapshot messages: reasoning/content not yet persisted, plus any tool
     calls whose results are not in the history yet.
 
-    ONE accumulator: the controller fills the model-stream half (reasoning,
-    answer, tool-call arguments) and the session folds in the tool-exec
-    events it emits itself."""
+    ONE accumulator: the session feeds it the model-stream events as they
+    arrive and folds in the tool-execution events it emits itself."""
 
     reasoning: str = ""
     content: str = ""
@@ -160,6 +165,34 @@ class PartialRound(BaseModel):
             (call for call in self.tool_calls if call.call_id == call_id), None,
         )
 
+    def apply(self, event: Any) -> None:
+        """Fold one live event into the round (the single reducer).
+
+        Matches on the wire ``type`` discriminator, so the events module can
+        keep importing these views without a cycle."""
+        kind = event.type
+        if kind == "reasoning_delta":
+            self.reasoning += event.text
+        elif kind == "content_delta":
+            self.content += event.text
+        elif kind == "tool_call_started":
+            self.tool_calls.append(PartialToolCall(
+                call_id=event.call_id, name=event.name,
+            ))
+        elif kind == "tool_call_arguments_delta":
+            if (call := self.find_call(event.call_id)) is not None:
+                call.arguments += event.text
+        elif kind == "tool_call_arguments_done":
+            if (call := self.find_call(event.call_id)) is not None:
+                call.arguments = event.arguments_json
+        elif kind == "tool_output_delta":
+            if (call := self.find_call(event.call_id)) is not None:
+                call.content += event.text
+        elif kind == "tool_finished":
+            if (call := self.find_call(event.call_id)) is not None:
+                call.status = event.status
+                call.content = event.content
+
     def __bool__(self) -> bool:
         return bool(self.reasoning or self.content or self.tool_calls)
 
@@ -167,12 +200,9 @@ class PartialRound(BaseModel):
 class Snapshot(BaseModel):
     """The full state a client receives when it attaches (SSE first event)."""
 
-    # The visible slice — what the model sees.
+    # The whole append-only history, compacted-away prefix included: the
+    # client renders every summary as a handoff divider.
     messages: list[Message] = Field(default_factory=list)
-    # Messages the visible slice hides (compacted away). They are still sent
-    # so a human resuming the session sees the full transcript, with each
-    # summary message rendered as the handoff divider.
-    history: list[Message] = Field(default_factory=list)
     status: Status = Field(default_factory=Status)
     # Live round state; None when no round is streaming.
     partial_round: PartialRound | None = None
@@ -206,6 +236,8 @@ class SessionSummary(BaseModel):
     model: str | None = None
     sandbox: str | None = None
     last_user_message_at: str | None = None
+    # Last write to disk: the listing's idea of "recently used".
+    updated_at: str | None = None
     message_count: int = 0
     parent_id: str | None = None
     tracking: bool = False
@@ -277,9 +309,11 @@ class DiffFileInfo(BaseModel):
     is_new: bool = False
     # Derived per viewer; the default must never be agent.
     kind: DiffKind = "drift"
+    # The session whose own delta this row counts; None for a row covering
+    # the path's whole pending change (a combined row, or no recorded author).
+    author: str | None = None
     # The sessions that wrote this path explicitly, in event order (empty for
-    # bash-only or drift rows). More than one means the file is shared: the
-    # row's +A/-D count the shown author's own delta, not the whole file's.
+    # bash-only or drift rows). More than one means the file is shared.
     authors: tuple[str, ...] = ()
 
 
