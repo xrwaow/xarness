@@ -142,6 +142,32 @@ def name_options(names: Sequence[str], current: str | None = None) -> list[Optio
     ]
 
 
+# Palette keys previewed as the five color squares on each /theme row.
+THEME_SWATCH_KEYS = ("bg", "text", "accent", "success", "error")
+# The square glyph; one cell, colored with each palette key.
+SWATCH = "■"
+
+
+def theme_options(
+    names: Sequence[str], current: str | None = None,
+) -> list[Option]:
+    """Rows for the /theme picker: the name, then five right-aligned squares.
+
+    Each square is a "■" painted in its palette color: background, text,
+    accent, success, error — a quick preview of the theme.
+    """
+    options = []
+    for name in names:
+        palette = theme.THEMES[name]
+        squares = Text(" ").join(
+            Text(SWATCH, style=palette[key]) for key in THEME_SWATCH_KEYS
+        )
+        row = Text(f"{name}  (current)" if name == current else name)
+        row.append(" " * max(2, SESSION_ROW_WIDTH - row.cell_len - squares.cell_len))
+        options.append(Option(row + squares, id=name))
+    return options
+
+
 def session_options(
     entries: Sequence[SessionSummary], workspace: str | None,
     current: str | None = None,

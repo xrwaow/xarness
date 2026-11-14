@@ -1297,6 +1297,29 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         # Saved / not loaded sessions show no state word at all.
         self.assertIsNone(_STATE_WORDS.get("saved"))
 
+    def test_theme_rows_show_five_color_squares(self) -> None:
+        """Each /theme row previews the palette with five painted swatches
+        lined up on the right of the name."""
+        from xarness import theme
+        from xarness.tui.list_picker import (
+            SESSION_ROW_WIDTH, SWATCH, THEME_SWATCH_KEYS, theme_options,
+        )
+
+        options = theme_options(list(theme.THEMES), current=theme.CURRENT_THEME)
+        self.assertEqual([str(o.id) for o in options], list(theme.THEMES))
+        for option in options:
+            palette = theme.THEMES[str(option.id)]
+            spans = [span for span in option.prompt.spans
+                     if span.style and span.style.startswith("#")]
+            swatches = [option.prompt.plain[s.start:s.end] for s in spans]
+            self.assertEqual(len(swatches), 5, "one square per swatch key")
+            self.assertEqual(swatches, [SWATCH] * 5)
+            expected = [palette[key] for key in THEME_SWATCH_KEYS]
+            self.assertEqual([span.style for span in spans], expected)
+            # Name first, swatches flush against the right edge.
+            self.assertGreater(spans[0].start, str(option.prompt).index(str(option.id)))
+            self.assertEqual(len(str(option.prompt)), SESSION_ROW_WIDTH)
+
     def test_ask_state_gets_its_own_word(self) -> None:
         """A session blocked on its ask tool reads "ask", not "waiting"."""
         from xarness.tui.list_picker import (

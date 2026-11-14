@@ -80,7 +80,7 @@ from . import flow as tflow
 from .confirm_screen import ConfirmScreen
 from .diff_summary import DiffSummary
 from .flow import LineItem, PendingItem, UserItem
-from .list_picker import ListPicker, name_options, session_options
+from .list_picker import ListPicker, name_options, session_options, theme_options
 from .refs_screen import RefsScreen
 from .tools_screen import ToolsScreen
 from .transcript import Transcript
@@ -1324,13 +1324,15 @@ class AgentApp(App[None]):
 
     async def _pick(
         self, names: list[str], *, current: str | None, title: str,
+        options: Callable[[list[str], str | None], list] = name_options,
     ) -> str | None:
         """Show a picker screen and wait for the choice (None = dismissed).
 
         Awaited only from within a worker: push_screen_wait requires an
-        active worker context."""
+        active worker context. ``options`` builds the rows, letting a
+        picker decorate its names (the /theme swatches)."""
         return await self.push_screen_wait(
-            ListPicker(name_options(names, current), title=title)
+            ListPicker(options(names, current), title=title)
         )
 
     @work(group="picker", exclusive=True)
@@ -1517,6 +1519,7 @@ class AgentApp(App[None]):
     async def _pick_theme(self) -> None:
         name = await self._pick(
             list(theme.THEMES), current=theme.CURRENT_THEME, title="Color theme",
+            options=theme_options,
         )
         if name:
             self._handle_theme_command(name)
