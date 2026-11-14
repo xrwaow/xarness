@@ -47,10 +47,11 @@ from textual_flowview import Presentation
 from .. import images, theme
 from ..images import token_text
 from ..theme import blend_hex as _lerp_hex
-from ..util import format_duration, format_tokens
+from ..util import format_duration, format_usage
 from .tool_view import (
     ToolCallView,
     body_renderable,
+    display_name,
 )
 from .tool_view import (
     live_parts as _stream_parts,
@@ -396,7 +397,11 @@ class Presenter:
             if item.status is ToolStatus.MAKING_CALL else None
         )
         key = (self.epoch, width, item.expanded, item.status, len(item.args),
-               len(item.output), phase)
+               len(item.output), phase,
+               None if item.usage is None else (
+                   item.usage.input_tokens, item.usage.output_tokens,
+                   item.usage.approximate,
+               ))
         view = ToolCallView(
             name=item.name, args=item.args, output=item.output,
             status=item.status, expanded=item.expanded,
@@ -419,6 +424,8 @@ class Presenter:
             else:
                 dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
                 head = _tool_head(item, view)
+            if item.usage is not None:
+                head.append(" " + format_usage(item.usage), style=p["muted"])
             dot_strips = render_strips(Text.assemble(dot, " ", head), width)
             strips = list(dot_strips)
             if item.expanded:
@@ -461,10 +468,7 @@ class Presenter:
             text += (f" ({format_duration(item.busy)} | "
                      f"{format_duration(item.idle)})")
         if item.usage is not None:
-            usage = item.usage
-            approx = "~" if usage.approximate else ""
-            text += (f" · {approx}↑{format_tokens(usage.input_tokens)} "
-                     f"↓{format_tokens(usage.output_tokens)}")
+            text += f" · {format_usage(item.usage)}"
         return render_strips(Text(text, style=theme.PALETTE["muted"]), width)
 
 
@@ -615,17 +619,18 @@ def _settled_strips(
 
 
 def _tool_head(item: ToolItem, view: ToolCallView) -> Text:
-    """The settled tool line: verb + name, plus a one-line detail when the
-    summary adds more than the bare tool name."""
+    """The settled tool line: verb + displayed name, plus a one-line detail
+    when the summary adds more than the bare name."""
     verb = item.STATUS_VERB[item.status]
-    summary = Text(f"{verb} {item.name}" if verb else item.name)
+    name = display_name(item.name)
+    head = Text(f"{verb} {name}" if verb else name)
     if item.status is ToolStatus.CALL_SUCCEEDED and not (
         item.expanded and item.name == "run_bash"
     ):
-        detail = _tool_summary_text(view)
-        if detail.plain != item.name:
-            summary.append_text(detail[len(item.name):])
-    return summary
+        # The summary is ``displayed name + detail``; append just the detail
+        # so a bespoke name (MCP: ``server · tool``) is not duplicated.
+        head.append_text(_tool_summary_text(view)[len(name):])
+    return head
 
 
 @singledispatch

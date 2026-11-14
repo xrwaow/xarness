@@ -29,10 +29,15 @@ conversation, no `ask_user` and no `subagent` tool of its own, and returns
 the child's last non-empty assistant message. It shares the workspace and
 container with its parent, so its edits are tracked (and undone, accepted or
 rejected) exactly like any other agent's; it is stored as
-`<parent-uuid>/agent-N`, appears in `/sessions` as `agent-N` under its parent, and you
+`<parent-uuid>/agent-N`, appears in `/sessions` as `agent-N` under its parent
+(only while you are in the parent's own family — see "Sessions" below), and you
 can attach to watch it. `mode: "plan"` children are
 read-only; a plan-mode agent can only start plan children. Which model they
-run is the preset's `subagent_model`.
+run is the preset's `subagent_model`. Consecutive `subagent` calls in one
+model round run in parallel (each child is an independent session with its
+own shell); every other tool stays in stream order. A subagent's tool row
+shows its `↑input ↓output` token spend live and keeps the final numbers once
+the call ends.
 
 A subagent is an ordinary session: once it finishes it stays saved (unless
 the run is `--no-session`), so you can open it from `/sessions` and drive it
@@ -42,6 +47,60 @@ labelled as its own. Reopening does not give it back the `subagent` or
 to a child that is still running is queued as steering, exactly like one
 sent to a running session. With `--no-session` nothing is saved for the
 parent or the child, so a finished child cannot be reopened.
+
+### MCP servers
+
+MCP servers add their tools to the same registry. A server is either a
+host-side subprocess speaking the Model Context Protocol over stdio, or a
+remote Streamable HTTP endpoint; in both cases its tools appear as
+`mcp__<server>__<tool>` to the model and as `<server> · <tool>` in the
+transcript.
+
+Configure servers in the `mcp` section of the config (or add one from
+`/tools`). A server is exactly one of `command` (stdio) or `url` (HTTP):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "filesystem": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+        "env": {},
+        "cwd": null,
+        "enabled": true,
+        "timeout": 120
+      },
+      "exa": {
+        "url": "https://mcp.exa.ai/mcp",
+        "enabled": true,
+        "timeout": 120
+      }
+    }
+  }
+}
+```
+
+A remote server is spoken to over **Streamable HTTP** (2025-03-26 and later
+revisions, with session ids, protocol-version negotiation and SSE responses);
+the older HTTP+SSE transport from 2024-11-05 is not supported. xarness speaks
+the `2025-11-25` handshake *era*: the stateless `2026-07-28` revision (no
+`initialize`, version in every request's `_meta`, `server/discover`) is not
+implemented yet, and such a server fails with an error that says so.
+
+`/tools` opens the manager: the effective tool set at the top, then every
+configured MCP server with its availability and tools. Click a server name
+to enable/disable it, click a tool row to include/exclude one tool, or type
+`name: command args…` — or just a URL like `https://mcp.exa.ai/mcp` — in the
+bottom box to add a server (a JSON object is also accepted for
+`env`/`cwd`/`timeout`). Toggles are written back to the config and take
+effect immediately; changes are idle-only.
+
+MCP servers are **trusted host-side extensions**. They are not run inside
+bubblewrap — a stdio server is a host subprocess and an HTTP server is a
+remote endpoint — so they can reach the host filesystem and network, and
+their file writes are not tracked by `/diff` or undone by `/undo`. Only run
+servers you trust.
 
 There is no `ls`, `glob`, `grep`, or `web_search` tool: use `run_bash`
 with `rg`/`find`/`ls` (pipe search output through `head`). Compaction is not
@@ -423,7 +482,10 @@ Titles are padded to the widest title of the list, so the age, workspace and
 `<parent-uuid>/agent-N`, shown as `agent-N` nested under its parent, and a
 whole group moves to the live section
 when any member is live (hosted children above idle ones) — so attaching to a
-finished subagent brings its parent and siblings up with it. The
+finished subagent brings its parent and siblings up with it. Subagents are
+only listed while you are inside their family: a draft (`/new`) session shows
+only top-level sessions, and opening `/sessions` from a parent shows that
+parent's `agent-N` children; another session's children stay hidden. The
 +/- columns are that session's own pending work plus whatever its subagents
 wrote; a session blocked on the ask tool reads `ask` (it wants your answer),
 one blocked on a tool call (including a running subagent) reads `waiting`,
@@ -561,11 +623,11 @@ container on/off state is overridden.
 
 | Command | Action |
 | --- | --- |
-| `/tools` | List the tools the model currently has |
+| `/tools` | Browse the effective tools and manage MCP servers (enable/disable servers and tools, add a server) |
 | `/model` | Choose the model profile |
 | `/sandbox` | Choose this session's sandbox profile (idle only) |
 | `/filter add <path>` / `/filter remove <path>` / `/filter list` | Add or remove a workspace path excluded from the sandbox mounts |
-| `/sessions` | Resume a previous session of this workspace; a group (parent and its `agent-N` children) stays together, and moves to the live section when any member is live |
+| `/sessions` | Resume a previous session of this workspace; a subagent (`agent-N`) is listed only when you open the picker from its parent's family, and a group stays together and moves to the live section when any member is live |
 | `/mode` | Switch between plan (read-only) and write mode |
 | `/theme` | Choose a color theme |
 | `/refs` | Add or remove this workspace's external reference paths. Ref paths are bound read-only inside the container at `/tmp/refs/<alias>` — the same path tool calls and the shell use (nothing is created in your worktree); they persist per workspace and are shared by every session opened there |
@@ -620,6 +682,8 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   own spend as `↑input ↓output` next to its timing line (`Worked for 5.0s
   (4.0s | 1.0s) · ↑12.3k ↓456`; a `~` marks an estimate). The status bar keeps
   running session totals and context headroom against `max_context`.
+  A `subagent` tool row shows the child's own `↑input ↓output` spend while it
+  runs and after it finishes.
   Compaction's own
   summarization round is included in the totals, and the compaction notice
   reports what it freed (`compacted: 12,450 → 1,830 tokens (freed 10,620)`).
@@ -638,6 +702,7 @@ src/xarness/
   client.py       async httpx SSE client, reasoning-effort mapping
   compaction.py   context handoff: token estimates + summarizer round
   host.py         session host: FastAPI over a unix socket, lifecycle, config resolution
+  mcp.py          MCP stdio/HTTP clients + per-session server manager
   api.py          HTTP/SSE endpoints used by the TUI and other clients
   clientlib.py    async client used by the TUI (host spawn + API calls)
   conversation.py plain message history, wire-format faithful
@@ -649,7 +714,7 @@ src/xarness/
   file_search.py  bounded filename search backing @-mention autocomplete
   gitwork.py      tree snapshots, tree diffs, the read-only git shim
   theme.py        the color palettes
-  tui/            Textual app, widgets, screens (picker/resume/confirm), stylesheet
+  tui/            Textual app, widgets, screens (picker/resume/confirm/tools), stylesheet
 ```
 
 The UI consumes an async generator of typed stream events and knows nothing

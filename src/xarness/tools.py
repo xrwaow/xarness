@@ -22,6 +22,7 @@ defaults applied) instead of re-checking types.
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 from collections.abc import Awaitable, Callable
@@ -32,7 +33,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .conversation import AskQuestion, ToolResult
+from .conversation import AskQuestion, ToolResult, Usage
+from .mcp import McpManager, McpToolMeta
 from .sandbox import (
     DEFAULT_TIMEOUT,
     REFS_ANCHOR,
@@ -52,6 +54,9 @@ class Tool:
     # The provider-facing JSON schema, computed once at construction (it is
     # immutable; regenerating it per tool per round was pure waste).
     schema: dict[str, Any] = field(default_factory=dict)
+    # Where the tool came from: "builtin" for the harness's own tools, or
+    # the MCP server's name. The UI groups by it; the model never sees it.
+    source: str = "builtin"
 
     def __post_init__(self) -> None:
         """Derive the provider schema from the args model.
@@ -194,6 +199,17 @@ _output_limit: ContextVar[int | None] = ContextVar(
     "tool_output_limit", default=None
 )
 
+# Usage sink for the call in flight (a subagent reports its child's spend).
+_usage_sink: ContextVar[Callable[[Usage], None] | None] = ContextVar(
+    "tool_usage_sink", default=None
+)
+
+
+def report_tool_usage(usage: Usage) -> None:
+    """Report spend for the tool call running in this context (a no-op outside)."""
+    if (sink := _usage_sink.get()) is not None:
+        sink(usage)
+
 
 def _exec_error(result, fallback: str) -> ToolResult:
     return ToolResult(status="error", content=result.stderr.strip() or fallback)
@@ -288,10 +304,10 @@ class ToolRegistry:
         name: str,
         arguments_json: str,
         output_sink: Callable[[str], None] | None = None,
+        usage_sink: Callable[[Usage], None] | None = None,
     ) -> ToolResult:
-        """Execute one call. ``output_sink``, when given, receives streamed
-        output lines while the call runs (run_bash) so a UI can render them
-        live; the final ToolResult is unchanged either way."""
+        """Execute one call. ``output_sink`` streams live output (run_bash);
+        ``usage_sink`` gets spend reports from a self-running tool (subagent)."""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(status="error", content=f"unknown tool '{name}'")
@@ -310,9 +326,11 @@ class ToolRegistry:
         try:
             token = _output_sink.set(output_sink)
             limit_token = _output_limit.set(self.max_output_chars)
+            usage_token = _usage_sink.set(usage_sink)
             try:
                 result = await tool.handler(args)
             finally:
+                _usage_sink.reset(usage_token)
                 _output_limit.reset(limit_token)
                 _output_sink.reset(token)
         except Exception as exc:
@@ -885,6 +903,7 @@ def build_registry(
     ask_callback: Callable[[list[AskQuestion]], Awaitable[list[str] | None]] | None = None,
     default_timeout: float = DEFAULT_TIMEOUT,
     spawn_subagent: Callable[[str, str], Awaitable[str]] | None = None,
+    mcp: McpManager | None = None,
 ) -> ToolRegistry:
     """Build the tool set for one session.
 
@@ -894,6 +913,11 @@ def build_registry(
     is given, and ``subagent`` when the caller can start one (``spawn_subagent``;
     a subagent itself gets neither). The read-only-git policy is enforced by
     the PATH shim (gitwork.git_shim_script), not here.
+
+    ``mcp`` adds the tools of connected MCP servers, namespaced and tagged
+    with their server as ``source``. They run on the host, outside the
+    sandbox, so they are available in plan mode too (the server itself
+    cannot be made read-only).
 
     Does NOT touch ``sandbox.read_only`` — the caller owns the sandbox's mode
     (set it to ``mode != "write"`` before calling; a persistent
@@ -922,4 +946,62 @@ def build_registry(
         if mode == "write":
             registry.register(_make_write_tool(sandbox, default_timeout))  # write_file
             registry.register(_make_edit_tool(sandbox, default_timeout))  # edit_file
+    if mcp is not None:
+        for tool in mcp_tools(mcp):
+            registry.register(tool)
     return registry
+
+
+class _McpArgs(BaseModel):
+    """Permissive argument carrier for MCP tools.
+
+    The server owns its real input schema, so the harness advertises that
+    schema verbatim (``Tool.schema``) and does not second-guess the shape
+    here: extra keys survive into ``model_dump()`` and the server validates.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+def mcp_tools(manager: McpManager) -> list[Tool]:
+    """Wrap every enabled tool of every connected MCP server as a Tool."""
+    def tool_for(meta: McpToolMeta) -> Tool:
+        async def handler(args: BaseModel) -> ToolResult:
+            return await manager.call(meta.server, meta.name, args.model_dump())
+
+        description = meta.description.strip() or meta.name
+        return Tool(
+            name=meta.exposed_name,
+            description=(
+                description if description.lower().startswith("mcp")
+                else f"MCP ({meta.server}): {description}"
+            ),
+            args_model=_McpArgs,
+            handler=handler,
+            schema=_mcp_schema(meta.input_schema),
+            source=meta.server,
+        )
+
+    return [tool_for(meta) for meta in manager.tool_specs()]
+
+
+def _mcp_schema(input_schema: dict[str, Any]) -> dict[str, Any]:
+    """Make a server's input schema palatable to the provider's tool API.
+
+    The registry's flattener already exists for pydantic schemas (local
+    servers reject ``$ref``/``$defs``), so reuse it rather than writing a
+    second dialect. Anything that is not a usable JSON object schema falls
+    back to an empty object schema (the server still validates the call).
+    """
+    empty: dict[str, Any] = {"type": "object", "properties": {}}
+    if not isinstance(input_schema, dict) or not input_schema:
+        return empty
+    schema = copy.deepcopy(input_schema)
+    defs = schema.pop("$defs", {}) or schema.pop("definitions", {})
+    try:
+        flat = ToolRegistry._flatten_schema(schema, defs)
+    except Exception:
+        return empty
+    if not isinstance(flat, dict):
+        return empty
+    return {"type": "object", "properties": {}, **flat}

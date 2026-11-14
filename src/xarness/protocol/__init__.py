@@ -23,6 +23,7 @@ from ..conversation import (  # noqa: F401 - re-exported for clients
 )
 from .commands import (  # noqa: F401
     Accept,
+    AddMcpServer,
     AnswerAsk,
     Cancel,
     Command,
@@ -38,6 +39,8 @@ from .commands import (  # noqa: F401
     Reject,
     Rollback,
     SendMessage,
+    SetMcpServerEnabled,
+    SetMcpToolEnabled,
     SetViewState,
     SetMode,
     SetSandbox,
@@ -71,6 +74,7 @@ from .events import (  # noqa: F401
     ToolExecStarted,
     ToolFinished,
     ToolOutputDelta,
+    ToolUsageChanged,
     TurnEnded,
 )
 from .views import (  # noqa: F401
@@ -82,6 +86,8 @@ from .views import (  # noqa: F401
     DiffInfo,
     DiffKind,
     DiffScope,
+    McpServerInfo,
+    McpServerState,
     Mode,
     ModelInfo,
     PartialRound,
@@ -97,6 +103,8 @@ from .views import (  # noqa: F401
     Snapshot,
     State,
     Status,
+    ToolInfo,
+    ToolsInfo,
     ViewState,
     WorkspaceInfo,
     WorkspaceRefUpdate,

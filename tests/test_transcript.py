@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from xarness.conversation import SUMMARY_PREFIX, Timing, ToolCall
+from xarness.conversation import SUMMARY_PREFIX, Timing, ToolCall, Usage
 from xarness.conversation import AssistantMessage, ToolMessage, TurnStats, user_message
 from xarness.protocol import (
     ContentDelta,
@@ -17,6 +17,7 @@ from xarness.protocol import (
     ToolCallArgumentsDone,
     ToolCallStarted,
     ToolFinished,
+    ToolUsageChanged,
     RoundComplete,
     MessageAdded,
     TurnEnded,
@@ -200,6 +201,29 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(t.cancel(), [])
         # Events after cancel are ignored.
         self.assertEqual(t.apply(ContentDelta(text="late")), [])
+
+    def test_subagent_usage_is_live_then_final_and_reloads(self):
+        t = tr.Transcript()
+        t.apply(ToolCallStarted(call_id="c", name="subagent"))
+        t.apply(ToolUsageChanged(call_id="c", usage=Usage(input_tokens=7, output_tokens=3)))
+        tool = t.tool_blocks["c"]
+        self.assertEqual((tool.usage.input_tokens, tool.usage.output_tokens),
+                         (7, 3))
+        t.apply(ToolFinished(call_id="c", status="ok", content="done"))
+        self.assertEqual((tool.usage.input_tokens, tool.usage.output_tokens),
+                         (7, 3))
+        # A reload reads the local-only usage stamped on the tool message.
+        loaded = tr.Transcript().load(Snapshot(
+            status=Status(state="idle"),
+            messages=[
+                AssistantMessage(tool_calls=[
+                    ToolCall(call_id="c", name="subagent", arguments_json="{}")]),
+                ToolMessage(tool_call_id="c", content="done",
+                            usage=Usage(input_tokens=8, output_tokens=4)),
+            ],
+        ))
+        reloaded = next(i for i in loaded if isinstance(i, tr.ToolItem)).usage
+        self.assertEqual((reloaded.input_tokens, reloaded.output_tokens), (8, 4))
 
     def test_failed_call_keeps_both_output_and_reason(self):
         """A timed-out run_bash returns what it printed *and* the reason;

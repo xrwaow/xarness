@@ -46,6 +46,7 @@ from .protocol import ServerInfo, ServerStats, SessionSummary
 from .sandbox import SandboxConfig, SandboxRuntime, SandboxUnavailable, ref_infos
 from .errors import RefError, SessionError
 from .session import Session, SessionParts
+from .tools import report_tool_usage
 from .workspace import (
     WorkspaceState,
     change_workspace_ref,
@@ -279,6 +280,9 @@ class Host:
             workspace_state=workspace_state,
             tool_output_limit=sectioned.tool_output_limit,
             subagent_model=subagent_model,
+            # Copy: a session toggles its own servers in memory, and the
+            # sectioned config object is cached/shared across sessions.
+            mcp=sectioned.mcp.model_copy(deep=True),
             workspace_refs=workspace_refs,
             notify_workspace=(
                 (lambda reason=None: self.notify_workspace(
@@ -302,6 +306,10 @@ class Host:
             view=request.view,
         )
         self.sessions[name] = session
+        # Connect MCP servers once, before the first turn can ask for a
+        # tool schema. A slow/broken server is recorded on its status row;
+        # it never prevents the session from starting.
+        await session.prepare_mcp()
         if not request.no_session:
             # Durable from creation: the session shows up as saved in /sessions
             # and survives a host crash before the first turn.
@@ -381,10 +389,12 @@ class Host:
             no_save=parent.no_save,
             parent_id=parent.name,
             workspace_refs=list(parent.workspace_refs),
+            mcp_manager=parent.mcp,
             notify_workspace=(
                 (lambda reason=None: self.notify_workspace(state, reason=reason))
                 if state is not None else None
             ),
+            report_usage=report_tool_usage,
         )
         self.sessions[name] = child
         if not parent.no_save:
@@ -445,6 +455,7 @@ class Host:
         )
         session = Session.load(name, parts=parts, state=state)
         self.sessions[name] = session
+        await session.prepare_mcp()
         return session
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:

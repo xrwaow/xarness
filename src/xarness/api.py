@@ -32,6 +32,7 @@ from .protocol import (
     ServerStats,
     SessionSummary,
     Snapshot,
+    ToolsInfo,
 )
 from .session import Session, SessionError
 
@@ -234,6 +235,16 @@ def sessions_router(host: Host) -> APIRouter:
         before closing instead of trusting a cached status, and the policy
         lives with the state machine it is derived from."""
         return (await _session_or_load(host, name)).quit_verdict()
+
+    @router.get(
+        "/sessions/{name:path}/tools",
+        response_model=ToolsInfo,
+        summary="Effective tools plus configured MCP servers and availability",
+    )
+    async def tools(name: str) -> ToolsInfo:
+        """The /tools modal's data. Lazily starts configured MCP servers,
+        so opening the modal also refreshes a failed one."""
+        return await (await _session_or_load(host, name)).tools_info()
 
     @router.get(
         "/sessions/{name:path}/diff",

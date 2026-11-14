@@ -65,6 +65,8 @@ class FakeClient:
         self.quit_verdict_result = protocol.QuitVerdict(ask=False)
         self.quit_verdict_error: Exception | None = None
         self.uploads: list[tuple[str, bytes, str]] = []
+        # The host's answer to /tools (scripted per test).
+        self.tools_info = protocol.ToolsInfo()
 
     async def snapshot(self, name: str) -> Snapshot:
         return self.snapshot_data
@@ -106,6 +108,9 @@ class FakeClient:
 
     async def diff(self, name: str, path: str | None = None) -> DiffInfo:
         return DiffInfo()
+
+    async def tools(self, name: str) -> protocol.ToolsInfo:
+        return self.tools_info
 
     async def search_files(self, workspace: str, q: str) -> list[str]:
         return []
@@ -171,6 +176,141 @@ def make_snapshot(state: str = "idle") -> Snapshot:
 
 def running_status_event() -> Event:
     return protocol.StatusChanged(status=Status(state="running"))
+
+
+class ToolsScreenTest(unittest.IsolatedAsyncioTestCase):
+    def tools_info(self) -> protocol.ToolsInfo:
+        return protocol.ToolsInfo(
+            tools=[
+                protocol.ToolInfo(
+                    name="read_file", description="Read a file",
+                ),
+                protocol.ToolInfo(
+                    name="mcp__fs__cat", source="fs",
+                    description="Read through MCP",
+                ),
+            ],
+            servers=[protocol.McpServerInfo(
+                name="fs", command="npx", args=["pkg"],
+                status="connected",
+                tools=[protocol.ToolInfo(
+                    name="cat", source="fs", description="Read through MCP",
+                )],
+            )],
+        )
+
+    async def test_tools_modal_lists_sources_and_posts_toggles(self) -> None:
+        from textual.widgets import OptionList
+
+        from xarness.tui.tools_screen import ToolsScreen
+
+        client = FakeClient(make_snapshot())
+        client.tools_info = self.tools_info()
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            app._open_tools()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ToolsScreen)
+            screen = app.screen
+            top = screen.query_one("#tools-list")
+            bottom = screen.query_one("#mcp-list", OptionList)
+            blocks = top.query(".tools-tool")
+            self.assertEqual(len(blocks), 2)
+            self.assertIn(
+                "read_file",
+                str(blocks[0].query_one(".tools-tool-name").render()),
+            )
+            self.assertIn(
+                "mcp · fs",
+                str(blocks[1].query_one(".tools-tool-name").render()),
+            )
+            self.assertIn(
+                "Read a file",
+                str(blocks[0].query_one(".tools-tool-description").render()),
+            )
+            self.assertIn(
+                "Read through MCP",
+                str(blocks[1].query_one(".tools-tool-description").render()),
+            )
+            self.assertEqual(
+                [option.id for option in bottom.options],
+                ["server:fs", "tool:fs:cat"],
+            )
+            # Clicking a row posts the command the app sends to the host.
+            bottom.focus()
+            bottom.action_cursor_down()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(
+                [(command.type, getattr(command, "enabled", None))
+                 for _, command in client.commands],
+                [("set_mcp_server_enabled", False)],
+            )
+
+    async def test_tools_modal_shows_a_url_server_and_adds_by_url(self) -> None:
+        from textual.widgets import Input, OptionList
+
+        from xarness.tui.tools_screen import ToolsScreen
+
+        client = FakeClient(make_snapshot())
+        client.tools_info = protocol.ToolsInfo(
+            tools=[protocol.ToolInfo(
+                name="mcp__exa__search", source="exa",
+                description="Search the web",
+            )],
+            servers=[protocol.McpServerInfo(
+                name="exa", url="https://mcp.exa.ai/mcp",
+                status="connected", available=True,
+                tools=[protocol.ToolInfo(
+                    name="search", source="exa", description="Search the web",
+                )],
+            )],
+        )
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            app._open_tools()
+            for _ in range(3):
+                await pilot.pause()
+            screen = app.screen
+            self.assertIsInstance(screen, ToolsScreen)
+            bottom = screen.query_one("#mcp-list", OptionList)
+            header = str(bottom.get_option_at_index(0).prompt)
+            self.assertIn("https://mcp.exa.ai/mcp", header)
+            self.assertNotIn("None", header)
+
+            # The add field is an inset box, not panel-colored like the
+            # surface it sits on.
+            add = screen.query_one("#tools-add", Input)
+            self.assertNotEqual(
+                add.styles.background,
+                screen.query_one("#tools-modal").styles.background,
+            )
+
+            add.focus()
+            add.value = "https://mcp.exa.ai/mcp"
+            await pilot.press("enter")
+            for _ in range(3):
+                await pilot.pause()
+            added = [
+                command for _, command in client.commands
+                if command.type == "add_mcp_server"
+            ]
+            self.assertEqual(len(added), 1)
+            self.assertEqual(added[0].url, "https://mcp.exa.ai/mcp")
+            self.assertIsNone(added[0].command)
+            self.assertEqual(added[0].name, "exa-ai")
+
+    async def test_tools_requires_a_session(self) -> None:
+        from xarness.tui.tools_screen import ToolsScreen
+
+        client = FakeClient(make_snapshot())
+        app = make_app(client, session_name=None)
+        async with run_app(app) as pilot:
+            app._open_tools()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ToolsScreen)
 
 
 class CtrlCModalTest(unittest.IsolatedAsyncioTestCase):
@@ -957,6 +1097,28 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(live_parts("ask_user", "{}"), ("ask_user", ""))
 
+    def test_mcp_tools_read_as_server_dot_tool(self) -> None:
+        """A namespaced provider name is shown as ``server · tool`` in the
+        live label, the settled summary and the expanded body."""
+        from xarness.tui.tool_view import (
+            ToolCallView,
+            body_renderable,
+            live_parts,
+            summary_text,
+        )
+        from xarness.tui.transcript import ToolStatus
+
+        args = '{"path": "notes.md"}'
+        self.assertEqual(
+            live_parts("mcp__fs__read", args), ("fs · read", "notes.md"),
+        )
+        settled = summary_text(ToolCallView(
+            name="mcp__fs__read", args=args, status=ToolStatus.CALL_SUCCEEDED,
+        ))
+        self.assertEqual(settled.plain, "fs · read notes.md")
+        body = body_renderable(ToolCallView(name="mcp__fs__read", args=args))
+        self.assertIn('"path": "notes.md"', body.plain)
+
     def test_running_command_truncates_like_the_settled_one(self) -> None:
         """A long command may not shrink when the call finishes: the live
         detail keeps the settled width."""
@@ -1387,6 +1549,36 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
         finally:
             app_module.SESSIONS_REFRESH_SECONDS = previous_interval
 
+    async def test_sessions_command_scopes_subagents_to_the_current_session(
+        self,
+    ) -> None:
+        """The picker carries the session it was opened from."""
+        from textual.widgets import OptionList
+
+        def summary(name: str, parent: str | None = None) -> SessionSummary:
+            return SessionSummary(
+                name=name, parent_id=parent, state="saved",
+                last_user_message_at="2026-01-01T00:00:00+00:00",
+            )
+
+        client = FakeClient(make_snapshot())
+        client.session_list = [summary("a"), summary("a/sub", "a"),
+                               summary("b")]
+        for session_name, expected in (
+            (None, ["a", "b"]), ("a", ["a", "a/sub", "b"]),
+            ("b", ["a", "b"]),
+        ):
+            app = make_app(client, session_name=session_name)
+            async with run_app(app) as pilot:
+                await app._open_sessions_async()
+                await pilot.pause()
+                options = app.screen.query_one("#picker-list", OptionList)
+                self.assertEqual(
+                    [str(options.get_option_at_index(i).id)
+                     for i in range(options.option_count)],
+                    expected, f"wrong rows inside {session_name!r}",
+                )
+
     def test_child_sessions_nest_under_their_parent(self) -> None:
         from xarness.tui.list_picker import session_options
 
@@ -1408,13 +1600,34 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             summary("root/agent-1/agent-1", parent="root/agent-1",
                     at="00:00:01"),
         ]
-        options = session_options(entries, None)
+        options = session_options(entries, None, current="root")
         assert [str(o.id) for o in options] == [
             "root", "root/agent-1", "root/agent-1/agent-1", "other",
         ]
         assert str(options[1].prompt).startswith("↳ agent-1")
         assert str(options[2].prompt).startswith("↳ agent-1")
         assert str(options[3].prompt).startswith("other")
+
+    def test_subagents_only_show_under_the_session_they_ran_from(self) -> None:
+        """A draft chat lists top-level sessions alone; a subagent appears
+        only from its parent (or from the subagent itself)."""
+        from xarness.tui.list_picker import session_options
+
+        def summary(name: str, parent: str | None = None) -> SessionSummary:
+            return SessionSummary(
+                name=name, parent_id=parent, state="saved",
+                last_user_message_at="2026-01-01T00:00:00+00:00",
+            )
+
+        entries = [summary("sess1"), summary("sess1/sub1", "sess1"),
+                   summary("sess1/sub2", "sess1"), summary("sess2")]
+        names = lambda current: [str(o.id)  # noqa: E731
+                                 for o in session_options(entries, None, current)]
+        assert names(None) == ["sess1", "sess2"]
+        assert names("sess1") == ["sess1", "sess1/sub1", "sess1/sub2",
+                                  "sess2"]
+        assert names("sess2") == ["sess1", "sess2"]
+        assert names("sess1/sub1") == ["sess1", "sess1/sub1", "sess2"]
 
     def test_an_active_member_promotes_its_whole_group(self) -> None:
         """Attaching to an idle subagent keeps its parent and siblings in
@@ -1437,7 +1650,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
                     at="00:00:03"),
             summary("old", at="00:00:02"),
         ]
-        options = session_options(entries, None)
+        options = session_options(entries, None, current="root")
         assert [str(o.id) for o in options] == [
             "root", "root/agent-2", "root/agent-1", SPACER_ID, "old",
         ], [str(o.id) for o in options]
@@ -1464,7 +1677,7 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             summary("child", "saved", False, parent="root", at="00:00:04"),
             summary("old", "saved", False, at="00:00:01"),
         ]
-        options = session_options(entries, None)
+        options = session_options(entries, None, current="root")
         assert [str(o.id) for o in options] == [
             "root", "child", SPACER_ID, "old",
         ], [str(o.id) for o in options]
@@ -2890,6 +3103,26 @@ class DiffScopeChipTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.scope, "all")
 
 
+class CompactingStripTest(unittest.IsolatedAsyncioTestCase):
+    """Compaction has no ProcessingStarted: the status event drives the strip."""
+
+    async def test_compacting_status_shows_and_then_clears_the_strip(self) -> None:
+        client = FakeClient(make_snapshot("compacting"))
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            strips = [e for e in app._flow_model.entries
+                      if isinstance(e.item, tflow.PendingItem)]
+            self.assertEqual([e.item.label for e in strips], ["Compacting"])
+            self.assertTrue(strips[0].item.streaming())
+            client.queue.put_nowait(
+                protocol.StatusChanged(status=make_snapshot("running").status))
+            await pilot.pause()
+            self.assertFalse([e for e in app._flow_model.entries
+                              if isinstance(e.item, tflow.PendingItem)
+                              and e.alive])
+            self.assertEqual(app._phase, "idle")
+
+
 class ShimmerDirectionTest(unittest.TestCase):
     """The sweep must start at the base color and peak at the highlight."""
 
@@ -2907,6 +3140,13 @@ class ShimmerDirectionTest(unittest.TestCase):
         }
         self.assertEqual(colors[0], "#f0f0f0")  # band centre
         self.assertEqual(colors[len(label) - 1], "#101010")  # resting text
+        # Peak is white, not the theme's text color, in every palette.
+        from xarness import theme
+        for name in theme.THEMES:
+            theme.set_theme(name)
+            self.assertEqual(theme.SHIMMER_PROCESSING[1], "#ffffff")
+            self.assertEqual(theme.SHIMMER_THINKING[1], "#ffffff")
+        theme.set_theme(theme.DEFAULT_THEME)
 
 
 class UndoCommandTest(unittest.IsolatedAsyncioTestCase):

@@ -29,6 +29,7 @@ def system_prompt(
     tracked: bool = False,
     git_write: bool = False,
     default_timeout: float | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Render the whole system prompt for one session.
 
@@ -71,6 +72,12 @@ def system_prompt(
     else:
         lines.append("- No container: tools run directly on the host.")
     lines.append("- Tool paths are relative to the workspace root.")
+    if mcp_servers:
+        lines.append(
+            "- MCP tools (" + ", ".join(mcp_servers) + ") run on the host "
+            "outside the container: they are not sandboxed, and their file "
+            "changes are not tracked or undone by xarness."
+        )
     if default_timeout is not None:
         lines.append(
             f"- Tool commands are killed after {int(default_timeout)}s by "

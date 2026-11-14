@@ -401,6 +401,105 @@ def test_cancelling_the_parent_cancels_and_closes_the_child(
     asyncio.run(go())
 
 
+def test_subagent_usage_is_reported_live_and_on_finish(
+    tmp_path, monkeypatch,
+) -> None:
+    """The parent sees the child's spend while it runs, then the final numbers."""
+    gate = asyncio.Event()
+
+    class PausedSecondRoundClient(FakeClient):
+        rounds = 0
+
+        async def stream(self, wire_messages, tools=None):
+            if self.rounds:
+                await gate.wait()
+            self.rounds += 1
+            async for event in super().stream(wire_messages, tools):
+                yield event
+
+    child_round = [
+        ToolCallStarted(call_id="r1", name="read_file"),
+        ToolCallArgumentsDone(call_id="r1", name="read_file",
+                              arguments_json='{"path": "a.txt"}'),
+        RoundComplete(
+            usage=Usage(input_tokens=7, output_tokens=3), has_tool_calls=True),
+    ]
+    queue = [
+        FakeClient([_subagent_round(), _round("parent done")]),
+        PausedSecondRoundClient([child_round, _round("child answer")]),
+    ]
+    monkeypatch.setattr(
+        session_mod, "ChatClient",
+        lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
+    )
+
+    async def go():
+        host = _host(tmp_path)
+        parent = await _parent(host, tmp_path)
+        (tmp_path / "ws" / "a.txt").write_text("hi")
+        _, events = parent.subscribe()
+        await parent.execute(protocol.SendMessage(text="go"))
+        while True:
+            event = await asyncio.wait_for(events.get(), 5)
+            if isinstance(event, protocol.ToolUsageChanged):
+                break
+        assert event.call_id == "c1"
+        assert (event.usage.input_tokens, event.usage.output_tokens) == (7, 3)
+        gate.set()
+        await parent.wait_idle()
+        # Final totals are stored on the tool message (and shown on reload).
+        usage = _tool_result(parent).usage
+        assert (usage.input_tokens, usage.output_tokens) == (8, 4)
+
+    asyncio.run(go())
+
+
+def test_consecutive_subagent_calls_run_in_parallel(tmp_path, monkeypatch) -> None:
+    """Two subagents in one round run together: each waits for the other."""
+    tracker = {"entered": 0, "both": asyncio.Event()}
+
+    class BarrierClient(FakeClient):
+        async def stream(self, wire_messages, tools=None):
+            tracker["entered"] += 1
+            if tracker["entered"] >= 2:
+                tracker["both"].set()
+            await asyncio.wait_for(tracker["both"].wait(), 2)
+            async for event in super().stream(wire_messages, tools):
+                yield event
+
+    calls = []
+    for call_id, prompt in (("c1", "one"), ("c2", "two")):
+        calls += [
+            ToolCallStarted(call_id=call_id, name="subagent"),
+            ToolCallArgumentsDone(call_id=call_id, name="subagent",
+                                  arguments_json=json.dumps(
+                                      {"prompt": prompt, "mode": "write"})),
+        ]
+    calls.append(RoundComplete(has_tool_calls=True))
+    queue = [
+        FakeClient([calls, _round("parent done")]),
+        BarrierClient([_round("child one")]),
+        BarrierClient([_round("child two")]),
+    ]
+    monkeypatch.setattr(
+        session_mod, "ChatClient",
+        lambda profile, api_key: queue.pop(0) if queue else FakeClient([]),
+    )
+
+    async def go():
+        host = _host(tmp_path)
+        parent = await _parent(host, tmp_path)
+        await parent.execute(protocol.SendMessage(text="go"))
+        await parent.wait_idle()
+        assert tracker["entered"] == 2, "the children did not overlap"
+        results = [m.content for m in parent.conversation.messages
+                   if m.role == "tool"]
+        assert set(results) == {"child one", "child two"}
+        assert [s.name for s in host.sessions.values()] == [parent.name]
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize(
     ("preset", "request_model", "expected"),
     [

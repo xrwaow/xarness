@@ -442,8 +442,99 @@ DiffSummary.expanded #diff-body {
     color: $c-bg;
 }
 
-ConfirmScreen, RefsScreen, ListPicker {
+ConfirmScreen, RefsScreen, ListPicker, ToolsScreen {
     align: center middle;
+}
+
+/* The /tools manager: a wide surface panel with two lists and an input. */
+#tools-modal {
+    width: 90%;
+    max-width: 88;
+    max-height: 90%;
+}
+
+#tools-title {
+    color: $c-text;
+}
+
+.tools-section {
+    color: $c-muted;
+    text-style: bold;
+    margin-top: 1;
+}
+
+#tools-list {
+    height: auto;
+    max-height: 10;
+    background: $c-surface;
+    border: none;
+    padding: 0;
+    overflow-y: auto;
+    color: $c-text;
+}
+
+.tools-tool {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+.tools-tool-name, .tools-tool-description, .tools-empty {
+    height: auto;
+}
+
+.tools-tool-name {
+    color: $c-text;
+}
+
+.tools-tool-description {
+    padding-left: 8;
+    color: $c-muted;
+}
+
+.tools-empty {
+    padding: 0 1;
+    color: $c-muted;
+}
+
+/* The MCP list is the picker's list: same chrome, shorter. */
+#mcp-list {
+    max-height: 7;
+}
+
+#mcp-list > .option-list--option-disabled {
+    background: $c-surface;
+    color: $c-muted;
+}
+
+/* The literal separator between the effective tools and the MCP sources.
+   Rich text, so it spans the panel width on every theme. */
+#tools-rule {
+    color: $c-border;
+    margin: 1 0 0 0;
+}
+
+#tools-hint {
+    color: $c-muted;
+    margin-top: 1;
+}
+
+#tools-add-hint {
+    color: $c-muted;
+}
+
+#tools-error {
+    height: auto;
+    color: $c-error;
+    margin-top: 0;
+}
+
+/* The modal panel is $c-surface, so a panel-colored field disappears inside
+   it; one step up (border) reads as an input, the same way the chat input
+   sits a step above the screen background. */
+#tools-add, #tools-add:focus {
+    margin-top: 0;
+    background: $c-border;
 }
 
 #refs-modal {
@@ -495,7 +586,7 @@ ConfirmScreen, RefsScreen, ListPicker {
     max-height: 28;
 }
 
-#picker-list {
+#picker-list, #mcp-list {
     /* The default height: 1fr collapses to a single visible row inside the
        auto-height modal — one entry at a time, the rest only reachable by
        scrolling. Also: the widgets default to Textual's own dark $surface,
@@ -508,14 +599,16 @@ ConfirmScreen, RefsScreen, ListPicker {
     color: $c-text;
 }
 
-#picker-list > .option-list--option {
+#picker-list > .option-list--option, #mcp-list > .option-list--option {
     background: $c-surface;
     color: $c-text;
     padding: 0 1;
 }
 
 #picker-list > .option-list--option-hover,
-#picker-list > .option-list--option-highlighted {
+#picker-list > .option-list--option-highlighted,
+#mcp-list > .option-list--option-hover,
+#mcp-list > .option-list--option-highlighted {
     background: $c-border;
     color: $c-text;
     text-style: bold;

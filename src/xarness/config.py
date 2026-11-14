@@ -267,6 +267,89 @@ class SandboxSettings(BaseModel):
         return merged
 
 
+class McpServerSettings(BaseModel):
+    """One MCP server (the ``mcp.servers`` config map).
+
+    A server is either a stdio child process (``command`` + ``args``) or a
+    remote Streamable HTTP endpoint (``url``). Servers are host-side and
+    deliberately not sandboxed: an MCP server is a trusted extension, and
+    the UI says so where its tools appear."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    # Streamable HTTP endpoint (e.g. https://mcp.exa.ai/mcp). Exactly one of
+    # command/url is required.
+    url: str | None = None
+    # Extra variables layered over the host environment. Provider keys are
+    # inherited too (the host process owns them); keep third-party servers
+    # to trusted packages.
+    env: dict[str, str] = Field(default_factory=dict)
+    # Working directory; a relative path is resolved against the workspace.
+    cwd: str | None = None
+    enabled: bool = True
+    # Per-call timeout (seconds). Process startup uses a smaller cap so a
+    # broken command cannot hold session creation for the full call budget.
+    timeout: float = Field(default=120.0, gt=0)
+    # Tools the user switched off from /tools. Persisted with the server so
+    # the choice survives a restart.
+    disabled_tools: list[str] = Field(default_factory=list)
+
+    @field_validator("command", "url", "cwd", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: Any) -> Any:
+        return (value.strip() or None) if isinstance(value, str) else value
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith(("http://", "https://")):
+            raise ValueError("url must be an http(s) URL")
+        return value
+
+    @field_validator("cwd")
+    @classmethod
+    def _validate_cwd(cls, value: str | None) -> str | None:
+        if value is not None and ".." in Path(value).parts:
+            raise ValueError(f"cwd must not contain '..': {value!r}")
+        return value
+
+    @field_validator("args", "disabled_tools")
+    @classmethod
+    def _validate_strings(cls, value: list[str]) -> list[str]:
+        return [str(item) for item in value if str(item)]
+
+    @model_validator(mode="after")
+    def _one_transport(self) -> "McpServerSettings":
+        if bool(self.command) == bool(self.url):
+            raise ValueError("set exactly one of 'command' (stdio) or 'url' (HTTP)")
+        return self
+
+
+class McpSettings(BaseModel):
+    """The config's ``mcp`` section."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    servers: dict[str, McpServerSettings] = Field(default_factory=dict)
+
+    @field_validator("servers")
+    @classmethod
+    def _validate_names(
+        cls, value: dict[str, McpServerSettings],
+    ) -> dict[str, McpServerSettings]:
+        for name in value:
+            if not name or not all(
+                char.isalnum() or char in "_-" for char in name
+            ):
+                raise ValueError(
+                    f"invalid MCP server name {name!r}: use letters, digits, "
+                    "'_' or '-'"
+                )
+        return value
+
+
 class PresetSettings(BaseModel):
     """One named preset: a model + sandbox profile."""
 
@@ -291,6 +374,8 @@ class SectionedConfig(BaseModel):
     presets: dict[str, PresetSettings] = Field(default_factory=dict)
     theme: str = DEFAULT_THEME
     default_preset: str = "default"
+    # Host-side MCP servers exposed as tools (see mcp.py).
+    mcp: McpSettings = Field(default_factory=McpSettings)
     # Not a sandbox concern: the cap on tool-result text sent to the model.
     tool_output_limit: int | None = Field(default=None, ge=256)
 
@@ -469,6 +554,28 @@ def save_preferences(
             defaults["preset"] = matching[0]
         else:
             presets.setdefault(current, {})["model"] = default_profile
+    _atomic_write(path, data)
+
+
+def save_mcp_settings(path: Path, settings: McpSettings) -> None:
+    """Persist the ``mcp`` section, leaving the rest of the file untouched.
+
+    The host owns the config file (the UI sends commands, never paths), so
+    this is the one place a server toggle or an added server is written
+    back. A failed write is reported to the session's client; it is not
+    fatal to the running session."""
+    data = _read(path)
+    data["mcp"] = {
+        "servers": {
+            name: server.model_dump(mode="json", exclude_none=True)
+            for name, server in settings.servers.items()
+        },
+    }
+    _atomic_write(path, data)
+
+
+def _atomic_write(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON through a same-directory temp file and rename."""
     tmp = path.with_suffix(f".json.tmp-{os.getpid()}")
     try:
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

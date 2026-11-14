@@ -285,6 +285,72 @@ def _bash_live(args_text: str) -> tuple[str, str]:
     return "run_bash", _bash_line(args_text)
 
 
+# -- MCP tools -------------------------------------------------------------
+#
+# A server's tools are namespaced ``mcp__<server>__<tool>`` for the provider,
+# which reads as noise in a transcript row; the display is ``server · tool``.
+
+MCP_PREFIX = "mcp__"
+
+
+def mcp_parts(tool_name: str) -> tuple[str, str] | None:
+    """``mcp__<server>__<tool>`` -> (server, tool), or None for a built-in.
+
+    Names are sanitized for the provider (dots/spaces become ``_``), so the
+    display is the sanitized spelling rather than the server's original
+    identifier; the server and tool are still legible, and the expanded body
+    carries the exact call."""
+    if not tool_name.startswith(MCP_PREFIX):
+        return None
+    server, _, tool = tool_name[len(MCP_PREFIX):].partition("__")
+    return server, tool
+
+
+def display_name(tool_name: str) -> str:
+    """The name a tool row shows (an MCP tool reads ``server · tool``)."""
+    parts = mcp_parts(tool_name)
+    if parts is None:
+        return tool_name or "tool"
+    server, tool = parts
+    return f"{server} · {tool}" if tool else server
+
+
+def _mcp_detail(args_text: str) -> str:
+    """A short, human argument for the one-line row.
+
+    Common MCP tools name a file/query/url first; otherwise fall back to the
+    compact JSON. Still-streaming JSON is salvaged for those same keys so the
+    live row fills in as the model types."""
+    args = json_tool_args(args_text)
+    for key in (
+        "path", "file_path", "filename", "query", "url", "pattern",
+        "command", "name", "prompt", "message",
+    ):
+        value = args.get(key) or _partial_string(args_text, key, unescape=True)
+        if isinstance(value, str) and value:
+            return _shorten(value, 72)
+    try:
+        return _shorten(json.dumps(args, ensure_ascii=False), 72) if args else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _mcp_settled(args_text: str) -> Text | None:
+    """The dimmed argument of a settled MCP row."""
+    detail = _mcp_detail(args_text)
+    return _muted(" " + detail) if detail else None
+
+
+def _mcp_body(call: ToolCallView) -> RenderableType:
+    """The expanded MCP call: its arguments, then its result."""
+    args = json_tool_args(call.args)
+    text = (
+        json.dumps(args, indent=2, ensure_ascii=False)
+        if args else call.args.strip()
+    )
+    return _with_output(text, call.output)
+
+
 def _write_settled(args_text: str) -> Text | None:
     loc, path = _write_loc(args_text), _path(args_text)
     if loc is None:
@@ -318,7 +384,8 @@ def live_parts(tool_name: str, args_text: str) -> tuple[str, str]:
     "tool"."""
     view = TOOL_VIEWS.get(tool_name)
     if view is None:
-        return tool_name or "tool", ""
+        detail = _mcp_detail(args_text) if mcp_parts(tool_name) else ""
+        return display_name(tool_name), _shorten(detail, 80)
     name, detail = view[0](args_text)
     return name, _shorten(detail, 80) if detail else detail
 
@@ -327,13 +394,17 @@ def summary_text(call: ToolCallView) -> Text:
     """Settled one-line summary after the status verb."""
     if getattr(call.status, "name", "") != "CALL_SUCCEEDED":
         return Text(call.name)
-    _, settled, _ = TOOL_VIEWS.get(call.name, _DEFAULT)
-    detail = settled(call.args)
-    text = Text(call.name)
+    text = Text(display_name(call.name))
+    detail = (
+        _mcp_settled(call.args) if mcp_parts(call.name)
+        else TOOL_VIEWS.get(call.name, _DEFAULT)[1](call.args)
+    )
     if detail is not None:
         text.append_text(detail)
     return text
 
 
 def body_renderable(call: ToolCallView) -> RenderableType:
+    if mcp_parts(call.name):
+        return _mcp_body(call)
     return TOOL_VIEWS.get(call.name, _DEFAULT)[2](call)

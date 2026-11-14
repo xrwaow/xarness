@@ -82,6 +82,7 @@ from .diff_summary import DiffSummary
 from .flow import LineItem, PendingItem, UserItem
 from .list_picker import ListPicker, name_options, session_options
 from .refs_screen import RefsScreen
+from .tools_screen import ToolsScreen
 from .transcript import Transcript
 from .widgets import (
     AskBar,
@@ -141,12 +142,8 @@ def _command(name: str, description: str, handler, takes_arg: bool = False):
     COMMANDS[name] = SlashCommand(name, description, handler, takes_arg)
 
 
-_command("tools", "list available tools",
-         lambda s, a: s._notice(
-             "tools: " + (
-                 ", ".join(s.view_status.tools) if s.view_status.tools else "none"
-             )
-         ))
+_command("tools", "browse tools and manage MCP servers",
+         lambda s, a: s.call_later(s._open_tools))
 _command("model", "choose what model and reasoning effort to use",
          lambda s, a: s._pick_model())
 _command("sessions", "resume a previous session",
@@ -453,6 +450,18 @@ class AgentApp(App[None]):
             self._remove_entry(self._pending_entry)
             self._pending_entry = None
 
+    def _sync_compacting(self, state: str) -> None:
+        """Mirror the session's compacting flag into the pending strip (the
+        summarizer emits no ProcessingStarted; status is the only signal)."""
+        if state == "compacting":
+            if self._phase != "compacting":
+                self._drop_pending()
+                self._phase = "compacting"
+                self._pending_entry = self._append_item(
+                    PendingItem(label="Compacting"))
+        elif self._phase == "compacting":
+            self._phase_idle()
+
     # ------------------------------------------------------------------
     # layout
 
@@ -543,6 +552,7 @@ class AgentApp(App[None]):
                         self._refresh_title()
                         await self._render_history(item)
                         self._refresh_bars()
+                        self._sync_compacting(item.status.state)
                         await self.refresh_diff_summary()
                         self._sync_ask()
                     else:
@@ -567,6 +577,7 @@ class AgentApp(App[None]):
             self._status = event.status
             self._set_vision(event.status.supports_vision)
             self._refresh_bars()
+            self._sync_compacting(event.status.state)
             self._sync_refs_screen()
             self._sync_ask()
             return
@@ -1267,16 +1278,20 @@ class AgentApp(App[None]):
         if not entries:
             return
         workspace = str(self.workspace) if self.workspace else None
+        # The picker lists a subagent only under the family of the session
+        # it was opened from, so a draft chat shows top-level sessions alone.
+        current = self.session_name
         screen = ListPicker(
-            session_options(entries, workspace),
+            session_options(entries, workspace, current),
             title="Open session", filterable=True,
         )
         self.push_screen(screen, self._on_session_selected)
-        self._refresh_sessions_screen(screen, workspace)
+        self._refresh_sessions_screen(screen, workspace, current)
 
     @work(group="sessions-refresh", exclusive=True)
     async def _refresh_sessions_screen(
         self, screen: ListPicker, workspace: str | None,
+        current: str | None,
     ) -> None:
         """Keep an open /sessions picker in step with the host.
 
@@ -1293,7 +1308,9 @@ class AgentApp(App[None]):
             except (ClientError, httpx.HTTPError):
                 continue
             if entries and screen in self.screen_stack:
-                screen.update_options(session_options(entries, workspace))
+                screen.update_options(
+                    session_options(entries, workspace, current)
+                )
 
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
@@ -1427,6 +1444,54 @@ class AgentApp(App[None]):
             self.screen.post_message(
                 RefsScreen.RefsChanged(list(self.view_status.refs))
             )
+
+    # ------------------------------------------------------------------
+    # Tools / MCP servers
+
+    @work(group="tools-open", exit_on_error=False)
+    async def _open_tools(self) -> None:
+        """Open the tool manager for the attached session.
+
+        A draft has no tool set yet: the registry is built with the session,
+        so there is nothing honest to show before the first message."""
+        if self.session_name is None:
+            self._error(
+                "send a message first — the tool set is built with the session"
+            )
+            return
+        try:
+            info = await self.client.tools(self.session_name)
+        except ClientError as exc:
+            self._error(f"/tools failed: {exc}")
+            return
+        self.push_screen(ToolsScreen(info))
+
+    def on_tools_screen_change(self, event: ToolsScreen.Change) -> None:
+        self._tools_command(event.command)
+
+    @work(group="tools-command", exit_on_error=False)
+    async def _tools_command(self, command: Command) -> None:
+        """Send a toggle/add and refresh the modal from the host's answer.
+
+        The command result is the only place availability changes are
+        immediate; a broadcast StatusChanged would arrive behind the modal
+        with no data about the per-server error."""
+        if self.session_name is None:
+            return
+        screen = self.screen if isinstance(self.screen, ToolsScreen) else None
+        if screen is not None:
+            screen.show("applying…")
+        try:
+            await self.client.command(self.session_name, command)
+            info = await self.client.tools(self.session_name)
+        except ClientError as exc:
+            self._error(str(exc))
+            if screen is not None:
+                screen.show(str(exc), error=True)
+            return
+        if isinstance(self.screen, ToolsScreen):
+            self.screen.update_info(info)
+            self.screen.show("")
 
     @work(group="refs", exit_on_error=False)
     async def _ref_update(self, add: bool, path: str) -> None:
@@ -1636,6 +1701,7 @@ class AgentApp(App[None]):
         self._status = event.snapshot.status
         self._refresh_bars()
         await self._render_history(event.snapshot)
+        self._sync_compacting(event.snapshot.status.state)
         self._notice(self._history_text(event))
         self._refresh_status()
         self.call_later(self.refresh_diff_summary)
@@ -1654,6 +1720,9 @@ class AgentApp(App[None]):
         self._entries = {}
         self._anim = {}
         self._presenter.reset()
+        # The snapshot is the transcript now: any ephemeral strip went with
+        # the old model. The caller re-syncs it from the snapshot's status.
+        self._phase, self._pending_entry = "idle", None
         self._register_items(self._transcript.load(snap))
         try:
             self._flow_view().scroll_to_bottom(animate=False)

@@ -335,6 +335,9 @@ class ToolMessage(BaseMessage):
     tool_call_id: str
     content: str = ""
     status: ToolStatus = "ok"
+    # Local-only: the token spend of a tool that ran its own model rounds (a
+    # subagent). None for ordinary tools. Never sent to the provider.
+    usage: Usage | None = None
 
     def to_wire(
         self, include_reasoning: bool = False,

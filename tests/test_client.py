@@ -278,3 +278,37 @@ def test_connect_error_respawns_host_and_retries() -> None:
     assert sessions == []
     assert len(attempts) == 2
     assert spawned == [1]
+
+
+def test_validation_error_is_reported_as_readable_fields() -> None:
+    """A 422 from an out-of-date host must say which field is wrong, not
+    dump FastAPI's list of dicts into the modal."""
+    from xarness import clientlib
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": [
+            {"type": "string_type", "loc": ["body", "add_mcp_server", "command"],
+             "msg": "Input should be a valid string", "input": None},
+            {"type": "extra_forbidden", "loc": ["body", "add_mcp_server", "url"],
+             "msg": "Extra inputs are not permitted",
+             "input": "https://mcp.exa.ai/mcp"},
+        ]})
+
+    async def go():
+        client = clientlib.XarnessClient(httpx.AsyncClient(
+            base_url="http://test", transport=httpx.MockTransport(handler),
+        ))
+        try:
+            await client.sessions()
+        except clientlib.ClientError as exc:
+            return exc
+        finally:
+            await client.aclose()
+        raise AssertionError("no error raised")
+
+    error = asyncio.run(go())
+    text = str(error)
+    assert error.status == 422
+    assert "body.add_mcp_server.command: Input should be a valid string" in text
+    assert "body.add_mcp_server.url: Extra inputs are not permitted" in text
+    assert "[{" not in text

@@ -106,6 +106,39 @@ class Ref(CommandBase):
     add: bool
 
 
+class SetMcpServerEnabled(CommandBase):
+    """Switch one configured MCP server on or off (idle only)."""
+
+    type: Literal["set_mcp_server_enabled"] = "set_mcp_server_enabled"
+    name: str
+    enabled: bool
+
+
+class SetMcpToolEnabled(CommandBase):
+    """Include/exclude one tool of a connected MCP server."""
+
+    type: Literal["set_mcp_tool_enabled"] = "set_mcp_tool_enabled"
+    server: str
+    tool: str
+    enabled: bool
+
+
+class AddMcpServer(CommandBase):
+    """Add and start one MCP server, persisted to the config.
+
+    A server is either a stdio command or a remote URL; exactly one of
+    ``command``/``url`` is set."""
+
+    type: Literal["add_mcp_server"] = "add_mcp_server"
+    name: str
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    url: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+    timeout: float = 120.0
+
+
 Command = Annotated[
     Union[
         SendMessage,
@@ -123,6 +156,9 @@ Command = Annotated[
         SetSandbox,
         Filter,
         Ref,
+        SetMcpServerEnabled,
+        SetMcpToolEnabled,
+        AddMcpServer,
     ],
     Field(discriminator="type"),
 ]

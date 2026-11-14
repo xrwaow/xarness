@@ -26,6 +26,7 @@ from ..protocol import (
     ToolCallStarted,
     ToolFinished,
     ToolOutputDelta,
+    ToolUsageChanged,
     TurnEnded,
     image_refs,
 )
@@ -213,6 +214,7 @@ class ToolItem(TranscriptItem):
     output: str = ""
     status: ToolStatus = ToolStatus.MAKING_CALL
     expanded: bool = False
+    usage: Usage | None = None  # subagent spend (live, then final)
 
     STATUS_COLOR_KEY = {
         ToolStatus.MAKING_CALL: "warning",
@@ -410,6 +412,8 @@ class Transcript:
                         else ToolStatus.CALL_FAILED
                     )
                     item.output = result.content
+                    # Local-only spend of a tool that ran its own rounds.
+                    item.usage = getattr(result, "usage", None)
                 elif live:
                     # The snapshot says the turn is running, so an unanswered
                     # call is the one in flight. Claiming "interrupted" here
@@ -576,17 +580,19 @@ class Transcript:
             room = MAX_LIVE_TOOL_OUTPUT - len(item.output)
             item.output += event.text[:room]
             return [item]
-        if isinstance(event, ToolFinished):
+        if isinstance(event, (ToolUsageChanged, ToolFinished)):
             item = self.tool_blocks.get(event.call_id)
             if item is None:
                 return []
-            if event.status == "parse_error":
-                item.status = ToolStatus.PARSING_ERROR
-            elif event.status == "ok":
-                item.status = ToolStatus.CALL_SUCCEEDED
+            if isinstance(event, ToolUsageChanged):
+                item.usage = event.usage
             else:
-                item.status = ToolStatus.CALL_FAILED
-            item.output = event.content
+                item.status = (
+                    ToolStatus.PARSING_ERROR if event.status == "parse_error"
+                    else ToolStatus.CALL_SUCCEEDED if event.status == "ok"
+                    else ToolStatus.CALL_FAILED
+                )
+                item.output = event.content
             return [item]
         if isinstance(event, RoundComplete):
             # The round's usage needs no client-side bookkeeping: the host

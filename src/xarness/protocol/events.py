@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from ..conversation import Message, ToolStatus, TurnStats, Usage
 from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 22
 
 # Error convention: every route fails with HTTP 4xx (400 bad request, 404
 # missing session/path), commands included — a rejected command raises
@@ -139,6 +139,14 @@ class ToolOutputDelta(EventBase):
     text: str
 
 
+class ToolUsageChanged(EventBase):
+    """Live token spend for a tool with its own model rounds (subagent)."""
+
+    type: Literal["tool_usage_changed"] = "tool_usage_changed"
+    call_id: str
+    usage: Usage = Field(default_factory=Usage)
+
+
 class ToolFinished(EventBase):
     type: Literal["tool_finished"] = "tool_finished"
     call_id: str
@@ -243,6 +251,7 @@ class SessionDeleted(EventBase):
 HostEvent = (
     ToolExecStarted
     | ToolOutputDelta
+    | ToolUsageChanged
     | ToolFinished
     | MessageAdded
     | StatusChanged

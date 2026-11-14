@@ -146,8 +146,9 @@ def set_theme(name: str) -> None:
         "scrollbar-background-active": PALETTE["surface"],
         "scrollbar-corner-color": PALETTE["surface"],
     })
-    SHIMMER_PROCESSING = (PALETTE["muted"], PALETTE["text"])
-    SHIMMER_THINKING = (PALETTE["muted"], PALETTE["surface"])
+    # Sweep to white, never to the theme's text color (that reads as plain
+    # emphasis, not a highlight).
+    SHIMMER_PROCESSING = SHIMMER_THINKING = (PALETTE["muted"], "#ffffff")
 
 
 set_theme(DEFAULT_THEME)

@@ -35,6 +35,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, fields
 from functools import partial
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +44,13 @@ from .client import ChatClient, StreamClient
 from .compaction import CHARS_PER_TOKEN
 from .config import (
     ConfigError,
+    McpServerSettings,
+    McpSettings,
     ProviderProfile,
     SandboxSettings,
     load_sectioned,
     resolve_api_key,
+    save_mcp_settings,
     validate_filter_path,
 )
 from .errors import RefError, SessionError
@@ -70,6 +74,7 @@ from .gitwork import (
     write_blob,
 )
 from .images import ImageRef
+from .mcp import McpError, McpManager
 from .prompts import system_prompt
 from .protocol import (
     Command,
@@ -118,6 +123,8 @@ DIFF_DEBOUNCE_SECONDS = 0.25
 IDLE_ONLY = (
     protocol.Rollback, protocol.Compact, protocol.SwitchModel,
     protocol.SetSandbox, protocol.Filter, protocol.Ref,
+    protocol.SetMcpServerEnabled, protocol.SetMcpToolEnabled,
+    protocol.AddMcpServer,
 )
 
 # Commands that only touch a flag or a future: they skip the command lock, so
@@ -164,6 +171,8 @@ class SessionParts:
     # The model a subagent of this session runs (a model key), resolved from
     # the preset's `subagent_model`.
     subagent_model: str | None = None
+    # MCP servers this session may expose (from the config's `mcp` section).
+    mcp: McpSettings = field(default_factory=McpSettings)
     # Workspace reference paths (shared per workspace, managed with /ref).
     workspace_refs: list[str] = field(default_factory=list)
     # Called after a workspace event so every agent in the repo refreshes
@@ -172,6 +181,9 @@ class SessionParts:
     # Starts one subagent session for this one and returns its final message;
     # injected by the host, and None for a subagent itself (no nesting).
     spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None
+    # Receives a child session's cumulative usage after each round, so the
+    # parent's tool row can show it live.
+    report_usage: Callable[[Usage], None] | None = None
 
     def session_kwargs(self, name: str) -> dict[str, Any]:
         """Keyword arguments for ``Session(name=..., **kwargs)`` (shallow:
@@ -203,7 +215,10 @@ class Session:
         notify_workspace: Callable[[str | None], None] | None = None,
         subagent_model: str | None = None,
         spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None,
+        report_usage: Callable[[Usage], None] | None = None,
         view: protocol.ViewState | None = None,
+        mcp: McpSettings | None = None,
+        mcp_manager: McpManager | None = None,
     ) -> None:
         self.name = name
         # Set only for a subagent's session: the session that spawned it.
@@ -231,11 +246,18 @@ class Session:
             else lambda prompt, mode_arg: spawn_subagent(self, prompt, mode_arg)
         )
         self._ask_callback = None if parent_id is not None else self._ask_user
+        self._report_usage = report_usage
+        # MCP servers are host-side subprocesses. A subagent shares its
+        # parent's manager (and therefore its already-running processes);
+        # only the owner closes them.
+        self._owns_mcp = mcp_manager is None
+        self.mcp = mcp_manager or McpManager(mcp or McpSettings(), workspace)
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_callback,
             default_timeout=self._tool_timeout(),
             spawn_subagent=self._spawn_subagent,
+            mcp=self.mcp,
         )
         if tool_output_limit is not None:
             self.tool_registry.max_output_chars = tool_output_limit
@@ -299,7 +321,10 @@ class Session:
         # The tool call currently executing (if any). A session whose model
         # has handed off to a tool is waiting on it, not generating: /sessions
         # shows that as "waiting" (a subagent call can run for minutes).
+        # ``_executing_calls`` counts parallel subagents so the first one to
+        # finish does not clear the status while its sibling still runs.
         self._executing_tool: str | None = None
+        self._executing_calls = 0
 
         # Fan-out.
         self._subscribers: list[asyncio.Queue[Event]] = []
@@ -349,6 +374,110 @@ class Session:
         return session
 
     # ------------------------------------------------------------------
+    # MCP
+
+    async def prepare_mcp(self) -> None:
+        """Connect the configured MCP servers once, then rebuild the tools.
+
+        Called by the host before a session can be used, and again from
+        :meth:`tools_info` so a client that attaches to an old session sees
+        live availability rather than an empty listing."""
+        if self.mcp.started or self._closed:
+            return
+        await self.mcp.start()
+        self._rebuild_tools()
+
+    async def tools_info(self) -> protocol.ToolsInfo:
+        """The effective tools (built-ins plus enabled MCP tools) and every
+        configured MCP server, failed and disabled ones included.
+
+        Server processes are started lazily here too, so opening /tools is
+        enough to make a newly configured server available."""
+        await self.prepare_mcp()
+        return protocol.ToolsInfo(
+            tools=[
+                protocol.ToolInfo(
+                    name=tool.name, source=tool.source,
+                    description=tool.description,
+                )
+                for tool in self.tool_registry.tools()
+            ],
+            servers=self.mcp.statuses(),
+        )
+
+    def _mcp_state(self, name: str) -> str:
+        """One server's status word ("connected", "unavailable", …, or
+        "configured" for a name the manager does not know)."""
+        return next(
+            (server.status for server in self.mcp.statuses()
+             if server.name == name),
+            "configured",
+        )
+
+    async def _apply_mcp(self, change: Callable[[], Awaitable[None]]) -> None:
+        """Run one MCP change: persist it, rebuild the tools, push status.
+
+        The tool set is derived from the connected servers, so every change
+        goes through here rather than each handler repeating the three
+        steps (and forgetting one)."""
+        try:
+            await change()
+        except McpError as exc:
+            raise SessionError(str(exc)) from None
+        self._save_mcp_settings()
+        self._rebuild_tools()
+        self._emit_status()
+
+    async def _cmd_set_mcp_server_enabled(
+        self, command: protocol.SetMcpServerEnabled,
+    ) -> CommandResult:
+        await self._apply_mcp(lambda: self.mcp.set_server_enabled(
+            command.name, command.enabled,
+        ))
+        self._emit_notice(f"mcp {command.name}: {self._mcp_state(command.name)}")
+        return CommandResult()
+
+    async def _cmd_set_mcp_tool_enabled(
+        self, command: protocol.SetMcpToolEnabled,
+    ) -> CommandResult:
+        await self._apply_mcp(lambda: self.mcp.set_tool_enabled(
+            command.server, command.tool, command.enabled,
+        ))
+        return CommandResult()
+
+    async def _cmd_add_mcp_server(
+        self, command: protocol.AddMcpServer,
+    ) -> CommandResult:
+        try:
+            settings = McpServerSettings(
+                **command.model_dump(exclude={"type", "name"}),
+            )
+        except ValueError as exc:
+            raise SessionError(f"invalid MCP server: {exc}") from None
+        await self._apply_mcp(lambda: self.mcp.add_server(command.name, settings))
+        state = self._mcp_state(command.name)
+        self._emit_notice(
+            f"mcp {command.name}: {state}" if state == "connected" else
+            f"mcp {command.name}: configured ({state})"
+        )
+        return CommandResult()
+
+    def _save_mcp_settings(self) -> None:
+        """Persist toggles/additions in the host's config file.
+
+        The live session keeps working when the file cannot be written; the
+        user gets a notice instead of losing the running change."""
+        if self.config_path is None:
+            return
+        try:
+            save_mcp_settings(self.config_path, self.mcp.settings)
+        except (ConfigError, OSError) as exc:
+            self._emit_notice(
+                f"mcp settings changed for this session only: {exc}",
+                level="warn",
+            )
+
+    # ------------------------------------------------------------------
     # lifecycle
 
     async def stop(self) -> None:
@@ -364,6 +493,10 @@ class Session:
         # Close the sandbox shell here (not only on host eviction) so every
         # path — explicit unload, delete, eviction, shutdown — releases it.
         await self.sandbox.close()
+        # Only the owner closes MCP processes; a subagent shares its
+        # parent's manager and must leave it running.
+        if self._owns_mcp:
+            await self.mcp.close()
         # Release the provider connection pool.
         client = self._client
         if client is not None and hasattr(client, "aclose"):
@@ -591,6 +724,12 @@ class Session:
                 return await self._cmd_filter(command.path, command.add)
             case protocol.Ref():
                 return await self._cmd_ref(command.path, command.add)
+            case protocol.SetMcpServerEnabled():
+                return await self._cmd_set_mcp_server_enabled(command)
+            case protocol.SetMcpToolEnabled():
+                return await self._cmd_set_mcp_tool_enabled(command)
+            case protocol.AddMcpServer():
+                return await self._cmd_add_mcp_server(command)
             case _:
                 raise SessionError(f"unsupported command: {type(command).__name__}")
 
@@ -1301,13 +1440,18 @@ class Session:
                 )
             yield event
 
-    def record_tool_result(self, call_id: str, result: Any) -> None:
+    def record_tool_result(
+        self, call_id: str, result: Any, usage: Usage | None = None,
+    ) -> None:
         """Append a ``tool`` message with the outcome of one call.
 
         ``content`` is stored as-is — a failing call keeps its real output,
-        so failing test output reaches the model."""
+        so failing test output reaches the model. ``usage`` is the token
+        spend of a tool that ran its own rounds (a subagent); it stays
+        local and is never sent to the provider."""
         self.conversation.add(ToolMessage(
-            tool_call_id=call_id, content=result.content, status=result.status,
+            tool_call_id=call_id, content=result.content,
+            status=result.status, usage=usage,
         ))
 
     def _save_interrupted_round(self) -> bool:
@@ -1345,6 +1489,8 @@ class Session:
         already-emitted status payloads keep their point-in-time values."""
         self.usage_total = self.usage_total + usage
         self.last_usage = usage.model_copy()
+        if self._report_usage is not None:
+            self._report_usage(self.usage_total)
 
     def _estimate_usage(self, content: str) -> Usage:
         prompt_chars = sum(
@@ -1429,9 +1575,10 @@ class Session:
                     # start instead (see the top of this method).
                     break
                 # Execute the calls this round requested, in stream order.
+                # Parallel subagents are the one exception (see _execute_calls):
+                # a round that spawns several children runs them together.
                 tool_start = time.monotonic()
-                for call in done_calls:
-                    await self._execute_call(call)
+                await self._execute_calls(done_calls)
                 busy += time.monotonic() - tool_start
                 self._persist()
                 # Steering: anything queued while this round streamed is
@@ -1532,11 +1679,35 @@ class Session:
         # "send queued now" cancel) starts immediately.
         await self._start_queued()
 
+    async def _execute_calls(self, calls: list[ToolCall]) -> None:
+        """Run the round's calls in stream order, except that consecutive
+        ``subagent`` calls run concurrently (independent children, no shared
+        shell). Other tools mutate one workspace and stay ordered."""
+        for parallel, group in groupby(calls, lambda c: c.name == "subagent"):
+            batch = list(group)
+            if not parallel:
+                for call in batch:
+                    await self._execute_call(call)
+                continue
+            async with asyncio.TaskGroup() as tasks:
+                for call in batch:
+                    tasks.create_task(self._execute_call(call))
+
     async def _execute_call(self, call: ToolCall) -> None:
         """Run one tool call, streaming its output as ToolOutputDelta."""
         self._emit(protocol.ToolExecStarted(call_id=call.call_id))
         call_id = call.call_id
         remaining = self.tool_registry.max_output_chars
+        # The last token report a subagent made, stamped onto the finished
+        # row so even an instant child shows its spend.
+        last_usage: Usage | None = None
+
+        def usage_sink(usage: Usage) -> None:
+            nonlocal last_usage
+            last_usage = usage
+            self._emit(protocol.ToolUsageChanged(
+                call_id=call_id, usage=usage,
+            ))
 
         def sink(text: str) -> None:
             nonlocal remaining
@@ -1555,12 +1726,16 @@ class Session:
         ws = self.workspace_state
         record = None if ws is None else await self._observe(ws, call)
         self._executing_tool = call.name or call_id
+        self._executing_calls += 1
         try:
             result = await self.tool_registry.call(
                 call.name, call.arguments_json, output_sink=sink,
+                usage_sink=usage_sink,
             )
         finally:
-            self._executing_tool = None
+            self._executing_calls = max(0, self._executing_calls - 1)
+            if self._executing_calls == 0:
+                self._executing_tool = None
         # A command's change is measured from its before/after snapshots, so
         # it is recorded whatever the exit status: a failing command still
         # leaves its writes on disk. Explicit writes keep the success gate.
@@ -1576,7 +1751,7 @@ class Session:
             # Coalesced: a burst of run_bash calls must not trigger a git
             # snapshot each; one trailing debounce covers them all.
             self._workspace_changed()
-        self.record_tool_result(call_id, result)
+        self.record_tool_result(call_id, result, usage=last_usage)
 
     def _write_target(
         self, ws: WorkspaceState, call: ToolCall,
@@ -1810,6 +1985,7 @@ class Session:
             tracked=self.workspace_state is not None,
             git_write=self.sandbox.allow_git_write,
             default_timeout=self._tool_timeout(),
+            mcp_servers=self.mcp.connected_server_names(),
         )
 
     def _tool_timeout(self) -> float:
@@ -1827,6 +2003,7 @@ class Session:
             ask_callback=self._ask_callback,
             default_timeout=self._tool_timeout(),
             spawn_subagent=self._spawn_subagent,
+            mcp=self.mcp,
         )
         self.tool_registry.max_output_chars = limit
         self._refresh_system_prompt()

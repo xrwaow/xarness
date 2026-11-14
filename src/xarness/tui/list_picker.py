@@ -144,6 +144,7 @@ def name_options(names: Sequence[str], current: str | None = None) -> list[Optio
 
 def session_options(
     entries: Sequence[SessionSummary], workspace: str | None,
+    current: str | None = None,
 ) -> list[Option]:
     """Live groups, then saved groups — only this workspace's sessions.
 
@@ -151,6 +152,11 @@ def session_options(
     of the checkout the TUI runs in, so live sessions hosted for another
     workspace are dropped along with the saved ones. ``None`` means no
     filter (every session matches).
+
+    ``current`` is the session the picker was opened from: a subagent is
+    listed only from its own family (its parent, an ancestor or one of its
+    children), so a draft chat shows top-level sessions alone. ``None``
+    means no current session (a draft chat).
 
     Each row is one Text: name, dimmed age, innermost workspace directory,
     the session's own unaccepted (``mine``) +/- totals, right-aligned state
@@ -166,6 +172,11 @@ def session_options(
         if _same_path(entry.workspace or "", resolved)
     ]
     by_name = {entry.name: entry for entry in entries}
+    # Without its family a child row would read as a stray ``agent-N`` at
+    # the top level, so it is left out of the list entirely.
+    family = _family(current, by_name)
+    entries = [entry for entry in entries
+               if entry.parent_id is None or entry.name in family]
     groups: dict[str, list[SessionSummary]] = {}
     for entry in entries:
         groups.setdefault(_group_root(entry, by_name), []).append(entry)
@@ -227,6 +238,24 @@ def session_options(
         options.append(_spacer())
     options.extend(row(entry) for entry in saved_rows)
     return options
+
+
+def _family(
+    current: str | None, by_name: dict[str, SessionSummary],
+) -> set[str]:
+    """``current`` plus its ancestors and every descendant under it."""
+    def ancestry(name: str) -> set[str]:
+        chain: set[str] = set()
+        entry = by_name.get(name)
+        while entry is not None and entry.parent_id not in chain:
+            chain.add(entry.parent_id)
+            entry = by_name.get(entry.parent_id)
+        return chain
+
+    if current not in by_name:
+        return set()
+    return {name for name in by_name if name == current
+            or current in ancestry(name)} | ancestry(current)
 
 
 def _group_root(

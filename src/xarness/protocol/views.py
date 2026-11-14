@@ -275,6 +275,57 @@ class SandboxInfo(BaseModel):
     name: str
 
 
+class ToolInfo(BaseModel):
+    """One tool in the effective set, or one server tool in a listing."""
+
+    name: str
+    # "builtin" or the MCP server's name.
+    source: str = "builtin"
+    description: str = ""
+    # Built-in tools are always on; an MCP tool can be switched off.
+    enabled: bool = True
+
+
+McpServerState = Literal["disabled", "starting", "connected", "unavailable"]
+
+
+class McpServerInfo(BaseModel):
+    """One configured MCP server and the tools it advertises."""
+
+    name: str
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    # Remote servers are addressed by URL; stdio servers leave this empty.
+    url: str = ""
+    enabled: bool = True
+    status: McpServerState = "disabled"
+    error: str | None = None
+    tools: list[ToolInfo] = Field(default_factory=list)
+
+    @property
+    def target(self) -> str:
+        """What the server is: its URL, or its command line."""
+        return self.url or " ".join([self.command, *self.args]).strip()
+
+    @property
+    def available(self) -> bool:
+        """Derived from ``status``: one source of truth, not a second flag
+        that can disagree with it."""
+        return self.status == "connected"
+
+
+class ToolsInfo(BaseModel):
+    """GET /sessions/{name}/tools: what the model has, and the MCP sources.
+
+    ``tools`` is the effective registry (built-ins plus the enabled tools
+    of connected servers). ``servers`` always lists every configured server,
+    including disabled and failed ones, so the manager can show and toggle
+    them."""
+
+    tools: list[ToolInfo] = Field(default_factory=list)
+    servers: list[McpServerInfo] = Field(default_factory=list)
+
+
 class ConfigInfo(BaseModel):
     """GET /config: names and non-secret fields for the client's pickers."""
 

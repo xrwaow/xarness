@@ -237,6 +237,12 @@ class XarnessClient:
             f"/v1/sessions/{_session_path(name)}/load", {}, model=SessionSummary,
         )
 
+    async def tools(self, name: str) -> protocol.ToolsInfo:
+        return await self._get(
+            f"/v1/sessions/{_session_path(name)}/tools",
+            model=protocol.ToolsInfo,
+        )
+
     async def diff(
         self, name: str, path: str | None = None, author: str | None = None,
     ) -> protocol.DiffInfo:
@@ -382,11 +388,26 @@ class XarnessClient:
 
     @staticmethod
     def _error_detail(response: httpx.Response) -> str:
-        """The API's ``detail`` for an error response, else the raw body."""
+        """The API's ``detail`` for an error response, else the raw body.
+
+        A 422 carries FastAPI's validation list, which stringifies into one
+        unreadable blob; fold it into the offending field paths and their
+        messages instead — that is what tells a stale host from a real bug."""
         try:
-            return str(response.json().get("detail", response.text))
+            detail = response.json().get("detail", response.text)
         except Exception:
             return response.text
+        if isinstance(detail, list):
+            parts = []
+            for item in detail:
+                if not isinstance(item, dict):
+                    parts.append(str(item))
+                    continue
+                location = ".".join(str(part) for part in item.get("loc") or ())
+                message = str(item.get("msg") or item)
+                parts.append(f"{location}: {message}" if location else message)
+            return "; ".join(parts) or response.text
+        return str(detail)
 
     @classmethod
     def _json(cls, response: httpx.Response) -> Any:

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # a leaf module: no runtime dependency on the models
+    from .conversation import Usage
 
 
 def format_duration(seconds: float) -> str:
@@ -25,6 +29,13 @@ def format_tokens(count: int) -> str:
     if count < 1_000_000:
         return f"{count / 1_000:.1f}k"
     return f"{count / 1_000_000:.2f}M"
+
+
+def format_usage(usage: Usage) -> str:
+    """Compact ``~↑input ↓output`` spend (``~`` marks an estimate)."""
+    return (f"{'~' if usage.approximate else ''}↑"
+            f"{format_tokens(usage.input_tokens)} "
+            f"↓{format_tokens(usage.output_tokens)}")
 
 
 def utcnow_iso() -> str:
