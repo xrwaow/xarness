@@ -942,14 +942,13 @@ def _make_search_tools(sandbox: SandboxConfig) -> list[Tool]:
 
     @tool(
         "glob",
-        "Find files by glob pattern, read-only, on the host. There is no shell "
-        "in this mode, so use it instead of find/ls. Patterns are matched "
-        "against paths relative to `path` (the workspace root by default): a "
-        "pattern without '/' matches a file's name at any depth ('*.py'), one "
-        "with '/' matches the whole relative path, where '**' crosses "
-        "directories ('pkg/**/*.py'). Gitignored and binary files are skipped. "
-        f"Returns up to {MAX_GLOB_RESULTS} workspace-relative paths, one per "
-        "line, ready to pass to read_file.",
+        "Find files by glob pattern. Patterns are matched against paths "
+        "relative to `path` (the workspace root by default): a pattern "
+        "without '/' matches a file's name at any depth ('*.py'), one with "
+        "'/' matches the whole relative path, where '**' crosses directories "
+        "('pkg/**/*.py'). Gitignored files are skipped. Returns up to "
+        f"{MAX_GLOB_RESULTS} workspace-relative paths, one per line, ready to "
+        "pass to read_file.",
         GlobArgs,
     )
     async def glob(args: GlobArgs) -> ToolResult:
@@ -973,12 +972,11 @@ def _make_search_tools(sandbox: SandboxConfig) -> list[Tool]:
 
     @tool(
         "grep",
-        "Search file contents with a regular expression, read-only, on the "
-        "host. There is no shell in this mode, so use it instead of rg/grep. "
-        "Searches text files at or under `path` (a file or a directory; the "
-        "workspace root by default), skipping gitignored files, binaries and "
-        "files over 2 MiB. Returns matching lines as 'workspace-relative-path:"
-        "line: text'. Narrow with `glob` (e.g. '*.py') and cap the output with "
+        "Search file contents with a regular expression. Searches text files "
+        "at or under `path` (a file or a directory; the workspace root by "
+        "default), skipping gitignored files, binaries and files over 2 MiB. "
+        "Returns matching lines as 'workspace-relative-path:line: text'. "
+        "Narrow with `glob` (e.g. '*.py') and cap the output with "
         "`max_results`.",
         GrepArgs,
     )
