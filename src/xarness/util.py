@@ -22,6 +22,15 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def format_elapsed(seconds: float) -> str:
+    """Whole-second duration for running timers: 1s · 45s · 2m15s.
+
+    A timer that counts seconds must show the same digits it has counted
+    (no tenths that the user never saw tick)."""
+    total = max(0, int(seconds))
+    return f"{total}s" if total < 60 else format_duration(total)
+
+
 def format_tokens(count: int) -> str:
     """Compact token count: 999 · 1.2k · 1.23M."""
     if count < 1_000:

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import time
 import unittest
 from contextlib import asynccontextmanager
 
@@ -737,9 +738,9 @@ class ThinkingDurationTest(unittest.IsolatedAsyncioTestCase):
         thinking.finish(None)
         self.assertEqual(thinking.summary_text(), "Thought for …")
         thinking.finish(7.0)
-        self.assertEqual(thinking.summary_text(), "Thought for 7.0s")
+        self.assertEqual(thinking.summary_text(), "Thought for 7s")
         thinking.finish(99.0)  # a later event must not extend it
-        self.assertEqual(thinking.summary_text(), "Thought for 7.0s")
+        self.assertEqual(thinking.summary_text(), "Thought for 7s")
 
     def test_streaming_expands_then_finish_collapses_and_click_toggles(self) -> None:
         # Streaming: expanded by default, and clickable mid-stream.
@@ -755,6 +756,17 @@ class ThinkingDurationTest(unittest.IsolatedAsyncioTestCase):
         thinking.expanded = True
         thinking.finish(3.0)
         self.assertTrue(thinking.expanded)
+
+    def test_summary_appends_reported_reasoning_tokens(self) -> None:
+        thinking = tflow.ThinkingItem(parts=["hmm"], tokens=1_234)
+        thinking.finish(4.2)
+        self.assertEqual(
+            thinking.summary_text(), "Thought for 4s · 1.2k tokens")
+
+    def test_summary_omits_tokens_the_provider_did_not_report(self) -> None:
+        thinking = tflow.ThinkingItem(parts=["hmm"], tokens=0)
+        thinking.finish(4.2)
+        self.assertEqual(thinking.summary_text(), "Thought for 4s")
 
 
 class CommandPathsTest(unittest.IsolatedAsyncioTestCase):
@@ -1196,9 +1208,9 @@ class LiveToolDetailTest(unittest.IsolatedAsyncioTestCase):
             flow = app.query_one("#chat-log")
             painted = "\n".join(
                 flow.row_text(y) for y in range(flow.row_count))
-            self.assertIn("Running write_file +3 a.py", painted)
-            self.assertIn("Running run_bash grep -rn foo", painted)
-            self.assertIn("Running run_bash la -la /workspace", painted)
+            self.assertIn("write_file +3 a.py", painted)
+            self.assertIn("run_bash grep -rn foo", painted)
+            self.assertIn("run_bash la -la /workspace", painted)
 
     def test_expanded_edit_file_body_shows_the_diff(self) -> None:
         """edit_file's returned unified diff must render as +/- rows — the
@@ -2419,6 +2431,89 @@ class PresenterWidthTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text.count("a") + text.count("b") + text.count("c"), 12)
         for strip in presentation.strips:
             self.assertEqual(strip.cell_length, width)
+
+    async def test_pending_strip_shows_its_running_time(self) -> None:
+        from xarness.tui.flow import Presenter
+        from xarness.tui.transcript import PendingItem
+
+        item = PendingItem(label="Compacting", started=time.monotonic() - 3.0)
+        presentation = await Presenter().present(self._Entry(item), 60)
+        text = "".join(strip.text for strip in presentation.strips)
+
+        self.assertIn("Compacting 3s", text)
+        self.assertIn("esc to interrupt", text)
+
+    async def test_running_details_and_times_use_the_muted_color(self) -> None:
+        """Live args and running times are dimmed like a settled row's
+        detail; only the label participates in the shimmer sweep."""
+        from xarness import theme
+        from xarness.tui.flow import Presenter
+        from xarness.tui.transcript import PendingItem, ThinkingItem, ToolItem
+
+        muted = theme.PALETTE["muted"]
+
+        async def segments(item):
+            presentation = await Presenter().present(self._Entry(item), 60)
+            return [
+                (seg.text, seg.style.color.get_truecolor().hex)
+                for strip in presentation.strips
+                for seg in strip._segments
+                if seg.style is not None and seg.style.color is not None
+            ]
+
+        # Running tool: the args are the muted segment after the shimmered
+        # label (the settled row uses the same palette entry).
+        tool = ToolItem(call_id="c", name="run_bash",
+                        args='{"command": "echo hi"}')
+        self.assertEqual(
+            next(color for text, color in await segments(tool)
+                 if "echo hi" in text),
+            muted,
+        )
+
+        # Running timers: pending strip and live thinking block.
+        for item in (
+            PendingItem(label="Compacting", started=time.monotonic() - 3.0),
+            ThinkingItem(parts=["x"], started=time.monotonic() - 4.0),
+        ):
+            self.assertEqual(
+                next(color for text, color in await segments(item)
+                     if text.strip().endswith("s") and "esc" not in text),
+                muted,
+            )
+
+    async def test_running_tool_name_is_text_color_without_the_verb(self) -> None:
+        from unittest.mock import patch
+
+        from xarness import theme
+        from xarness.tui.flow import Presenter
+        from xarness.tui.transcript import ToolItem
+
+        item = ToolItem(call_id="c", name="run_bash",
+                        args='{"command": "echo hi"}')
+        # Phase 0 parks the sweep band before the label: every name cell
+        # renders at its base color.
+        with patch("xarness.tui.flow.shimmer_now", return_value=0.0):
+            presentation = await Presenter().present(self._Entry(item), 60)
+        segments = [
+            (seg.text, seg.style.color.get_truecolor().hex)
+            for strip in presentation.strips
+            for seg in strip._segments
+            if seg.style is not None and seg.style.color is not None
+        ]
+        text = "".join(seg.text for strip in presentation.strips
+                       for seg in strip._segments)
+        self.assertIn("run_bash echo hi", text)
+        self.assertNotIn("Running", text)
+        name_colors = {
+            color for chars, color in segments
+            if len(chars) == 1 and chars in set("run_bash")
+        }
+        self.assertEqual(name_colors, {theme.PALETTE["text"]})
+        self.assertEqual(
+            next(color for chars, color in segments if "echo hi" in chars),
+            theme.PALETTE["muted"],
+        )
 
 
 class TextSelectionTest(unittest.IsolatedAsyncioTestCase):

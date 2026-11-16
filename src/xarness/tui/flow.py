@@ -47,7 +47,7 @@ from textual_flowview import Presentation
 from .. import images, theme
 from ..images import token_text
 from ..theme import blend_hex as _lerp_hex
-from ..util import format_duration, format_usage
+from ..util import format_duration, format_elapsed, format_usage
 from .tool_view import (
     ToolCallView,
     body_renderable,
@@ -135,7 +135,7 @@ def shimmer_now(span: float) -> float:
 
 
 def shimmer_text(
-    label: str, base_color: str, peak_color: str, phase: float, suffix: str = "",
+    label: str, base_color: str, peak_color: str, phase: float,
 ) -> Text:
     """One frame of the shimmer sweep (the former ShimmerText widget)."""
     text = Text()
@@ -148,9 +148,6 @@ def shimmer_text(
         # the peak first to get the base at intensity 0 and peak at 1.
         color = _lerp_hex(peak_color, base_color, intensity)
         text.append(ch, style=Style(color=color, bold=intensity > 0.6))
-    if suffix:
-        suffix_color = _lerp_hex(peak_color, base_color, 0.35)
-        text.append(" " + suffix, style=Style(color=suffix_color))
     return text
 
 
@@ -355,13 +352,18 @@ class Presenter:
     def _thinking(self, entry, width: int) -> list[Strip]:
         item: ThinkingItem = entry.item
         p = theme.PALETTE
+        now = time.monotonic()
+        # The live running time is drawn dimmed, like a settled block's
+        # detail: only the label sweeps.
+        label = item.summary_text()
+        elapsed = item.running_time(now)
         # Shimmer phase derives at render time; settled items keep a stable
         # cache key (phase None).
         phase = None if item.done else shimmer_now(
-            len(item.summary_text()) + 2 * theme.SHIMMER_BAND_WIDTH
+            len(label) + 2 * theme.SHIMMER_BAND_WIDTH
         )
         key = (self.epoch, width, item.expanded, len(item.reasoning),
-               item.done, item.duration, phase)
+               item.done, item.duration, item.tokens, phase)
 
         def build():
             if item.done:
@@ -371,8 +373,10 @@ class Presenter:
                 )
             else:
                 pill = shimmer_text(
-                    item.summary_text(), *theme.SHIMMER_THINKING, phase=phase,
+                    label, *theme.SHIMMER_THINKING, phase=phase,
                 )
+                if elapsed:
+                    pill.append(f" {elapsed}", style=p["muted"])
             strips = render_strips(pill, width)
             if item.expanded:
                 strips.extend(_prefix_strips(
@@ -391,7 +395,7 @@ class Presenter:
     def _tool(self, entry, width: int) -> list[Strip]:
         item: ToolItem = entry.item
         p = theme.PALETTE
-        label = f"Running {item.name}"
+        label = item.name
         phase = (
             shimmer_now(len(label) + 2 * theme.SHIMMER_BAND_WIDTH)
             if item.status is ToolStatus.MAKING_CALL else None
@@ -417,10 +421,13 @@ class Presenter:
             if item.status is ToolStatus.MAKING_CALL:
                 name, detail = live_name, live_detail
                 dot = Text("•", style=p["warning"])
+                # The name sits at the body's text color, brightening
+                # through the sweep; the args stay dimmed.
                 head = shimmer_text(
-                    f"Running {name}", *theme.SHIMMER_THINKING,
-                    phase=phase, suffix=detail,
+                    name, p["text"], theme.SHIMMER_THINKING[1], phase=phase,
                 )
+                if detail:
+                    head.append(" " + detail, style=p["muted"])
             else:
                 dot = Text("•", style=p[item.STATUS_COLOR_KEY[item.status]])
                 head = _tool_head(item, view)
@@ -441,9 +448,15 @@ class Presenter:
 
     def _shimmering(self, item: PendingItem, width: int) -> list[Strip]:
         p = theme.PALETTE
+        # The running time is drawn dimmed, like a settled block's detail:
+        # only the label sweeps.
         head = shimmer_text(
             item.label, *theme.SHIMMER_PROCESSING,
             phase=shimmer_now(len(item.label) + 2 * theme.SHIMMER_BAND_WIDTH),
+        )
+        head.append(
+            f" {format_elapsed(time.monotonic() - item.started)}",
+            style=p["muted"],
         )
         if item.hint:
             head.append(f"  ({item.hint})", style=p["muted"])

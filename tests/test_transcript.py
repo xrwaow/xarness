@@ -161,10 +161,47 @@ class TranscriptTest(unittest.TestCase):
         t.apply(ReasoningDelta(text=" more", t=3.0))
         changed = t.apply(ContentDelta(text="answer", t=4.5))
         self.assertIn(t.thinking, changed)  # repainted, not left stale
-        self.assertEqual(t.thinking.summary_text(), "Thought for 3.5s")
+        self.assertEqual(t.thinking.summary_text(), "Thought for 3s")
         t.apply(ContentDelta(text=" answer", t=9.0))
         t.apply(RoundComplete(t=20.0))
         self.assertEqual(t.thinking.duration, 3.5)
+
+    def test_thinking_tokens_are_stamped_at_round_complete(self):
+        """reasoning_tokens ride on RoundComplete, not on the deltas: the
+        settled pill picks them up without re-measuring anything."""
+        t = tr.Transcript()
+        t.apply(ProcessingStarted(t=0.0))
+        t.apply(ReasoningDelta(text="think", t=1.0))
+        t.apply(ContentDelta(text="answer", t=2.0))
+        self.assertEqual(t.thinking.summary_text(), "Thought for 1s")
+        changed = t.apply(RoundComplete(
+            usage=Usage(reasoning_tokens=1_234), t=3.0))
+        self.assertIn(t.thinking, changed)  # repainted, not left stale
+        self.assertEqual(
+            t.thinking.summary_text(), "Thought for 1s · 1.2k tokens")
+
+    def test_thinking_tokens_survive_replay(self):
+        # The round's usage is already persisted on the assistant message;
+        # a reload reads the same count the live RoundComplete carried.
+        assistant = AssistantMessage(
+            content="answer", reasoning="think",
+            usage=Usage(reasoning_tokens=999),
+            timing=Timing(reasoning_seconds=1.0),
+        )
+        thinking = next(
+            i for i in tr.Transcript().load(_snap([assistant]))
+            if isinstance(i, tr.ThinkingItem))
+        self.assertEqual(thinking.tokens, 999)
+        self.assertEqual(
+            thinking.summary_text(), "Thought for 1s · 999 tokens")
+
+    def test_live_thinking_shows_a_running_time(self):
+        item = tr.ThinkingItem(parts=["x"], started=100.0)
+        self.assertEqual(item.summary_text(), "Thinking")  # no clock supplied
+        self.assertEqual(item.summary_text(now=104.2), "Thinking 4s")
+        # The settled pill still uses the host's duration, never the clock.
+        item.finish(4.2)
+        self.assertEqual(item.summary_text(now=999.0), "Thought for 4s")
 
     def test_tool_call_ends_the_cot_block_not_the_round(self):
         """Tool-argument streaming is call time: the pill must stop at the
@@ -173,18 +210,18 @@ class TranscriptTest(unittest.TestCase):
         t.apply(ProcessingStarted(t=0.0))
         t.apply(ReasoningDelta(text="think", t=1.0))
         t.apply(ToolCallStarted(call_id="c", name="run_bash", t=2.0))
-        self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
+        self.assertEqual(t.thinking.summary_text(), "Thought for 1s")
         t.apply(ToolCallArgumentsDelta(call_id="c", text='{"command":"ls"}',
                                        t=8.0))
         t.apply(RoundComplete(has_tool_calls=True, t=9.0))
-        self.assertEqual(t.thinking.summary_text(), "Thought for 1.0s")
+        self.assertEqual(t.thinking.summary_text(), "Thought for 1s")
 
     def test_reasoning_only_round_falls_back_to_round_complete(self):
         t = tr.Transcript()
         t.apply(ProcessingStarted(t=0.0))
         t.apply(ReasoningDelta(text="think", t=1.0))
         t.apply(RoundComplete(t=6.0))
-        self.assertEqual(t.thinking.summary_text(), "Thought for 5.0s")
+        self.assertEqual(t.thinking.summary_text(), "Thought for 5s")
 
     def test_tool_lifecycle_and_cancel(self):
         t = tr.Transcript()
@@ -418,9 +455,9 @@ class TranscriptTest(unittest.TestCase):
         item.finish(None)  # e.g. settled from a snapshot mid-round
         self.assertEqual(item.summary_text(), "Thought for …")
         item.finish(2.0)   # ...then stamped by a later event
-        self.assertEqual(item.summary_text(), "Thought for 2.0s")
+        self.assertEqual(item.summary_text(), "Thought for 2s")
         item.finish(9.0)
-        self.assertEqual(item.summary_text(), "Thought for 2.0s")
+        self.assertEqual(item.summary_text(), "Thought for 2s")
 
 
 if __name__ == "__main__":

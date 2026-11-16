@@ -675,10 +675,12 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
 - **States while waiting**: `Processing` from a request being sent until the
   first token of any kind, then `Thinking` (pulsing) while reasoning-channel
   tokens arrive (`reasoning_content` / `reasoning` delta fields), then the
-  streamed answer. It appears only while an LLM request is in flight — tool
-  calls that execute between rounds show their own `Running …` line, not the
-  `Processing` strip. Models without a reasoning channel skip the thinking state.
-  Compaction shows its own shimmering `Compacting` line while it summarizes.
+  streamed answer. Each shimmering state carries its own running time
+  (`Processing 3s`, `Thinking 4s`, `Compacting 8s`). It appears only
+  while an LLM request is in flight — tool calls that execute between rounds
+  show their own tool-name line (dimmed arguments), not the `Processing`
+  strip. Models without a reasoning channel skip the thinking state. Compaction
+  shows its own shimmering `Compacting` line while it summarizes.
 - **Interrupting**: one `Escape` only arms the interrupt and shows a
   `press esc again to interrupt` prompt; a second `Escape` within a couple of
   seconds actually stops the turn, so a stray keypress can't kill work.
@@ -688,8 +690,10 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   history untouched. A round that fails mid-stream (provider or transport
   error) keeps its partial answer the same way.
 - **Thoughts**: after a turn with reasoning, a collapsed `▸ Thought for Xs`
-  indicator stays in the scrollback; `Ctrl+T` or a click expands it inline.
-  Reasoning text is kept in the conversation history regardless of visibility.
+  indicator stays in the scrollback; when the provider reports reasoning
+  tokens it reads `Thought for 4s · 1.2k tokens`. `Ctrl+T` or a click expands
+  it inline. Reasoning text is kept in the conversation history regardless of
+  visibility.
 - **Scrolling**: the log follows new output only while you are at the bottom.
   Scroll up mid-answer and it stays where you put it (nothing yanks it back);
   scroll back to the bottom and it resumes following. Expanding a tool call

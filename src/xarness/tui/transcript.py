@@ -9,6 +9,7 @@ item to a widget entry and re-render the items ``apply`` reports as changed.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -33,7 +34,7 @@ from ..protocol import (
 from ..protocol import (
     Message as ConversationMessage,
 )
-from ..util import format_duration
+from ..util import format_elapsed, format_tokens
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
@@ -168,6 +169,14 @@ class ThinkingItem(TranscriptItem):
     done: bool = False
     duration: float | None = None
     expanded: bool = True
+    # The round's reasoning-token spend, stamped once ``RoundComplete``
+    # carries it (the deltas themselves report no counts). None until then,
+    # and when the provider reports none.
+    tokens: int | None = None
+    # Client monotonic stamp of the first reasoning delta: drives the live
+    # "Thinking 4s" pill. Never used for the settled duration, which stays
+    # the host's measurement.
+    started: float | None = None
 
     @property
     def reasoning(self) -> str:
@@ -184,12 +193,28 @@ class ThinkingItem(TranscriptItem):
         self.duration = duration
         self.expanded = False  # auto-collapse once the round moves on
 
-    def summary_text(self) -> str:
+    def running_time(self, now: float | None = None) -> str:
+        """The live elapsed text, empty once settled or without a start
+        stamp. Kept separate from :meth:`summary_text` so the presenter can
+        draw it outside the shimmer sweep."""
+        if self.done or self.started is None or now is None:
+            return ""
+        return format_elapsed(max(0.0, now - self.started))
+
+    def summary_text(self, now: float | None = None) -> str:
+        """The pill: live running time while streaming, then the host's
+        duration plus the round's reasoning tokens once settled.
+
+        ``now`` is the caller's monotonic clock reading; None keeps the live
+        pill text static (tests, and any caller that does not tick)."""
         if not self.done:
-            return "Thinking"
-        if self.duration is not None:
-            return f"Thought for {format_duration(self.duration)}"
-        return "Thought for …"
+            elapsed = self.running_time(now)
+            return f"Thinking {elapsed}" if elapsed else "Thinking"
+        text = (
+            f"Thought for {format_elapsed(self.duration)}"
+            if self.duration is not None else "Thought for …"
+        )
+        return f"{text} · {format_tokens(self.tokens)} tokens" if self.tokens else text
 
     def streaming(self) -> bool:
         return not self.done
@@ -246,6 +271,9 @@ class PendingItem(TranscriptItem):
 
     label: str = "Processing"
     hint: str = "esc to interrupt"
+    # Client monotonic stamp of when the strip went up: the live running
+    # time starts here and resets with each new strip.
+    started: float = field(default_factory=time.monotonic)
 
     def streaming(self) -> bool:
         return True
@@ -394,6 +422,10 @@ class Transcript:
                 self.items.append(ThinkingItem(
                     parts=[message.reasoning], done=True,
                     duration=message.timing.reasoning_seconds, expanded=False,
+                    tokens=(
+                        message.usage.reasoning_tokens
+                        if message.usage is not None else None
+                    ),
                 ))
             if message.content or (not message.tool_calls and not message.reasoning):
                 item = AssistantItem(finalized=True)
@@ -435,7 +467,11 @@ class Transcript:
         if partial is None:
             return
         if partial.reasoning:
-            self.thinking = ThinkingItem(parts=[partial.reasoning])
+            # The snapshot carries no start stamp: count from attach rather
+            # than freeze the pill. The settled duration stays unknown (…).
+            self.thinking = ThinkingItem(
+                parts=[partial.reasoning], started=time.monotonic(),
+            )
             self.items.append(self.thinking)
         if partial.content:
             self.assistant = AssistantItem()
@@ -533,7 +569,9 @@ class Transcript:
             return []
         if isinstance(event, ReasoningDelta):
             if self.thinking is None:
-                self.thinking = self._add(ThinkingItem())
+                self.thinking = self._add(
+                    ThinkingItem(started=time.monotonic()),
+                )
                 self._reasoning_t = event.t
             self.thinking.parts.append(event.text)
             return [self.thinking]
@@ -597,7 +635,16 @@ class Transcript:
         if isinstance(event, RoundComplete):
             # The round's usage needs no client-side bookkeeping: the host
             # sums the turn's spend onto the stamped stats the footer reads.
-            return self.settle(event.t)
+            # The cot block is the one round-scoped number the client shows,
+            # so stamp its reasoning tokens here and repaint the pill.
+            changed = self.settle(event.t)
+            tokens = event.usage.reasoning_tokens if event.usage else 0
+            thinking = self.thinking
+            if thinking is not None and tokens and tokens != thinking.tokens:
+                thinking.tokens = tokens
+                if thinking not in changed:
+                    changed.append(thinking)
+            return changed
         if isinstance(event, StreamError):
             return self.settle(None)
         return []
