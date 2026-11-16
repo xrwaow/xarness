@@ -6,8 +6,10 @@ SandboxSession so shell state survives across calls within one chat.
 
 Plan mode exposes read_file plus run_bash against a read-only workspace
 mount; write mode exposes read_file plus the editing tools (write_file,
-edit_file). ask_user is available in both modes, and subagent in both modes
-when the caller can start one.
+edit_file). When plan mode runs on the host (no container) there is no
+read-only mount to enforce a shell with, so run_bash is absent and the
+read-only search tools (grep, glob) take its place. ask_user is available in
+both modes, and subagent in both modes when the caller can start one.
 
 A tool whose text names the machine it runs on is described by the factory
 that builds it, which is handed the sandbox the tool will run against — so
@@ -25,6 +27,7 @@ from __future__ import annotations
 import copy
 import difflib
 import json
+import re
 import stat
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -34,6 +37,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .conversation import AskQuestion, ToolResult, Usage
+from .file_search import (
+    MAX_GLOB_RESULTS,
+    MAX_GREP_MATCHES,
+    glob_files,
+    grep_files,
+)
 from .gitwork import TEXT_PROBE_BYTES, UTF16_BOMS, looks_binary
 from .mcp import McpManager, McpToolMeta
 from .sandbox import (
@@ -233,6 +242,31 @@ class RunBashArgs(_ToolArgs):
         default=None, ge=1,
         description="kill the command after this many seconds; on timeout the "
                     "shell is restarted and the output so far is returned")
+
+
+class GlobArgs(_ToolArgs):
+    pattern: str = Field(
+        description="glob to match, e.g. '*.py' (a bare name matches at any "
+                    "depth) or 'pkg/**/*.py' ('**' crosses directories)")
+    path: str = Field(
+        default=".",
+        description="directory to search, workspace-relative (default: the root)")
+
+
+class GrepArgs(_ToolArgs):
+    pattern: str = Field(
+        description="Python regular expression matched against each line")
+    path: str = Field(
+        default=".",
+        description="file or directory to search, workspace-relative (default: the root)")
+    glob: str | None = Field(
+        default=None,
+        description="only search files matching this glob, e.g. '*.py'")
+    case_sensitive: bool = Field(
+        default=True, description="match case (default: true)")
+    max_results: int = Field(
+        default=MAX_GREP_MATCHES, ge=1, le=1000,
+        description="stop after this many matching lines")
 
 
 class AskUserArgs(_ToolArgs):
@@ -877,6 +911,104 @@ def _make_run_bash_tool(session: SandboxSession) -> Tool:
 
 
 # ----------------------------------------------------------------------
+# grep / glob: the bounded, read-only search a container-free plan mode gets
+# instead of run_bash (see file_search.py for the scan itself).
+
+
+def _make_search_tools(sandbox: SandboxConfig) -> list[Tool]:
+    """glob + grep, confined to the workspace: with no mount namespace there
+    is nothing else bounding them, and a mistaken ``/`` would walk the user's
+    whole home directory. Symlinked parents resolve as for writes (see
+    :meth:`SandboxConfig.normalize_tool_path`)."""
+
+    def locate(path: str) -> tuple[str | None, str | None]:
+        """(workspace-relative base, error)."""
+        norm, error = sandbox.normalize_tool_path(path)
+        if error is not None:
+            return None, error
+        host = sandbox.host_path(norm)
+        if host is None:
+            return None, f"'{path or '.'}' is not reachable from the workspace"
+        try:
+            rel = host.resolve().relative_to(sandbox.workspace)
+        except ValueError:
+            return None, (
+                f"'{path}' is outside the workspace ({sandbox.tool_root}); "
+                "search stays inside it"
+            )
+        if not (sandbox.workspace / rel).exists():
+            return None, f"no such file or directory: {path}"
+        return rel.as_posix() or ".", None
+
+    @tool(
+        "glob",
+        "Find files by glob pattern, read-only, on the host. There is no shell "
+        "in this mode, so use it instead of find/ls. Patterns are matched "
+        "against paths relative to `path` (the workspace root by default): a "
+        "pattern without '/' matches a file's name at any depth ('*.py'), one "
+        "with '/' matches the whole relative path, where '**' crosses "
+        "directories ('pkg/**/*.py'). Gitignored and binary files are skipped. "
+        f"Returns up to {MAX_GLOB_RESULTS} workspace-relative paths, one per "
+        "line, ready to pass to read_file.",
+        GlobArgs,
+    )
+    async def glob(args: GlobArgs) -> ToolResult:
+        if not args.pattern.strip():
+            return _bad("'pattern' is required")
+        base, error = locate(args.path)
+        if error is not None:
+            return _denied(error)
+        if not (sandbox.workspace / base).is_dir():
+            return _denied(f"{args.path} is not a directory")
+        matches, total = await glob_files(sandbox.workspace, base, args.pattern)
+        if not matches:
+            return _ok(f"no files matched {args.pattern!r} under {args.path}")
+        body = "\n".join(matches)
+        if total > len(matches):
+            body += (
+                f"\n[{total} matches; showing the first {len(matches)} — "
+                "narrow the pattern or path]"
+            )
+        return _ok(body)
+
+    @tool(
+        "grep",
+        "Search file contents with a regular expression, read-only, on the "
+        "host. There is no shell in this mode, so use it instead of rg/grep. "
+        "Searches text files at or under `path` (a file or a directory; the "
+        "workspace root by default), skipping gitignored files, binaries and "
+        "files over 2 MiB. Returns matching lines as 'workspace-relative-path:"
+        "line: text'. Narrow with `glob` (e.g. '*.py') and cap the output with "
+        "`max_results`.",
+        GrepArgs,
+    )
+    async def grep(args: GrepArgs) -> ToolResult:
+        if not args.pattern:
+            return _bad("'pattern' is required")
+        base, error = locate(args.path)
+        if error is not None:
+            return _denied(error)
+        try:
+            matches, truncated = await grep_files(
+                sandbox.workspace, base, args.pattern,
+                args.glob, args.case_sensitive, args.max_results,
+            )
+        except re.error as exc:
+            return _bad(f"invalid regular expression: {exc}")
+        if not matches:
+            return _ok(f"no matches for {args.pattern!r} under {args.path}")
+        body = "\n".join(matches)
+        if truncated:
+            body += (
+                f"\n[stopped after {len(matches)} matches — narrow the "
+                "pattern, path or glob, or raise max_results]"
+            )
+        return _ok(body)
+
+    return [glob, grep]
+
+
+# ----------------------------------------------------------------------
 # ask_user
 
 
@@ -983,11 +1115,13 @@ def build_registry(
     """Build the tool set for one session.
 
     Plan mode is read-only: read_file plus run_bash against a read-only
-    workspace mount. Write mode adds the editing tools: write_file,
-    edit_file. ``ask_user`` is available in both modes when ``ask_callback``
-    is given, and ``subagent`` when the caller can start one (``spawn_subagent``;
-    a subagent itself gets neither). The read-only-git policy is enforced by
-    the PATH shim (gitwork.git_shim_script), not here.
+    workspace mount. Without a container there is no mount to enforce that
+    with, so run_bash is omitted and the bounded read-only search tools
+    (glob, grep) are registered instead. Write mode adds the editing tools:
+    write_file, edit_file. ``ask_user`` is available in both modes when
+    ``ask_callback`` is given, and ``subagent`` when the caller can start one
+    (``spawn_subagent``; a subagent itself gets neither). The read-only-git
+    policy is enforced by the PATH shim (gitwork.git_shim_script), not here.
 
     ``mcp`` adds the tools of connected MCP servers, namespaced and tagged
     with their server as ``source``. They run on the host, outside the
@@ -1013,11 +1147,16 @@ def build_registry(
         # EXCEPT when the sandbox is unsandboxed (use_sandbox=False):
         # there is no read-only mount to enforce plan mode with — commands
         # would run unsandboxed on the host — so run_bash is NOT available
-        # in plan mode at all (read_file still is). filter_list,
-        # allow_network and gpu_access are likewise ignored in that mode
-        # (see SandboxConfig.use_sandbox).
+        # in plan mode at all. The read-only search tools (grep, glob) take
+        # its place instead, so the model can still find files and lines
+        # without a shell. filter_list, allow_network and gpu_access are
+        # likewise ignored in that mode (see SandboxConfig.use_sandbox).
         if session is not None and (sandbox.use_sandbox or mode != "plan"):
             registry.register(_make_run_bash_tool(session))  # run_bash
+        elif mode == "plan" and not sandbox.use_sandbox:
+            # Container-free plan mode: no shell, read-only search instead.
+            for search_tool in _make_search_tools(sandbox):
+                registry.register(search_tool)
         if mode == "write":
             registry.register(_make_write_tool(sandbox, default_timeout))  # write_file
             registry.register(_make_edit_tool(sandbox, default_timeout))  # edit_file

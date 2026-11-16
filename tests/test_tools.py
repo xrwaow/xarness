@@ -130,6 +130,41 @@ def test_write_registry_exposes_write_tools(tmp_path) -> None:
     }
 
 
+def _host_plan_registry(tmp_path) -> ToolRegistry:
+    sandbox = SandboxConfig(workspace=tmp_path, use_sandbox=False)
+    return build_registry(sandbox, None, mode="plan")
+
+
+def test_plan_registry_on_the_host_swaps_the_shell_for_search(tmp_path) -> None:
+    """No container means no read-only mount to enforce run_bash with, so the
+    bounded read-only search tools take its place."""
+    names = {t["function"]["name"] for t in _host_plan_registry(tmp_path).schema()}
+    assert names == {"read_file", "glob", "grep"}
+
+
+def test_host_search_tools_find_files_and_lines(tmp_path) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("class A:\n    pass\n")
+    (tmp_path / "notes.txt").write_text("class notes\n")
+    registry = _host_plan_registry(tmp_path)
+
+    globbed = asyncio.run(registry.call("glob", '{"pattern": "*.py"}'))
+    assert globbed.content.splitlines() == ["pkg/a.py"]
+    grepped = asyncio.run(
+        registry.call("grep", '{"pattern": "class", "glob": "*.py"}'))
+    assert grepped.content.splitlines() == ["pkg/a.py:1: class A:"]
+
+
+def test_host_search_tools_are_read_only_and_confined(tmp_path) -> None:
+    registry = _host_plan_registry(tmp_path)
+    outside = asyncio.run(registry.call("glob", '{"pattern": "*", "path": "/etc"}'))
+    assert not outside.ok and "outside the workspace" in outside.content
+    traversal = asyncio.run(registry.call("grep", '{"pattern": "x", "path": ".."}'))
+    assert not traversal.ok
+    invalid = asyncio.run(registry.call("grep", '{"pattern": "(unclosed"}'))
+    assert invalid.status == "parse_error"
+
+
 def _descriptions(registry: ToolRegistry) -> dict[str, str]:
     return {
         t["function"]["name"]: t["function"]["description"]

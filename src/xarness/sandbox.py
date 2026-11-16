@@ -378,8 +378,9 @@ class SandboxConfig:
     # IGNORED — filter_list (no mounts to exclude), allow_network (nothing
     # blocks network on the host) and gpu_access (all devices are already
     # reachable) have no effect. Plan mode therefore refuses run_bash in
-    # this mode (see tools.build_registry): there is no read-only mount to
-    # enforce it with.
+    # this mode and registers the read-only search tools instead (see
+    # tools.build_registry): there is no read-only mount to enforce a
+    # shell with.
     use_sandbox: bool = True
     # Install the read-only git shim (gitwork.git_shim_script) first on
     # PATH: blocked subcommands fail in place at execution time instead of

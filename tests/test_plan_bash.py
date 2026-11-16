@@ -103,14 +103,16 @@ def test_mode_switch_restarts_shell_under_new_mounts(tmp_path) -> None:
 
 def test_plan_mode_without_container_has_no_run_bash(tmp_path) -> None:
     """Plan mode with use_sandbox=False: there is no read-only mount to
-    enforce the mode with, so run_bash must not be available at all
-    (read_file stays). No bwrap needed — registry construction only."""
+    enforce the mode with, so run_bash must not be available at all. The
+    read-only search tools stand in for the shell that is gone. No bwrap
+    needed — registry construction only."""
     sandbox = SandboxConfig(workspace=_make_repo(tmp_path), use_sandbox=False)
     session = SandboxSession(sandbox)
     sandbox.read_only = True
     registry = build_registry(sandbox, session, mode="plan")
     names = {t["function"]["name"] for t in registry.schema()}
-    assert names == {"read_file"}
+    assert names == {"read_file", "grep", "glob"}
+    assert "run_bash" not in names
     # Write mode keeps run_bash (unsandboxed, but that is the mode's contract).
     write_registry = build_registry(sandbox, session, mode="write")
     write_names = {t["function"]["name"] for t in write_registry.schema()}

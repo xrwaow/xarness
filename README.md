@@ -13,6 +13,8 @@ When a filesystem sandbox is available, the model gets:
 | Tool | Mode | What it does |
 | --- | --- | --- |
 | `read_file` | plan + write | Read a file (large files return a structural outline; read sections with `start_line`/`end_line`) |
+| `glob` | plan (host only) | Find files by glob pattern, read-only — the stand-in for `find`/`ls` when there is no shell |
+| `grep` | plan (host only) | Search file contents with a regular expression, read-only — the stand-in for `rg`/`grep` when there is no shell |
 | `write_file` | write | Create or overwrite a file |
 | `edit_file` | write | Replace exact, unique strings in a file — pass a list of edits to change several places in one call; the result includes a diff of what changed |
 | `run_bash` | plan + write | Run a shell command in a persistent sandboxed shell (cwd and env vars survive across calls). In plan mode the workspace is mounted read-only |
@@ -113,8 +115,12 @@ remote endpoint — so they can reach the host filesystem and network, and
 their file writes are not tracked by `/diff` or undone by `/undo`. Only run
 servers you trust.
 
-There is no `ls`, `glob`, `grep`, or `web_search` tool: use `run_bash`
-with `rg`/`find`/`ls` (pipe search output through `head`). Compaction is not
+There is no `ls`, `glob`, `grep`, or `web_search` tool while a shell is
+available: use `run_bash` with `rg`/`find`/`ls` (pipe search output through
+`head`). The exception is plan mode without a container: `run_bash` is not
+available there, so the read-only `glob` and `grep` tools are added instead.
+They search only the workspace, skip gitignored and binary files, and bound
+their output. Compaction is not
 a tool the model can call — it's automatic (`auto_compact`): when the context
 window crosses the configured threshold, the conversation is summarized into
 a handoff (the task, what's known so far, and what to do next) that continues
@@ -128,7 +134,9 @@ Switch between modes with `/mode`:
 
 - **plan** — read-only: the model can inspect files with `read_file` and run
   read-only shell commands, but cannot edit files or write through the
-  sandbox mount.
+  sandbox mount. With no container (`sandbox.use_sandbox false`) there is no
+  read-only mount to enforce that with, so `run_bash` is omitted and the
+  read-only `glob`/`grep` tools are provided instead.
 - **write** — the model can read, edit, and run shell commands.
 
 ### Sandbox
