@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import json
 import time
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -35,6 +37,7 @@ from xarness.protocol import (
 )
 from xarness.errors import SessionError
 from xarness.session import Session
+from xarness.sandbox import SandboxConfig, SandboxRuntime
 from xarness.workspace import WorkspaceState, open_workspace
 from pydantic import BaseModel as _PydanticBase
 
@@ -1409,20 +1412,28 @@ def _blocking_edit(tmp_path, name="a.txt"):
     return registry, started, release
 
 
-def _tool_round(call_id="c1"):
+def _tool_round(call_id="c1", path="a.txt"):
     return [
         ToolCallStarted(call_id=call_id, name="edit_file"),
         ToolCallArgumentsDone(
             call_id=call_id, name="edit_file",
-            arguments_json='{"path": "a.txt"}',
+            arguments_json=json.dumps({"path": path}),
         ),
         RoundComplete(has_tool_calls=True),
     ]
 
 
-def test_an_explicit_write_records_its_own_provenance(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "path", ["a.txt", "/workspace/a.txt"], ids=["relative", "absolute"],
+)
+def test_an_explicit_write_records_its_own_provenance(
+    tmp_path, monkeypatch, path,
+) -> None:
     """edit_file's event carries the before/after blob shas, so /diff reports
-    that call's delta instead of the whole pending file."""
+    that call's delta instead of the whole pending file.
+
+    An absolute path the tool accepts names one file on both sides, so it is
+    attributed the same way — the container view's /workspace included."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def go():
@@ -1436,16 +1447,23 @@ def test_an_explicit_write_records_its_own_provenance(tmp_path, monkeypatch) -> 
         registry = ToolRegistry()
         registry.register(edit)
         session, state = await _tracked_session(
-            tmp_path, [_tool_round()], registry, files={"a.txt": "before\n"},
+            tmp_path, [_tool_round(path=path)], registry,
+            files={"a.txt": "before\n"},
         )
+        if path.startswith("/"):
+            # In a container the tool is handed /workspace/a.txt; without a
+            # config that names the same file, the write is unattributable.
+            with mock.patch("shutil.which", return_value="/usr/bin/bwrap"):
+                session.sandbox = SandboxRuntime(
+                    config=SandboxConfig(workspace=ws))
         session.subscribe()
         await session.execute(SendMessage(text="hi"))
         await wait_idle(session)
 
         event = state.events[0]
         assert event.paths == ("a.txt",)
-        path, before, after = event.writes[0]
-        assert path == "a.txt"
+        written, before, after = event.writes[0]
+        assert written == "a.txt"
         assert before is not None and after is not None
         assert await gitwork.read_blob(state, before) == b"before\n"
         assert await gitwork.read_blob(state, after) == b"after\n"

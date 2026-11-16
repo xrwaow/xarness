@@ -244,9 +244,36 @@ class ToolsScreenTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.pause()
             self.assertEqual(
-                [(command.type, getattr(command, "enabled", None))
+                [(command.type, command.scope)
                  for _, command in client.commands],
-                [("set_mcp_server_enabled", False)],
+                [("set_mcp_server_scope", "workspace")],
+            )
+
+    async def test_tools_modal_shows_and_cycles_a_server_scope(self) -> None:
+        """The server header names its scope; a click asks for the next."""
+        from textual.widgets import OptionList
+
+        from xarness.tui.tools_screen import ToolsScreen
+
+        client = FakeClient(make_snapshot())
+        client.tools_info = self.tools_info()
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            app._open_tools()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ToolsScreen)
+            bottom = app.screen.query_one("#mcp-list", OptionList)
+            self.assertIn("on (global)", bottom.options[0].prompt.plain)
+            bottom.focus()
+            bottom.action_cursor_down()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(
+                [(command.type, command.scope)
+                 for _, command in client.commands],
+                [("set_mcp_server_scope", "workspace")],
             )
 
     async def test_tools_modal_shows_a_url_server_and_adds_by_url(self) -> None:

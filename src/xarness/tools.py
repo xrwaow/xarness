@@ -25,22 +25,21 @@ from __future__ import annotations
 import copy
 import difflib
 import json
+import stat
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .conversation import AskQuestion, ToolResult, Usage
+from .gitwork import TEXT_PROBE_BYTES, UTF16_BOMS, looks_binary
 from .mcp import McpManager, McpToolMeta
 from .sandbox import (
     DEFAULT_TIMEOUT,
-    REFS_ANCHOR,
     SandboxConfig,
     SandboxSession,
-    is_refs_path,
     run_in_sandbox,
 )
 
@@ -111,6 +110,79 @@ def _ok(content: str) -> ToolResult:
 def _bad(error: str) -> ToolResult:
     """An argument error: the model should retry with valid arguments."""
     return ToolResult(status="parse_error", content=error)
+
+
+def _denied(error: str) -> ToolResult:
+    """A refusal: the arguments were well formed, the path or the file is
+    something this tool will not do (``_bad`` is for arguments that did not
+    validate)."""
+    return ToolResult(status="error", content=error)
+
+
+# What any text-only tool offers instead, whatever it was asked for: reads
+# and writes both go through run_bash.
+_RUN_BASH_INSTEAD = (
+    " Use run_bash instead (e.g. `xxd <file> | head` or `base64 <file>` to "
+    "read; `printf`, `base64 -d` or `xxd -r -p` to write)."
+)
+
+
+def _refuse_unrepresentable(
+    sandbox: SandboxConfig, path: str, target: str, consequence: str,
+) -> ToolResult | None:
+    """Refuse a text-only tool a target it cannot carry: a directory or a
+    file whose bytes are not UTF-8 text. ``consequence`` finishes the
+    sentence for the tool that asked.
+
+    The file is classified from the host, one open and one read: binary as
+    :func:`gitwork.looks_binary` decides it (the same test that keeps the
+    file out of /diff), or a UTF-16 BOM, which that probe exempts so git
+    tracks such files as text but a text tool still cannot edit, or bytes
+    that do not decode within the window ``read_file`` can show.
+
+    None when the target is fine, missing (write_file creates it), or
+    invisible from the host (the container mounts something this process
+    cannot map): the tool then behaves as if this check did not exist."""
+    host = sandbox.host_path(target)
+    if host is None:
+        return None
+    try:
+        info = host.stat()
+    except OSError:
+        return None
+    shown = path or "."
+    if stat.S_ISDIR(info.st_mode):
+        return _denied(f"{shown} is a directory, not a file")
+    if not stat.S_ISREG(info.st_mode):
+        return None  # fifo, device: the shell reports what it is
+    try:
+        with open(host, "rb") as fh:
+            head = fh.read(TEXT_PROBE_BYTES)
+            reason = None
+            if head.startswith(UTF16_BOMS):
+                reason = "is UTF-16 — binary as far as these tools are concerned"
+            elif looks_binary(head):
+                reason = "is a binary file"
+            else:
+                try:
+                    (head + fh.read(READ_CAP - len(head))).decode()
+                except UnicodeDecodeError:
+                    reason = "is not valid UTF-8 — some bytes cannot be shown as text"
+    except OSError:
+        return None
+    if reason is None:
+        return None
+    size = info.st_size
+    for unit, scale in (("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if size >= scale:
+            note = (f"{size // scale} {unit}" if size % scale == 0
+                    else f"{size / scale:.1f} {unit}")
+            break
+    else:
+        note = f"{size} bytes"
+    return _denied(
+        f"{shown} {reason} ({note}): {consequence}{_RUN_BASH_INSTEAD}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -212,7 +284,7 @@ def report_tool_usage(usage: Usage) -> None:
 
 
 def _exec_error(result, fallback: str) -> ToolResult:
-    return ToolResult(status="error", content=result.stderr.strip() or fallback)
+    return _denied(result.stderr.strip() or fallback)
 
 
 # ----------------------------------------------------------------------
@@ -310,7 +382,7 @@ class ToolRegistry:
         ``usage_sink`` gets spend reports from a self-running tool (subagent)."""
         tool = self._tools.get(name)
         if tool is None:
-            return ToolResult(status="error", content=f"unknown tool '{name}'")
+            return _denied(f"unknown tool '{name}'")
         try:
             args = json.loads(arguments_json) if arguments_json.strip() else {}
         except json.JSONDecodeError as exc:
@@ -334,7 +406,7 @@ class ToolRegistry:
                 _output_limit.reset(limit_token)
                 _output_sink.reset(token)
         except Exception as exc:
-            result = ToolResult(status="error", content=f"{type(exc).__name__}: {exc}")
+            result = _denied(f"{type(exc).__name__}: {exc}")
         result = result._replace(
             content=_truncate_output(result.content, self.max_output_chars),
         )
@@ -394,19 +466,6 @@ def _python_outline(source: str) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-def _check_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
-    error = sandbox.validate_relpath(path)
-    return None if error is None else _bad(error)
-
-
-def _check_write_path(sandbox: SandboxConfig, path: str) -> ToolResult | None:
-    """Workspace-relative path checks shared by the writing tools: no
-    absolute paths except the read-only refs area, no traversal."""
-    if sandbox.use_sandbox and is_refs_path(path):
-        return ToolResult(status="error", content=f"'{REFS_ANCHOR}/' is read-only")
-    return _check_path(sandbox, path)
-
-
 def _line_window(
     lines: list[str], start: int, end: int, total: int, limit: int | None,
 ) -> str:
@@ -458,16 +517,16 @@ def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
         ReadFileArgs,
     )
     async def read_file(args: ReadFileArgs) -> ToolResult:
-        path = args.path
-        if Path(path).is_absolute():
-            # Taken as given: the environment bounds it, not this check. The
-            # container mounts the workspace, the caches and the refs and
-            # nothing else; the host has no jail, exactly like run_bash there.
-            target = path
-        elif err := _check_path(sandbox, path):
-            return err
-        else:
-            target = sandbox.tool_path(path)
+        path, error = sandbox.normalize_tool_path(args.path)
+        if error is not None:
+            return _denied(error)
+        target = sandbox.tool_path(path)
+
+        if refusal := _refuse_unrepresentable(
+            sandbox, path, target,
+            "read_file returns text, so it cannot show these bytes.",
+        ):
+            return refusal
 
         start = args.start_line
         end = args.end_line
@@ -495,7 +554,7 @@ def _make_read_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
             try:
                 total_lines = int(result.stdout[:first_nl].strip())
             except ValueError:
-                return ToolResult(status="error", content=f"could not count lines in {path}")
+                return _denied(f"could not count lines in {path}")
             contents = result.stdout[first_nl + 1:]
             if end is None or end > total_lines:
                 end = total_lines
@@ -577,16 +636,23 @@ def _make_write_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
         "write_file",
         "Create a new file or overwrite an existing one with completely new "
         "contents (parent directories are created as needed). Prefer "
-        "edit_file for changing part of an existing file.",
+        "edit_file for changing part of an existing file. Paths are relative "
+        "to the workspace root; an absolute path inside the workspace is "
+        "accepted too.",
         WriteFileArgs,
     )
     async def write_file(args: WriteFileArgs) -> ToolResult:
-        path = args.path
         content = args.content
-        if err := _check_write_path(sandbox, path):
-            return err
+        path, error = sandbox.normalize_tool_path(args.path, write=True)
+        if error is not None:
+            return _denied(error)
 
         target = sandbox.tool_path(path)
+        if refusal := _refuse_unrepresentable(
+            sandbox, path, target,
+            "write_file writes text and would replace these bytes.",
+        ):
+            return refusal
         # One bwrap spawn, not two: report whether the file existed before
         # ("created" vs "overwrote") and write it in the same shell. The
         # content travels on stdin (tee), so no quoting issues.
@@ -689,13 +755,15 @@ def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
         "and the error identifies the offending edit (e.g. `edit 2: old_string "
         "not found in file`). The result includes a diff of what "
         "changed. Use write_file to create a file or replace its whole "
-        "contents; use run_bash on non-UTF-8 files.",
+        "contents; use run_bash on non-UTF-8 files. Paths are relative to "
+        "the workspace root; an absolute path inside the workspace is "
+        "accepted too.",
         EditFileArgs,
     )
     async def edit_file(args: EditFileArgs) -> ToolResult:
-        path = args.path
-        if err := _check_write_path(sandbox, path):
-            return err
+        path, error = sandbox.normalize_tool_path(args.path, write=True)
+        if error is not None:
+            return _denied(error)
 
         edits = args.edits
         if not edits:
@@ -704,27 +772,34 @@ def _make_edit_tool(sandbox: SandboxConfig, default_timeout: float) -> Tool:
             if not edit.old_string:
                 return _bad(f"edit {index} needs a non-empty 'old_string'")
 
+        target = sandbox.tool_path(path)
+        if refusal := _refuse_unrepresentable(
+            sandbox, path, target,
+            "edit_file replaces text and cannot edit these bytes.",
+        ):
+            return refusal
+
         read_result = await run_in_sandbox(
-            sandbox, ["cat", "--", sandbox.tool_path(path)], timeout=default_timeout)
+            sandbox, ["cat", "--", target], timeout=default_timeout)
         if read_result.exit_code != 0:
             return _exec_error(read_result, "read failed")
         current = read_result.stdout
         if "\ufffd" in current:
-            # run_in_sandbox decodes with errors="replace": writing this back
-            # would bake U+FFFD into the user's file.
-            return ToolResult(
-                status="error",
-                content=f"{path} is not valid UTF-8; edit it with run_bash instead",
-            )
+            # Backstop: run_in_sandbox decodes with errors="replace" and
+            # writing that back would bake U+FFFD into the user's file. The
+            # probe above already refused a non-UTF-8 file; this catches one
+            # that changed between the probe and this read.
+            return _denied(
+                f"{path} is not valid UTF-8; edit it with run_bash instead")
 
         try:
             updated = _apply_edits(current, edits)
         except _EditError as exc:
-            return ToolResult(status="error", content=str(exc))
+            return _denied(str(exc))
 
         write_result = await run_in_sandbox(
             sandbox,
-            ["sh", "-c", 'tee -- "$1" >/dev/null', "edit_file", sandbox.tool_path(path)],
+            ["sh", "-c", 'tee -- "$1" >/dev/null', "edit_file", target],
             input_bytes=updated.encode(), timeout=default_timeout,
         )
         if write_result.exit_code != 0:

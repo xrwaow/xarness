@@ -144,6 +144,20 @@ def _schema_of(registry: ToolRegistry, name: str) -> dict:
     )
 
 
+def _every_text_tool(registry: ToolRegistry, path: str) -> list[ToolResult]:
+    """read_file, write_file and edit_file called on one path: what they
+    answer must agree, so every refusal is asserted once per tool here."""
+    return [
+        asyncio.run(registry.call(tool, json.dumps(args)))
+        for tool, args in (
+            ("read_file", {"path": path}),
+            ("write_file", {"path": path, "content": "x\n"}),
+            ("edit_file", {"path": path,
+                           "edits": [{"old_string": "a", "new_string": "b"}]}),
+        )
+    ]
+
+
 def test_refs_do_not_vary_the_tool_descriptions(tmp_path) -> None:
     """Tool descriptions are stable regardless of refs (a stable schema keeps
     the provider's prompt cache warm); refs are described in the system
@@ -238,7 +252,7 @@ def test_read_small_file_returns_full_contents(tmp_path) -> None:
 
 def test_read_accepts_absolute_container_path(tmp_path) -> None:
     """read_file also takes absolute (container) paths, e.g. files in the
-    shared cache anchor; only reads — writes stay workspace-relative."""
+    shared cache anchor; writes take them only inside the workspace."""
     (tmp_path / "a.txt").write_text("one\ntwo\n")
     result = asyncio.run(_registry_for(tmp_path).call(
         "read_file", '{"path": "/workspace/a.txt"}'
@@ -470,13 +484,207 @@ def test_write_file_reports_bytes_not_characters(tmp_path) -> None:
 
 def test_write_tools_reject_the_read_only_refs_area(tmp_path) -> None:
     """The canonical refs path is absolute; writes there must say read-only,
-    not "use a workspace-relative path". Dot segments cannot escape it."""
-    for path in ("/tmp/refs/x", "/tmp/refs/./x", "/tmp/refs/../refs/x"):
+    not "use a workspace-relative path"."""
+    for path in ("/tmp/refs", "/tmp/refs/x", "/tmp/refs/./x"):
         result = asyncio.run(_registry_for(tmp_path).call(
             "write_file", json.dumps({"path": path, "content": "no"})
         ))
         assert not result.ok, path
         assert "read-only" in result.content, path
+    # No dot segment escapes the area — nor is one a way in: it is refused
+    # for the same reason as any other path that names a walk.
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "write_file", json.dumps({"path": "/tmp/refs/../refs/x", "content": "no"})
+    ))
+    assert not result.ok
+    assert "must not contain '..'" in result.content
+
+
+def test_write_file_accepts_an_absolute_path_inside_the_workspace(tmp_path) -> None:
+    """The workspace's container mount is a path like any other: naming a file
+    by it writes that file, and the result names it workspace-relative."""
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "write_file",
+        json.dumps({"path": "/workspace/sub/a.txt", "content": "hi\n"}),
+    ))
+    assert result.ok, result.content
+    assert (tmp_path / "sub" / "a.txt").read_text() == "hi\n"
+    assert result.content.startswith("created sub/a.txt")
+
+
+def test_edit_file_accepts_an_absolute_path_inside_the_workspace(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("one\ntwo\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "edit_file",
+        json.dumps({
+            "path": "/workspace/./a.txt",
+            "edits": [{"old_string": "two", "new_string": "three"}],
+        }),
+    ))
+    assert result.ok, result.content
+    assert (tmp_path / "a.txt").read_text() == "one\nthree\n"
+    assert "applied edit to a.txt" in result.content
+
+
+def test_write_tools_reject_an_absolute_path_outside_the_workspace(tmp_path) -> None:
+    for path in ("/etc/passwd", "/tmp/x.txt"):
+        result = asyncio.run(_registry_for(tmp_path).call(
+            "write_file", json.dumps({"path": path, "content": "no"})
+        ))
+        assert not result.ok, path
+        assert "outside the workspace" in result.content, path
+        assert "run_bash" in result.content, path
+    assert not (tmp_path.parent / "x.txt").exists()
+
+
+def test_unsandboxed_write_takes_the_real_absolute_path(tmp_path) -> None:
+    """No container: the workspace is the real directory, so that is the
+    absolute form that works — /workspace names nothing on the host."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    sandbox = SandboxConfig(workspace=workspace, use_sandbox=False)
+    registry = build_registry(sandbox, None, mode="write")
+
+    result = asyncio.run(registry.call(
+        "write_file",
+        json.dumps({"path": str(workspace / "a.txt"), "content": "hi\n"}),
+    ))
+    assert result.ok, result.content
+    assert (workspace / "a.txt").read_text() == "hi\n"
+
+    reject = asyncio.run(registry.call(
+        "write_file", json.dumps({"path": "/workspace/a.txt", "content": "no"})
+    ))
+    assert not reject.ok
+    assert "outside the workspace" in reject.content
+
+
+def test_the_file_tools_share_one_path_check(tmp_path) -> None:
+    """read_file, write_file and edit_file answer a bad path identically: one
+    validator, one message, and dotted/doubled segments normalize the same"""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("one\ntwo\n")
+    registry = _registry_for(tmp_path)
+    for result in _every_text_tool(registry, "./sub/../a.txt"):
+        assert result.status == "error"
+        assert result.content == "path must not contain '..', got './sub/../a.txt'"
+
+    read = asyncio.run(registry.call(
+        "read_file", json.dumps({"path": "sub//./a.txt"})))
+    assert read.ok and read.content == "one\ntwo\n"
+    write = asyncio.run(registry.call(
+        "write_file", json.dumps({"path": "sub//./b.txt", "content": "hi\n"})))
+    assert write.content.startswith("created sub/b.txt")
+    edit = asyncio.run(registry.call("edit_file", json.dumps({
+        "path": "./sub/a.txt",
+        "edits": [{"old_string": "two", "new_string": "2"}],
+    })))
+    assert edit.content.startswith("applied edit to sub/a.txt")
+
+
+def test_a_binary_file_is_refused_by_all_three(tmp_path) -> None:
+    """Bytes the text tools cannot carry are refused with the way out,
+    instead of being handed back as replacement characters.
+
+    "Binary" is gitwork's probe (magic prefix or a NUL in the head) — the
+    same test that keeps the file out of /diff, so the tools and the change
+    tracking agree on what a binary is."""
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+    before = (tmp_path / "logo.png").read_bytes()
+    (tmp_path / "nul.dat").write_bytes(b"a\x00b")
+    registry = _registry_for(tmp_path)
+
+    for path in ("logo.png", "nul.dat", "/workspace/logo.png"):
+        for result in _every_text_tool(registry, path):
+            assert result.status == "error", path
+            assert "is a binary file" in result.content, path
+            assert "run_bash" in result.content, path
+            assert "xxd" in result.content, path
+    assert (tmp_path / "logo.png").read_bytes() == before  # nothing written
+
+    named = asyncio.run(registry.call(
+        "read_file", json.dumps({"path": "logo.png"})))
+    assert named.content.startswith("logo.png is a binary file (48 bytes):")
+
+
+def test_non_utf8_text_is_refused_by_all_three(tmp_path) -> None:
+    """latin-1/CP1252 source is text, but not UTF-8: the model would be shown
+    U+FFFD where bytes were. All three refuse, so nothing is lost silently."""
+    (tmp_path / "latin1.c").write_bytes(b"/* caf\xe9 */\nint x;\n")
+    before = (tmp_path / "latin1.c").read_bytes()
+
+    for result in _every_text_tool(_registry_for(tmp_path), "latin1.c"):
+        assert result.status == "error"
+        assert "not valid UTF-8" in result.content
+        assert "run_bash" in result.content
+    assert (tmp_path / "latin1.c").read_bytes() == before
+
+
+def test_utf16_is_refused_as_binary(tmp_path) -> None:
+    """UTF-16 is text, but not text these tools can carry: the probe exempts
+    the BOM (so git keeps tracking the file as text), so the tools refuse it
+    separately."""
+    (tmp_path / "u16.txt").write_bytes("hi\n".encode("utf-16"))
+    for result in _every_text_tool(_registry_for(tmp_path), "u16.txt"):
+        assert result.status == "error"
+        assert "UTF-16" in result.content
+        assert "run_bash" in result.content
+
+
+def test_a_valid_utf8_file_with_a_replacement_char_is_not_refused(tmp_path) -> None:
+    """The check is on the file's bytes, not on the character: a file that
+    really contains U+FFFD is valid UTF-8 and reads normally."""
+    (tmp_path / "u.txt").write_text("a\ufffdb\n")
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "read_file", json.dumps({"path": "u.txt"})))
+    assert result.ok, result.content
+    assert result.content == "a\ufffdb\n"
+
+
+def test_a_directory_is_refused_by_all_three(tmp_path) -> None:
+    """A path that names a directory is refused up front, not by the shell
+    (whose message names the binary that ran, not the mistake)."""
+    (tmp_path / "dir").mkdir()
+    for result in _every_text_tool(_registry_for(tmp_path), "dir"):
+        assert result.status == "error"
+        assert result.content == "dir is a directory, not a file"
+
+
+def test_dotdot_is_refused_for_reads_too(tmp_path) -> None:
+    """One rule for every tool: no path is read as a walk — so
+    /workspace/../etc/passwd is refused like ../etc/passwd, even though
+    /etc/passwd itself is readable."""
+    registry = _registry_for(tmp_path)
+    for path in ("../up.txt", "/workspace/../etc/passwd", "/tmp/refs/../x"):
+        result = asyncio.run(registry.call("read_file", json.dumps({"path": path})))
+        assert not result.ok, path
+        assert result.status == "error", path
+        assert "must not contain '..'" in result.content, path
+    assert asyncio.run(registry.call(
+        "read_file", json.dumps({"path": "/etc/passwd"}))).ok
+
+
+def test_write_still_creates_a_new_file(tmp_path) -> None:
+    """The probe looks at the file that is there; a new file (even one with
+    a binary-sounding name) is written as usual."""
+    result = asyncio.run(_registry_for(tmp_path).call(
+        "write_file", json.dumps({"path": "data.bin", "content": "text\n"})
+    ))
+    assert result.ok, result.content
+    assert (tmp_path / "data.bin").read_text() == "text\n"
+
+
+def test_unsandboxed_refuses_a_binary_host_path(tmp_path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+    sandbox = SandboxConfig(workspace=workspace, use_sandbox=False)
+    registry = build_registry(sandbox, None, mode="write")
+
+    for path in ("logo.png", str(workspace / "logo.png")):
+        result = asyncio.run(registry.call("read_file", json.dumps({"path": path})))
+        assert not result.ok, path
+        assert "is a binary file" in result.content, path
 
 
 def test_string_integers_are_coerced(tmp_path) -> None:

@@ -510,23 +510,95 @@ class SandboxConfig:
             return norm
         if not self.use_sandbox:
             return str(self.workspace / norm) if norm != "." else str(self.workspace)
-        return f"{_WORKSPACE}/{norm}"
+        return _WORKSPACE if norm == "." else f"{_WORKSPACE}/{norm}"
 
-    def validate_relpath(self, path: str) -> str | None:
-        """Defense-in-depth path check; bwrap's mount namespace is the real
-        enforcement — this just gives a clean error instead of a bwrap
-        failure.
+    def sandbox_venv(self) -> Path:
+        """Host dir bound over ``<workspace>/.venv`` (the uv project
+        environment, keyed by the workspace path — see _cache_binds_and_env)."""
+        return sandbox_cache_root() / "venvs" / hashlib.sha1(
+            str(self.workspace).encode()).hexdigest()[:12]
 
-        Paths are relative to the agent's workspace (see tool_path).
-        Absolute paths and traversal are rejected, so a path can never
-        point outside the workspace's mount (the read-only mount in plan
-        mode is what enforces write restrictions)."""
-        p = Path(path)
-        if p.is_absolute():
-            return f"path must be relative to the workspace, got absolute path '{path}'"
-        if ".." in p.parts:
-            return f"path must not contain '..', got '{path}'"
+    def host_path(self, path: str) -> Path | None:
+        """Host path for a path the tools run against, or None when this
+        process cannot see the file — the host-side view a content probe
+        needs. Relative paths resolve against the workspace; absolute ones
+        are mapped back through the mounts build_argv sets up. ``/usr``,
+        ``/etc`` and the container's ``/tmp`` have no counterpart and return
+        None, so the caller probes nothing."""
+        norm = posixpath.normpath(path) if path else "."
+        if not posixpath.isabs(norm):
+            if not self.use_sandbox:
+                return self.workspace / norm
+            norm = _WORKSPACE if norm == "." else f"{_WORKSPACE}/{norm}"
+        elif not self.use_sandbox:
+            return Path(norm)
+        mounts = [(ref.mount, ref.host) for ref in self.external_refs.values()]
+        mounts.append((_WORKSPACE, self.workspace))
+        if self.uses_project_venv():
+            # .venv is bound over by the sandbox's own project env, so the
+            # host file at that path is not the one the tools see.
+            mounts.append((f"{_WORKSPACE}/.venv", self.sandbox_venv()))
+        if norm == CACHE_ANCHOR or norm.startswith(CACHE_ANCHOR + "/"):
+            # The cache anchors _cache_binds_and_env mounts; a bind added
+            # there belongs here too (tests check they agree).
+            home = Path.home()
+            mounts += [
+                (f"{CACHE_ANCHOR}/uv", home / ".cache/uv"),
+                (f"{CACHE_ANCHOR}/uv-python", home / ".local/share/uv/python"),
+                (f"{CACHE_ANCHOR}/rustup", home / ".rustup"),
+                (f"{CACHE_ANCHOR}/cargo-bin", home / ".cargo/bin"),
+                (f"{CACHE_ANCHOR}/local-bin", home / ".local/bin"),
+                (CACHE_ANCHOR, sandbox_cache_root()),
+            ]
+        # Most specific first: a ref mounted inside the workspace, a cache
+        # anchor over the cache root, or .venv over the workspace wins.
+        for mount, host in sorted(mounts, key=lambda pair: len(pair[0]), reverse=True):
+            if norm == mount:
+                return host
+            if norm.startswith(mount + "/"):
+                return host / norm[len(mount) + 1:]
         return None
+
+    def normalize_tool_path(
+        self, path: str, *, write: bool = False,
+    ) -> tuple[str | None, str | None]:
+        """``(path for tool_path, error)`` — the one path check read_file,
+        write_file and edit_file share, so they agree on what a path means
+        and on how a bad one is reported.
+
+        A relative path is workspace-relative and normalized (``a/./b`` →
+        ``a/b``); ``..`` is refused in any form, so no path names a walk out
+        of where it starts. An absolute path is taken as given for a read:
+        the mounts bound what it can name. A write has no such bound, so it
+        must name something inside the workspace — converted here to its
+        relative form, so one file has one name — or be refused, as is the
+        read-only refs area.
+
+        Lexical comparison first, then resolved, so a path given through a
+        symlinked parent (``/tmp/p/x`` for a workspace at ``/private/tmp/p``)
+        is recognized. This is a guard against mistakes, not a jail: bwrap's
+        mount namespace is the real enforcement, and unsandboxed mode has
+        none (run_bash writes anywhere)."""
+        if ".." in Path(path).parts:
+            return None, f"path must not contain '..', got '{path}'"
+        if not Path(path).is_absolute():
+            return posixpath.normpath(path), None
+        if not write:
+            return path, None
+        if self.use_sandbox and is_refs_path(path):
+            return None, f"'{REFS_ANCHOR}/' is read-only"
+        root = Path(self.tool_root)
+        lexical = Path(posixpath.normpath(path))
+        for candidate, base in ((lexical, root), (lexical.resolve(), root.resolve())):
+            try:
+                return candidate.relative_to(base).as_posix() or ".", None
+            except ValueError:
+                continue
+        return None, (
+            f"absolute path '{path}' is outside the workspace "
+            f"(writes stay inside {root}); use run_bash for other paths "
+            f"(e.g. /cache, /tmp)"
+        )
 
     def _system_ro_binds(self) -> list[str]:
         args: list[str] = []
@@ -597,9 +669,7 @@ class SandboxConfig:
         # mount inside the sandbox — without this uv would try to rebuild
         # .venv in the user's worktree, corrupting it. VIRTUAL_ENV is
         # dropped for the same mismatch reason.
-        venv = root / "venvs" / hashlib.sha1(
-            str(self.workspace).encode()
-        ).hexdigest()[:12]
+        venv = self.sandbox_venv()
         venv.mkdir(parents=True, exist_ok=True)
         argv += [
             "--setenv", "UV_PROJECT_ENVIRONMENT", f"{anchor}/venvs/{venv.name}",

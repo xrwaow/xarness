@@ -108,6 +108,8 @@ from .workspace import (
     _EXPLICIT_WRITES,
     WorkspaceState,
     change_workspace_ref,
+    load_workspace_mcp_servers,
+    save_workspace_mcp_servers,
     save_workspace_refs,
 )
 
@@ -123,7 +125,7 @@ DIFF_DEBOUNCE_SECONDS = 0.25
 IDLE_ONLY = (
     protocol.Rollback, protocol.Compact, protocol.SwitchModel,
     protocol.SetSandbox, protocol.Filter, protocol.Ref,
-    protocol.SetMcpServerEnabled, protocol.SetMcpToolEnabled,
+    protocol.SetMcpServerScope, protocol.SetMcpToolEnabled,
     protocol.AddMcpServer,
 )
 
@@ -251,7 +253,12 @@ class Session:
         # parent's manager (and therefore its already-running processes);
         # only the owner closes them.
         self._owns_mcp = mcp_manager is None
-        self.mcp = mcp_manager or McpManager(mcp or McpSettings(), workspace)
+        # The owner reads this workspace's server overrides; a subagent
+        # shares the parent's manager and therefore its already-loaded ones.
+        self.mcp = mcp_manager or McpManager(
+            mcp or McpSettings(), workspace,
+            workspace_servers=load_workspace_mcp_servers(workspace),
+        )
         self.tool_registry = build_registry(
             self.sandbox.config, self.sandbox.shell, mode=self.mode,
             ask_callback=self._ask_callback,
@@ -428,12 +435,13 @@ class Session:
         self._rebuild_tools()
         self._emit_status()
 
-    async def _cmd_set_mcp_server_enabled(
-        self, command: protocol.SetMcpServerEnabled,
+    async def _cmd_set_mcp_server_scope(
+        self, command: protocol.SetMcpServerScope,
     ) -> CommandResult:
-        await self._apply_mcp(lambda: self.mcp.set_server_enabled(
-            command.name, command.enabled,
+        await self._apply_mcp(lambda: self.mcp.set_server_scope(
+            command.name, command.scope,
         ))
+        self._save_workspace_mcp_servers()
         self._emit_notice(f"mcp {command.name}: {self._mcp_state(command.name)}")
         return CommandResult()
 
@@ -461,6 +469,21 @@ class Session:
             f"mcp {command.name}: configured ({state})"
         )
         return CommandResult()
+
+    def _save_workspace_mcp_servers(self) -> None:
+        """Persist this workspace's "on (workspace)" servers.
+
+        The running session keeps the live choice when the store cannot be
+        written; the user gets a notice instead of a lost click."""
+        try:
+            save_workspace_mcp_servers(
+                self.workspace, self.mcp.workspace_servers,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            self._emit_notice(
+                f"mcp workspace scope changed for this session only: {exc}",
+                level="warn",
+            )
 
     def _save_mcp_settings(self) -> None:
         """Persist toggles/additions in the host's config file.
@@ -724,8 +747,8 @@ class Session:
                 return await self._cmd_filter(command.path, command.add)
             case protocol.Ref():
                 return await self._cmd_ref(command.path, command.add)
-            case protocol.SetMcpServerEnabled():
-                return await self._cmd_set_mcp_server_enabled(command)
+            case protocol.SetMcpServerScope():
+                return await self._cmd_set_mcp_server_scope(command)
             case protocol.SetMcpToolEnabled():
                 return await self._cmd_set_mcp_tool_enabled(command)
             case protocol.AddMcpServer():
@@ -1762,8 +1785,11 @@ class Session:
         file's pending diff.
 
         The tool interprets a relative path against the sandbox cwd
-        (``--workspace repo/sub``); events are repo-root-relative. None when
-        the arguments do not name a file inside the workspace."""
+        (``--workspace repo/sub``); events are repo-root-relative. An
+        absolute path the tool would accept (inside the workspace) is
+        normalized by the same helper the tool uses, so both sides name one
+        file. None when the arguments do not name a file inside the
+        workspace."""
         try:
             args = json.loads(call.arguments_json)
         except (TypeError, ValueError):
@@ -1771,6 +1797,11 @@ class Session:
         path = args.get("path") if isinstance(args, dict) else None
         if not isinstance(path, str) or not path:
             return None
+        config = self.sandbox.config
+        if config is not None:
+            rel_path, error = config.normalize_tool_path(path, write=True)
+            if error is None and rel_path is not None:
+                path = rel_path
         try:
             rel = (self.workspace / path).resolve().relative_to(
                 ws.root).as_posix()

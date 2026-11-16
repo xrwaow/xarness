@@ -71,7 +71,15 @@ def system_prompt(
         )
     else:
         lines.append("- No container: tools run directly on the host.")
-    lines.append("- Tool paths are relative to the workspace root.")
+    lines.append(
+        "- Tool paths are relative to the workspace root; an absolute path "
+        "inside it is accepted too."
+    )
+    lines.append(
+        "- The file tools are text-only: a binary, UTF-16 or non-UTF-8 file "
+        "is refused." + (" Use run_bash (xxd, base64, printf) for those."
+                        if shell else "")
+    )
     if mcp_servers:
         lines.append(
             "- MCP tools (" + ", ".join(mcp_servers) + ") run on the host "

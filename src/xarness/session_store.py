@@ -10,10 +10,11 @@ write only ever has to replace rows from a watermark onward
 re-serializes O(history) on every tool result. Image blobs stay
 content-addressed files under the session directory.
 
-Per-workspace state (tracking trees, epoch, ignored set, reference paths)
-lives in the same database, in the ``workspaces`` table: it is shared by every
-session opened in the same repo. That table belongs to
-:mod:`xarness.workspace`; this module owns the schema and the connection.
+Per-workspace state (tracking trees, epoch, ignored set, reference paths,
+and settings such as servers kept on only there) lives in the same database,
+in the ``workspaces`` table: it is shared by every session opened in the same
+repo. That table belongs to :mod:`xarness.workspace`; this module owns the
+schema and the connection.
 """
 
 from __future__ import annotations
@@ -334,6 +335,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             root TEXT PRIMARY KEY,
             state TEXT NOT NULL,
             refs TEXT NOT NULL,
+            settings TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS workspace_events (
@@ -344,6 +346,13 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    # The settings column arrived after the table existed: add it in place.
+    columns = {row[1] for row in connection.execute(
+        "PRAGMA table_info(workspaces)")}
+    if "settings" not in columns:
+        connection.execute(
+            "ALTER TABLE workspaces ADD COLUMN settings TEXT NOT NULL DEFAULT ''"
+        )
     _import_v4_rows(connection)
 
 

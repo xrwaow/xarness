@@ -26,7 +26,7 @@ from ..protocol import (
     AddMcpServer,
     Command,
     McpServerInfo,
-    SetMcpServerEnabled,
+    SetMcpServerScope,
     SetMcpToolEnabled,
     ToolInfo,
     ToolsInfo,
@@ -36,9 +36,15 @@ from .tool_view import _shorten, mcp_parts
 # status -> (dot, palette color, word). Unknown states fall back to muted.
 SERVER_LOOK = {
     "connected": ("●", "success", "available"),
-    "disabled": ("○", "muted", "disabled"),
+    "disabled": ("○", "muted", "off"),
     "starting": ("◌", "warning", "starting"),
     "unavailable": ("✕", "error", "unavailable"),
+}
+# A server's three states, in click order. "on (global)" is the config
+# default; "on (workspace)" starts it here only.
+SERVER_SCOPE_NEXT = {"off": "global", "global": "workspace", "workspace": "off"}
+SERVER_SCOPE_WORD = {
+    "off": "off", "global": "on (global)", "workspace": "on (workspace)",
 }
 
 
@@ -68,10 +74,15 @@ def _tool_block(tool: ToolInfo, *, show_source: bool) -> Vertical:
 def _server_header(server: McpServerInfo) -> Text:
     palette = theme.PALETTE
     dot, color, word = SERVER_LOOK.get(server.status, ("○", "muted", server.status))
+    if server.status == "connected":
+        # The dot says "running"; the word says where the choice lives.
+        word = SERVER_SCOPE_WORD[server.scope]
     row = Text()
     row.append(dot + " ", style=palette[color])
     row.append(server.name, style=palette["text"])
-    row.append("  " + word, style=palette[color])
+    row.append("  " + word, style=(
+        palette["accent"] if server.scope == "workspace" else palette[color]
+    ))
     if server.available:
         count = len(server.tools)
         row.append(f"  {count} tool" + ("s" if count != 1 else ""),
@@ -130,7 +141,8 @@ class ToolsScreen(ModalScreen[None]):
             yield Label("mcp servers", classes="tools-section")
             yield OptionList(id="mcp-list")
             yield Static(
-                "click a row to toggle · esc to close",
+                "click a server: off → on (global) → on (workspace) "
+                "· tools toggle one by one · esc to close",
                 id="tools-hint",
             )
             yield Static("", id="tools-error")
@@ -230,11 +242,14 @@ class ToolsScreen(ModalScreen[None]):
                 server=server.name, tool=tool.name, enabled=not tool.enabled,
             )))
             return
-        # A failed-but-enabled server restarts on click; otherwise the click
-        # flips its enabled state.
-        self.post_message(self.Change(SetMcpServerEnabled(
-            name=server.name,
-            enabled=True if server.status == "unavailable" else not server.enabled,
+        # A failed-but-on server retries on click; otherwise the click moves
+        # it to the next scope.
+        scope = (
+            server.scope if server.status == "unavailable"
+            else SERVER_SCOPE_NEXT[server.scope]
+        )
+        self.post_message(self.Change(SetMcpServerScope(
+            name=server.name, scope=scope,
         )))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

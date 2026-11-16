@@ -89,12 +89,23 @@ the `2025-11-25` handshake *era*: the stateless `2026-07-28` revision (no
 implemented yet, and such a server fails with an error that says so.
 
 `/tools` opens the manager: the effective tool set at the top, then every
-configured MCP server with its availability and tools. Click a server name
-to enable/disable it, click a tool row to include/exclude one tool, or type
+configured MCP server with its availability and tools. Type
 `name: command args…` — or just a URL like `https://mcp.exa.ai/mcp` — in the
 bottom box to add a server (a JSON object is also accepted for
-`env`/`cwd`/`timeout`). Toggles are written back to the config and take
-effect immediately; changes are idle-only.
+`env`/`cwd`/`timeout`).
+
+Clicking a server header cycles it through three states:
+
+- **off** — not started anywhere (the server's `enabled: false` in the
+  global config).
+- **on (global)** — started in every workspace (the config default).
+- **on (workspace)** — started only in this workspace. The global setting
+  stays `false`; the server is listed in this workspace's `settings` in the
+  shared workspace row (same place as its `/refs`), so no other workspace
+  starts it and nothing is written into your worktree.
+
+Tool rows stay a plain per-server include/exclude (`disabled_tools`).
+Toggles take effect immediately; changes are idle-only.
 
 MCP servers are **trusted host-side extensions**. They are not run inside
 bubblewrap — a stdio server is a host subprocess and an HTTP server is a

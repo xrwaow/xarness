@@ -287,6 +287,9 @@ class ToolInfo(BaseModel):
 
 
 McpServerState = Literal["disabled", "starting", "connected", "unavailable"]
+# Where a server's on/off choice lives: off everywhere, on in every
+# workspace (the config default), or on only in the current workspace.
+McpScope = Literal["off", "global", "workspace"]
 
 
 class McpServerInfo(BaseModel):
@@ -297,7 +300,9 @@ class McpServerInfo(BaseModel):
     args: list[str] = Field(default_factory=list)
     # Remote servers are addressed by URL; stdio servers leave this empty.
     url: str = ""
+    # Effective on-ness here; ``scope`` says where the choice is kept.
     enabled: bool = True
+    scope: McpScope = "global"
     status: McpServerState = "disabled"
     error: str | None = None
     tools: list[ToolInfo] = Field(default_factory=list)

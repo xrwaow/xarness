@@ -18,6 +18,7 @@ from xarness.config import RefSpec, SandboxSettings
 from xarness.sandbox import (
     CACHE_ANCHOR,
     REFS_ANCHOR,
+    ContainerRef,
     bind_ref,
     SANDBOX_CARGO_TARGET_DIR,
     SandboxConfig,
@@ -98,6 +99,141 @@ class SandboxArgvTest(unittest.TestCase):
 
     def argv(self, command: list[str] | None = None, **kw) -> list[str]:
         return self.config(**kw).build_argv(command or ["/bin/sh"])
+
+
+class ToolPathNormalizationTest(SandboxArgvTest):
+    """normalize_tool_path is the one place a tool path is checked: both
+    path styles name the same file, a write stays inside the workspace, and
+    no path names a walk."""
+
+    def test_relative_paths_are_normalized(self):
+        config = self.config()
+        for path, rel in (
+            ("a.txt", "a.txt"),
+            ("./a/b.txt", "a/b.txt"),
+            ("a//b/./c.txt", "a/b/c.txt"),
+            (".", "."),
+        ):
+            for write in (False, True):
+                self.assertEqual(
+                    config.normalize_tool_path(path, write=write), (rel, None),
+                    (path, write),
+                )
+
+    def test_relative_traversal_is_rejected(self):
+        for write in (False, True):
+            rel, error = self.config().normalize_tool_path(
+                "../etc/passwd", write=write)
+            self.assertIsNone(rel)
+            self.assertIn("'..'", error)
+
+    def test_a_read_takes_an_absolute_path_as_given(self):
+        """Only the mounts bound what a read can name — the same path the
+        tool then hands to the shell."""
+        config = self.config()
+        for path in ("/workspace/a.txt", "/etc/passwd", "/tmp/refs/x"):
+            self.assertEqual(config.normalize_tool_path(path), (path, None), path)
+
+    def test_a_write_inside_the_mount_is_relative(self):
+        config = self.config()
+        for path, rel in (
+            ("/workspace/a.txt", "a.txt"),
+            ("/workspace/./a.txt", "a.txt"),
+            ("/workspace", "."),
+        ):
+            self.assertEqual(
+                config.normalize_tool_path(path, write=True), (rel, None), path)
+
+    def test_dotdot_is_refused_whatever_the_form(self):
+        """One rule for every tool: a path never names a walk, relative or
+        absolute — even one that would land back inside the workspace."""
+        config = self.config()
+        for path in ("../etc/passwd", "a/../../b", "/workspace/../etc/passwd",
+                     "/workspace/src/../a.txt", "/tmp/refs/../refs/x"):
+            for write in (False, True):
+                rel, error = config.normalize_tool_path(path, write=write)
+                self.assertIsNone(rel, (path, write))
+                self.assertEqual(
+                    error, f"path must not contain '..', got '{path}'", path)
+
+    def test_a_write_outside_the_mount_is_rejected(self):
+        config = self.config()
+        for path in ("/tmp/x.txt", "/etc/passwd"):
+            rel, error = config.normalize_tool_path(path, write=True)
+            self.assertIsNone(rel, path)
+            self.assertIn("outside the workspace", error, path)
+            self.assertIn("run_bash", error, path)
+
+    def test_a_write_to_the_read_only_refs_area_is_rejected(self):
+        config = self.config()
+        for path in ("/tmp/refs", "/tmp/refs/x", "/tmp/refs/./x"):
+            rel, error = config.normalize_tool_path(path, write=True)
+            self.assertIsNone(rel, path)
+            self.assertIn("read-only", error, path)
+            # A read of the same path is fine: the mount is read-only already.
+            self.assertEqual(config.normalize_tool_path(path), (path, None), path)
+
+    def test_unsandboxed_absolute_uses_the_real_directory(self):
+        config = SandboxConfig(workspace=self.workspace, use_sandbox=False)
+        self.assertEqual(
+            config.normalize_tool_path(str(self.workspace / "a.txt"), write=True),
+            ("a.txt", None),
+        )
+        # /workspace is only the container mount; the host has nothing there.
+        self.assertIsNone(
+            config.normalize_tool_path("/workspace/a.txt", write=True)[0])
+
+    def test_a_symlinked_parent_of_the_workspace_is_recognized(self):
+        """/tmp/p and /private/tmp/p are one directory (macOS); so are these.
+        """
+        link = Path(self._tmp.name) / "link"
+        link.symlink_to(self.workspace)
+        config = SandboxConfig(workspace=self.workspace, use_sandbox=False)
+        self.assertEqual(
+            config.normalize_tool_path(str(link / "a.txt"), write=True),
+            ("a.txt", None),
+        )
+
+    def test_host_path_maps_the_container_view(self):
+        """host_path is how a host-side probe finds the file a tool names in
+        the container: the workspace, the refs and the cache anchors map; the
+        container's own /etc does not.
+        """
+        ref_host = Path(self._tmp.name) / "refs" / "spec"
+        config = self.config(external_refs={
+            "spec.md": ContainerRef(host=ref_host, mount="/tmp/refs/spec.md"),
+        })
+        self.assertEqual(config.host_path("a.txt"), self.workspace / "a.txt")
+        self.assertEqual(config.host_path("/workspace/a/b.txt"),
+                         self.workspace / "a" / "b.txt")
+        self.assertEqual(config.host_path("/tmp/refs/spec.md"), ref_host)
+        self.assertEqual(config.host_path("/cache/uv/x"),
+                         Path.home() / ".cache" / "uv" / "x")
+        self.assertEqual(config.host_path("/cache/rustup/toolchains"),
+                         Path.home() / ".rustup" / "toolchains")
+        self.assertEqual(config.host_path("/cache/pip/http/x"),
+                         sandbox_cache_root() / "pip" / "http" / "x")
+        self.assertIsNone(config.host_path("/etc/passwd"))
+        self.assertIsNone(config.host_path("/usr/bin/env"))
+
+    def test_host_path_unsandboxed_is_already_a_host_path(self):
+        config = SandboxConfig(workspace=self.workspace, use_sandbox=False)
+        self.assertEqual(config.host_path("a.txt"), self.workspace / "a.txt")
+        self.assertEqual(config.host_path("/etc" + "/passwd"), Path("/etc/passwd"))
+
+    def test_host_path_agrees_with_the_real_binds(self):
+        """Every bind host_path can map must be the directory build_argv
+        actually binds at that destination — a mismatch would probe a
+        different file than the tool touches (and refuse the wrong one)."""
+        config = self.config()
+        binds = {dest: src for flag, src, dest
+                 in argv_binds(config.build_argv(["/bin/sh"]))}
+        self.assertTrue(any(dest.startswith(CACHE_ANCHOR) for dest in binds))
+        for dest, src in binds.items():
+            host = config.host_path(dest)
+            if host is None:  # container-only (/etc, /usr, /proc, /dev…)
+                continue
+            self.assertEqual(host, Path(src), dest)
 
 
 class SandboxSessionProtocolTest(unittest.TestCase):

@@ -344,10 +344,8 @@ def harness_ignores(root: Path) -> tuple[str, ...]:
 # binary detection
 
 # How much of a file's head is inspected: git's own ``buffer_is_binary``
-# window. A magic prefix (for formats whose head may be NUL-free) or a NUL
-# byte means binary, except a UTF-16 BOM (its NULs are structural) and an
-# empty file. The NUL scan catches everything the list misses.
-_TEXT_PROBE = 8000
+# window (see :func:`looks_binary`).
+TEXT_PROBE_BYTES = 8000
 _BINARY_MAGIC = (
     b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"%PDF-", b"PK\x03\x04",
     b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ", b"7z\xbc\xaf", b"Rar!",
@@ -355,25 +353,37 @@ _BINARY_MAGIC = (
     b"\xca\xfe\xba\xbe", b"SQLite format 3\0", b"OggS", b"fLaC", b"ID3",
     b"II*\0", b"MM\0*", b"8BPS", b"wOFF", b"wOF2", b"OTTO", b"\x1aE\xdf\xa3",
 )
+# A UTF-16 BOM's NULs are structural, so such a file is not binary (git
+# tracks it as text) — but a text tool cannot carry it either, so the tools
+# check it separately.
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+
+def looks_binary(head: bytes) -> bool:
+    """Whether a file head is binary: a magic prefix or a NUL byte, unless
+    it is a UTF-16 BOM file (its NULs are structural) or empty.
+
+    The NUL scan catches everything the format list misses; the list covers
+    the formats whose head carries no NUL (PDF, images, ID3…)."""
+    return bool(head) and not head.startswith(UTF16_BOMS) and (
+        head.startswith(_BINARY_MAGIC)
+        or (head[:4] == b"RIFF" and head[8:12] in (b"WEBP", b"AVI ", b"WAVE"))
+        or head[4:8] == b"ftyp"
+        or b"\0" in head
+    )
 
 
 def probe_binary_path(target: Path) -> bool:
-    """Whether ``target`` is binary: a magic prefix or a NUL in the first
-    :data:`_TEXT_PROBE` bytes, unless it is a UTF-16 BOM file (see above).
-    Symlinks and non-files are not: git stores a link as text."""
+    """Whether the file at ``target`` is binary (see :func:`looks_binary`
+    for the test itself). Symlinks and non-files are not: git stores a link
+    as text."""
     try:
         if not stat.S_ISREG(os.lstat(target).st_mode):
             return False
         with open(target, "rb") as fh:
-            data = fh.read(_TEXT_PROBE)
+            return looks_binary(fh.read(TEXT_PROBE_BYTES))
     except OSError:
         return False
-    return bool(data) and not data.startswith((b"\xff\xfe", b"\xfe\xff")) and (
-        data.startswith(_BINARY_MAGIC)
-        or (data[:4] == b"RIFF" and data[8:12] in (b"WEBP", b"AVI ", b"WAVE"))
-        or data[4:8] == b"ftyp"
-        or b"\0" in data
-    )
 
 
 def _classify_binary(

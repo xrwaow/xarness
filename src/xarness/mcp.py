@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shlex
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ import httpx
 
 from .config import McpServerSettings, McpSettings
 from .conversation import ToolResult
-from .protocol.views import McpServerInfo, ToolInfo
+from .protocol.views import McpScope, McpServerInfo, ToolInfo
 
 LOG = logging.getLogger(__name__)
 
@@ -210,12 +211,17 @@ class McpManager:
         self,
         settings: McpSettings | None = None,
         workspace: Path | None = None,
+        workspace_servers: Iterable[str] | None = None,
     ) -> None:
         self.settings = settings or McpSettings()
         self.workspace = workspace or Path.cwd()
+        # Servers switched on for this workspace only ("on (workspace)"):
+        # their global setting stays off, so no other workspace gets them.
+        self.workspace_servers = set(workspace_servers or ())
         self._servers: dict[str, _Server] = {
             name: _Server(settings=server, status=(
-                "starting" if server.enabled else "disabled"
+                "starting" if server.enabled or name in self.workspace_servers
+                else "disabled"
             ))
             for name, server in self.settings.servers.items()
         }
@@ -249,7 +255,8 @@ class McpManager:
                 command=server.settings.command or "",
                 args=list(server.settings.args),
                 url=server.settings.url or "",
-                enabled=server.settings.enabled,
+                enabled=self._enabled(name),
+                scope=self.server_scope(name),
                 status=server.status,  # type: ignore[arg-type]
                 error=server.error,
                 tools=[
@@ -268,18 +275,31 @@ class McpManager:
         """Servers whose tools the model currently has (for the prompt)."""
         return [
             name for name, server in self._servers.items()
-            if server.settings.enabled and server.status == "connected"
+            if self._enabled(name) and server.status == "connected"
         ]
 
     def tool_specs(self) -> list[McpToolMeta]:
         """Tools currently offered to the model, in configured order."""
         return [
             tool
-            for server in self._servers.values()
-            if server.settings.enabled and server.status == "connected"
+            for name, server in self._servers.items()
+            if self._enabled(name) and server.status == "connected"
             for tool in server.tools
             if tool.name not in server.settings.disabled_tools
         ]
+
+    def _enabled(self, name: str) -> bool:
+        """On here: globally on, or kept on only for this workspace."""
+        return (
+            self._servers[name].settings.enabled
+            or name in self.workspace_servers
+        )
+
+    def server_scope(self, name: str) -> McpScope:
+        """Where this server's on/off choice lives, as /tools shows it."""
+        if self._require(name).settings.enabled:
+            return "global"
+        return "workspace" if name in self.workspace_servers else "off"
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -294,7 +314,7 @@ class McpManager:
                 *(
                     self._start_one(name, server)
                     for name, server in self._servers.items()
-                    if server.settings.enabled
+                    if self._enabled(name)
                 ),
                 return_exceptions=True,
             )
@@ -368,10 +388,36 @@ class McpManager:
         server.error = None
 
     async def set_server_enabled(self, name: str, enabled: bool) -> None:
+        """Old binary toggle: global on, or off everywhere."""
+        await self.set_server_scope(name, "global" if enabled else "off")
+
+    async def set_server_scope(self, name: str, scope: McpScope) -> None:
+        """Move one server's choice: off, global on, or on only here.
+
+        "workspace" leaves the global setting off (so other workspaces do
+        not start it) and records the override for this one. A server that
+        stays on through the move keeps running: only on/off starts or
+        stops a process."""
+        if scope not in ("off", "global", "workspace"):
+            raise McpError(f"unknown server scope {scope!r}")
+        server = self._require(name)
+        was_on = self._enabled(name)
+        if scope == "workspace":
+            self.workspace_servers.add(name)
+            server.settings.enabled = False
+        else:
+            self.workspace_servers.discard(name)
+            server.settings.enabled = scope == "global"
+        if was_on != (scope != "off") or (
+            scope != "off" and server.status == "unavailable"
+        ):
+            await self._set_running(name, scope != "off")
+
+    async def _set_running(self, name: str, running: bool) -> None:
+        """Start or stop the process without touching the saved choice."""
         server = self._require(name)
         async with self._lock:
-            server.settings.enabled = enabled
-            if not enabled:
+            if not running:
                 client, server.client = server.client, None
                 server.status = "disabled"
                 server.error = None
@@ -419,7 +465,7 @@ class McpManager:
         self, server_name: str, tool_name: str, arguments: dict[str, Any],
     ) -> ToolResult:
         server = self._require(server_name)
-        if not server.settings.enabled:
+        if not self._enabled(server_name):
             return ToolResult(
                 status="error",
                 content=f"MCP server {server_name!r} is disabled",

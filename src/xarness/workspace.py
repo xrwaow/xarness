@@ -14,6 +14,9 @@ tracked state is per workspace, not per session:
   - ``binary``: content-detected binaries (path -> size, mtime_ns), which
     never enter a tree either and are not re-probed while unchanged
 
+The same row carries the workspace's own choices: its ``refs`` (``/refs``)
+and ``settings`` (servers kept on only here).
+
 It also owns the one persistent snapshot index and the lock that serializes
 snapshots, accept, reject and undo (a second ``git add`` on the same index
 would fail on ``index.lock``).
@@ -639,17 +642,20 @@ def _collapse_ignored(paths: Iterable[str]) -> tuple[str, ...]:
 def _write(
     db: sqlite3.Connection, root: Path, *,
     state: str | None = None, refs: str | None = None,
+    settings: str | None = None,
 ) -> None:
-    """Upsert one row's columns on ``db``. State and refs share a row but are
-    written independently, so neither can clobber the other."""
+    """Upsert one row's columns on ``db``. State, refs and settings share a
+    row but are written independently, so none can clobber another."""
     # COALESCE keeps the column this call does not set (the INSERT's own
     # value only matters for the row it creates).
     db.execute(
-        "INSERT INTO workspaces (root, state, refs, updated_at) "
-        "VALUES (?, ?, ?, ?) "
+        "INSERT INTO workspaces (root, state, refs, settings, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(root) DO UPDATE SET state = COALESCE(?, state), "
-        "refs = COALESCE(?, refs), updated_at = excluded.updated_at",
-        (str(root), state or "", refs or "", utcnow_iso(), state, refs),
+        "refs = COALESCE(?, refs), settings = COALESCE(?, settings), "
+        "updated_at = excluded.updated_at",
+        (str(root), state or "", refs or "", settings or "", utcnow_iso(),
+         state, refs, settings),
     )
 
 
@@ -685,15 +691,16 @@ def _is_ignored(path: str, listing: tuple[str, ...]) -> bool:
     )
 
 
-def _row(root: Path) -> tuple[str, str] | None:
-    """The (state, refs) JSON columns for ``root``, or None — also when there
-    is no database yet, since reading must not create one."""
+def _row(root: Path) -> tuple[str, str, str] | None:
+    """The (state, refs, settings) JSON columns for ``root``, or None — also
+    when there is no database yet, since reading must not create one."""
     try:
         with session_store.read_connection() as db:
             if db is None:
                 return None
             return db.execute(
-                "SELECT state, refs FROM workspaces WHERE root = ?", (str(root),),
+                "SELECT state, refs, settings FROM workspaces WHERE root = ?",
+                (str(root),),
             ).fetchone()
     except sqlite3.Error:
         return None
@@ -853,6 +860,46 @@ def save_workspace_refs(workspace: Path | str, refs: list[str]) -> None:
     root = Path(workspace).expanduser().resolve()
     with session_store.connection() as db:
         _write(db, root, refs=json.dumps(specs))
+
+
+# ----------------------------------------------------------------------
+# workspace settings: MCP servers kept on only here ("on (workspace)")
+
+
+def load_workspace_mcp_servers(workspace: Path | str) -> set[str]:
+    """Servers whose global setting is off but which are on here."""
+    row = _row(Path(workspace).expanduser().resolve())
+    try:
+        saved = json.loads(row[2] or "{}") if row is not None else {}
+    except json.JSONDecodeError:
+        return set()
+    servers = saved.get("mcp") if isinstance(saved, dict) else None
+    return (
+        {name for name in servers if isinstance(name, str) and name}
+        if isinstance(servers, list) else set()
+    )
+
+
+def save_workspace_mcp_servers(
+    workspace: Path | str, servers: Iterable[str],
+) -> None:
+    """Persist the servers kept on only here; an empty set clears the key."""
+    names = sorted({name for name in servers if name})
+    root = Path(workspace).expanduser().resolve()
+    settings: dict[str, Any] = {}
+    row = _row(root)
+    if row is not None:
+        try:
+            loaded = json.loads(row[2] or "{}")
+            settings = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            pass
+    if names:
+        settings["mcp"] = names
+    else:
+        settings.pop("mcp", None)
+    with session_store.connection() as db:
+        _write(db, root, settings=json.dumps(settings))
 
 
 def change_workspace_ref(

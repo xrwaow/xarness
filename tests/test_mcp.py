@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from xarness import session_store
 from xarness.config import (
     McpServerSettings,
     McpSettings,
@@ -23,10 +24,19 @@ from xarness.mcp import (
     exposed_tool_name,
     parse_server_spec,
 )
-from xarness.protocol import AddMcpServer, SetMcpServerEnabled, SetMcpToolEnabled
+from xarness.protocol import (
+    AddMcpServer,
+    SetMcpServerScope,
+    SetMcpToolEnabled,
+)
 from xarness.sandbox import SandboxRuntime
 from xarness.session import Session, SessionError
 from xarness.tools import ToolRegistry, build_registry, mcp_tools
+from xarness.workspace import (
+    load_workspace_mcp_servers,
+    load_workspace_refs,
+    save_workspace_refs,
+)
 
 FAKE_SERVER = r'''
 import json, sys
@@ -212,6 +222,65 @@ def test_manager_reports_a_missing_command(tmp_path: Path) -> None:
     asyncio.run(go())
 
 
+def test_server_scope_cycles_and_workspace_override_persists(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """off → on (global) → on (workspace): the workspace choice keeps the
+    global setting off and rides in the workspace's shared row."""
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path / "sessions")
+    save_workspace_refs(tmp_path, ["/tmp/ref"])  # same shared row
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    async def go() -> None:
+        session = Session(
+            name="scope-test",
+            workspace=tmp_path,
+            profile=ProviderProfile(
+                base_url="http://127.0.0.1:1/v1", model_id="test",
+            ),
+            profile_name="test",
+            api_key=None,
+            config_path=config_path,
+            sandbox=SandboxRuntime(),
+            mcp=McpSettings(servers={"fake": McpServerSettings(
+                command=sys.executable, args=[str(fake_server)],
+            )}),
+        )
+        await session.prepare_mcp()
+
+        def server() -> object:
+            return session.mcp.statuses()[0]
+
+        assert server().scope == "global" and server().enabled
+
+        await session.execute(SetMcpServerScope(name="fake", scope="off"))
+        assert server().scope == "off" and not server().enabled
+        assert server().status == "disabled"
+
+        await session.execute(SetMcpServerScope(
+            name="fake", scope="workspace",
+        ))
+        assert server().scope == "workspace" and server().enabled
+        assert server().status == "connected"
+        # Global stays off for every other workspace…
+        assert load_sectioned(config_path).mcp.servers["fake"].enabled is False
+        # …and this workspace remembers the override, without disturbing
+        # the other per-workspace columns.
+        assert load_workspace_mcp_servers(tmp_path) == {"fake"}
+        assert load_workspace_refs(tmp_path) == ["/tmp/ref"]
+
+        await session.execute(SetMcpServerScope(
+            name="fake", scope="global",
+        ))
+        assert server().scope == "global" and server().enabled
+        assert load_sectioned(config_path).mcp.servers["fake"].enabled is True
+        assert load_workspace_mcp_servers(tmp_path) == set()
+        await session.mcp.close()
+
+    asyncio.run(go())
+
+
 def test_registry_exposes_mcp_tools_and_keeps_schemas(fake_server: Path) -> None:
     async def go() -> None:
         manager = _manager(fake_server)
@@ -247,7 +316,10 @@ def test_build_registry_includes_mcp_only_when_injected(fake_server: Path) -> No
     asyncio.run(go())
 
 
-def test_session_tools_info_and_toggles_persist(fake_server: Path, tmp_path: Path) -> None:
+def test_session_tools_info_and_toggles_persist(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path / "sessions")
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
 
@@ -283,12 +355,12 @@ def test_session_tools_info_and_toggles_persist(fake_server: Path, tmp_path: Pat
             t.name == "boom" and not t.enabled for t in info.servers[0].tools
         )
 
-        await session.execute(SetMcpServerEnabled(name="fake", enabled=False))
+        await session.execute(SetMcpServerScope(name="fake", scope="off"))
         info = await session.tools_info()
         assert info.servers[0].status == "disabled"
         assert not any(tool.source == "fake" for tool in info.tools)
 
-        await session.execute(SetMcpServerEnabled(name="fake", enabled=True))
+        await session.execute(SetMcpServerScope(name="fake", scope="global"))
         info = await session.tools_info()
         assert info.servers[0].status == "connected"
 

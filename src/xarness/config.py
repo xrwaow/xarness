@@ -293,7 +293,9 @@ class McpServerSettings(BaseModel):
     # broken command cannot hold session creation for the full call budget.
     timeout: float = Field(default=120.0, gt=0)
     # Tools the user switched off from /tools. Persisted with the server so
-    # the choice survives a restart.
+    # the choice survives a restart. ``enabled`` is the global scope only; a
+    # server switched on for one workspace stays ``enabled: false`` here and
+    # is listed in that workspace's row (load_workspace_mcp_servers).
     disabled_tools: list[str] = Field(default_factory=list)
 
     @field_validator("command", "url", "cwd", mode="before")

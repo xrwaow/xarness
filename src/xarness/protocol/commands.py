@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..images import ImageRef
-from .views import Mode, ViewState
+from .views import McpScope, Mode, ViewState
 
 
 class CommandBase(BaseModel):
@@ -106,12 +106,15 @@ class Ref(CommandBase):
     add: bool
 
 
-class SetMcpServerEnabled(CommandBase):
-    """Switch one configured MCP server on or off (idle only)."""
+class SetMcpServerScope(CommandBase):
+    """Set where one MCP server's on/off choice lives (idle only).
 
-    type: Literal["set_mcp_server_enabled"] = "set_mcp_server_enabled"
+    ``off`` is off everywhere, ``global`` on in every workspace, and
+    ``workspace`` on only in the current workspace."""
+
+    type: Literal["set_mcp_server_scope"] = "set_mcp_server_scope"
     name: str
-    enabled: bool
+    scope: McpScope
 
 
 class SetMcpToolEnabled(CommandBase):
@@ -156,7 +159,7 @@ Command = Annotated[
         SetSandbox,
         Filter,
         Ref,
-        SetMcpServerEnabled,
+        SetMcpServerScope,
         SetMcpToolEnabled,
         AddMcpServer,
     ],

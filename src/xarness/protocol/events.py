@@ -16,7 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from ..conversation import Message, ToolStatus, TurnStats, Usage
 from .views import DiffInfo, Snapshot, Status
 
-PROTOCOL_VERSION = 22
+# Bumped whenever a wire model changes shape incompatibly. The client's
+# connect-time check shuts down a stale host rather than sending it a
+# command its older command union would reject with a 422.
+PROTOCOL_VERSION = 23
 
 # Error convention: every route fails with HTTP 4xx (400 bad request, 404
 # missing session/path), commands included — a rejected command raises
