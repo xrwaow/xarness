@@ -16,11 +16,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
+import secrets
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import __version__, protocol, session_store
 from .config import ConfigError
@@ -42,9 +45,26 @@ MAX_IMAGE_UPLOAD = 20 * 1024 * 1024
 
 LOG = logging.getLogger(__name__)
 
+# The web UI's static files. The repo layout (``<root>/webui``) is what an
+# editable install sees; the packaged copy lives next to this module.
+WEBUI_DIRS = (
+    Path(__file__).resolve().parent / "webui",
+    Path(__file__).resolve().parents[2] / "webui",
+)
 
-def create_app(host: Host) -> FastAPI:
-    """Build the FastAPI app (served on the unix socket only)."""
+
+def webui_dir() -> Path | None:
+    """The first existing web UI directory, or None (no static mount)."""
+    return next((path for path in WEBUI_DIRS if (path / "index.html").is_file()), None)
+
+
+def create_app(host: Host, *, token: str | None = None) -> FastAPI:
+    """Build the FastAPI app.
+
+    ``token`` is only given to the TCP listener ``xarness --web`` starts: the
+    web UI is reachable from the network, so it must prove it was told the
+    token the host printed. The unix-socket app (the TUI's) passes none and
+    is unauthenticated exactly as before."""
     app = FastAPI(
         title="xarness",
         version=__version__,
@@ -77,7 +97,64 @@ def create_app(host: Host) -> FastAPI:
 
     app.include_router(sessions_router(host))
     app.include_router(meta_router(host))
+    if token:
+        _require_token(app, token)
+    # Mounts must come last: a mount at "/" matches every remaining path, so
+    # it would shadow the API routes registered above it.
+    _mount_webui(app)
     return app
+
+
+def _require_token(app: FastAPI, token: str) -> None:
+    """Bearer-token gate for the API routes of a network-reachable app.
+
+    Only ``/v1/*`` is gated: the static UI itself is public (it is what asks
+    for the token), and the OpenAPI docs carry no data."""
+
+    @app.middleware("http")
+    async def _check_token(request: Request, call_next):
+        if request.url.path.startswith("/v1"):
+            header = request.headers.get("authorization", "")
+            scheme, _, value = header.partition(" ")
+            if (
+                scheme.lower() != "bearer"
+                or not secrets.compare_digest(value.strip(), token)
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "missing or invalid host token"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
+
+
+def _mount_webui(app: FastAPI) -> None:
+    """Serve ``webui/`` at ``/`` when it exists (after every API route)."""
+    directory = webui_dir()
+    if directory is None:
+        LOG.debug("no webui directory found; serving the API only")
+        return
+    # Python's mimetypes does not know the manifest on every platform, and a
+    # PWA manifest served as octet-stream is ignored by browsers.
+    mimetypes.add_type("application/manifest+json", ".webmanifest")
+
+    class _WebUIStaticFiles(StaticFiles):
+        """Static files that must be revalidated on every load.
+
+        Without a ``Cache-Control`` header browsers apply *heuristic*
+        freshness (a slice of the file's age), so a phone that reloads the
+        page can keep running yesterday's ``style.css`` while a desktop — or
+        a localhost page, where a service worker is allowed and revalidates —
+        shows the current one. ``no-cache`` still lets the ETag answer a
+        cheap 304, so the cost on a LAN is one round trip.
+        """
+
+        def file_response(self, *args: Any, **kwargs: Any) -> Response:
+            response = super().file_response(*args, **kwargs)
+            response.headers.setdefault("cache-control", "no-cache")
+            return response
+
+    app.mount("/", _WebUIStaticFiles(directory=directory, html=True), name="webui")
 
 
 async def _session_or_load(host: Host, name: str) -> Session:

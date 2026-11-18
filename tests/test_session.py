@@ -258,6 +258,47 @@ def test_send_while_running_becomes_steering(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_several_steering_messages_merge_into_one(tmp_path) -> None:
+    """Steers queued during the same round reach the history as one user
+    message, not one message per send."""
+    release = asyncio.Event()
+
+    @tool("noop", "does nothing", _NoArgs)
+    async def noop(args) -> ToolResult:
+        await release.wait()
+        return ToolResult()
+
+    registry = ToolRegistry()
+    registry.register(noop)
+    session = make_session(
+        [
+            [
+                ToolCallStarted(call_id="c1", name="noop"),
+                ToolCallArgumentsDone(call_id="c1", name="noop", arguments_json="{}"),
+                RoundComplete(has_tool_calls=True),
+            ],
+            [ContentDelta(text="second round"), RoundComplete()],
+        ],
+        tmp_path, tools=registry,
+    )
+
+    async def go():
+        session.subscribe()
+        await session.execute(SendMessage(text="go"))
+        await session.execute(SendMessage(text="steer one"))
+        await session.execute(SendMessage(text="steer two"))
+        assert len(session._queued) == 2
+        release.set()
+        await wait_idle(session)
+
+    asyncio.run(go())
+    user_texts = [
+        m.content for m in session.conversation.messages if m.role == "user"
+    ]
+    # Both steers landed in the same message, in send order.
+    assert user_texts[1:] == ["steer one\n\nsteer two"]
+
+
 def test_rewrite_commands_rejected_while_busy(tmp_path) -> None:
     release = asyncio.Event()
 

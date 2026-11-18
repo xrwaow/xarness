@@ -145,6 +145,15 @@ class _QueuedSteer:
     send_time: str
 
 
+def _merge_steer(items: list[_QueuedSteer]) -> tuple[str, list[ImageRef] | None, str]:
+    """Fold several steering messages into one user message: texts joined by a
+    blank line (image tokens keep pointing at their attachment), images
+    concatenated in send order, and the oldest send time."""
+    text = "\n\n".join(item.text for item in items if item.text)
+    images = [ref for item in items for ref in (item.images or [])]
+    return text, images or None, items[0].send_time
+
+
 LOG = logging.getLogger(__name__)
 
 
@@ -936,8 +945,8 @@ class Session:
         return CommandResult()
 
     def _cmd_flush_queued(self) -> CommandResult:
-        """Send the oldest queued message now: cancel the running turn or
-        compaction; the cleanup starts the queued message immediately."""
+        """Send the queued messages now: cancel the running turn or
+        compaction; the cleanup starts them immediately, merged into one."""
         if self.state == "idle" or not self._queued:
             return CommandResult()
         self._cancel_work()
@@ -1048,12 +1057,14 @@ class Session:
         await self._start_queued()
 
     async def _start_queued(self) -> bool:
-        """Start the oldest queued message unless the session is closed."""
+        """Start every queued message as one turn unless the session is closed."""
         if not self._queued or self._closed:
             return False
-        item = self._queued.pop(0)
+        items = self._queued
+        self._queued = []
         self._emit_status()
-        await self._start_turn(item.text, item.images)
+        text, images, _ = _merge_steer(items)
+        await self._start_turn(text, images)
         return True
 
     async def _cmd_accept(self) -> CommandResult:
@@ -1885,20 +1896,21 @@ class Session:
             )
 
     def _inject_queued(self) -> None:
-        """Inject the steering queue at a round boundary: the messages land
-        in the history (with their original send_time) so the next LLM call
-        sees them. No checkpoint of their own: they belong to the turn that
-        is already running."""
+        """Inject the steering queue at a round boundary: the messages land in
+        the history as ONE user message (with the oldest send_time) so the next
+        LLM call sees them. No checkpoint of their own: they belong to the turn
+        that is already running."""
         if not self._queued:
             return
-        for item in self._queued:
-            message = user_message(
-                item.text, item.images, self.images,
-                timing=Timing(send=item.send_time),
-            )
-            self.conversation.add(message)
-            self._emit_user_message(message)
-        self._queued.clear()
+        items = self._queued
+        self._queued = []
+        text, images, send_time = _merge_steer(items)
+        message = user_message(
+            text, images, self.images,
+            timing=Timing(send=send_time),
+        )
+        self.conversation.add(message)
+        self._emit_user_message(message)
         self._emit_status()
 
     def _repair_tool_calls(self) -> None:

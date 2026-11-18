@@ -22,11 +22,13 @@ import asyncio
 import fcntl
 import logging
 import os
+import secrets
 import signal
 import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,6 +84,28 @@ REAP_INTERVAL_SECONDS = 0.25
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
+
+# Defaults for the browser-facing listener (``xarness --web``). Loopback by
+# default: reaching the agent's shell from the network is a deliberate choice.
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8765
+
+
+@dataclass(frozen=True)
+class WebListen:
+    """The TCP listener ``xarness --web`` adds beside the unix socket.
+
+    ``token`` gates the ``/v1`` routes of that listener only; the unix-socket
+    app the TUI uses never checks one."""
+
+    bind: str = DEFAULT_WEB_HOST
+    port: int = DEFAULT_WEB_PORT
+    token: str | None = None
+
+    @property
+    def loopback(self) -> bool:
+        return self.bind in ("127.0.0.1", "localhost", "::1")
+
 
 
 class Host:
@@ -718,39 +742,88 @@ class Host:
     # ------------------------------------------------------------------
     # lifecycle
 
-    async def serve(self, stats_interval: float | None = None) -> None:
+    async def serve(
+        self, stats_interval: float | None = None, *,
+        web: "WebListen | None" = None,
+        on_ready=None,
+    ) -> None:
         """Run until shutdown: bind the unix socket, arm the grace timer,
         run until the shutdown event (or print stats every
         ``stats_interval`` seconds in foreground mode), then tear everything
-        down."""
+        down.
+
+        ``web`` adds the browser-facing TCP listener (``xarness --web``);
+        the unix socket is always bound, so a TUI can attach to the same
+        host and its sessions. ``on_ready`` runs once both listeners are
+        actually up — printing a URL before that would advertise something
+        a failed bind never served."""
         HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if web is not None:
+            # Probe the TCP address before binding anything else: a bad
+            # ``--host`` should cost one clear line, not a half-started host.
+            _probe_bind(web.bind, web.port)
         server, server_task = await _start_unix_server(self)
+        web_server = web_task = None
+        if web is not None:
+            web_server, web_task = await _start_web_server(
+                self, web.bind, web.port, web.token,
+            )
         self._reaper = asyncio.get_running_loop().create_task(self._reap())
+        if on_ready is not None:
+            on_ready()
+        listeners = (server_task, web_task)
         try:
-            if stats_interval is None:
-                await self._shutdown_event.wait()
-            else:
-                while not self._shutdown_event.is_set():
+            while True:
+                if stats_interval is not None:
                     stats = self.stats()
                     print(
                         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                         f"{_format_stats(stats)}",
                         flush=True,
                     )
-                    await asyncio.sleep(stats_interval)
+                if await self._wait_for_stop(listeners, stats_interval):
+                    break
         finally:
             if self._reaper is not None:
                 self._reaper.cancel()
                 self._reaper = None
-            server.should_exit = True
-            try:
-                await asyncio.wait_for(server_task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                server_task.cancel()
+            for one, task in ((server, server_task), (web_server, web_task)):
+                if one is None or task is None:
+                    continue
+                one.should_exit = True
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    task.cancel()
             for session in list(self.sessions.values()):
                 await session.stop()
             if self.unix_socket.exists():
                 self.unix_socket.unlink()
+
+    async def _wait_for_stop(self, listeners, timeout: float | None) -> bool:
+        """Whether the host should tear down: shutdown was requested, or a
+        listener exited on its own.
+
+        uvicorn turns SIGINT/SIGTERM into a clean exit of *its* server, and
+        with two listeners the other one would keep the process alive (a
+        Ctrl-C that closes the port but never returns). Waiting on the
+        listener tasks as well fixes that for ``--server`` and ``--web``
+        alike."""
+        shutdown = asyncio.ensure_future(self._shutdown_event.wait())
+        waiters = [shutdown, *(t for t in listeners if t is not None)]
+        try:
+            done, _ = await asyncio.wait(
+                waiters, timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            shutdown.cancel()
+        if self._shutdown_event.is_set():
+            return True
+        if done:
+            self._shutdown_event.set()
+            return True
+        return False
 
     async def _reap(self) -> None:
         """The host's one lifecycle loop: evict inactive sessions and, for a
@@ -823,6 +896,84 @@ async def _start_unix_server(host: Host):
             )
         host.unix_socket.unlink()  # stale socket from a dead host
     config = uvicorn.Config(app, log_level="warning", uds=str(host.unix_socket))
+    return await _serve_uvicorn(config, wait_for=lambda: host.unix_socket)
+
+
+async def _start_web_server(
+    host: Host, bind: str, port: int, token: str | None,
+):
+    """Second listener: the same app (API + the web UI's static files) on
+    TCP, so a browser can reach it. The token gates ``/v1/*`` only when one
+    was given."""
+    import uvicorn
+
+    from .api import create_app
+    app = create_app(host, token=token)
+    _probe_bind(bind, port)
+    config = uvicorn.Config(
+        app, host=bind, port=port, log_level="warning",
+    )
+    try:
+        return await _serve_uvicorn(config, wait_for=lambda: None)
+    except (OSError, SystemExit) as exc:
+        # A bind that went wrong after the probe (another process took the
+        # port in between): uvicorn answers with a raw ``sys.exit`` from
+        # inside its task, so say it in one line instead of a traceback.
+        raise RuntimeError(
+            f"cannot listen on {bind}:{port} ({_bind_reason(exc)}) — check "
+            "--host/--port, or that the port is free",
+        ) from None
+
+
+def _probe_bind(bind: str, port: int) -> None:
+    """Bind and release the address before uvicorn does.
+
+    uvicorn turns a failing bind into ``sys.exit(3)`` from inside its server
+    task: the process dies with a traceback from the event loop, before the
+    URLs above it were ever true. A wrong ``--host`` (an address this
+    machine no longer has, say after DHCP moved it) is an easy mistake, so
+    it gets one clear line instead."""
+    try:
+        infos = socket.getaddrinfo(
+            bind or None, port, type=socket.SOCK_STREAM,
+            flags=socket.AI_PASSIVE,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError(
+            f"cannot listen on {bind}:{port} ({exc.strerror or exc}) — check "
+            "--host",
+        ) from None
+    reason = "no usable address"
+    for family, kind, proto, _canon, address in infos:
+        probe = socket.socket(family, kind, proto)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(address)
+            return
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+        finally:
+            probe.close()
+    raise RuntimeError(
+        f"cannot listen on {bind}:{port} ({reason}) — check --host/--port, "
+        "or whether the port is already taken",
+    )
+
+
+def _bind_reason(exc: BaseException) -> str:
+    """The short human reason a bind failed."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return "address unavailable or port in use"
+
+
+async def _serve_uvicorn(config, *, wait_for):
+    """Start one uvicorn server on the running loop and wait until it is up.
+
+    ``wait_for`` returns a socket path to chmod 0600 once bound (the unix
+    listener), or None for TCP."""
+    import uvicorn
+
     server = uvicorn.Server(config)
     task = asyncio.get_running_loop().create_task(server.serve())
     loop = asyncio.get_running_loop()
@@ -837,7 +988,9 @@ async def _start_unix_server(host: Host):
             task.cancel()
             raise RuntimeError("timed out waiting for the host server to start")
         await asyncio.sleep(0.05)
-    os.chmod(host.unix_socket, 0o600)
+    path = wait_for()
+    if path is not None and path.exists():
+        os.chmod(path, 0o600)
     return server, task
 
 
@@ -1012,6 +1165,112 @@ async def _serve_forever(host: Host) -> None:
         flush=True,
     )
     await host.serve(stats_interval=1.0)
+
+
+# ---------------------------------------------------------------------------
+# web UI (``xarness --web``)
+
+
+def _lan_address() -> str | None:
+    """The machine's primary LAN address, for the printed URL (best effort:
+    a UDP connect sends no packet, but an offline host has no route)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))  # TEST-NET-1: never actually reached
+        address = sock.getsockname()[0]
+        return None if address.startswith("127.") else address
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _web_urls(web: WebListen) -> list[str]:
+    """The URLs to print: the bind address, plus the LAN address when the
+    listener is reachable from other machines."""
+    if web.bind in ("0.0.0.0", "::"):
+        urls = [f"http://127.0.0.1:{web.port}/"]
+        lan = _lan_address()
+        if lan:
+            urls.append(f"http://{lan}:{web.port}/")
+        return urls
+    return [f"http://{web.bind}:{web.port}/"]
+
+
+def _banner(web: WebListen):
+    """A callable that prints where the UI is, once it is really there."""
+
+    def announce() -> None:
+        print("xarness web UI:", flush=True)
+        for url in _web_urls(web):
+            print(f"  {url}", flush=True)
+        print(f"  workspace: {Path.cwd()}", flush=True)
+        if web.token:
+            print(
+                f"  token:     {web.token}\n"
+                "  (enter it once in the UI; it is not stored on the host)",
+                flush=True,
+            )
+        else:
+            print(
+                "  (loopback only, no token — a phone needs "
+                "`--host 0.0.0.0`)",
+                flush=True,
+            )
+
+    return announce
+
+
+def run_web(
+    *,
+    bind: str = DEFAULT_WEB_HOST,
+    port: int = DEFAULT_WEB_PORT,
+    token: str | None = None,
+) -> None:
+    """``xarness --web``: the persistent host, in the foreground, serving the
+    web UI on TCP as well as the unix socket every other client uses.
+
+    A token is generated (and printed) whenever the bind address is not
+    loopback and none was given: the API can run shell commands in the
+    workspace, so it must not be reachable from the LAN unauthenticated."""
+    HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if _socket_alive():
+        print(
+            f"error: a host is already running (socket {SOCKET_PATH}).\n"
+            "  It has no web listener. Stop it first (`xarness --kill`), then "
+            "run `xarness --web` again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    web = WebListen(bind=bind, port=port, token=token or None)
+    if not web.loopback and not web.token:
+        web = WebListen(bind=web.bind, port=web.port, token=secrets.token_urlsafe(18))
+    lock_handle = open(LOCK_PATH, "a")
+    try:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(
+                "error: another host is starting up; retry in a moment",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from None
+        print_urls = _banner(web)
+        host = Host(
+            persistent=True, unix_socket=SOCKET_PATH, config_path=DEFAULT_CONFIG_PATH,
+        )
+        try:
+            asyncio.run(host.serve(
+                stats_interval=10.0, web=web, on_ready=print_urls,
+            ))
+        except KeyboardInterrupt:
+            pass
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+    finally:
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
+        lock_handle.close()
 
 
 def main(argv: list[str] | None = None) -> None:

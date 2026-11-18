@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="xarness">
+  <rect width="512" height="512" rx="96" fill="#121212"/>
+  <rect x="56" y="56" width="400" height="400" rx="56" fill="#1d1f21" stroke="#2d2f34" stroke-width="8"/>
+  <path d="M118 168 L196 256 L118 344" fill="none" stroke="#d2a6fe" stroke-width="34"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M232 196 L330 256 L232 316" fill="none" stroke="#5ac1fe" stroke-width="22"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  <rect x="250" y="344" width="144" height="22" rx="11" fill="#aad84c"/>
+</svg>

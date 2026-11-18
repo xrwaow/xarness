@@ -127,6 +127,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the host in the foreground, persistent, printing the stats.",
     )
     parser.add_argument(
+        "--web", action="store_true",
+        help="Run the host in the foreground with the browser UI enabled "
+        "(the unix socket stays open, so the TUI shares the same sessions).",
+    )
+    parser.add_argument(
+        "--host", default=None, metavar="ADDR",
+        help="Address the --web listener binds (default 127.0.0.1; use "
+        "0.0.0.0 to reach it from a phone on the LAN).",
+    )
+    parser.add_argument(
+        "--port", type=int, default=None, metavar="PORT",
+        help="Port for the --web listener (default 8765).",
+    )
+    parser.add_argument(
+        "--token", default=None, metavar="SECRET",
+        help="Bearer token the --web listener demands for API calls. "
+        "Default: none on loopback, a generated one (printed at startup) "
+        "on any other address.",
+    )
+    parser.add_argument(
         "--network", type=_bool_arg, default=None, metavar="true|false",
         help="Force network access for sandboxed tool commands on or off "
         "(--network false = offline: UV_OFFLINE and no net namespace); not "
@@ -155,6 +175,25 @@ def main(argv: list[str] | None = None) -> None:
     if args.server:
         from .host import run_foreground
         run_foreground()
+        return
+    if args.web:
+        import os
+
+        from .host import run_web
+        if args.workspace is not None:
+            workspace = args.workspace.expanduser().resolve()
+            # The web UI creates sessions in the host's cwd; chdir so
+            # --workspace means the same thing it does for the TUI.
+            workspace.mkdir(parents=True, exist_ok=True)
+            os.chdir(workspace)
+        options = {}
+        if args.host is not None:
+            options["bind"] = args.host
+        if args.port is not None:
+            options["port"] = args.port
+        if args.token is not None:
+            options["token"] = args.token
+        run_web(**options)
         return
     if args.sessions:
         _print_sessions()

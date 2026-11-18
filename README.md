@@ -628,6 +628,7 @@ xarness --session my-session         # attach/load a saved session
 xarness --sessions                   # list active sessions
 xarness --kill                       # close all active sessions and stop the host (sessions stay saved)
 xarness --server                     # run the host in the foreground
+xarness --web                        # the same host, plus a browser UI (see below)
 ```
 
 The boolean flags all take an explicit value (`--network true`, `--gpu
@@ -637,6 +638,121 @@ takes either a profile name or `true`/`false`: with `true`/`false` no
 profile is named, so the usual resolution applies (preset, then the
 workspace's most recently used profile, then `default`) and only the
 container on/off state is overridden.
+
+## Web UI
+
+The same sessions, in a browser — handy on a phone, a tablet or a second
+machine. It is plain HTML/CSS/JS served by the host itself: no build step,
+no npm, nothing loaded from a CDN.
+
+```sh
+xarness --web                                  # http://127.0.0.1:8765/
+xarness --web --port 9000                      # some other port
+xarness --web --host 0.0.0.0                   # reachable from the LAN, prints a token
+xarness --web --host 0.0.0.0 --token s3cret    # choose the token yourself
+```
+
+`--web` runs a host in the foreground with a TCP listener beside the usual
+unix socket, prints the URLs, and stops on Ctrl-C. It refuses to start while
+another host is running — `xarness --kill` first. Binding anything but
+loopback prints a generated bearer token: the UI asks for it once and keeps
+it in this browser's `localStorage`; the sidebar's **token** button shows,
+changes or forgets it. The static files are public (they are what asks for
+the token), every `/v1/*` call needs the header, and the unix-socket app the
+TUI talks to is unchanged — same routes, no token.
+
+**From a phone.** Run `xarness --web --host 0.0.0.0 --workspace ~/code/project`
+on the machine with your code, open `http://<that-machine's-LAN-IP>:8765/` on
+a network you trust, and enter the printed token once. With Tailscale, use
+the `100.x` address or the MagicDNS name instead of the LAN IP and it works
+from anywhere. See “If the phone cannot reach it” below when it does not.
+
+Over plain `http://` to a LAN address the app works fully, but browsers only
+allow a service worker (and therefore "Add to home screen", the offline
+shell) in a secure context: `localhost`, or HTTPS. For that, put it behind
+HTTPS — `tailscale serve https / http://127.0.0.1:8765`, a reverse proxy, or
+`ssh -L`. Without it nothing breaks; the page just is not installable and
+needs the host to load. Either way the shell is never served stale: the
+files go out with `Cache-Control: no-cache` (a reload revalidates against
+the ETag) and, where a service worker is allowed, it fetches them from the
+host first and keeps the cache only for when the host is away.
+
+It covers what the TUI does: streaming answers and reasoning, expandable
+tool rows, the ask/approve prompt, session list and switching, interrupt
+(`Esc` twice, or the **Stop** button), every slash command, the
+diff/accept/reject bar, plan/write mode, model and sandbox pickers, `@` file
+mentions, image attachments and the status line. The layout is the web UI's
+own: tool calls are tappable cards with their arguments and output in
+scrollable boxes. The composer is a bottom sheet with **Send** in the input
+row and a slim toolbar under it; the slash palette opens as its top band,
+above the pending-changes bar. A diff keeps its indentation; tapping a file
+row scrolls to its patch, and closing it (the patch header, or the same row
+tap) returns to where the list was. The transcript follows
+new output until you scroll away, and starts following again by itself when
+you scroll back to the bottom (a flick that carries you up is never snapped
+back mid-fling); the reasoning block closes when you
+tap it. On a phone the sheet tracks the visible viewport, so the software
+keyboard lifts it instead of covering it.
+
+Keys depend on the pointing device. With a mouse or trackpad `Enter` sends,
+`Shift+Enter` (or `Alt+Enter`) is a newline and `Ctrl+K` opens the command
+palette. On a touch screen (`pointer: coarse`) `Enter` inserts a newline and
+the **Send** button sends, so a message can be several lines; `Ctrl+Enter`
+sends there too if a keyboard is attached. `Tab` toggles the mode, `/` opens
+the slash palette and `@` the file palette either way. Colours come from the
+TUI's `theme.py` as CSS variables and follow `prefers-color-scheme` until you
+pick one with `/theme`.
+
+`webui/PLAN.md` lists what was ported, which endpoint each feature uses, and
+what was deliberately left out (the `/tools` add-a-server form, the quit
+prompt, transcript virtualisation).
+
+**If the phone cannot reach it**, in the order that explains it 99% of the
+time:
+
+1. **The listener is loopback-only.** Plain `xarness --web` binds
+   `127.0.0.1` on purpose (a network-reachable agent shell is a deliberate
+   choice). Its banner ends with `(loopback only, no token — a phone needs
+   --host 0.0.0.0)`. Start it again with `--host 0.0.0.0`; the banner then
+   prints both a `127.0.0.1` and a LAN URL, and both must load locally. The
+   banner is printed only after both listeners are actually up, so a URL on
+   screen is a URL on a socket.
+2. **Check what is actually listening**:
+
+   ```sh
+   ss -ltn | grep 8765        # want 0.0.0.0:8765, not 127.0.0.1:8765
+   ```
+
+3. **The printed LAN address can be the wrong interface.** A VPN, a Docker
+   bridge or a second NIC can win the route lookup. Compare with
+   `ip -4 addr` and use the WiFi/Ethernet address by hand, or pass it:
+   `--host 192.168.x.y`.
+4. **The firewall.** Most desktop distributions drop unsolicited inbound
+   connections by default — on Fedora and friends this is the usual answer:
+
+   ```sh
+   sudo ufw allow 8765/tcp                               # ufw (persistent)
+   sudo firewall-cmd --add-port=8765/tcp                 # firewalld, runtime only
+   sudo firewall-cmd --permanent --add-port=8765/tcp     # firewalld, survives reboot
+   sudo firewall-cmd --reload
+   ```
+
+   If the bind fails instead (wrong address, port taken), `--web` says so in
+   one line and exits rather than printing a URL it is not serving.
+5. **Test from a second machine, not the phone:**
+   `curl -v http://192.168.100.48:8765/v1/health` from the laptop's own LAN
+   address, then from another computer. A `401` means the network is fine and
+   the browser just needs the token; a timeout from the other computer but
+   not from the laptop means the firewall; a timeout from both means the
+   network.
+6. **The WiFi itself.** Guest networks and some APs enable client isolation
+   (devices cannot talk to each other), and a phone VPN routes the request
+   elsewhere. Test on a normal network, or use Tailscale/`ssh -L` instead:
+   `ssh -L 8765:127.0.0.1:8765 laptop` then open `localhost:8765` on the
+   phone through an SSH app.
+7. **WSL2 or a VM**: the address belongs to the VM, so the Windows host needs
+   a port proxy plus a firewall rule. Running `xarness` directly on Windows
+   (or forwarding the port) avoids that.
 
 ## Slash commands
 
@@ -739,6 +855,9 @@ src/xarness/
   theme.py        the color palettes
   tui/            Textual app, widgets, screens (picker/resume/confirm/tools), stylesheet
 ```
+
+Beside the package, `webui/` holds the browser UI: `index.html`, ES modules
+and `style.css`, with no build step (see “Web UI” above).
 
 The UI consumes an async generator of typed stream events and knows nothing
 about HTTP; conversation state is plain data, and the tool registry is built
