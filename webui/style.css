@@ -229,8 +229,12 @@ button { cursor: pointer; touch-action: manipulation; }
 .session-child { padding-left: calc(var(--gutter) + 14px); }
 .scrim { position: fixed; inset: 0; z-index: 20; background: rgb(0 0 0 / 0.5); }
 .main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-.logwrap { position: relative; flex: 1; min-height: 0; }
-.log { --log-pad-top: 12px; position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; padding: var(--log-pad-top) var(--gutter) 4px; scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
+/* The log runs all the way to the bottom of the column and the composer sits
+   over it, so the conversation keeps sliding underneath the input instead of
+   being cut off at a hard bg-colored edge. --composer-h (set from app.js) is
+   how much room the overlay takes up. */
+.logwrap { position: relative; flex: 1; min-height: 0; margin-bottom: calc(-1 * var(--composer-h, 0px)); }
+.log { --log-pad-top: 12px; position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; padding: var(--log-pad-top) var(--gutter) calc(var(--composer-h, 0px) + 4px); scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
 .log::-webkit-scrollbar { width: 8px; }
 .log::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-sm); }
 .log:focus-visible { outline: none; }
@@ -394,15 +398,20 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 /* A run of thinking + tool calls is one block. The header aggregates the
    shapes, names the run and follows the current activity; the eight-line
    window below it is the live tail of that activity. */
-.item-activity { margin-top: 8px; }
+.item-activity { margin-top: 8px; border: 1px solid transparent; border-radius: var(--radius); }
+.item-activity:hover, .item-activity:has(:focus-visible), .item-activity.open { border-color: var(--border); }
 .activity { min-width: 0; }
 .activity-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-areas: "copy loc usage time" "shapes shapes shapes shapes";
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 0;
   width: 100%;
   min-height: var(--tap);
-  padding: 6px 6px 6px 4px;
+  padding: 6px 2px 6px 2px;
   background: transparent;
   border: 0;
   border-radius: var(--radius);
@@ -412,26 +421,26 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity.open .activity-head { min-height: 0; }
 /* Keep the block header in view while its expanded activity list scrolls,
    and the open row's header below it while that row's body scrolls. */
-.activity.open > .activity-head { position: sticky; top: calc(-1 * var(--log-pad-top, 0px)); z-index: 3; background: var(--bg); }
-.activity.open > .activity-head:hover, .activity.open > .activity-head:focus-visible { background: var(--surface); }
+.activity.open > .activity-head { position: sticky; top: calc(-1 * var(--log-pad-top, 0px)); z-index: 3; background: var(--surface); }
+.activity.open > .activity-head:hover, .activity.open > .activity-head:focus-visible { background: color-mix(in srgb, var(--text) 5%, var(--surface)); }
 .activity-head:hover, .activity-head:focus-visible { background: var(--surface); }
-.activity-copy { position: relative; display: flex; align-self: stretch; flex: 1 1 auto; flex-direction: column; min-width: 0; }
+.activity-copy { grid-area: copy; position: relative; display: flex; align-self: stretch; flex-direction: column; min-width: 0; }
 .activity-title { color: var(--text); font-family: var(--font-mono); font-size: 12px; font-weight: 600; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
 .activity-title .activity-shape { margin-left: 6px; vertical-align: -1px; }
-.activity-shapes { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 3px; margin-top: 3px; }
+.activity-shapes { grid-area: shapes; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 3px; margin-top: 3px; min-width: 0; }
 .activity-shapes[hidden] { display: none; }
-/* the connector hangs from the bottom of the header (copy is stretched, so it
-   always ends a padding away from the panel) and the row lines carry it on. */
-.activity.open .activity-copy::after { content: ''; position: absolute; left: 4px; top: 100%; width: 1px; height: 10px; background: var(--border); pointer-events: none; }
+/* the connector hangs from the bottom of the header (the shapes span its full
+   width) and the row lines carry it on. */
+.activity.open .activity-head::after { content: ''; position: absolute; left: 8px; top: 100%; width: 1px; height: 10px; background: var(--border); pointer-events: none; }
 .activity-shape { display: inline-flex; }
 .activity-shape .shape { width: 11px; height: 11px; }
-.activity-loc { flex: 0 0 auto; padding-top: 1px; font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+.activity-loc { grid-area: loc; padding-top: 1px; font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
 .activity-loc[hidden] { display: none; }
 .activity-loc .loc-add { color: var(--diff-add); }
 .activity-loc .loc-del { color: var(--diff-del); }
-.activity-usage { flex: 0 0 auto; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-usage { grid-area: usage; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .activity-usage[hidden] { display: none; }
-.activity-time { flex: 0 0 auto; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-time { grid-area: time; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .activity-time[hidden] { display: none; }
 .activity-time[data-state="failed"] { color: var(--error); }
 
@@ -519,7 +528,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity-lines::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-sm); }
 
 @media (max-width: 559px) {
-  .activity-head { gap: 6px; padding-right: 4px; }
+  .activity-head { column-gap: 6px; padding-right: 4px; }
   .activity-panel { --activity-line-top: 22px; }
   .activity-row-head { column-gap: 6px; min-height: var(--tap); }
   .activity-row-name { max-width: 38%; }
@@ -569,7 +578,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .item-divider { margin-top: 14px; }
 .handoff { background: var(--surface); border-left: 2px solid var(--accent); border-radius: 0 var(--radius) var(--radius) 0; padding: 6px 12px; }
 .handoff-head { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: 0; padding: 0; color: var(--accent); font-family: var(--font-mono); font-size: 12px; min-height: 30px; text-align: left; }
-.handoff-body { display: none; margin-top: 4px; color: var(--text); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow-y: auto; }
+.handoff-body { display: none; margin-top: 4px; color: var(--text); font-size: 13px; overflow-wrap: anywhere; max-height: 40vh; overflow-y: auto; }
 .handoff.open .handoff-body { display: block; }
 .welcome { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12vh 8px 0; color: var(--muted); text-align: center; }
 .welcome pre { margin: 0; font-family: var(--font-mono); font-size: 10px; line-height: 1.15; color: var(--border); white-space: pre; overflow-x: auto; max-width: 100%; }
@@ -577,7 +586,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .jump {
   position: absolute;
   right: 14px;
-  bottom: 12px;
+  bottom: calc(var(--composer-h, 0px) + 12px);
   z-index: 10;
   min-height: 36px;
   padding: 0 12px;
@@ -589,7 +598,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
   font-size: 12px;
 }
 .jump:hover { border-color: var(--muted); }
-.composer { position: relative; flex: 0 0 auto; background: var(--bg); padding: 0 var(--gutter); }
+.composer { position: relative; z-index: 4; flex: 0 0 auto; background: transparent; padding: 0 var(--gutter); }
 .composer > .askbar, .composer > .steerbar { margin: 8px 0; }
 .composer-panel { max-width: var(--col); margin: 0 auto; background: var(--surface); border: 1px solid var(--border); border-bottom: 0; border-radius: 14px 14px 0 0; padding: 0 8px calc(7px + var(--safe-bottom)); }
 .composer-panel:has(.inputbar[data-plan="true"]) { border-top-color: var(--status); }

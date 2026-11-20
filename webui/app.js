@@ -1088,6 +1088,25 @@ class App {
     window.addEventListener('resize', apply);
     window.addEventListener('orientationchange', apply);
     apply();
+    this.trackComposer(root);
+  }
+
+  // The composer floats over the bottom of the log, so the log needs to know
+  // how tall it is: --composer-h drives both the log's bottom padding (room to
+  // scroll the last item clear of it) and its negative margin underneath.
+  trackComposer(root) {
+    const composer = byId('composer');
+    let current = -1;
+    const apply = () => {
+      const height = Math.max(0, Math.round(composer.offsetHeight));
+      if (height === current) return;
+      current = height;
+      root.style.setProperty('--composer-h', `${height}px`);
+    };
+    if (typeof ResizeObserver === 'function') new ResizeObserver(apply).observe(composer);
+    window.addEventListener('resize', apply);
+    window.addEventListener('orientationchange', apply);
+    apply();
   }
 
   tick() {

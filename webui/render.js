@@ -289,7 +289,8 @@ function activitySummary(items) {
     else tools += 1;
   }
   const parts = [];
-  if (thoughts) parts.push(`thought ${thoughts} ${thoughts === 1 ? 'time' : 'times'}`);
+  if (thoughts === 1) parts.push('Thinking');
+  else if (thoughts > 1) parts.push(`Thought ${thoughts} times`);
   if (tools) parts.push(`ran ${tools} ${tools === 1 ? 'tool' : 'tools'}`);
   const text = parts.join(', ');
   return text ? text[0].toUpperCase() + text.slice(1) : '';
@@ -453,7 +454,10 @@ function createNode(item) {
     case 'footer':
       return el('article', { class: 'item item-footer', text: footerText(item) });
     case 'divider': {
-      const body = el('div', { class: 'handoff-body', text: item.text });
+      // the summary the host hands over is markdown, so it reads like prose here
+      // instead of a wall of preformatted text.
+      const body = el('div', { class: 'handoff-body prose' });
+      appendMarkdown(body, item.text);
       const head = el(
         'button',
         { class: 'handoff-head', type: 'button' },
@@ -619,10 +623,11 @@ class ActivityBlock {
     this.head = el(
       'button',
       { class: 'activity-head', type: 'button', 'aria-expanded': 'false' },
-      el('span', { class: 'activity-copy' }, this.title, this.shapes),
+      el('span', { class: 'activity-copy' }, this.title),
       this.loc,
       this.usage,
       this.time,
+      this.shapes,
     );
     this.list = el('div', { class: 'activity-list', role: 'list' });
     this.panel = el('div', { class: 'activity-panel' }, this.list);
@@ -633,10 +638,7 @@ class ActivityBlock {
       this.headObserver = new ResizeObserver(() => this.syncHeadHeight());
       this.headObserver.observe(this.head);
     }
-    this.head.addEventListener('click', () => {
-      this.expanded = !this.expanded;
-      this.refresh();
-    });
+    this.head.addEventListener('click', () => this.toggleExpanded());
     this.lines.addEventListener(
       'scroll',
       () => {
@@ -649,6 +651,21 @@ class ActivityBlock {
 
   get last() {
     return this.items[this.items.length - 1] || null;
+  }
+
+  // Collapsing a block that has been scrolled past pulls its whole list out of
+  // the document, so the log's scroll height drops under the current position
+  // and the conversation snaps to wherever that leaves it. The head is pinned at
+  // the top while the block scrolls by, so put it back there once the list is
+  // gone: same click target, same place on screen.
+  toggleExpanded() {
+    const log = this.node.closest('.log');
+    const pinned = !!log && this.head.getBoundingClientRect().top <= log.getBoundingClientRect().top + 1;
+    this.expanded = !this.expanded;
+    this.refresh();
+    if (!pinned) return;
+    const drift = this.node.getBoundingClientRect().top - log.getBoundingClientRect().top;
+    if (drift) log.scrollTop += drift;
   }
 
   add(item) {
