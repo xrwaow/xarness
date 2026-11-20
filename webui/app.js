@@ -4,7 +4,7 @@
 import { api, ApiError } from './api.js';
 import { byId, el, replace, toast } from './dom.js';
 import { LogView } from './render.js';
-import { patchView } from './diff.js';
+import { diffTree } from './diff.js';
 import { Transcript, formatTokens } from './state.js';
 import { COMMANDS, commandUsage, findCommand } from './commands.js';
 import { showConfirm, showInfo, showPicker, showPrompt, sheetSection } from './ui.js';
@@ -220,7 +220,7 @@ class App {
       lastNoticeAt: 0,
       log: byId('log'),
       input: byId('input'),
-      diffRestore: null,
+      diffView: byId('diffview'),
     });
     this.view = new LogView(this.log, {
       onUndoTo: (id) => this.undoTo(id),
@@ -397,6 +397,11 @@ class App {
   }
 
   onGlobalKey(event) {
+    if (event.key === 'Escape' && this.diffPatch) {
+      event.preventDefault();
+      this.closePatch();
+      return;
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
       event.preventDefault();
       this.openCommandPalette();
@@ -463,6 +468,11 @@ class App {
       return;
     }
     if (event.key === 'Escape') {
+      if (this.diffPatch) {
+        event.preventDefault();
+        this.closePatch();
+        return;
+      }
       if (paletteOpen) {
         event.preventDefault();
         this.closePalette();
@@ -1330,6 +1340,7 @@ class App {
     this.diff = null;
     this.diffOpen = false;
     this.diffPatch = null;
+    this.renderDiffView();
   }
 
   async refreshDiff() {
@@ -1347,8 +1358,14 @@ class App {
       this.diffOpen = false;
       this.diffPatch = null;
       this.diffExpanded.clear();
+    } else if (this.diffPatch) {
+      const path = this.diffPatch.path;
+      const listed =
+        (info.files || []).some((file) => file.path === path) || (info.groups || []).some((group) => group.prefix === path);
+      if (!listed) this.diffPatch = null;
     }
     if (this.status?.view?.diff_scope && !this.diffScopePending) this.diffScope = this.status.view.diff_scope;
+    if (!this.diffPatch) this.renderDiffView();
     this.renderDiffBar();
   }
 
@@ -1365,6 +1382,16 @@ class App {
     bar.classList.toggle('open', this.diffOpen);
     const count = info.files.length,
       label = `Edited ${count} file${count === 1 ? '' : 's'}`;
+    const files = info.files || [],
+      groups = info.groups || [],
+      scope = this.diffScope;
+    const isInline = (item) => item.kind === 'mine' || (item.kind === 'agent' && scope === 'all');
+    // The totals follow the scope chip: this session's own rows while it reads
+    // "agent", every session's rows while "agent" is dimmed. The auto/drift
+    // sections never count toward either.
+    const inlineFiles = files.filter(isInline);
+    const adds = inlineFiles.reduce((total, file) => total + (file.additions || 0), 0);
+    const dels = inlineFiles.reduce((total, file) => total + (file.deletions || 0), 0);
     const head = el(
       'div',
       {
@@ -1407,15 +1434,11 @@ class App {
           ? [el('span', { class: 'hi', text: 'age' }), el('span', { class: 'dim', text: 'nt' })]
           : el('span', { class: 'hi', text: 'agent' }),
       ),
-      el('span', { class: 'adds', text: `+${info.additions || 0}` }),
-      el('span', { class: 'dels', text: `-${info.deletions || 0}` }),
+      el('span', { class: 'adds', text: `+${adds}` }),
+      el('span', { class: 'dels', text: `-${dels}` }),
     );
     const body = el('div', { class: 'diff-body' });
     if (this.diffOpen) {
-      const files = info.files || [],
-        groups = info.groups || [],
-        scope = this.diffScope;
-      const isInline = (item) => item.kind === 'mine' || (item.kind === 'agent' && scope === 'all');
       const sectionOf = (kind) => (kind === 'mine' || kind === 'agent' ? 'agent' : kind);
       const sections = scope === 'all' ? ['auto', 'drift'] : ['agent', 'auto', 'drift'];
       const sectionFiles = (section) => files.filter((file) => sectionOf(file.kind) === section && !isInline(file));
@@ -1457,7 +1480,6 @@ class App {
               on: { click: () => this.toggleDiffSection(section) },
             },
             el('span', { class: 'name', text: section }),
-            el('span', { class: 'toggle', text: expanded ? '▾' : '▸' }),
             el('span', { class: 'spacer' }),
             el('span', { class: 'count', text: ignored ? `${ignored} files` : '' }),
             el('span', { class: 'adds', text: `+${adds}` }),
@@ -1471,28 +1493,6 @@ class App {
       if (!files.length && !groups.length)
         list.appendChild(el('div', { class: 'diff-empty', text: 'no pending changes' }));
       body.appendChild(list);
-      if (this.diffPatch && this.diffPatch.text) {
-        body.appendChild(
-          el(
-            'div',
-            { class: 'diff-patch' },
-            el(
-              'button',
-              {
-                class: 'diff-patch-head',
-                type: 'button',
-                title: 'Close this diff',
-                'aria-label': `Close the diff for ${this.diffPatch.path}`,
-                on: { click: () => this.closePatch() },
-              },
-              el('span', { class: 'path', text: this.diffPatch.path }),
-              el('span', { class: 'diff-patch-hint', text: 'tap to close' }),
-              el('span', { class: 'diff-patch-close', text: '✕' }),
-            ),
-            patchView(this.diffPatch.text),
-          ),
-        );
-      }
       body.appendChild(
         el(
           'div',
@@ -1555,14 +1555,74 @@ class App {
   }
 
   closePatch() {
+    if (!this.diffPatch) return;
+    const path = this.diffPatch.path,
+      active = document.activeElement,
+      restore = !!active && (this.diffView.contains(active) || active.classList?.contains('diff-row'));
     this.diffPatch = null;
+    this.renderDiffView();
     this.renderDiffBar();
-    this.restorePatchScroll();
+    if (restore) [...byId('diffbar').querySelectorAll('.diff-row')].find((row) => row.title === path)?.focus();
+  }
+
+  /** The right-hand diff panel: what a file row opened, colored and with
+   * line numbers. Clicking that same row again (or ✕/Esc, or folding the
+   * bar) removes it; clicking another row swaps it in place. */
+  renderDiffView() {
+    const panel = this.diffView,
+      patch = this.diffPatch;
+    if (!patch || !patch.text) {
+      if (!panel.hidden) {
+        panel.hidden = true;
+        replace(panel);
+      }
+      return;
+    }
+    const focusInside = panel.contains(document.activeElement);
+    const samePath = panel.dataset.path === patch.path;
+    const position = samePath ? (panel.querySelector('.diffview-body')?.scrollTop ?? 0) : 0;
+    const tree = diffTree(patch.text);
+    const file = tree.files[0];
+    const notes = file?.notes || [];
+    const sub = el(
+      'div',
+      { class: 'diffview-sub' },
+      notes.includes('new') ? el('span', { class: 'tag', text: 'new file' }) : null,
+      notes.includes('deleted') ? el('span', { class: 'tag', text: 'deleted' }) : null,
+      notes.includes('binary') ? el('span', { class: 'tag', text: 'binary' }) : null,
+      notes.some((note) => note.startsWith('renamed from ')) ? el('span', { class: 'tag', text: 'renamed' }) : null,
+      tree.files.length > 1 ? el('span', { text: `${tree.files.length} files` }) : null,
+      el('span', { class: 'adds', text: `+${tree.additions}` }),
+      el('span', { class: 'dels', text: `-${tree.deletions}` }),
+    );
+    const body = el('div', { class: 'diffview-body', tabindex: '0' }, tree.node);
+    const head = el(
+      'div',
+      { class: 'diffview-head' },
+      el('div', { class: 'diffview-title' }, el('span', { class: 'path', text: patch.path, title: patch.path }), sub),
+      el('button', {
+        class: 'diffview-close',
+        type: 'button',
+        title: 'Close the diff (Esc)',
+        'aria-label': `Close the diff for ${patch.path}`,
+        text: '✕',
+        on: { click: () => this.closePatch() },
+      }),
+    );
+    replace(panel, head, body);
+    panel.hidden = false;
+    panel.dataset.path = patch.path;
+    body.scrollTop = position;
+    if (focusInside) body.focus({ preventScroll: true });
   }
 
   toggleDiff() {
     const hadFocus = document.activeElement?.classList?.contains('diff-head');
     this.diffOpen = !this.diffOpen;
+    if (!this.diffOpen && this.diffPatch) {
+      this.diffPatch = null;
+      this.renderDiffView();
+    }
     this.renderDiffBar();
     if (hadFocus) byId('diffbar').querySelector('.diff-head')?.focus();
   }
@@ -1571,6 +1631,7 @@ class App {
     const scope = this.diffScope === 'all' ? 'mine' : 'all';
     this.diffScope = scope;
     this.diffPatch = null;
+    this.renderDiffView();
     this.renderDiffBar();
     if (!this.session) return;
     this.diffScopePending = scope;
@@ -1592,8 +1653,6 @@ class App {
       this.closePatch();
       return;
     }
-    const body = this.diffBody(),
-      wasAt = body ? body.scrollTop : 0;
     try {
       const info = await api.diff(this.session, { path, author });
       if (!String(info.text || '').trim()) {
@@ -1602,29 +1661,12 @@ class App {
       }
       this.diffPatch = { path, author, text: info.text };
       this.diffOpen = true;
-      this.diffRestore = wasAt;
       this.renderDiffBar();
-      this.revealPatch();
+      this.renderDiffView();
+      this.diffView.querySelector('.diffview-body')?.focus({ preventScroll: true });
     } catch (error) {
       this.addLine(`diff failed: ${error.message}`, 'error');
     }
-  }
-
-  diffBody() {
-    return byId('diffbar').querySelector('.diff-body');
-  }
-
-  revealPatch() {
-    const body = this.diffBody(),
-      patch = body?.querySelector('.diff-patch');
-    if (!body || !patch) return;
-    body.scrollTop += patch.getBoundingClientRect().top - body.getBoundingClientRect().top;
-  }
-
-  restorePatchScroll() {
-    const body = this.diffBody();
-    if (body && this.diffRestore !== null) body.scrollTop = this.diffRestore;
-    this.diffRestore = null;
   }
 
   async showDiffCommand(arg) {
@@ -1725,11 +1767,12 @@ class App {
     this.scheduleScroll();
   }
 
-  // dim the send button while there is nothing typed (every programmatic change to
-  // the textarea goes through resizeInput, so this stays in sync)
+  // dim the send icon while there is nothing to send (every programmatic
+  // change to the textarea goes through resizeInput, and attachment changes go
+  // through syncAttachments, so this stays in sync)
   syncSendButton() {
     const send = byId('send');
-    if (send) send.dataset.filled = String(Boolean(this.input.value.trim()));
+    if (send) send.dataset.filled = String(Boolean(this.input.value.trim() || this.attachments.length));
   }
 
   async submit() {

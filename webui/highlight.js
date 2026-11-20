@@ -352,7 +352,7 @@ export function tokenize(source, spec) {
       const text = found[0];
       let type = typeof rule.type === 'function' ? rule.type(text, { pending, prevChar }) : rule.type;
       if (type === '@ident') {
-        type = spec.ident(text, { pending, afterDot: prevChar === '.', prevChar });
+        type = text === 'this' ? 'keyword-alt' : spec.ident(text, { pending, afterDot: prevChar === '.', prevChar });
         if (type === 'plain' && pending) type = pending;
       }
       push(text, type === 'plain' ? '' : type);

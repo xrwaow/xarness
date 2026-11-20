@@ -220,11 +220,7 @@ and vocabulary, but rows are laid out for a thumb, not a terminal.
   separators (indentation and tabs intact), and `markdown.js` hands a run of
   patch lines to it instead of parsing them. Fenced ` ```diff ` blocks get
   the same treatment.
-- **An open diff would not close.** The patch now has a header naming the
-  file with a sticky *tap to close* row and `✕`; clicking the row that is
-  already showing closes it too (group rows included — they never had an
-  `author` to match). The bar's body is capped at `46dvh` and scrolls
-  inside, instead of pushing the log off a phone screen.
+- **An open diff lives in a side panel.** Clicking a file row fetches its patch into a panel floating over the right edge, so the transcript keeps its width and never reflows (`diff.js` parses the hunks into old/new line-numbered rows, wraps long lines and colors the code with the same lexer as fenced blocks); below 900px the panel covers the screen. Clicking the same row again, `✕`, Esc, or folding the bar removes it; clicking a different row swaps the file in place (group rows included — they never had an `author` to match). The bar's body is capped at `46dvh` and scrolls inside, instead of pushing the log off a phone screen.
 
 ## Composer round
 
@@ -251,9 +247,7 @@ and vocabulary, but rows are laid out for a thumb, not a terminal.
   an argument-taking command's word — see the next section.)
 - **Diff file rows stack on a phone.** The path gets its own line (wrapped,
   not ellipsised) and the badges and `+/-` totals sit under it; on wider
-  screens they stay on one line. Tapping a file scrolls the bar so that
-  file's patch starts at the top, and closing the patch returns the list to
-  the scroll offset it was opened from.
+  screens they stay on one line.
 - **Shimmer.** The TUI's sweeping highlight is reproduced with a clipped
   CSS gradient on the pending label, the live `Thinking …` pill and a tool
   name while its arguments stream (`--shimmer-peak` is white on dark themes

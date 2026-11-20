@@ -627,7 +627,7 @@ xarness --enable_tracking false      # no checkpoints/diff bar/undo
 xarness --session my-session         # attach/load a saved session
 xarness --sessions                   # list active sessions
 xarness --kill                       # close all active sessions and stop the host (sessions stay saved)
-xarness --server                     # run the host in the foreground
+xarness --server                     # foreground host + live dashboard
 xarness --web                        # the same host, plus a browser UI (see below)
 ```
 
@@ -638,6 +638,33 @@ takes either a profile name or `true`/`false`: with `true`/`false` no
 profile is named, so the usual resolution applies (preset, then the
 workspace's most recently used profile, then `default`) and only the
 container on/off state is overridden.
+
+## Host dashboard (`--server`)
+
+```sh
+xarness --server                                  # this machine only (unix socket)
+xarness --server --host 0.0.0.0                  # + browser UI, LAN URLs and a token
+xarness --server --host 0.0.0.0 --port 9000      # + the web UI on another port
+```
+
+`--server` runs the persistent host in the foreground with a live dashboard,
+in the TUI's palette and vocabulary. It lists the hosted sessions — state,
+attached clients, `in`/`out` tokens for each, messages, model, age — with a
+totals line (sessions by state, clients, summed tokens) and the host's pid,
+uptime, version and socket. A subagent sits under the session that spawned
+it. Columns drop away as the terminal narrows; `session`, `state` and the
+token columns stay.
+
+Any of `--host`, `--port` or `--token` also turns on the browser listener
+(`--web` is the same with its defaults), so the header gains the URLs and
+the bearer token the browser asks for once. With `--host 0.0.0.0` it shows
+both `http://127.0.0.1:<port>/` and the machine's LAN address.
+
+**Stopping.** The `stop host` button (bottom right) asks once, then shuts
+the host down; `q` and `ctrl+c` do the same, and `ctrl+c` copies a text
+selection first, so a long token can be selected and copied. Sessions stay
+saved on disk. When stdout is not a terminal (a pipe, a service manager)
+the dashboard is skipped and the host prints its one-line stats instead.
 
 ## Web UI
 
@@ -653,13 +680,15 @@ xarness --web --host 0.0.0.0 --token s3cret    # choose the token yourself
 ```
 
 `--web` runs a host in the foreground with a TCP listener beside the usual
-unix socket, prints the URLs, and stops on Ctrl-C. It refuses to start while
-another host is running — `xarness --kill` first. Binding anything but
-loopback prints a generated bearer token: the UI asks for it once and keeps
-it in this browser's `localStorage`; the sidebar's **token** button shows,
-changes or forgets it. The static files are public (they are what asks for
-the token), every `/v1/*` call needs the header, and the unix-socket app the
-TUI talks to is unchanged — same routes, no token.
+unix socket. It refuses to start while another host is running —
+`xarness --kill` first. The dashboard shows the URLs and the stop button
+ends the host (`q` / `ctrl+c`, with one confirmation). Binding anything but
+loopback generates a bearer token, shown on the dashboard's token line: the
+UI asks for it once and keeps it in this browser's `localStorage`; the
+sidebar's **token** button shows, changes or forgets it. The static files
+are public (they are what asks for the token), every `/v1/*` call needs the
+header, and the unix-socket app the TUI talks to is unchanged — same routes,
+no token.
 
 **From a phone.** Run `xarness --web --host 0.0.0.0 --workspace ~/code/project`
 on the machine with your code, open `http://<that-machine's-LAN-IP>:8765/` on
@@ -712,11 +741,11 @@ time:
 
 1. **The listener is loopback-only.** Plain `xarness --web` binds
    `127.0.0.1` on purpose (a network-reachable agent shell is a deliberate
-   choice). Its banner ends with `(loopback only, no token — a phone needs
-   --host 0.0.0.0)`. Start it again with `--host 0.0.0.0`; the banner then
-   prints both a `127.0.0.1` and a LAN URL, and both must load locally. The
-   banner is printed only after both listeners are actually up, so a URL on
-   screen is a URL on a socket.
+   choice). Its dashboard ends with `(loopback only, no token — a phone
+   needs --host 0.0.0.0)`. Start it again with `--host 0.0.0.0`; the
+   dashboard then lists both a `127.0.0.1` and a LAN URL, and both must
+   load locally. URLs appear only once both listeners are actually up, so
+   a URL on screen is a URL on a socket.
 2. **Check what is actually listening**:
 
    ```sh
@@ -853,7 +882,8 @@ src/xarness/
   file_search.py  bounded filename search backing @-mention autocomplete
   gitwork.py      tree snapshots, tree diffs, the read-only git shim
   theme.py        the color palettes
-  tui/            Textual app, widgets, screens (picker/resume/confirm/tools), stylesheet
+  tui/            Textual app, widgets, screens (picker/resume/confirm/tools), stylesheet,
+                  and the foreground host dashboard (server_view.py)
 ```
 
 Beside the package, `webui/` holds the browser UI: `index.html`, ES modules

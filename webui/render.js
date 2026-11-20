@@ -457,7 +457,6 @@ function createNode(item) {
       const head = el(
         'button',
         { class: 'handoff-head', type: 'button' },
-        el('span', { class: 'pill-icon', text: '▸' }),
         el('span', { text: 'earlier conversation, summarized' }),
       );
       const node = el('article', { class: 'item item-divider' }, el('div', { class: 'handoff' }, head, body));
@@ -520,6 +519,10 @@ function thinkingText(item) {
   }
   const text = item.duration !== null ? `Thought for ${formatDuration(item.duration)}` : 'Thought for …';
   return item.tokens ? `${text} · ${formatTokens(item.tokens)} tokens` : text;
+}
+
+function isBash(item) {
+  return item.kind === 'tool' && (item.name === 'run_bash' || item.name === 'bash');
 }
 
 function footerText(item) {
@@ -626,6 +629,10 @@ class ActivityBlock {
     this.lines = el('pre', { class: 'activity-lines', 'aria-label': 'current activity' });
     this.preview = el('div', { class: 'activity-preview' }, this.lines);
     this.node = el('section', { class: 'item item-activity activity' }, this.head, this.panel, this.preview);
+    if (typeof ResizeObserver === 'function') {
+      this.headObserver = new ResizeObserver(() => this.syncHeadHeight());
+      this.headObserver.observe(this.head);
+    }
     this.head.addEventListener('click', () => {
       this.expanded = !this.expanded;
       this.refresh();
@@ -739,23 +746,35 @@ class ActivityBlock {
     this.refresh();
   }
 
+  syncHeadHeight() {
+    this.node.style.setProperty('--activity-head-h', this.expanded ? `${this.head.offsetHeight}px` : '0px');
+  }
+
+  /** Elapsed time for a bash row: live while it runs, frozen once it settles. */
+  toolTime(item) {
+    if (!isBash(item)) return '';
+    const entry = this.times.get(item.id);
+    if (!entry) return '';
+    if (item.status === STATUS.MAKING) return formatElapsed(Math.max(0, now() - entry.start));
+    if (entry.end === null) return '';
+    return formatDuration(Math.max(0, entry.end - entry.start));
+  }
+
   createRow(item) {
     const shape = el('span', { class: 'activity-row-icon' });
     const name = el('span', { class: 'activity-row-name' });
     const args = el('span', { class: 'activity-row-args' });
     const state = el('span', { class: 'activity-row-state' });
-    const caret = el('span', { class: 'activity-row-caret', text: '▸' });
     const head = el(
       'button',
       { class: 'activity-row-head', type: 'button', 'aria-expanded': 'false' },
       shape,
       el('span', { class: 'activity-row-label' }, name, args),
       state,
-      caret,
     );
     const body = el('div', { class: 'activity-row-body' });
     const node = el('div', { class: 'activity-row', role: 'listitem' }, head, body);
-    const row = { node, head, shape, name, args, state, caret, body, item, shapeKey: null, signature: null };
+    const row = { node, head, shape, name, args, state, body, item, shapeKey: null, signature: null };
     head.addEventListener('click', () => {
       row.item.expanded = !row.item.expanded;
       this.updateRow(row, row.item);
@@ -779,16 +798,18 @@ class ActivityBlock {
       if (item.done) {
         const stats = [];
         if (item.duration !== null) stats.push(formatDuration(item.duration));
-        if (item.tokens) stats.push(formatTokens(item.tokens));
+        if (item.tokens) stats.push(`${formatTokens(item.tokens)} tok`);
         row.state.textContent = stats.join(' · ');
-      } else row.state.textContent = 'thinking';
+      } else row.state.textContent = '';
     } else {
       const failed = toolFailed(item);
       row.name.textContent = displayName(item.name);
       row.name.classList.toggle('failed', failed);
       setDetail(row.args, failed ? '' : toolDetail(item.name, item.args, item.output));
-      row.state.textContent =
-        item.status === STATUS.MAKING ? 'running' : failed ? 'failed' : item.usage ? formatUsage(item.usage) : '';
+      let text = item.status === STATUS.MAKING ? 'running' : failed ? 'failed' : item.usage ? formatUsage(item.usage) : '';
+      const timer = this.toolTime(item);
+      if (timer) text = text ? `${text} · ${timer}` : timer;
+      row.state.textContent = text;
     }
     row.head.setAttribute('aria-expanded', item.expanded ? 'true' : 'false');
     row.node.classList.toggle('open', !!item.expanded);
@@ -860,6 +881,10 @@ class ActivityBlock {
     const last = this.last;
     this.node.classList.toggle('open', this.expanded);
     this.head.setAttribute('aria-expanded', this.expanded ? 'true' : 'false');
+    this.syncHeadHeight();
+    // a running bash row counts its seconds up on every tick
+    for (const row of this.rows.values())
+      if (isBash(row.item) && row.item.status === STATUS.MAKING) this.updateRow(row, row.item);
     const status = last ? activityStatus(last) : 'ok';
     const running = status === 'thinking' || status === 'running';
     const live = !this.closed && running;

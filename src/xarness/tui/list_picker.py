@@ -216,9 +216,9 @@ def session_options(
     saved_groups = [members for members in ordered_groups
                     if not any(entry.active for entry in members)]
     active = [entry for members in live_groups
-              for entry in _flatten(members)]
+              for entry in flatten_sessions(members)]
     saved = [entry for members in saved_groups
-             for entry in _flatten(members)]
+             for entry in flatten_sessions(members)]
     # Column widths are derived from the data so every row lines up as a
     # table: the title is padded to the longest title of the list, the age
     # is right-aligned, the workspace dir left-aligned, the session's own
@@ -306,7 +306,9 @@ def _group_activity(members: Sequence[SessionSummary]) -> str:
                default="")
 
 
-def _flatten(members: Sequence[SessionSummary]) -> list[SessionSummary]:
+def flatten_sessions(
+    members: Sequence[SessionSummary],
+) -> list[SessionSummary]:
     """Each member once, parent before children, active children first.
 
     The section order is recency; within one group a parent stays above

@@ -2,14 +2,14 @@
 
 One host owns many :class:`~xarness.session.Session` objects. It serves the
 API on a unix socket under the xarness data dir (mode 0600 in a 0700
-directory) — the only listener; the web UI (a later task) will decide on
-TCP.
+directory), and ``--web`` adds a TCP listener for the browser UI.
 
 **Lifecycle.** The host auto-starts (detached, survives the TUI) when the
 first client needs it. It exits once no session is running, compacting, or
 waiting on an ask — attached clients do not count — after a short grace
 period. ``xarness --server`` runs it in the foreground in persistent mode
-(never exits on its own) and prints the stats.
+(never exits on its own); with a terminal it opens the live dashboard, and
+piped it prints the stats.
 
 **Hardening.** An exclusive startup lock keeps racing clients from
 spawning two hosts (the loser retries connecting); a stale socket file
@@ -1094,12 +1094,29 @@ def stop_host(
     raise TimeoutError(f"stale host (pid {pid}) did not exit within {timeout}s")
 
 
-def run_foreground() -> None:
-    """``xarness --server``: run the host in the foreground, persistent,
-    and print the stats once a second. If a live host already exists, print
-    its stats instead of binding (a live socket is never unlinked)."""
+def run_foreground(*, web: "WebListen | None" = None) -> None:
+    """``xarness --server``: run the host in the foreground, persistent.
+
+    With a terminal attached the host's dashboard is the display: sessions,
+    clients and per-session token spend, plus the browser listener's URLs
+    and token when ``web`` is given. Piped or under a service manager it
+    keeps the old behaviour — one stats line per interval — because escape
+    sequences in a log file are worse than lines.
+
+    ``web`` is what ``xarness --web`` passes; ``--server --host/--port/
+    --token`` builds the same listener. A live host is never shared: a bare
+    ``--server`` prints the running host's stats, while asking for the web
+    listener fails (that host has no listener to add one to)."""
     HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     if _socket_alive():
+        if web is not None:
+            print(
+                f"error: a host is already running (socket {SOCKET_PATH}).\n"
+                "  It has no web listener. Stop it first (`xarness --kill`), then "
+                "run the command again.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         _print_live_stats()
         return
     lock_handle = open(LOCK_PATH, "a")
@@ -1113,19 +1130,74 @@ def run_foreground() -> None:
             )
             raise SystemExit(2) from None
         host = Host(persistent=True, unix_socket=SOCKET_PATH, config_path=DEFAULT_CONFIG_PATH)
-        asyncio.run(_serve_forever(host))
+        if _interactive():
+            _run_dashboard(host, web=web)
+            return
+        try:
+            # Piped: lines, not a screen. The web listener still gets its
+            # banner, once it is really up.
+            print("\n".join(_host_intro(host.server_info())), flush=True)
+            asyncio.run(host.serve(
+                stats_interval=1.0 if web is None else 10.0,
+                web=web, on_ready=_banner(web) if web is not None else None,
+            ))
+        except KeyboardInterrupt:
+            pass
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
     finally:
         fcntl.flock(lock_handle, fcntl.LOCK_UN)
         lock_handle.close()
 
 
+def _interactive() -> bool:
+    """Whether the dashboard can be drawn and driven (both ends are a
+    terminal): a redirected stdin would make the app exit immediately and
+    take the host down with it."""
+    try:
+        return sys.stdout.isatty() and sys.stdin.isatty()
+    except (AttributeError, ValueError):  # replaced or closed streams
+        return False
+
+
+def _run_dashboard(host: Host, *, web: "WebListen | None") -> None:
+    """Run the foreground host inside the dashboard, then report its exit.
+
+    The app starts ``host.serve`` on its own event loop; a startup failure
+    (a live socket, a bad bind) surfaces through ``error`` instead of a
+    traceback from a task."""
+    from .tui.server_view import ServerDashboard
+
+    view = ServerDashboard(
+        host,
+        web=web,
+        urls=_web_urls(web) if web is not None else (),
+        token=web.token if web is not None else None,
+    )
+    try:
+        view.run()
+    except KeyboardInterrupt:
+        # A signal (not the ctrl+c key, which is a binding) already unwound
+        # the app; the host's teardown ran with it.
+        return
+    if view.error is not None:
+        reason = (
+            f"exited with status {view.error.code}"
+            if isinstance(view.error, SystemExit) else str(view.error)
+        )
+        print(f"error: {reason}", file=sys.stderr)
+        raise SystemExit(2)
+    if view.stats is not None:
+        print(f"host stopped · {_format_stats(view.stats)}", flush=True)
+
+
 def _format_stats(stats: ServerStats) -> str:
     """The one-line session/client/token summary shared by the foreground
     stats printer and the periodic live-stats loop."""
-    by_state: dict[str, int] = {}
-    for summary in stats.sessions:
-        by_state[summary.state] = by_state.get(summary.state, 0) + 1
-    states = ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())) or "none"
+    states = ", ".join(
+        f"{state}={count}" for state, count in sorted(stats.by_state().items())
+    ) or "none"
     return (
         f"sessions: {len(stats.sessions)} ({states}), "
         f"clients: {stats.clients_attached}, "
@@ -1154,17 +1226,13 @@ def _print_live_stats() -> None:
     )
 
 
-async def _serve_forever(host: Host) -> None:
-    """``xarness --server``: run the host in the foreground, persistent,
-    printing the stats once a second."""
-    info = host.server_info()
-    print(
-        f"xarness host: pid {info.pid}, protocol v{info.protocol_version}\n"
-        f"  socket: {info.unix_socket}\n"
-        f"  docs:   (unix socket) GET /v1/health, /v1/server/stats, /docs",
-        flush=True,
-    )
-    await host.serve(stats_interval=1.0)
+def _host_intro(info: ServerInfo) -> list[str]:
+    """The first lines a piped foreground host prints: who it is and where."""
+    return [
+        f"xarness host: pid {info.pid}, protocol v{info.protocol_version}",
+        f"  socket: {info.unix_socket}",
+        "  docs:   (unix socket) GET /v1/health, /v1/server/stats, /docs",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1221,56 +1289,22 @@ def _banner(web: WebListen):
     return announce
 
 
-def run_web(
+def web_listen(
     *,
     bind: str = DEFAULT_WEB_HOST,
     port: int = DEFAULT_WEB_PORT,
     token: str | None = None,
-) -> None:
-    """``xarness --web``: the persistent host, in the foreground, serving the
-    web UI on TCP as well as the unix socket every other client uses.
+) -> WebListen:
+    """The browser-facing listener, with a token when it is not loopback.
 
-    A token is generated (and printed) whenever the bind address is not
-    loopback and none was given: the API can run shell commands in the
-    workspace, so it must not be reachable from the LAN unauthenticated."""
-    HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-    if _socket_alive():
-        print(
-            f"error: a host is already running (socket {SOCKET_PATH}).\n"
-            "  It has no web listener. Stop it first (`xarness --kill`), then "
-            "run `xarness --web` again.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    The API can run shell commands in the workspace, so an address reachable
+    from the LAN never goes unauthenticated."""
     web = WebListen(bind=bind, port=port, token=token or None)
     if not web.loopback and not web.token:
-        web = WebListen(bind=web.bind, port=web.port, token=secrets.token_urlsafe(18))
-    lock_handle = open(LOCK_PATH, "a")
-    try:
-        try:
-            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print(
-                "error: another host is starting up; retry in a moment",
-                file=sys.stderr,
-            )
-            raise SystemExit(2) from None
-        print_urls = _banner(web)
-        host = Host(
-            persistent=True, unix_socket=SOCKET_PATH, config_path=DEFAULT_CONFIG_PATH,
+        web = WebListen(
+            bind=web.bind, port=web.port, token=secrets.token_urlsafe(18),
         )
-        try:
-            asyncio.run(host.serve(
-                stats_interval=10.0, web=web, on_ready=print_urls,
-            ))
-        except KeyboardInterrupt:
-            pass
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            raise SystemExit(2) from None
-    finally:
-        fcntl.flock(lock_handle, fcntl.LOCK_UN)
-        lock_handle.close()
+    return web
 
 
 def main(argv: list[str] | None = None) -> None:

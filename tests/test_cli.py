@@ -78,6 +78,30 @@ def test_session_and_server_flags() -> None:
     assert args.server is True
 
 
+def test_server_host_flags_enable_the_browser_listener(monkeypatch) -> None:
+    """``--server`` alone is a unix-socket host; any of --host/--port/--token
+    adds the browser listener (with a token off loopback), like ``--web``."""
+    from xarness import host as host_mod
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        host_mod, "run_foreground",
+        lambda *, web=None: seen.update(web=web),
+    )
+    cli.main(["--server"])
+    assert seen["web"] is None
+
+    cli.main(["--server", "--host", "0.0.0.0", "--port", "9000"])
+    web = seen["web"]
+    assert web.bind == "0.0.0.0" and web.port == 9000
+    assert web.token  # reachable from the LAN, so it demands one
+
+    cli.main(["--web", "--token", "s3cret"])
+    web = seen["web"]
+    assert web.bind == "127.0.0.1" and web.port == 8765
+    assert web.token == "s3cret"
+
+
 def test_chat_startup_creates_a_starter_config(tmp_path, monkeypatch) -> None:
     from xarness.tui import app as tui_app
 

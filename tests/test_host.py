@@ -979,6 +979,16 @@ def test_run_foreground_with_live_host_prints_stats_and_never_binds(tmp_path, ca
     assert "already running" in out and "sessions:" in out
 
 
+def test_web_listen_generates_a_token_only_off_loopback() -> None:
+    """A listener reachable from the LAN must demand a token: one is made
+    when none was given, and an explicit one is kept as-is."""
+    assert host_mod.web_listen().token is None
+    generated = host_mod.web_listen(bind="0.0.0.0", port=9000)
+    assert generated.token and generated.port == 9000
+    assert host_mod.web_listen(bind="0.0.0.0", token="s3cret").token == "s3cret"
+    assert host_mod.web_listen(bind="127.0.0.1", token="s3cret").token == "s3cret"
+
+
 def test_start_unix_server_refuses_to_unlink_a_live_socket(tmp_path) -> None:
     import socket as socket_mod
 

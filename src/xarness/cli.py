@@ -5,7 +5,8 @@ until the first message is sent). ``xarness --session <name>`` attaches to
 an active session or loads a saved one; ``xarness --sessions`` prints the
 active sessions and exits; ``xarness --kill`` closes every active session
 (each stays saved on disk) and stops the host; ``xarness --server`` runs
-the host in the foreground (persistent) and prints the stats.
+the host in the foreground as a live dashboard (``--web`` adds the browser
+UI to the same dashboard).
 """
 
 from __future__ import annotations
@@ -124,7 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--server", action="store_true",
-        help="Run the host in the foreground, persistent, printing the stats.",
+        help="Run the host in the foreground with a live dashboard: hosted "
+        "sessions, attached clients and each session's in/out tokens, plus a "
+        "stop button. --host/--port/--token also enable the browser UI.",
     )
     parser.add_argument(
         "--web", action="store_true",
@@ -133,18 +136,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host", default=None, metavar="ADDR",
-        help="Address the --web listener binds (default 127.0.0.1; use "
-        "0.0.0.0 to reach it from a phone on the LAN).",
+        help="Address the browser listener binds (--web, or --server with any "
+        "of --host/--port/--token; default 127.0.0.1; use 0.0.0.0 to reach "
+        "it from a phone on the LAN).",
     )
     parser.add_argument(
         "--port", type=int, default=None, metavar="PORT",
-        help="Port for the --web listener (default 8765).",
+        help="Port for the browser listener (default 8765).",
     )
     parser.add_argument(
         "--token", default=None, metavar="SECRET",
-        help="Bearer token the --web listener demands for API calls. "
-        "Default: none on loopback, a generated one (printed at startup) "
-        "on any other address.",
+        help="Bearer token the browser listener demands for API calls. "
+        "Default: none on loopback, a generated one (shown in the "
+        "dashboard) on any other address.",
     )
     parser.add_argument(
         "--network", type=_bool_arg, default=None, metavar="true|false",
@@ -172,28 +176,8 @@ def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
     args = build_parser().parse_args(argv)
-    if args.server:
-        from .host import run_foreground
-        run_foreground()
-        return
-    if args.web:
-        import os
-
-        from .host import run_web
-        if args.workspace is not None:
-            workspace = args.workspace.expanduser().resolve()
-            # The web UI creates sessions in the host's cwd; chdir so
-            # --workspace means the same thing it does for the TUI.
-            workspace.mkdir(parents=True, exist_ok=True)
-            os.chdir(workspace)
-        options = {}
-        if args.host is not None:
-            options["bind"] = args.host
-        if args.port is not None:
-            options["port"] = args.port
-        if args.token is not None:
-            options["token"] = args.token
-        run_web(**options)
+    if args.server or args.web:
+        _run_host(args)
         return
     if args.sessions:
         _print_sessions()
@@ -202,6 +186,34 @@ def main(argv: list[str] | None = None) -> None:
         _kill_sessions()
         return
     _run_chat(args)
+
+
+def _run_host(args: argparse.Namespace) -> None:
+    """``--server`` / ``--web``: the foreground host, dashboard in front.
+
+    Any of ``--host/--port/--token`` also turns on the browser listener, so
+    ``--server --host 0.0.0.0`` does what it reads like; ``--web`` is the
+    same with that listener's defaults."""
+    import os
+
+    from .host import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, run_foreground, web_listen
+
+    web = None
+    # `None` is what "flag absent" means here, so `--port 0` still asks for
+    # the listener; a plain truthiness test would read it as absent.
+    if args.web or (args.host, args.port, args.token) != (None, None, None):
+        web = web_listen(
+            bind=DEFAULT_WEB_HOST if args.host is None else args.host,
+            port=DEFAULT_WEB_PORT if args.port is None else args.port,
+            token=args.token,
+        )
+        if args.workspace is not None:
+            # The web UI creates sessions in the host's cwd; chdir so
+            # --workspace means the same thing it does for the TUI.
+            workspace = args.workspace.expanduser().resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            os.chdir(workspace)
+    run_foreground(web=web)
 
 
 def _print_sessions() -> None:

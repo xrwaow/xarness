@@ -257,6 +257,13 @@ class ServerStats(BaseModel):
     total_output_tokens: int = 0
     sessions: list[SessionSummary] = Field(default_factory=list)
 
+    def by_state(self) -> dict[str, int]:
+        """How many sessions are in each state, for a one-line summary."""
+        counts: dict[str, int] = {}
+        for summary in self.sessions:
+            counts[summary.state] = counts.get(summary.state, 0) + 1
+        return counts
+
 
 class ModelInfo(BaseModel):
     """One configured model profile (names and non-secret fields only)."""
