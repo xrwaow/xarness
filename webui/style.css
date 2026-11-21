@@ -30,6 +30,7 @@
   --gutter: 14px;
   --topbar-h: 48px;
   --safe-bottom: env(safe-area-inset-bottom);
+  --shape-stroke: var(--border);
 }
 :root[data-keyboard="open"] { --safe-bottom: 0px; }
 
@@ -57,6 +58,7 @@
     --diff-hunk: #4a6fe0;
     --diff-meta: #6b6c72;
     --shimmer-peak: #ffffff;
+    --shape-stroke: var(--text);
   }
 }
 
@@ -83,6 +85,7 @@
   --diff-hunk: #5ac1fe;
   --diff-meta: #8a8986;
   --shimmer-peak: #ffffff;
+  --shape-stroke: var(--border);
 }
 
 :root[data-theme="light"] {
@@ -108,6 +111,7 @@
   --diff-hunk: #4a6fe0;
   --diff-meta: #6b6c72;
   --shimmer-peak: #ffffff;
+  --shape-stroke: var(--text);
 }
 * { box-sizing: border-box; }
 * { -webkit-tap-highlight-color: transparent; }
@@ -298,91 +302,23 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .prose .md-table .align-right { text-align: right; font-variant-numeric: tabular-nums; }
 .prose .md-table .align-center { text-align: center; }
 .md-live { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-prose); }
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  min-height: 28px;
-  padding: 2px 0;
-  margin-left: 2px;
-  background: transparent;
-  border: 0;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  max-width: 100%;
-}
-.pill:hover { color: var(--text); }
-.thinking-body { display: none; margin: 4px 0 0 18px; padding-left: 12px; border-left: 2px solid var(--border); color: var(--reasoning); font-size: 13.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.thinking.open .thinking-body { display: block; cursor: pointer; }
-
-@media (max-width: 559px) {
-  .pill { min-height: var(--tap); }
-}
-.item-tool { margin-top: 10px; }
-.tool-head {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  grid-template-areas: "dot name usage" "dot detail detail";
-  align-items: center;
-  column-gap: 8px;
-  row-gap: 1px;
-  width: 100%;
-  min-height: var(--tap);
-  padding: 6px 6px 6px 4px;
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius);
-  text-align: left;
-  color: var(--text);
-}
-.tool-head:hover, .tool-head:focus-visible { background: var(--surface); }
-.tool-head:hover .tool-name { color: var(--highlight); }
-.tool-dot { grid-area: dot; align-self: start; padding-top: 3px; font-size: 10px; color: var(--warning); line-height: 1.4; }
-.tool[data-status="call_succeeded"] .tool-dot { color: var(--success); }
-.tool[data-status="call_failed"] .tool-dot, .tool[data-status="parsing_error"] .tool-dot { color: var(--error); }
-.tool[data-status="call_making"] .tool-dot { animation: tool-pulse 1.1s ease-in-out infinite; }
-@keyframes tool-pulse {
-  50% { opacity: 0.2; }
-}
-.tool-name { grid-area: name; font-family: var(--font-mono); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
-.tool[data-status="call_failed"] .tool-name, .tool[data-status="parsing_error"] .tool-name { color: var(--error); }
-.tool-usage { grid-area: usage; color: var(--muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
-.tool-detail {
-  grid-area: detail;
-  min-width: 0;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
-}
-.tool-detail[hidden] { display: none; }
-.tool-head.detail-inline { grid-template-columns: auto auto minmax(0, 1fr) auto; grid-template-areas: "dot name detail usage"; align-items: baseline; }
-.tool-head.detail-inline .tool-detail { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; -webkit-line-clamp: unset; line-clamp: unset; }
-.tool-detail .loc-add { color: var(--diff-add); }
-.tool-detail .loc-del { color: var(--diff-del); }
-.tool.open .tool-detail { display: block; overflow: visible; -webkit-line-clamp: unset; line-clamp: unset; }
-.tool.open .tool-head.detail-inline { grid-template-columns: auto 1fr auto; grid-template-areas: "dot name usage" "dot detail detail"; align-items: center; }
-.tool-body { display: none; margin: 2px 0 6px 18px; min-width: 0; }
-.tool.open .tool-body { display: block; }
-.tool-block { margin-top: 8px; }
-.tool-label { display: block; margin-bottom: 3px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
-.tool-body pre {
+/* prose that hands over to an activity block: the trailing gap of the last
+   markdown block (the live tail sits after it, so `:last-child` never reaches
+   it) and the block's own top margin would open a hole under the last line */
+.item-answer:has(+ .item-activity) .prose > :has(+ .md-live) { margin-bottom: 0; }
+.item-answer + .item-activity { margin-top: 0; }
+/* ------------------------------------------------------ tool row bodies */
+/* The body of an expanded row is the call's content — the terminal, the file,
+   the patch — not a card about it. No fill, no border, no heading: the row's
+   rail carries the structure, monospace and colour carry the rest. */
+.tool-code,
+.tool-cmd {
   margin: 0;
-  padding: 8px 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: auto;
   max-height: 50dvh;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.5;
@@ -391,8 +327,70 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
   color: var(--text);
   -webkit-overflow-scrolling: touch;
 }
-.tool-body pre.tool-args { white-space: pre-wrap; overflow-wrap: anywhere; }
-.tool-body .tool-note { font-size: 11px; color: var(--muted); font-family: var(--font-mono); padding-top: 4px; }
+.tool-code::-webkit-scrollbar,
+.tool-cmd::-webkit-scrollbar,
+.tool-diff::-webkit-scrollbar { height: 8px; width: 8px; }
+.tool-code::-webkit-scrollbar-thumb,
+.tool-cmd::-webkit-scrollbar-thumb,
+.tool-diff::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-sm); }
+/* a command wraps: it is one line of intent, not a table */
+.tool-cmd { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-prompt { color: var(--success); user-select: none; }
+/* reasoning and argument JSON wrap too; only source/output scroll sideways */
+.tool-thought {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--reasoning);
+  font-family: var(--font-prose);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.tool-args { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); }
+.tool-error { color: var(--error); }
+/* a written file is a new-file diff: the + gutter says green, the code keeps
+   its own syntax colours, the line gets the add tint */
+.tool-added { font-size: 12.5px; }
+.tool-added .diff-line { min-height: 1.5em; }
+.tool-added .diff-line.add { color: var(--text); }
+.tool-added .diff-line.add .diff-sign { display: inline-block; width: 1.5ch; color: var(--diff-add); user-select: none; }
+.tool-note {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tool-exit {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--success);
+}
+.tool-exit.fail { color: var(--error); }
+.tool-exit .mark { font-size: 10px; }
+/* a diff body is its own scroll box so its file headers can stick */
+.tool-diff {
+  max-height: 50dvh;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+/* the diff view's own gutters are tuned for the side panel; in a row the code
+   starts where the rest of the body does, with no card padding to pay for */
+.activity-row-body .dv-lines { padding: 2px 0; }
+.activity-row-body .dv-line.hunk { padding: 2px 6px; }
+.activity-row-body .dv-line.meta { padding: 0 6px; }
+.activity-row-body .dv-file-head { padding: 3px 6px; }
+.activity-row-body .dv-code { padding-right: 6px; }
+.tool-provisional { max-height: 50dvh; }
 
 /* ------------------------------------------------------- activity block */
 /* A run of thinking + tool calls is one block. The header aggregates the
@@ -400,18 +398,18 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
    window below it is the live tail of that activity. */
 .item-activity { margin-top: 8px; border: 1px solid transparent; border-radius: var(--radius); }
 .item-activity:hover, .item-activity:has(:focus-visible), .item-activity.open { border-color: var(--border); }
-.activity { min-width: 0; }
+.activity { --row-icon-w: 17px; --row-gap: 8px; min-width: 0; }
 .activity-head {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
-  grid-template-areas: "copy loc usage time" "shapes shapes shapes shapes";
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "copy stats" "shapes shapes";
   align-items: start;
   column-gap: 8px;
   row-gap: 0;
   width: 100%;
   min-height: var(--tap);
-  padding: 6px 2px 6px 2px;
+  padding: 6px 6px 6px 2px;
   background: transparent;
   border: 0;
   border-radius: var(--radius);
@@ -421,26 +419,24 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity.open .activity-head { min-height: 0; }
 /* Keep the block header in view while its expanded activity list scrolls,
    and the open row's header below it while that row's body scrolls. */
-.activity.open > .activity-head { position: sticky; top: calc(-1 * var(--log-pad-top, 0px)); z-index: 3; background: var(--surface); }
-.activity.open > .activity-head:hover, .activity.open > .activity-head:focus-visible { background: color-mix(in srgb, var(--text) 5%, var(--surface)); }
+.activity.open > .activity-head { position: sticky; top: calc(-1 * var(--log-pad-top, 0px)); z-index: 3; background: var(--bg); }
+.activity.open > .activity-head:hover, .activity.open > .activity-head:focus-visible { background: var(--surface); }
 .activity-head:hover, .activity-head:focus-visible { background: var(--surface); }
 .activity-copy { grid-area: copy; position: relative; display: flex; align-self: stretch; flex-direction: column; min-width: 0; }
 .activity-title { color: var(--text); font-family: var(--font-mono); font-size: 12px; font-weight: 600; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
 .activity-title .activity-shape { margin-left: 6px; vertical-align: -1px; }
 .activity-shapes { grid-area: shapes; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 3px; margin-top: 3px; min-width: 0; }
 .activity-shapes[hidden] { display: none; }
-/* the connector hangs from the bottom of the header (the shapes span its full
-   width) and the row lines carry it on. */
-.activity.open .activity-head::after { content: ''; position: absolute; left: 8px; top: 100%; width: 1px; height: 10px; background: var(--border); pointer-events: none; }
 .activity-shape { display: inline-flex; }
 .activity-shape .shape { width: 11px; height: 11px; }
-.activity-loc { grid-area: loc; padding-top: 1px; font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+.activity-loc { padding-top: 1px; font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .activity-loc[hidden] { display: none; }
 .activity-loc .loc-add { color: var(--diff-add); }
 .activity-loc .loc-del { color: var(--diff-del); }
-.activity-usage { grid-area: usage; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-stats { grid-area: stats; display: flex; align-items: baseline; justify-content: flex-end; gap: 0.5ch; min-width: 0; }
+.activity-usage { padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .activity-usage[hidden] { display: none; }
-.activity-time { grid-area: time; padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-time { padding-top: 1px; color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
 .activity-time[hidden] { display: none; }
 .activity-time[data-state="failed"] { color: var(--error); }
 
@@ -457,14 +453,20 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity-list { min-width: 0; }
 .activity-row { position: relative; min-width: 0; }
 .activity-row + .activity-row { margin-top: 1px; }
-.activity-row::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 1px; background: var(--border); pointer-events: none; }
+/* the connector is carried by the rows themselves, so it starts under the
+   shapes row (never in the header) and each row's shape paints over it. */
+.activity-row::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 1px; border-radius: 1px; background: var(--border); pointer-events: none; }
+/* a little air below the shapes, then the line falls to the first shape. */
+.activity-row:first-child::before { top: 3px; }
+/* bridge the 1px gap between rows: the connector is one stroke, not dashes. */
+.activity-row + .activity-row::before { top: -1px; }
 .activity-row:last-child::before { bottom: calc(100% - var(--activity-line-top)); }
 .activity-row:only-child::before { bottom: calc(100% - var(--activity-line-top)); }
 .activity-row-head {
   display: grid;
-  grid-template-columns: 17px minmax(0, 1fr) auto;
+  grid-template-columns: var(--row-icon-w) minmax(0, 1fr) auto;
   align-items: center;
-  column-gap: 8px;
+  column-gap: var(--row-gap);
   width: 100%;
   min-height: 30px;
   padding: 3px 6px 3px 0;
@@ -484,29 +486,24 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity-row-args { flex: 1 1 auto; min-width: 0; color: var(--muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .activity-row-args .loc-add { color: var(--diff-add); }
 .activity-row-args .loc-del { color: var(--diff-del); }
+.activity-row-tail { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.activity-row-loc { flex: 0 0 auto; min-width: 0; font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-row-loc:empty { display: none; }
+.activity-row-loc .loc-add { color: var(--diff-add); }
+.activity-row-loc .loc-del { color: var(--diff-del); }
 .activity-row-state { color: var(--muted); font-family: var(--font-mono); font-size: 10px; white-space: nowrap; }
+.activity-row-state:empty { display: none; }
 .activity-row-state[data-state="thinking"], .activity-row-state[data-state="running"] { color: var(--warning); }
 .activity-row-state[data-state="failed"] { color: var(--error); }
-.activity-row-body { display: none; margin: 0 0 8px 25px; min-width: 0; }
+/* The body hangs in the name column, under the row's label, and carries no
+   rule of its own: the connector above is the only vertical line in a block. */
+.activity-row-body { display: none; margin: 0 0 10px calc(var(--row-icon-w) + var(--row-gap)); min-width: 0; }
 .activity-row.open .activity-row-body { display: block; }
-.activity-row-body pre {
-  margin: 0;
-  padding: 8px 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: auto;
-  max-height: 50dvh;
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  line-height: 1.5;
-  white-space: pre;
-  tab-size: 4;
-  color: var(--text);
-  -webkit-overflow-scrolling: touch;
-}
-.activity-row-body pre.tool-args { white-space: pre-wrap; overflow-wrap: anywhere; }
-.activity-preview { position: relative; margin: 2px 0 8px 8px; padding-left: 11px; border-left: 1px solid var(--border); }
+.activity-row-body > * + * { margin-top: 6px; }
+/* the expanded rows' code starts a hair below the header */
+.activity-row.open .activity-row-body { padding-top: 1px; }
+/* the live tail sits in the same column, so it never draws a second rail */
+.activity-preview { position: relative; margin: 2px 0 8px calc(var(--row-icon-w) + var(--row-gap)); }
 .activity-preview[hidden] { display: none; }
 .activity:not(.live) .activity-preview { display: none; }
 .activity-lines {
@@ -528,9 +525,10 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .activity-lines::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-sm); }
 
 @media (max-width: 559px) {
-  .activity-head { column-gap: 6px; padding-right: 4px; }
+  .activity-head { column-gap: 6px; padding-right: 6px; }
   .activity-panel { --activity-line-top: 22px; }
-  .activity-row-head { column-gap: 6px; min-height: var(--tap); }
+  .activity { --row-gap: 6px; }
+  .activity-row-head { min-height: var(--tap); }
   .activity-row-name { max-width: 38%; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -559,7 +557,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
   box-decoration-break: clone;
   animation: shimmer-sweep 3.4s linear infinite;
 }
-.tool-name.shimmer { --shimmer-base: var(--text); }
+
 @keyframes shimmer-sweep {
   from { background-position: 100% 0; }
   to { background-position: 0% 0; }
@@ -791,7 +789,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 .diff-hint .cmd { color: var(--accent); background: var(--bg); border-radius: var(--radius-sm); padding: 1px 4px; }
 
 /* ------------------------------------------------- the file diff panel */
-.diffview { position: fixed; top: var(--topbar-h); right: 0; bottom: 0; z-index: 40; width: clamp(320px, 40vw, 680px); display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); box-shadow: -10px 0 24px rgb(0 0 0 / 0.18); }
+.diffview { position: fixed; top: var(--topbar-h); right: 0; bottom: 0; z-index: 40; width: clamp(320px, 40vw, 680px); display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); }
 .diffview[hidden] { display: none; }
 .diffview-head { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; min-height: var(--topbar-h); padding: 4px 6px 4px 14px; border-bottom: 1px solid var(--border); }
 .diffview-title { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 1px; padding: 3px 0; }
@@ -944,7 +942,7 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
 }
 .tool-item { padding: 6px 0; }
 .tool-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.tool-name { flex: 0 1 auto; min-width: 0; font-family: var(--font-mono); font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool-name { flex: 0 1 auto; min-width: 0; font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tool-src { flex: 0 0 auto; margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--accent); white-space: nowrap; }
 .tool-desc { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; margin: 1px 0 0; font-size: 11.5px; line-height: 1.45; color: var(--muted); }
 .mcp-servers { display: flex; flex-direction: column; margin: 0 calc(var(--sheet-x) - var(--row-x)); }
@@ -1029,9 +1027,6 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
   .diffbar { margin: 0 -8px; }
   .palette { margin-inline: -10px; }
   .foot-status { font-size: 11px; gap: 7px; }
-  .tool-head { grid-template-columns: auto auto 1fr auto; grid-template-areas: "dot name detail usage"; align-items: baseline; min-height: 28px; padding: 4px 6px; }
-  .tool-detail { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; -webkit-line-clamp: unset; line-clamp: unset; }
-  .tool.open .tool-detail { white-space: pre-wrap; }
 }
 
 @media (max-width: 379px) {

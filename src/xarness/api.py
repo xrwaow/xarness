@@ -37,7 +37,7 @@ from .protocol import (
     Snapshot,
     ToolsInfo,
 )
-from .session import Session, SessionError
+from .session import HISTORY_PAGE, Session, SessionError
 
 # Cap on one uploaded image blob (base64 inflation happens client-side; this
 # bounds the raw bytes the host buffers).
@@ -223,19 +223,48 @@ def sessions_router(host: Host) -> APIRouter:
                 "description": (
                     "text/event-stream. The first frame is `snapshot` (a "
                     "Snapshot); then `event` frames carrying Event models "
-                    "(discriminated on `type`). The snapshot's "
-                    "`partial_round` renders the in-flight round. "
-                    "Reconnects always receive a fresh snapshot."
+                    "(discriminated on `type`). Reconnects always receive "
+                    "a fresh snapshot (`messages=N` windows its history)."
                 ),
             },
         },
     )
-    async def events(name: str) -> StreamingResponse:
+    async def events(name: str, messages: int | None = None) -> StreamingResponse:
         session = await _session_or_load(host, name)
         return StreamingResponse(
-            _event_stream(session),
+            _event_stream(session, messages),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @router.get(
+        "/sessions/{name:path}/messages",
+        response_model=protocol.MessagePage,
+        summary="One page of older history, oldest-first and turn-aligned",
+    )
+    async def messages(
+        name: str, before: int | None = None, limit: int = HISTORY_PAGE,
+        slim: bool = False,
+    ) -> protocol.MessagePage:
+        """The page in front of a window: pass the snapshot's (or the last
+        page's) ``start`` as ``before`` and walk back while ``has_more``.
+        ``slim`` drops reasoning, arguments and output (expand to fetch)."""
+        return (await _session_or_load(host, name)).message_page(
+            before=before, limit=limit, slim=slim,
+        )
+
+    @router.get(
+        "/sessions/{name:path}/messages/{index}",
+        response_model=protocol.MessageBody,
+        summary="Full text of one history round (lazy page expansion)",
+    )
+    async def message_body(
+        name: str, index: int, content: bool = True,
+    ) -> protocol.MessageBody:
+        """``content=False`` is the round's headers: reasoning and tool
+        arguments, no tool output."""
+        return (await _session_or_load(host, name)).message_body(
+            index, content=content,
         )
 
     @router.post(
@@ -339,15 +368,18 @@ def sessions_router(host: Host) -> APIRouter:
         response_model=Snapshot,
         summary="Snapshot of a session (messages, status, live round)",
     )
-    async def get_session(name: str) -> Snapshot:
+    async def get_session(name: str, messages: int | None = None) -> Snapshot:
         """The session's snapshot. A saved-but-released session is re-hosted
         on demand (cheap: constructing a Session starts no shell); the
         reaper evicts it again once nothing is attached.
 
-        Registered after the fixed suffixes (``/events``, ``/images/..``,
-        ``/quit``, ``/diff``): its ``:path`` converter also matches those,
-        and first-match-wins."""
-        return (await _session_or_load(host, name)).snapshot()
+        ``messages`` windows the history like ``GET …/events``; omit it for
+        the whole transcript. Fixed suffixes (``/events``, ``/images/..``,
+        ``/quit``, ``/diff``, ``/messages``) are registered first: their
+        ``:path`` also matches here, and first match wins."""
+        return (await _session_or_load(host, name)).snapshot(
+            message_limit=messages,
+        )
 
     @router.delete(
         "/sessions/{name:path}",
@@ -426,12 +458,14 @@ def meta_router(host: Host) -> APIRouter:
     return router
 
 
-async def _event_stream(session: Session) -> AsyncIterator[str]:
+async def _event_stream(
+    session: Session, message_limit: int | None = None,
+) -> AsyncIterator[str]:
     """SSE frames: a fresh snapshot first, then live events. Reconnects
     always re-snapshot: on a local unix socket the only real disconnect is
     host death, and replaying deltas across a history rewrite would corrupt
-    the transcript."""
-    snapshot, queue = session.subscribe()
+    the transcript. ``message_limit`` windows that snapshot."""
+    snapshot, queue = session.subscribe(message_limit=message_limit)
     yield _sse("snapshot", snapshot)
     try:
         while True:

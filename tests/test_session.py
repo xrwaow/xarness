@@ -12,7 +12,7 @@ import pytest
 from xarness import gitwork, protocol, session_store
 from xarness.config import ProviderProfile
 from xarness.conversation import (
-    SUMMARY_PREFIX, AssistantMessage, Timing, ToolMessage, user_message,
+    SUMMARY_PREFIX, AssistantMessage, Timing, ToolCall, ToolMessage, user_message,
     Conversation,
 )
 from xarness.images import ImageAttachment
@@ -916,6 +916,93 @@ def test_snapshot_carries_hidden_epochs_as_human_history(tmp_path) -> None:
     assert [m.id for m in snap.messages] == [old.id, summary.id]
 
 
+def test_windowed_snapshot_is_the_newest_whole_turns(tmp_path) -> None:
+    """Attaching ships only the tail, turn-aligned; an untrimmed snapshot
+    (the TUI's) still carries every message."""
+    session = make_session([], tmp_path)
+    for index in range(60):
+        session.conversation.add(user_message(f"q{index}"))
+        session.conversation.add(AssistantMessage(content=f"a{index}"))
+    full = list(session.conversation.messages)
+
+    snap = session.snapshot(message_limit=10)
+    assert snap.message_total == 120 and snap.has_more
+    assert 0 < snap.message_offset < 120 and snap.message_offset % 2 == 0
+    assert snap.messages == full[snap.message_offset:] and len(snap.messages) >= 10
+
+    # No limit: the whole history, with the window fields saying so.
+    for whole in (session.snapshot(), session.subscribe()[0]):
+        assert whole.messages == full and not whole.has_more
+        assert (whole.message_offset, whole.message_total) == (0, 120)
+
+
+def test_message_pages_walk_the_history_once_in_whole_turns(tmp_path) -> None:
+    """Paging back from the snapshot covers every message exactly once, and
+    never cuts a turn in two."""
+    session = make_session([], tmp_path)
+    for index in range(25):
+        session.conversation.add(user_message(f"q{index}"))
+        session.conversation.add(AssistantMessage(content=f"a{index}"))
+    full = list(session.conversation.messages)
+
+    page, collected = session.message_page(limit=8), []
+    while True:
+        assert page.start % 2 == 0, "a page must end on a turn boundary"
+        collected = [*page.messages, *collected]
+        if not page.has_more:
+            break
+        page = session.message_page(before=page.start, limit=8)
+    assert collected == full and page.start == 0
+
+
+def test_slim_pages_leave_the_bodies_for_the_body_endpoint(tmp_path) -> None:
+    """A history page carries shapes and headers only; one round's text comes
+    from GET …/messages/{index} (headers alone with content=false)."""
+    session = make_session([], tmp_path)
+    session.conversation.add(user_message("q0"))
+    call = ToolCall(call_id="c1", name="bash", arguments_json='{"command": "ls"}')
+    session.conversation.add(AssistantMessage(
+        content="answer", reasoning="thought " * 50, tool_calls=[call],
+    ))
+    session.conversation.add(ToolMessage(tool_call_id="c1", content="output"))
+    full = list(session.conversation.messages)
+
+    page = session.message_page(limit=10, slim=True)
+    assert page.slim and len(page.messages) == 3
+    assert page.messages[0] == full[0]
+    assistant, result = page.messages[1], page.messages[2]
+    assert assistant.content == "answer"
+    assert assistant.reasoning == "thought " * 20  # SLIM_REASONING chars
+    assert assistant.tool_calls[0].arguments_json == ""
+    assert result.content == ""
+
+    headers = session.message_body(1, content=False)
+    assert [m.role for m in headers.messages] == ["assistant", "tool"]
+    assert headers.messages[0].tool_calls[0].arguments_json == '{"command": "ls"}'
+    assert headers.messages[1].content == ""
+
+    body = session.message_body(1)
+    assert body.messages[-1].content == "output"
+    with pytest.raises(SessionError):
+        session.message_body(99)
+
+
+def test_history_page_keeps_a_tool_call_with_its_result(tmp_path) -> None:
+    """Cutting off the tool result would render the call as interrupted, so
+    the page takes the whole turn."""
+    session = make_session([], tmp_path)
+    session.conversation.add(user_message("q0"))
+    session.conversation.add(AssistantMessage(content="a0"))
+    call = ToolCall(call_id="c1", name="read_file", arguments_json="{}")
+    session.conversation.add(user_message("q1"))
+    session.conversation.add(AssistantMessage(content="", tool_calls=[call]))
+    session.conversation.add(ToolMessage(tool_call_id="c1", content="ok"))
+    messages = list(session.conversation.messages)
+
+    page = session.message_page(limit=2)  # two from the end would split it
+    assert (page.start, page.messages) == (2, messages[2:])
+
+
 def test_stream_events_are_protocol_models() -> None:
     """Internal stream events cross the wire as-is: they are the protocol
     models themselves, with the ``type`` discriminator baked in."""
@@ -1275,7 +1362,7 @@ def test_no_save_disables_persistence(tmp_path) -> None:
 
 def test_stamp_turn_end_records_the_turn_stats(tmp_path) -> None:
     """The host writes the numbers it measured onto the turn's last answer:
-    total | busy | idle, busy being streaming + tools."""
+    total | busy | idle, busy being the model's generation time."""
     session = make_session([], tmp_path)
     opening = session.conversation.add(user_message("hi"))
     session.conversation.begin_turn(opening, before_tree=None)
@@ -1350,6 +1437,34 @@ def test_turn_ended_carries_the_stamped_breakdown(tmp_path) -> None:
     # Persisted, so a reload renders the same footer instead of deriving one.
     reloaded = session_store.load_state("test")
     assert reloaded.conversation.messages[-1].timing.stats == stats
+
+
+def test_busy_is_generation_only_so_tool_time_is_idle(tmp_path) -> None:
+    """The split is generating vs waiting: the model's streaming rounds are
+    busy, but the time a tool runs is the client waiting, so it is idle."""
+
+    @tool("edit_file", "edit a file", _NoArgs)
+    async def edit(args) -> ToolResult:
+        await asyncio.sleep(0.1)
+        return ToolResult(content="ok")
+
+    registry = ToolRegistry()
+    registry.register(edit)
+    session = make_session(
+        [_tool_round(), _round("done")], tmp_path, tools=registry,
+    )
+
+    async def go():
+        session.subscribe()
+        await session.execute(SendMessage(text="hi"))
+        await wait_idle(session)
+
+    asyncio.run(go())
+    stats = session.conversation.messages[-1].timing.stats
+    assert stats is not None
+    assert stats.busy is not None and stats.idle is not None
+    assert stats.idle >= 0.08  # the tool's sleep is the client waiting
+    assert stats.busy < stats.idle
 
 
 def test_cancelled_turn_is_stamped_without_a_split(tmp_path) -> None:

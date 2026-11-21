@@ -198,14 +198,48 @@ class PartialRound(BaseModel):
 
 
 class Snapshot(BaseModel):
-    """The full state a client receives when it attaches (SSE first event)."""
+    """The state a client receives when it attaches (SSE first event).
 
-    # The whole append-only history, compacted-away prefix included: the
-    # client renders every summary as a handoff divider.
+    ``messages`` is usually a *window* onto the end of the history, sized by
+    the fields below; :class:`MessagePage` fetches the rest. Untrimmed it is
+    the whole append-only history (compacted-away prefix included), which is
+    what the TUI expects."""
+
+    # A slice of the history (the whole list when untrimmed); every summary
+    # renders as a handoff divider.
     messages: list[Message] = Field(default_factory=list)
     status: Status = Field(default_factory=Status)
     # Live round state; None when no round is streaming.
     partial_round: PartialRound | None = None
+    # Index of ``messages[0]`` in the whole history, its length, and whether
+    # older messages exist to page in.
+    message_offset: int = 0
+    message_total: int = 0
+    has_more: bool = False
+
+
+class MessagePage(BaseModel):
+    """One page of older history (GET /sessions/{name}/messages): whole turns
+    (see ``session.history_page``), so a round keeps its results. ``slim``
+    stripped the bodies; :class:`MessageBody` fills them per round."""
+
+    messages: list[Message] = Field(default_factory=list)
+    # Index of ``messages[0]``; pass it back as ``before`` for the next page.
+    start: int = 0
+    total: int = 0
+    has_more: bool = False
+    slim: bool = False
+
+
+class MessageBody(BaseModel):
+    """GET /sessions/{name}/messages/{index}: one round's text.
+
+    ``messages[0]`` is the message at ``index``, followed by the tool results
+    that answered it, so one request fills a whole block's rows.
+    ``content=False`` leaves those results' text out (headers only)."""
+
+    index: int = 0
+    messages: list[Message] = Field(default_factory=list)
 
 
 class ServerInfo(BaseModel):

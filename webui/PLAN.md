@@ -25,6 +25,9 @@ Transcript rows, in the TUI's visual language:
 | turn footer | `Worked for 5.0s (4.0s | 1.0s) · ↑12.3k ↓456` | `TurnEnded.stats`, persisted `Timing.stats` |
 | compaction divider | the handoff text, accent color | snapshot `is_summary` message |
 
+The footer's two numbers are the turn's `busy | idle` split: time the model
+spent generating vs time spent waiting on tools, compaction and teardown.
+
 Palette (`src/xarness/theme.py`): `ayu-darker` by default and `one-light`
 alternate; semantic keys (`bg`, `surface`, `border`, `text`, `muted`, `user`,
 `reasoning`, `accent`, `accent2`, `status`, `error`, `success`, `warning`,
@@ -39,7 +42,9 @@ Slash commands (`COMMANDS` in `src/xarness/tui/app.py`): `tools`, `model`,
 
 | Feature | Backend |
 | --- | --- |
-| attach / reconnect / rebuild | `GET /v1/sessions/{name}/events` (SSE; first frame `snapshot`, then `event`) |
+| attach / reconnect / rebuild | `GET /v1/sessions/{name}/events?messages=N` (SSE; first frame `snapshot` — a turn-aligned window of the newest N messages — then `event`) |
+| load earlier messages | `GET …/messages?before=&limit=&slim=true` (a `MessagePage`; autoloaded near the top) |
+| expand a block / row | `GET …/messages/{index}?content=false` (headers) / `content=true` (the round's output) |
 | send message (no local echo) | `POST …/commands` `{type:"send_message"}` |
 | draft chat → first session | `POST /v1/sessions` `{workspace?, model?, view}` (then attach) |
 | interrupt (double Esc / Stop button) | `{type:"cancel"}` |
@@ -77,7 +82,10 @@ Slash commands (`COMMANDS` in `src/xarness/tui/app.py`): `tools`, `model`,
 - **Transcript virtualization.** The TUI's `FlowView` paints only visible
   rows. The browser's native scrolling handles a long log; we cap live tool
   output at the TUI's 64 KiB and collapse tool bodies, so a runaway command
-  cannot bloat the DOM.
+  cannot bloat the DOM. The *history* is autoloaded in slim pages instead
+  (see "Opening a long chat" below): attaching ships the newest window, and
+  older pages carry shapes and headers until a block is expanded, so the DOM
+  and the wire never hold a transcript nobody is reading.
 - **Terminal-title/OSC, copy-on-quit, mouse-selection workarounds.** Browser
   equivalents (document title, native copy) replace them.
 - **Theme persisted to the server config file.** `/model` persists its
@@ -302,6 +310,9 @@ and vocabulary, but rows are laid out for a thumb, not a terminal.
 - **Tool summaries carry the diff colours.** `edit_file` (`+A -D path`) and
   `write_file` (`+N path`) render their counts as spans tinted with
   `--diff-add`/`--diff-del`, the way the TUI does it; the path stays muted.
+  The counts sit at the row's right edge, with the state word (when there is
+  one) just before them; the header's `+A -D`, time and token counts share the
+  same right edge, so the numbers line up down the block.
   `read_file` shows no counts at all (nothing was added) — just the path and
   the requested range.
 - **The reasoning pill is left-aligned with the tool rows.** It used to be
@@ -457,6 +468,13 @@ activity, answer — the prose is the separator.
   square but takes a colour generated from its server name (`MCP_COLORS`), so
   one server is recognisable across a turn. Shapes carry status through
   `data-status` (running pulses, failed fades) rather than changing identity.
+  Each shape is also drawn a little hand-made: a few degrees of rotation and
+  skew with an independent stretch on each axis, and a thick outline that is
+  ink-dark on the light theme and the panel border colour on the dark one
+  (`--shape-stroke`). The variation is hashed from the session name plus the
+  item's stable identity
+  (message index and call id, never the in-memory id), so a reload redraws the
+  same shapes and none of that art is stored anywhere.
 - **The header is the run's summary.** Two tallies only: how many times the
   model thought and how many tools it ran, so it reads `Thought 9 times, ran 6
   tools`. The per-tool breakdown lives in the expanded rows. Below the
@@ -473,6 +491,12 @@ activity, answer — the prose is the separator.
   the block has been closed *and* its last activity failed: while the block is
   still open nothing is conclusive, so a call that a later round works around
   never flashes the counter, and an earlier failure is shown on its own row.
+  The diff counts, token spend and time form one right-aligned cluster on the
+  summary line: nothing reserves a slot, so the cluster sits tight and slides
+  with its content, while the shapes keep the full width of the line below.
+  The expanded header sticks to the top of the log, so it is filled with the log
+  background (opaque, not transparent) and dims to the surface colour on hover,
+  masking the rows scrolling under it.
 - **How the time is measured.** A live block is timed from its first activity
   to the moment a non-activity item closes it, so it includes the model and
   tool waiting: that is what "took" means. Tool calls are stamped in the view
@@ -488,21 +512,25 @@ activity, answer — the prose is the separator.
   hidden once the block ends, but stays visible while the header is expanded
   during a live run.
 - **Expand for the run, click a row for the item.** Tapping the header lists
-  every activity as shape · name · arguments · state. The connector runs down
-  from the bottom of the header (the header drops its tap min-height while
-  open, so it hugs the title/shapes) and is carried by a line on each row, so
-  it starts just under the shapes rather than floating beside the first row.
-  Each row's shape paints above that connector line, so the line runs behind
-  the icons instead of across them.
+  every activity as shape · name · arguments · state. The connector is carried
+  entirely by the rows, so it starts a few pixels *below* the shapes row
+  instead of poking up into the header, and the successive row lines overlap
+  the 1px row gap so the stroke stays unbroken. Each row's shape paints above
+  the connector, so the line runs behind the icons instead of across them.
   Tapping a row opens its arguments/output, or the full thought for a thinking
   row. Rows are 44px tap targets on phones.
 - **Changes in the block show at a glance.** When the run wrote to a file, the
-  header carries `+12 -3` between the summary and the time: line totals
-  summed over every successful `edit_file`/`write_file` in that block, coloured
-  like the diff bar and with a sentence for the tooltip. A block that only read
-  or ran commands shows nothing, and a failed edit is not counted.
-- **Tokens too.** Next to it, muted, the block's spend: `↑3.4k ↓1.6k`. It sums
-  two things: the **model round** that produced each item — `round_complete`
+  header carries `+12 -3` at the start of its right cluster, on the summary line
+  before the token counts and the time (all the same size, the counts still
+  coloured): line totals summed over every successful `edit_file`/`write_file`
+  in that block, coloured like the diff bar and with a sentence for the tooltip.
+  A block that only read or ran commands shows nothing, and a failed edit is not
+  counted. A slim page strips tool arguments, so the view hydrates a round as
+  soon as an `edit_file`/`write_file` lands in it: the header total is there
+  before anything is expanded.
+- **Tokens too.** Next to the counts, muted, the block's spend:
+  `↑3.4k ↓1.6k`. It sums two things: the **model round** that produced each
+  item — `round_complete`
   reports input/output for the whole response, stored as `roundUsage` on the
   round's thought, or on its last tool call when the round thought nothing —
   and any **local spend a tool reported** for rounds it ran itself
@@ -529,3 +557,74 @@ activity, answer — the prose is the separator.
   open block, except the live-only lines above. `thinkingItem` now starts
   collapsed, since the block header is the control.
 - The service-worker cache name moved to `xarness-ui-v30`.
+
+## Opening a long chat: autoload, shapes first
+
+Attaching sends the newest window only (40 messages), and older history
+loads itself as the reader reaches the top of the log — no button. A page is
+*also slim*: tool arguments and output are dropped and reasoning keeps its
+first 160 chars, so scrolling through an old chat is cheap.
+
+- `GET …/events?messages=N` / `GET /v1/sessions/{name}?messages=N` window the
+  snapshot (`message_offset`, `message_total`, `has_more`; no `messages` =
+  the whole history, the TUI's attach). `GET …/messages?before=&limit=&slim=`
+  returns one older `MessagePage`; pass its `start` back as `before` and walk
+  while `has_more`. Read-only, no command lock.
+- `session.history_page` cuts only at user messages, so a tool call is never
+  separated from its result (which would render as `interrupted`) and a
+  turn's footer stays with it; a turn bigger than `limit` ships whole.
+- Why slim is enough: a collapsed activity block draws shapes, counts,
+  LOC/usage totals, so it needs names, statuses and the head of the
+  reasoning — not the text. Expanding the block fetches its rounds' headers
+  (`GET …/messages/{index}?content=false`: reasoning plus tool arguments, no
+  output); expanding a row fetches the output. `Transcript.applyBody` fills
+  the items in place; `app.hydrate` dedupes a round's in-flight requests.
+- `LogView.prepend` builds a page in a detached `LogView` and moves the
+  nodes in above the transcript (nothing on screen is rebuilt; the live
+  block keeps streaming), correcting `scrollTop` by the page's height so the
+  reader stays put — or pinning to the bottom for a reader who never scrolled
+  away from it. `onScroll` calls `loadEarlier` within 600px of the top.
+- `history_replaced` still carries the full snapshot: `/undo`, compaction
+  and `/retry` hand every client the rewritten transcript whole. The
+  service-worker cache name moved to `xarness-ui-v34`.
+
+## Body round: the call's content, not a card about it
+
+The expanded row used to be a stack of labelled boxes — `arguments`,
+`output`, `thought`, `content` — each an uppercase caption over a
+rounded, bordered, surface-filled `<pre>`, indented 25px inside the row.
+Three signals at once read as a card that could not decide what it was, the
+captions repeated what the row already said (`output` above an output,
+`thought` directly under "Thought"), and on a phone the indent plus the
+card's padding plus its border spent ~40px of a 390px line before a single
+glyph.
+
+- **No captions.** `output` and `thought` said nothing the row did not; the
+  argument JSON of an MCP call is dimmed instead of titled, and `content`
+  is a diff. The body is just the content now.
+- **No card.** The surface fill, the 1px border and the 3px radius are gone.
+  The body hangs in the name column (25px, `--row-icon-w` + `--row-gap`, so
+  it follows the mobile gap) and monospace plus colour do the framing. The
+  row connector above is the only vertical line in a block: the thinking
+  body and the live preview each used to draw their own `border-left`, a
+  hair to the right of the connector — that was the second line.
+- **Diffs are diffs.** `edit_file`'s result (an ack line plus a git patch) is
+  split at `diff --git`, the ack dropped, and the patch handed to
+  `diffTree`: old/new line numbers, a tinted `@@` header, and add/del rows
+  with their backgrounds, lexed for the file type. While the call streams,
+  the salvaged `edits` become a provisional `-old`/`+new` patch. `write_file`
+  shows its content as `+` lines in the add tint, with the `created …`
+  ack demoted to a note underneath.
+- **run_bash reads as a terminal.** The command is the prompt line
+  (`$ ls webui && npm test`, the prompt in the success colour), the output
+  follows as-is, and the `[exit N]` the tool always appends becomes a
+  one-line verdict — green `✓ exit 0`, red `✗ exit 2`. A failed call still
+  renders the same way instead of falling back to raw JSON-in/pre-out, and a
+  command that printed a patch (`git diff`) gets the diff view in place of
+  its text. `read_file` lexes its result by extension, lifting the
+  `[showing lines …]` footers out of the code; arguments are only shown for
+  tools the UI has no presentation for.
+- The dead transcript rules (`tool-head`, `tool-dot`, `tool-detail`,
+  `tool-body`, `pill`, `thinking-body`) went with them; `.tool-name`'s
+  weight moved into the `/tools` sheet's own rule. The service-worker cache
+  name moved to `xarness-ui-v47`.

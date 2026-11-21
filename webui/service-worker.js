@@ -1,6 +1,6 @@
 /* App-shell cache. Never touches /v1/*: API responses and event streams must
  * always come from the host. */
-const CACHE = 'xarness-ui-v31';
+const CACHE = 'xarness-ui-v47';
 const SHELL = [
   './',
   'index.html',

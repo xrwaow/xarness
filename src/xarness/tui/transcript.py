@@ -300,11 +300,11 @@ class TurnSummaryItem(TranscriptItem):
     Every number on it is the host's. An ended turn carries them in
     ``Timing.stats`` on its last answer (what a replay renders); a live turn
     gets the same figures on ``TurnEnded``. A finished turn also carries the
-    ``busy``/``idle`` split (the breakdown under the total); a turn cut short
-    reports only how long it ran. ``usage`` is the turn's whole spend, None
-    when the provider reported none. One item type for both paths, and only
-    the host decides a turn is over, so a mid-turn attach and a live turn can
-    never disagree about whether a footer exists."""
+    ``busy``/``idle`` split (the breakdown under the total: generation vs
+    waiting); a turn cut short reports only how long it ran. ``usage`` is the
+    turn's whole spend, None when the provider reported none. One item type
+    for both paths, and only the host decides a turn is over, so a mid-turn
+    attach and a live turn can never disagree about whether a footer exists."""
 
     total: float
     busy: float | None = None

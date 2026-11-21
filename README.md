@@ -716,7 +716,10 @@ scrollable boxes. The composer is a bottom sheet with **Send** in the input
 row and a slim toolbar under it; the slash palette opens as its top band,
 above the pending-changes bar. A diff keeps its indentation; tapping a file
 row scrolls to its patch, and closing it (the patch header, or the same row
-tap) returns to where the list was. The transcript follows
+tap) returns to where the list was. A long chat opens on its newest page
+(40 messages) and older history loads itself as you scroll toward the top;
+those pages carry only shapes and headers, and a block's reasoning and tool
+output is fetched when you expand it. The transcript follows
 new output until you scroll away, and starts following again by itself when
 you scroll back to the bottom (a flick that carries you up is never snapped
 back mid-fling); the reasoning block closes when you
@@ -848,7 +851,8 @@ extended keyboard support; `Alt+Enter` is the portable fallback.
   (`stream_options.include_usage` is requested); otherwise a clearly-labeled
   approximate local estimate is shown. Each turn's footer shows that turn's
   own spend as `↑input ↓output` next to its timing line (`Worked for 5.0s
-  (4.0s | 1.0s) · ↑12.3k ↓456`; a `~` marks an estimate). The status bar keeps
+  (4.0s | 1.0s) · ↑12.3k ↓456`, the split being time spent generating vs
+  waiting on tools and teardown; a `~` marks an estimate). The status bar keeps
   running session totals and context headroom against `max_context`.
   A `subagent` tool row shows the child's own `↑input ↓output` spend while it
   runs and after it finishes.

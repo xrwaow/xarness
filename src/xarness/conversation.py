@@ -213,8 +213,8 @@ class TurnStats(BaseModel):
     not measure its rounds to an end, so ``total`` is the wall clock alone."""
 
     total: float  # the turn's wall clock, as the host timed it
-    busy: float | None = None  # streaming + tool time (finished turns only)
-    idle: float | None = None  # the rest: queueing, teardown
+    busy: float | None = None  # model generation time (finished turns only)
+    idle: float | None = None  # the rest: tools, queueing, teardown
     # The turn's whole token spend, summed over its rounds (None when the
     # provider reported none).
     usage: Usage | None = None
@@ -486,11 +486,11 @@ class Conversation(BaseModel):
 
         The host owns both the boundary and the numbers, and ``Timing.stats``
         is where a client already looks, so every client and reload renders
-        the same footer. ``busy`` is the measured streaming + tool time,
-        omitted for a turn cut short. The turn starts at its opening user
-        message (the last one with a checkpoint, which a steering message
-        lacks). Returns the stats for ``TurnEnded``, or None when there is no
-        answer to stamp."""
+        the same footer. ``busy`` is the time the model spent generating its
+        rounds (tools and queueing are ``idle``), omitted for a turn cut
+        short. The turn starts at its opening user message (the last one with
+        a checkpoint, which a steering message lacks). Returns the stats for
+        ``TurnEnded``, or None when there is no answer to stamp."""
         turn, turn_start = self._last_turn()
         # The turn's last answer, complete or interrupted: the message a
         # footer is drawn under, and the one a reload reads the numbers from.

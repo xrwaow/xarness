@@ -89,6 +89,8 @@ from .views import (  # noqa: F401
     McpScope,
     McpServerInfo,
     McpServerState,
+    MessageBody,
+    MessagePage,
     Mode,
     ModelInfo,
     PartialRound,

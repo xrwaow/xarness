@@ -86,23 +86,70 @@ export class Transcript {
   }
 
   load(snapshot) {
-    this.items = [];
     this.startRound();
-    const messages = snapshot?.messages || [],
-      results = new Map();
-    for (const m of messages) if (m.role === 'tool' && m.tool_call_id) results.set(m.tool_call_id, m);
-    const summaries = turnSummaries(messages),
-      live = snapshot?.status?.state === 'running';
-    for (const m of messages) this.addMessage(m, results, summaries.get(m), live);
+    // A snapshot may be just the newest window; building it like any page and
+    // filling this.toolBlocks keeps its indexes global (and the live round
+    // finds a persisted call).
+    const live = snapshot?.status?.state === 'running';
+    this.items = this.buildMessages(
+      snapshot?.messages || [], live, this.toolBlocks, snapshot?.message_offset || 0,
+    );
     this.loadPartial(snapshot?.partial_round);
     return this.items;
   }
 
-  addMessage(message, results, summary, live) {
+  /** Put a slim page's items in front; nothing here is live-tracked. */
+  prependMessages(messages, { base = 0, lazy = false } = {}) {
+    const items = this.buildMessages(messages, false, new Map(), base, lazy);
+    this.items = [...items, ...this.items];
+    return items;
+  }
+
+  /** Items for a run of whole turns: shared by the snapshot and a page.
+   * `base` is the first message's index in the history; `lazy` marks items
+   * whose text a slim page left out (see applyBody). */
+  buildMessages(messages, live, blocks, base, lazy = false) {
+    const items = [],
+      results = new Map();
+    for (const m of messages) if (m.role === 'tool' && m.tool_call_id) results.set(m.tool_call_id, m);
+    const summaries = turnSummaries(messages);
+    for (const [i, m] of messages.entries())
+      this.addMessage(m, results, summaries.get(m), live, items, blocks, base + i, lazy);
+    return items;
+  }
+
+  /** Fill a lazy round from GET …/messages/{index}. `content` false means
+   * the backend left the tool output out (headers only). */
+  applyBody(index, messages, content = false) {
+    const assistant = messages.find((m) => m.role === 'assistant'),
+      calls = new Map((assistant?.tool_calls || []).map((c) => [c.call_id, c])),
+      results = new Map(messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m])),
+      items = this.items.filter((item) => item.msgIndex === index);
+    for (const item of items) {
+      if (item.kind === 'thinking') {
+        item.text = assistant?.reasoning || '';
+        item.textLoaded = true;
+        continue;
+      }
+      const call = calls.get(item.callId), result = results.get(item.callId);
+      if (!call) continue;
+      item.args = call.arguments_json || '';
+      item.argsLoaded = true;
+      if (result && content) {
+        item.status = toolStatusOf(result.status);
+        item.output = result.content || '';
+        item.usage = result.usage || null;
+        item.outputLoaded = true;
+      }
+    }
+    return items;
+  }
+
+  addMessage(message, results, summary, live, items, blocks, index, lazy) {
     if (message.role === 'user') {
       if (message.is_summary)
-        this.items.push(item('divider', { text: String(messageText(message)).replace(SUMMARY_PREFIX, '').trim() }));
-      else this.items.push(userItem(message));
+        items.push(item('divider', { text: String(messageText(message)).replace(SUMMARY_PREFIX, '').trim() }));
+      else items.push(userItem(message));
       return;
     }
     if (message.role !== 'assistant') return;
@@ -115,17 +162,22 @@ export class Transcript {
         duration: message.timing?.reasoning_seconds ?? null,
         expanded: false,
         tokens: message.usage?.reasoning_tokens ?? null,
+        msgIndex: index,
+        textLoaded: !lazy,
       });
       if (roundUsage) thought.roundUsage = roundUsage;
       roundOwner = thought;
       thoughtOwnsRound = !!roundUsage;
-      this.items.push(thought);
+      items.push(thought);
     }
     if (message.content || (!message.tool_calls && !message.reasoning)) {
-      this.items.push(answerItem({ chunks: [message.content || '(no output)'], finalized: true }));
+      items.push(answerItem({ chunks: [message.content || '(no output)'], finalized: true }));
     }
     for (const call of message.tool_calls || []) {
       const tool = toolItem(call.call_id, call.name, call.arguments_json || '');
+      tool.msgIndex = index;
+      tool.argsLoaded = !lazy;
+      tool.outputLoaded = !lazy;
       const result = results.get(call.call_id);
       if (result) {
         tool.status = toolStatusOf(result.status);
@@ -136,14 +188,14 @@ export class Transcript {
         tool.status = STATUS.FAILED;
         tool.output = 'interrupted';
       }
-      this.toolBlocks.set(call.call_id, tool);
-      this.items.push(tool);
+      blocks.set(call.call_id, tool);
+      items.push(tool);
       if (roundUsage && !thoughtOwnsRound) roundOwner = tool;
     }
     // Same rule as the live reducer: the round's spend sits on its thought, or
     // on the last call it asked for when it thought nothing.
     if (roundOwner && !roundOwner.roundUsage) roundOwner.roundUsage = roundUsage;
-    if (summary) this.items.push(item('footer', { ...summary }));
+    if (summary) items.push(item('footer', { ...summary }));
   }
 
   loadPartial(partial) {

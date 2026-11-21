@@ -543,6 +543,65 @@ def test_clientlib_attach_reads_snapshot_and_events(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_attach_window_and_message_pages_cover_the_history(tmp_path) -> None:
+    """Attaching sends only the tail; pages fetched on demand add up to the
+    whole history exactly once (both on the SSE and the plain route)."""
+    from xarness.clientlib import XarnessClient
+    from xarness.conversation import AssistantMessage
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [])
+            conversation = host.sessions[name].conversation
+            for index in range(30):
+                conversation.add(user_message(f"q{index}"))
+                conversation.add(AssistantMessage(content=f"a{index}"))
+            full = list(conversation.messages)
+
+            client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
+            try:
+                stream = client.attach(name, message_limit=8)
+                first = await asyncio.wait_for(anext(stream), timeout=5)
+                await stream.aclose()
+                assert isinstance(first, Snapshot)
+                assert first.has_more and 0 < first.message_offset
+                assert first.messages == full[first.message_offset:]
+                assert first.message_total == len(full) > len(first.messages)
+
+                collected = list(first.messages)
+                before: int | None = first.message_offset
+                while before:
+                    page = await client.message_page(name, before=before, limit=8)
+                    collected = [*page.messages, *collected]
+                    before = page.start if page.has_more else None
+                assert page.start == 0 and collected == full
+            finally:
+                await client.aclose()
+
+            # The plain snapshot route takes the same window parameter.
+            async with _unix_http(host.unix_socket) as http:
+                response = await http.get(f"/v1/sessions/{name}", params={"messages": 8})
+                page = await http.get(
+                    f"/v1/sessions/{name}/messages",
+                    params={"limit": 8, "slim": "true"},
+                )
+                body = await http.get(
+                    f"/v1/sessions/{name}/messages/1", params={"content": "false"},
+                )
+            window = Snapshot.model_validate(response.json())
+            assert window.has_more
+            assert window.messages == full[window.message_offset:]
+            assert page.json()["slim"] is True
+            assert body.json()["messages"][0]["role"] == "assistant"
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_clientlib_refuses_a_host_that_speaks_another_protocol(
     tmp_path, monkeypatch,
 ) -> None:

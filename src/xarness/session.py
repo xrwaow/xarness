@@ -82,6 +82,8 @@ from .protocol import (
     ContentDelta,
     Event,
     HistoryReason,
+    MessageBody,
+    MessagePage,
     Mode,
     PartialRound,
     ReasoningDelta,
@@ -155,6 +157,51 @@ def _merge_steer(items: list[_QueuedSteer]) -> tuple[str, list[ImageRef] | None,
 
 
 LOG = logging.getLogger(__name__)
+
+# One page of history when the client doesn't ask for a size: a screenful,
+# small enough that a long chat opens as fast as a short one.
+HISTORY_PAGE = 40
+
+
+def history_page(
+    messages: list[Message], *, before: int | None = None,
+    limit: int | None = HISTORY_PAGE,
+) -> tuple[int, int]:
+    """The ``[start, end)`` slice for one page ending at ``before``.
+
+    Pages cut only at user messages (turn starts), so a tool call is never
+    separated from its result and a turn's footer stays with it; a turn
+    bigger than ``limit`` therefore ships whole. ``limit=None`` is the whole
+    history (the TUI's attach), ``before=None`` the newest page."""
+    end = len(messages) if before is None else max(0, min(before, len(messages)))
+    if limit is None:
+        return 0, end
+    # 0 is always a boundary: an old save need not open with a user message.
+    floor = end - max(1, limit)
+    starts = [i for i, m in enumerate(messages) if m.role == "user" and 0 < i <= floor]
+    return max(starts, default=0), end
+
+
+# Characters of reasoning a slim page keeps: enough for a row's snippet and
+# to know the thought existed; the block fetch fills the rest.
+SLIM_REASONING = 160
+
+
+def slim_message(message: Message) -> Message:
+    """One history message without its bulk: tool arguments/output, and all
+    but the head of the reasoning (the client needs that much to draw the
+    thought's shape and row). :meth:`Session.message_body` fills the rest."""
+    if message.role == "assistant":
+        return message.model_copy(update={
+            "reasoning": (message.reasoning or "")[:SLIM_REASONING],
+            "tool_calls": [
+                call.model_copy(update={"arguments_json": ""})
+                for call in message.tool_calls or []
+            ],
+        })
+    if message.role == "tool":
+        return message.model_copy(update={"content": ""})
+    return message
 
 
 def _alive(task: asyncio.Task[None] | None) -> bool:
@@ -617,13 +664,16 @@ class Session:
         if event.type in ("tool_output_delta", "tool_finished"):
             self.partial_round.apply(event)
 
-    def subscribe(self) -> tuple[Snapshot, asyncio.Queue[Event]]:
+    def subscribe(
+        self, *, message_limit: int | None = None,
+    ) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
 
         Synchronous on purpose: no await between building the snapshot and
         registering the queue, so the stream cannot move in between (no
-        gap, no duplicate)."""
-        snapshot = self.snapshot()
+        gap, no duplicate). ``message_limit`` windows the history exactly as
+        :meth:`snapshot` does."""
+        snapshot = self.snapshot(message_limit=message_limit)
         queue: asyncio.Queue[Event] = asyncio.Queue()
         self._subscribers.append(queue)
         return snapshot, queue
@@ -690,15 +740,56 @@ class Session:
             other_clients=others,
         )
 
-    def snapshot(self) -> Snapshot:
-        """Full client-facing state (synchronous; see :meth:`subscribe`).
-        Messages are pydantic models, so they go over the wire as-is."""
-        conversation = self.conversation
+    def snapshot(self, *, message_limit: int | None = None) -> Snapshot:
+        """Client-facing state (synchronous; see :meth:`subscribe`).
+
+        ``message_limit`` windows ``messages`` to the newest page(s) of the
+        history and says where the window starts; ``None`` keeps the whole
+        history (the TUI's attach)."""
+        page = self.message_page(limit=message_limit)
         return Snapshot(
-            messages=list(conversation.messages),
+            messages=page.messages,
             status=self.status(),
             partial_round=self.partial_round or None,
+            message_offset=page.start,
+            message_total=page.total,
+            has_more=page.has_more,
         )
+
+    def message_page(
+        self, *, before: int | None = None, limit: int | None = HISTORY_PAGE,
+        slim: bool = False,
+    ) -> MessagePage:
+        """One page of older history (see :func:`history_page`). ``slim``
+        drops the bodies (see :func:`slim_message`)."""
+        messages = self.conversation.messages
+        start, end = history_page(messages, before=before, limit=limit)
+        page = messages[start:end]
+        return MessagePage(
+            messages=[slim_message(m) for m in page] if slim else page,
+            start=start,
+            total=len(messages),
+            has_more=start > 0,
+            slim=slim,
+        )
+
+    def message_body(self, index: int, *, content: bool = True) -> MessageBody:
+        """The full text of one round: message ``index``, plus the tool
+        results that answered its calls. ``content=False`` leaves those
+        results' text out, so a block can fetch only its row headers."""
+        messages = self.conversation.messages
+        if not 0 <= index < len(messages):
+            raise SessionError(f"no message at index {index}")
+        end = index + 1
+        while end < len(messages) and messages[end].role == "tool":
+            end += 1
+        body = messages[index:end]
+        if not content:
+            body = [
+                m.model_copy(update={"content": ""}) if m.role == "tool" else m
+                for m in body
+            ]
+        return MessageBody(index=index, messages=body)
 
     def last_user_message_at(self) -> str | None:
         """Latest user send_time (see Conversation.last_user_message_at)."""
@@ -1564,7 +1655,9 @@ class Session:
         _start_turn, synchronously before the task existed."""
         self._reset_partial()
         turn_start = time.monotonic()
-        # Streaming + tool time, measured as it happens (see _close_out_turn).
+        # Time the model spent producing its rounds, measured as it happens
+        # (see _close_out_turn). Everything else — tools, compaction,
+        # queueing, teardown — is waiting, i.e. idle.
         busy = 0.0
         outcome = "finished"
         try:
@@ -1582,8 +1675,9 @@ class Session:
                         saw_stream_error = True
                     self._emit(event)
                 # A round is busy from its request to its last event (the
-                # same span the old per-message stamps covered); whatever is
-                # left of the turn is queueing and teardown, i.e. idle.
+                # same span the old per-message stamps covered): that is the
+                # model generating the reply. Tool execution is the client
+                # waiting on work, so it is not busy (see below).
                 busy += time.monotonic() - round_start
                 # A round that ended without finishing — a provider or
                 # transport error, say — still streamed something: keep the
@@ -1610,10 +1704,10 @@ class Session:
                     break
                 # Execute the calls this round requested, in stream order.
                 # Parallel subagents are the one exception (see _execute_calls):
-                # a round that spawns several children runs them together.
-                tool_start = time.monotonic()
+                # a round that spawns several children runs them together. The
+                # model is not generating while a tool runs, so none of this
+                # is busy: it lands in the turn's idle time.
                 await self._execute_calls(done_calls)
-                busy += time.monotonic() - tool_start
                 self._persist()
                 # Steering: anything queued while this round streamed is
                 # injected here — after the tool answers, before the next

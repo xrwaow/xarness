@@ -139,6 +139,17 @@ export class Api {
     return this.request('POST', `${sessionPath(name)}/commands`, { json: command });
   }
 
+  /** One page of older history: pass the previous page's `start` as
+   * `before` and walk while `has_more`; `slim` leaves out the bodies. */
+  messages(name, { before, limit, slim } = {}) {
+    return this.get(`${sessionPath(name)}/messages`, { before, limit, slim });
+  }
+
+  /** One round's text: `content` false fetches the headers only. */
+  body(name, index, content) {
+    return this.get(`${sessionPath(name)}/messages/${index}`, { content });
+  }
+
   async uploadImage(name, data, imageId) {
     await this.request('PUT', `${sessionPath(name)}/images/${imageId}`, {
       body: data,
@@ -159,8 +170,8 @@ export class Api {
     return url;
   }
 
-  async stream(name, { signal, onSnapshot = () => {}, onEvent = () => {}, onOpen = () => {} } = {}) {
-    const response = await fetch(`${sessionPath(name)}/events`, {
+  async stream(name, { signal, messageWindow, onSnapshot = () => {}, onEvent = () => {}, onOpen = () => {} } = {}) {
+    const response = await fetch(`${sessionPath(name)}/events${query({ messages: messageWindow })}`, {
       headers: this.headers({ Accept: 'text/event-stream' }),
       signal,
       cache: 'no-store',

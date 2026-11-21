@@ -243,6 +243,34 @@ class XarnessClient:
             model=protocol.ToolsInfo,
         )
 
+    async def message_page(
+        self, name: str, *, before: int | None = None, limit: int | None = None,
+        slim: bool = False,
+    ) -> protocol.MessagePage:
+        """One page of older history ending before ``before``: pass the
+        previous page's (or the snapshot's) ``start`` and walk while
+        ``has_more``. ``slim`` leaves the bodies for :meth:`message_body`.
+        Omitted ``limit`` means the host's page size."""
+        params: dict[str, Any] = {"slim": str(slim).lower()}
+        if before is not None:
+            params["before"] = before
+        if limit is not None:
+            params["limit"] = limit
+        return await self._get(
+            f"/v1/sessions/{_session_path(name)}/messages", params=params,
+            model=protocol.MessagePage,
+        )
+
+    async def message_body(
+        self, name: str, index: int, *, content: bool = True,
+    ) -> protocol.MessageBody:
+        """One round's full text (see :meth:`Session.message_body`)."""
+        return await self._get(
+            f"/v1/sessions/{_session_path(name)}/messages/{index}",
+            params={"content": str(content).lower()},
+            model=protocol.MessageBody,
+        )
+
     async def diff(
         self, name: str, path: str | None = None, author: str | None = None,
     ) -> protocol.DiffInfo:
@@ -311,20 +339,23 @@ class XarnessClient:
     # ------------------------------------------------------------------
     # attach: SSE with reconnect
 
-    async def attach(self, name: str) -> AsyncIterator[Snapshot | Event]:
+    async def attach(
+        self, name: str, *, message_limit: int | None = None,
+    ) -> AsyncIterator[Snapshot | Event]:
         """Yield a Snapshot, then live Events from one stream connection.
 
-        Every attach starts from a fresh Snapshot. Transport and API errors
-        propagate to the caller, which owns reconnection (and can respawn the
-        host): keeping one recovery layer avoids two loops racing to
-        reattach."""
+        Every attach starts from a fresh Snapshot; ``message_limit`` windows
+        its history (the TUI passes none, keeping the whole transcript).
+        Transport and API errors propagate: the caller owns reconnection."""
         headers = {"Accept": "text/event-stream"}
+        path = f"/v1/sessions/{_session_path(name)}/events"
+        if message_limit is not None:
+            path = f"{path}?messages={int(message_limit)}"
 
         @asynccontextmanager
         async def _response_cm() -> AsyncIterator[httpx.Response]:
             response = await self._request(
-                "GET", f"/v1/sessions/{_session_path(name)}/events",
-                headers=headers, stream=True,
+                "GET", path, headers=headers, stream=True,
             )
             try:
                 yield response

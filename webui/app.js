@@ -20,6 +20,12 @@ const STALL_MS = 12000,
   TICK_MS = 250;
 const DETACH_PX = 40,
   ATTACH_PX = 8;
+// How much history one attach carries. A long chat must open as fast as a
+// short one: the host sends the newest window (whole turns) and older pages
+// are fetched only as the reader reaches for them, at the host's page size.
+const HISTORY_PAGE = 40,
+  // How close to the top of the log (px) triggers the next older page.
+  LOAD_EARLIER_PX = 600;
 const STORAGE = {
   token: 'xarness.token',
   theme: 'xarness.theme',
@@ -203,6 +209,10 @@ class App {
       pendingItem: null,
       pendingSeq: 0,
       phase: 'idle',
+      historyOffset: 0,
+      hasEarlier: false,
+      loadingEarlier: false,
+      bodyPending: new Set(),
       hintItems: [],
       interruptArmed: false,
       interruptTimer: null,
@@ -225,6 +235,7 @@ class App {
     this.view = new LogView(this.log, {
       onUndoTo: (id) => this.undoTo(id),
       resolveImage: (image) => this.resolveImage(image),
+      onNeedBody: (item, content) => this.hydrate(item, content),
     });
   }
   // ---------------------------------------------------------------- boot
@@ -690,12 +701,14 @@ class App {
     if (!name) return;
     this.abortStream();
     this.session = name;
+    this.view.session = name;
     localStorage.setItem(STORAGE.session, name);
     this.setHash(name);
     this.renderTitle();
     this.resetDiff();
     this.diffScopePending = null;
     this.renderDiffBar();
+    this.setHistory();
     this.setConn('connecting');
     const seq = ++this.attachSeq;
     const stale = () => seq !== this.attachSeq || this.session !== name;
@@ -709,6 +722,7 @@ class App {
       try {
         await api.stream(name, {
           signal: controller.signal,
+          messageWindow: HISTORY_PAGE,
           onOpen: () => {
             this.touchStream();
             this.setConn('open');
@@ -788,12 +802,14 @@ class App {
   detach() {
     this.abortStream();
     this.session = null;
+    this.view.session = '';
     localStorage.removeItem(STORAGE.session);
     this.status = null;
     this.setHash(null);
     this.resetDiff();
     this.ask = null;
     this.phase = 'idle';
+    this.setHistory();
     this.pendingItem = null;
     this.hintItems = [];
     this.transcript = new Transcript();
@@ -840,6 +856,8 @@ class App {
 
   loadSnapshot(snapshot, keepStatus = false) {
     this.status = snapshot.status || (keepStatus ? this.status : null);
+    // A snapshot is the newest window (an older host sends no fields: all of it).
+    this.setHistory(snapshot.message_offset || 0, !!snapshot.has_more);
     this.view.renderAll(this.transcript.load(snapshot));
     this.phase = 'idle';
     this.pendingItem = null;
@@ -852,6 +870,73 @@ class App {
     this.syncAsk();
     this.refreshDiff();
     this.scrollToLatest();
+    // Layout can still settle this frame (fonts, markdown, a taller composer):
+    // re-pin, and fill the screen only if the window did not.
+    requestAnimationFrame(() => {
+      if (this.followOutput) this.scheduleScroll();
+      if (this.log.scrollHeight <= this.log.clientHeight) void this.loadEarlier();
+    });
+  }
+
+  /** Track which window of history is loaded; forget in-flight bodies. */
+  setHistory(offset = 0, hasEarlier = false) {
+    Object.assign(this, { historyOffset: offset, hasEarlier, loadingEarlier: false });
+    this.bodyPending.clear();
+  }
+
+  /** Autoload: when the reader nears the top, fetch the page in front of the
+   * window and splice it in above, keeping their place on screen. */
+  async loadEarlier() {
+    const name = this.session;
+    if (!name || !this.hasEarlier || this.loadingEarlier) return;
+    if (this.log.scrollTop > LOAD_EARLIER_PX) return;
+    this.loadingEarlier = true;
+    try {
+      const page = await api.messages(name, { before: this.historyOffset, slim: true }),
+        messages = page.messages || [];
+      if (this.session !== name) return;
+      const height = this.log.scrollHeight,
+        top = this.log.scrollTop;
+      this.view.prepend(
+        this.transcript.prependMessages(messages, { base: page.start ?? 0, lazy: !!page.slim }),
+      );
+      this.historyOffset = page.start ?? 0;
+      this.hasEarlier = !!page.has_more && messages.length > 0;
+      // Keep the reader on the message they were looking at (or on the bottom,
+      // for one who never scrolled away); the stamp makes this scroll ours.
+      this.selfScrollAt = performance.now();
+      this.log.scrollTop = this.followOutput
+        ? this.log.scrollHeight
+        : top + this.log.scrollHeight - height;
+      byId('jump').hidden = this.followOutput;
+    } catch (error) {
+      if (this.session === name) this.addLine(`could not load earlier messages: ${error.message}`, 'warn');
+      this.hasEarlier = false;
+    } finally {
+      this.loadingEarlier = false;
+      requestAnimationFrame(() => void this.loadEarlier());
+    }
+  }
+
+  /** Fetch a slim round's text; `content` false means row headers only.
+   * A filled item is never asked for again, so only the round's parallel
+   * requests need deduping. */
+  async hydrate(item, content = false) {
+    const name = this.session,
+      index = item.msgIndex,
+      key = `${index}:${content ? 1 : 0}`;
+    if (!name || !(index >= 0) || this.bodyPending.has(key)) return;
+    this.bodyPending.add(key);
+    try {
+      const body = await api.body(name, index, content);
+      if (this.session !== name) return;
+      for (const item of this.transcript.applyBody(index, body.messages || [], content))
+        this.view.update(item);
+    } catch {
+      /* stale index (a rewrite) or deleted session: keep the placeholder */
+    } finally {
+      this.bodyPending.delete(key);
+    }
   }
 
   handleEvent(event) {
@@ -1026,6 +1111,7 @@ class App {
     } else if (!this.followOutput && distance <= ATTACH_PX) this.followOutput = true;
     if (this.followOutput) this.scheduleScroll();
     byId('jump').hidden = this.followOutput;
+    if (this.log.scrollTop < LOAD_EARLIER_PX) void this.loadEarlier();
   }
 
   scheduleScroll() {
@@ -1102,6 +1188,9 @@ class App {
       if (height === current) return;
       current = height;
       root.style.setProperty('--composer-h', `${height}px`);
+      // The log's bottom padding just changed under the reader: staying
+      // pinned is the whole point of following the output.
+      if (this.followOutput) this.scheduleScroll();
     };
     if (typeof ResizeObserver === 'function') new ResizeObserver(apply).observe(composer);
     window.addEventListener('resize', apply);
@@ -1112,6 +1201,10 @@ class App {
   tick() {
     this.view.tick(this.transcript.items);
     if (this.pendingItem) this.scheduleScroll();
+    // Late layout (an image, a font, highlighted code) must not leave the
+    // reader short of the bottom while they follow the output.
+    else if (this.followOutput && this.log.scrollHeight - this.log.scrollTop > this.log.clientHeight)
+      this.scheduleScroll();
   }
   // -------------------------------------------------------------- status
   get viewStatus() {

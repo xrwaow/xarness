@@ -3,7 +3,8 @@
 import { el } from './dom.js';
 import { STATUS, formatDuration, formatElapsed, formatTokens, formatUsage } from './state.js';
 import { appendMarkdown } from './markdown.js';
-import { looksLikePatch, patchView } from './diff.js';
+import { diffTree, looksLikePatch, patchView } from './diff.js';
+import { appendHighlighted, specFor } from './highlight.js';
 
 export function tokenText(image) {
   return `[🖼 ${image.name} ${image.width}×${image.height} #${String(image.id || '').slice(0, 4)}]`;
@@ -205,8 +206,8 @@ export function toolDetail(name, argsText, outputText = '') {
 // was, so a long run reads as "bash, read, edit" without a legend; an MCP tool
 // call is a circle in its server's deterministic colour, so one server is
 // recognisable across a turn and reads apart from the built-ins at a glance.
-// The shapes are SVG, not glyphs, so they have real fills and a stroke in the
-// page colour.
+// The shapes are SVG, not glyphs, so they have real fills and an ink-coloured
+// stroke, and each one is nudged, stretched and skewed like a hand-drawn sticker.
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MCP_COLORS = ['#d8648f', '#2fa3a3', '#c08a1f', '#7f6cf0', '#4f9b64', '#d46b3c', '#b168d6', '#4c89d6'];
 // Mid-tone, saturated hues: legible on #fafafa and on #121212 alike.
@@ -237,6 +238,45 @@ function hashText(text) {
   return hash;
 }
 
+// The shape art below is a pure function of the session name and the shape's
+// stable identity, so a reload redraws exactly the same stickers without any of
+// it being stored. `unitHash` just spreads the hash over [0, 1).
+function unitHash(seed, salt) {
+  // FNV-1a over seed + salt, then a final avalanche so neighbouring salts are
+  // no more alike than neighbouring seeds.
+  let hash = 2166136261 >>> 0;
+  for (const ch of `${seed}\u0000${salt}`) {
+    hash = Math.imul(hash ^ ch.codePointAt(0), 16777619) >>> 0;
+  }
+  hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b) >>> 0;
+  hash ^= hash >>> 13;
+  return (hash >>> 0) / 4294967296;
+}
+
+// Shapes sit on the grid but are never quite straight: a little rotation, an
+// independent stretch on each axis and a hint of skew read as drawn by hand.
+const SHAPE_MAX_ROTATION = 12; // degrees
+const SHAPE_MAX_SKEW = 4; // degrees
+const SHAPE_STRETCH = 0.16; // ± on a 1.0 scale
+
+function shapeVariation(session, identity) {
+  const seed = `${session || ''}|${identity || ''}`;
+  const spread = (salt, amount) => (unitHash(seed, salt) * 2 - 1) * amount;
+  return {
+    rotation: spread('rotation', SHAPE_MAX_ROTATION),
+    skew: spread('skew', SHAPE_MAX_SKEW),
+    scaleX: 1 + spread('scale-x', SHAPE_STRETCH),
+    scaleY: 1 + spread('scale-y', SHAPE_STRETCH),
+  };
+}
+
+// Persisted items keep the message index and the provider's call id across a
+// reload; the in-memory item id does not, so seed the art from the former.
+function shapeIdentity(item) {
+  const at = item.msgIndex === undefined || item.msgIndex === null ? `d${item.id}` : `m${item.msgIndex}`;
+  return item.kind === 'tool' ? `${at}:${item.callId || item.name || ''}` : `${at}:think`;
+}
+
 function mcpColor(server) {
   return MCP_COLORS[hashText(server) % MCP_COLORS.length];
 }
@@ -260,7 +300,7 @@ function activityStatus(item) {
   return 'ok';
 }
 
-function shapeIcon(meta, status = 'ok') {
+function shapeIcon(meta, status = 'ok', session = '', identity = '') {
   const svg = document.createElementNS(SVG_NS, 'svg');
   svg.setAttribute('viewBox', '0 0 16 16');
   svg.setAttribute('aria-hidden', 'true');
@@ -272,9 +312,18 @@ function shapeIcon(meta, status = 'ok') {
   const path = document.createElementNS(SVG_NS, 'path');
   path.setAttribute('d', SHAPE_PATHS[meta.kind] || SHAPE_PATHS.tool);
   path.setAttribute('fill', 'currentColor');
-  path.setAttribute('stroke', 'var(--bg)');
-  path.setAttribute('stroke-width', '1.5');
+  // The thick outline is what makes the shapes look like cartoon stickers
+  // rather than UI glyphs. It is ink-dark on the light theme and the panel
+  // border colour on the dark one (see --shape-stroke).
+  path.setAttribute('stroke', 'var(--shape-stroke)');
+  path.setAttribute('stroke-width', '2.1');
   path.setAttribute('stroke-linejoin', 'round');
+  const { rotation, skew, scaleX, scaleY } = shapeVariation(session, identity);
+  path.setAttribute(
+    'transform',
+    `translate(8 8) rotate(${rotation.toFixed(2)}) skewX(${skew.toFixed(2)}) ` +
+      `scale(${scaleX.toFixed(3)} ${scaleY.toFixed(3)}) translate(-8 -8)`,
+  );
   svg.appendChild(path);
   return svg;
 }
@@ -551,43 +600,223 @@ function setDetail(node, text) {
   if (match[3]) node.appendChild(el('span', { class: 'loc-path', text: ` ${match[3]}` }));
 }
 
-function renderToolBody(item, body) {
-  const failed = toolFailed(item);
-  const args = parseArgs(item.args);
-  let argsNode = null,
-    argsLabel = 'arguments';
-  if (!failed && item.name === 'write_file') {
-    const content = args && typeof args.content === 'string' ? args.content : partialString(item.args, 'content', true);
-    if (content) {
-      argsNode = el('pre', { class: 'tool-args', text: content });
-      argsLabel = 'content';
-    }
-  } else if (!failed && item.name === 'edit_file' && !item.output) {
-    const diff = editDiffText(item.args);
-    if (diff) {
-      argsNode = patchView(diff);
-      argsLabel = 'diff';
+/* edit_file/write_file read `+A -D path`: the path stays next to the tool name
+ * and the diff counts are pulled out to the row's right edge, by the state word.
+ * A detail that is only a path (nothing counted yet) is left as it is. */
+const DIFF_COUNTS_RE = /^(\+\d+(?: -\d+)?)(?:\s+([\s\S]*))?$/;
+
+function setRowDetail(row, text, name, failed) {
+  const counted = !failed && (name === 'edit_file' || name === 'write_file');
+  const match = counted && text ? DIFF_COUNTS_RE.exec(text) : null;
+  if (!match) {
+    setDetail(row.args, text);
+    row.loc.replaceChildren();
+    return;
+  }
+  setDetail(row.args, match[2] || '');
+  setDetail(row.loc, match[1]);
+}
+
+// ------------------------------------------------------------- tool bodies
+// An expanded row shows the call's *content* — the terminal, the file it read
+// or wrote, the patch it applied — not a report about it. So there are no
+// "arguments"/"output" headings above the boxes (the row already names the
+// tool and its argument) and no card around them either: the body hangs off
+// the row's rail, monospace and colour do the framing.
+
+const BASH_TOOLS = new Set(['run_bash', 'bash']);
+const EXIT_RE = /^\[exit (\d+)\]$/;
+const SHOWING_RE = /^\[(?:showing lines|this file is larger)[^\]]*\]$/;
+const EDIT_ACK_RE = /^applied .* to .*$/;
+
+function noteLine(text, extra = '') {
+  return el('div', { class: `tool-note ${extra}`.trim(), text });
+}
+
+function languageOf(path) {
+  const base = String(path || '')
+    .split('/')
+    .pop();
+  const dot = base.lastIndexOf('.');
+  const ext = (dot > 0 ? base.slice(dot + 1) : '').toLowerCase();
+  return ext && specFor(ext) ? ext : '';
+}
+
+/** A block of code, lexed for its file type when the path says which. */
+function codeBlock(text, path, extra = '') {
+  const pre = el('pre', { class: `tool-code ${extra}`.trim() });
+  appendHighlighted(pre, text, languageOf(path));
+  return pre;
+}
+
+/** `+line` for every line of a file that was just written: a new-file diff,
+ * with the file's own syntax colours inside the add tint. */
+function addedBlock(text, path) {
+  const pre = el('pre', { class: 'diff tool-added' });
+  const lang = languageOf(path);
+  const lines = textLines(text);
+  if (!lines.length) pre.appendChild(el('span', { class: 'diff-line', text: '(empty file)' }));
+  for (const line of lines) {
+    const row = el('span', { class: 'diff-line add' }, el('span', { class: 'diff-sign', text: '+' }));
+    if (lang) appendHighlighted(row, line, lang);
+    else row.appendChild(document.createTextNode(line));
+    pre.appendChild(row);
+  }
+  return pre;
+}
+
+/** A tool's result as prose + patch: edit_file acks first, then diffs. */
+function splitPatch(text) {
+  const source = String(text || '');
+  const at = source.search(/^(?:diff --git |--- \S)/m);
+  if (at < 0 || !looksLikePatch(source.slice(at))) return { note: source.trim(), patch: '' };
+  return { note: source.slice(0, at).trim(), patch: source.slice(at).trim() };
+}
+
+function patchBlock(patch) {
+  const tree = diffTree(patch);
+  tree.node.classList.add('tool-diff');
+  return tree.node;
+}
+
+function bashBody(item, body, args) {
+  const command = (
+    args && typeof args.command === 'string' ? args.command : partialString(item.args, 'command', true)
+  ).replace(/\s+$/, '');
+  if (command.trim()) {
+    const cmd = el('pre', { class: 'tool-cmd' });
+    cmd.appendChild(el('span', { class: 'tool-prompt', text: '$ ' }));
+    cmd.appendChild(document.createTextNode(command));
+    body.appendChild(cmd);
+  }
+  // run_bash ends every result with `[exit N]`; pulled out of the output it
+  // becomes the one-line verdict the terminal never gives you for free.
+  let output = item.output || '';
+  let exit = '';
+  if (output) {
+    const lines = textLines(output);
+    const last = (lines[lines.length - 1] || '').trim();
+    const match = EXIT_RE.exec(last);
+    if (match) {
+      exit = match[1];
+      lines.pop();
+      output = lines.join('\n');
     }
   }
-  const skipArgs = failed || item.name === 'edit_file' || (item.name === 'read_file' && !!item.output);
-  if (!argsNode && !skipArgs && item.args.trim()) {
-    argsNode = args
-      ? el('pre', { class: 'tool-args', text: JSON.stringify(args, null, 2) })
-      : el('pre', { class: 'tool-args', text: item.args });
+  if (output.trim()) {
+    body.appendChild(looksLikePatch(output) ? patchBlock(output) : el('pre', { class: 'tool-code', text: output }));
   }
-  if (argsNode) {
-    argsNode.setAttribute('aria-label', 'tool arguments');
+  if (exit)
     body.appendChild(
-      el('div', { class: 'tool-block' }, el('span', { class: 'tool-label', text: argsLabel }), argsNode),
+      el(
+        'div',
+        { class: `tool-exit ${exit === '0' ? 'ok' : 'fail'}` },
+        el('span', { class: 'mark', text: exit === '0' ? '✓' : '✗' }),
+        el('span', { text: `exit ${exit}` }),
+      ),
     );
+  if (!command.trim() && !item.output) body.appendChild(noteLine('waiting for the command…'));
+  else if (!output.trim() && !exit && item.status === STATUS.MAKING) body.appendChild(noteLine('running…'));
+}
+
+function writeBody(item, body, args) {
+  const failed = toolFailed(item);
+  const content =
+    args && typeof args.content === 'string' ? args.content : partialString(item.args, 'content', true);
+  if (failed) {
+    if (item.output) body.appendChild(el('pre', { class: 'tool-code tool-error', text: item.output }));
+    else body.appendChild(noteLine('write failed'));
+    return;
   }
+  if (content) body.appendChild(addedBlock(content, args?.path || toolPath(item)));
+  else if (!item.args.trim()) body.appendChild(noteLine('waiting for the content…'));
+  // "created webui/notes.md (80 bytes)" — the part the diff cannot say.
+  if (item.output.trim()) body.appendChild(noteLine(item.output.replace(/\s+$/, '')));
+}
+
+function editBody(item, body) {
+  const failed = toolFailed(item);
+  const { note, patch } = splitPatch(item.output);
+  if (failed) {
+    if (item.output) body.appendChild(el('pre', { class: 'tool-code tool-error', text: item.output }));
+    else body.appendChild(noteLine('edit failed'));
+    return;
+  }
+  if (patch) {
+    body.appendChild(patchBlock(patch));
+    if (note && !EDIT_ACK_RE.test(note)) body.appendChild(noteLine(note));
+    return;
+  }
+  // A result without a patch says why ("(no textual change)") — showing the
+  // provisional patch over it would claim an edit that never happened.
+  if (note) {
+    body.appendChild(noteLine(note));
+    return;
+  }
+  // No result yet: the streamed arguments already spell out the change, so
+  // show that as a provisional patch instead of the raw JSON call.
+  const provisional = editDiffText(item.args);
+  if (provisional) {
+    body.appendChild(patchView(provisional, { className: 'tool-provisional' }));
+    return;
+  }
+  if (item.args.trim()) body.appendChild(el('pre', { class: 'tool-code tool-args', text: item.args }));
+  else body.appendChild(noteLine('waiting for the edit…'));
+}
+
+function readBody(item, body) {
+  if (toolFailed(item)) {
+    body.appendChild(el('pre', { class: 'tool-code tool-error', text: item.output || 'read failed' }));
+    return;
+  }
+  const output = item.output;
+  if (!output.trim()) {
+    body.appendChild(noteLine(item.args.trim() ? 'no output yet' : 'waiting for the path…'));
+    return;
+  }
+  // Large reads come with bracketed footers and an outline preamble that is
+  // prose, not code: lift them out before lexing.
+  const notes = [];
+  const code = textLines(output)
+    .filter((line) => {
+      if (!SHOWING_RE.test(line)) return true;
+      notes.push(line.slice(1, -1));
+      return false;
+    })
+    .join('\n');
+  const outline = /^File outline retrieved\./m.test(output) || /^# File outline for /m.test(output);
+  body.appendChild(
+    outline ? el('pre', { class: 'tool-code tool-args', text: output }) : codeBlock(code, toolPath(item)),
+  );
+  for (const entry of notes) body.appendChild(noteLine(entry));
+}
+
+function genericBody(item, body, args) {
+  const failed = toolFailed(item);
+  const argsText = args ? JSON.stringify(args, null, 2) : String(item.args || '').trim();
+  if (argsText) body.appendChild(el('pre', { class: 'tool-code tool-args', text: argsText }));
   if (item.output) {
-    const out = !failed && looksLikePatch(item.output) ? patchView(item.output) : el('pre', { text: item.output });
-    out.setAttribute('aria-label', 'tool output');
-    body.appendChild(el('div', { class: 'tool-block' }, el('span', { class: 'tool-label', text: 'output' }), out));
+    const out =
+      !failed && looksLikePatch(item.output)
+        ? patchBlock(item.output)
+        : el('pre', { class: `tool-code${failed ? ' tool-error' : ''}`, text: item.output });
+    body.appendChild(out);
   }
-  if (!item.args.trim() && !item.output)
-    body.appendChild(el('div', { class: 'tool-note', text: 'no output yet' }));
+  if (!argsText && !item.output) body.appendChild(noteLine('no output yet'));
+}
+
+function toolPath(item) {
+  const args = parseArgs(item.args);
+  return args && typeof args.path === 'string' ? args.path : partialString(item.args, 'path');
+}
+
+function renderToolBody(item, body) {
+  const args = parseArgs(item.args);
+  if (BASH_TOOLS.has(item.name)) return bashBody(item, body, args);
+  if (item.name === 'write_file') return writeBody(item, body, args);
+  if (item.name === 'edit_file') return editBody(item, body);
+  if (item.name === 'read_file') return readBody(item, body);
+  return genericBody(item, body, args);
 }
 
 /** One run of thinking + tool calls, between two pieces of assistant prose.
@@ -595,7 +824,8 @@ function renderToolBody(item, body) {
  * Collapsed it is a header (aggregate shapes, a generated summary, the current
  * activity and its state) plus an eight-line window on what the current
  * activity is writing. Expanded it lists every activity as shape · name ·
- * arguments; each row opens its own arguments/output. */
+ * arguments; each row opens its own body (the terminal, the code, the
+ * patch). */
 class ActivityBlock {
 
   constructor(view) {
@@ -616,6 +846,9 @@ class ActivityBlock {
     this.usage = el('span', { class: 'activity-usage' });
     this.usageSig = null;
     this.time = el('span', { class: 'activity-time' });
+    // the diff counts, token spend and time flow as one right-aligned cluster:
+    // nothing reserves a slot, so the row sits tight and slides as it changes.
+    this.stats = el('span', { class: 'activity-stats' }, this.loc, this.usage, this.time);
     this.startedAt = null;
     this.frozen = null;
     this.measured = false;
@@ -624,9 +857,7 @@ class ActivityBlock {
       'button',
       { class: 'activity-head', type: 'button', 'aria-expanded': 'false' },
       el('span', { class: 'activity-copy' }, this.title),
-      this.loc,
-      this.usage,
-      this.time,
+      this.stats,
       this.shapes,
     );
     this.list = el('div', { class: 'activity-list', role: 'list' });
@@ -663,6 +894,10 @@ class ActivityBlock {
     const pinned = !!log && this.head.getBoundingClientRect().top <= log.getBoundingClientRect().top + 1;
     this.expanded = !this.expanded;
     this.refresh();
+    if (this.expanded)
+      for (const item of this.items)
+        if (item.textLoaded === false || item.argsLoaded === false)
+          this.view.onNeedBody?.(item, false);
     if (!pinned) return;
     const drift = this.node.getBoundingClientRect().top - log.getBoundingClientRect().top;
     if (drift) log.scrollTop += drift;
@@ -781,20 +1016,26 @@ class ActivityBlock {
     const shape = el('span', { class: 'activity-row-icon' });
     const name = el('span', { class: 'activity-row-name' });
     const args = el('span', { class: 'activity-row-args' });
+    const loc = el('span', { class: 'activity-row-loc' });
     const state = el('span', { class: 'activity-row-state' });
+    const tail = el('span', { class: 'activity-row-tail' }, state, loc);
     const head = el(
       'button',
       { class: 'activity-row-head', type: 'button', 'aria-expanded': 'false' },
       shape,
       el('span', { class: 'activity-row-label' }, name, args),
-      state,
+      tail,
     );
     const body = el('div', { class: 'activity-row-body' });
     const node = el('div', { class: 'activity-row', role: 'listitem' }, head, body);
-    const row = { node, head, shape, name, args, state, body, item, shapeKey: null, signature: null };
+    const row = { node, head, shape, name, args, loc, state, body, item, shapeKey: null, signature: null };
     head.addEventListener('click', () => {
       row.item.expanded = !row.item.expanded;
       this.updateRow(row, row.item);
+      // A slim page left the output out; the row is where it is actually
+      // read, so that is when its text is fetched.
+      if (row.item.expanded && row.item.kind === 'tool' && row.item.outputLoaded === false)
+        this.view.onNeedBody?.(row.item, true);
     });
     return row;
   }
@@ -805,13 +1046,14 @@ class ActivityBlock {
     const shapeKey = `${meta.kind}:${meta.server || ''}:${status}`;
     if (row.shapeKey !== shapeKey) {
       row.shapeKey = shapeKey;
-      row.shape.replaceChildren(shapeIcon(meta, status));
+      row.shape.replaceChildren(shapeIcon(meta, status, this.view.session, shapeIdentity(item)));
     }
     row.state.dataset.state = status;
     row.node.dataset.status = status;
     if (item.kind === 'thinking') {
       row.name.textContent = item.done ? 'Thought' : 'Thinking';
       row.args.textContent = thinkingSnippet(item);
+      row.loc.replaceChildren();
       if (item.done) {
         const stats = [];
         if (item.duration !== null) stats.push(formatDuration(item.duration));
@@ -822,7 +1064,7 @@ class ActivityBlock {
       const failed = toolFailed(item);
       row.name.textContent = displayName(item.name);
       row.name.classList.toggle('failed', failed);
-      setDetail(row.args, failed ? '' : toolDetail(item.name, item.args, item.output));
+      setRowDetail(row, failed ? '' : toolDetail(item.name, item.args, item.output), item.name, failed);
       let text = item.status === STATUS.MAKING ? 'running' : failed ? 'failed' : item.usage ? formatUsage(item.usage) : '';
       const timer = this.toolTime(item);
       if (timer) text = text ? `${text} · ${timer}` : timer;
@@ -839,21 +1081,33 @@ class ActivityBlock {
     row.body.replaceChildren();
     if (!item.expanded) return;
     if (item.kind === 'thinking') {
+      // the row says "Thought" — a "thought" heading under it said nothing
       row.body.appendChild(
-        el(
-          'div',
-          { class: 'tool-block' },
-          el('span', { class: 'tool-label', text: 'thought' }),
-          el('pre', { class: 'tool-args', text: item.text || '(no reasoning text)' }),
-        ),
+        item.text.trim()
+          ? el('pre', { class: 'tool-code tool-thought', text: item.text })
+          : noteLine('no reasoning text'),
       );
       return;
     }
     renderToolBody(item, row.body);
   }
 
-  // `+12 -3` sits between the summary and the state word, and only appears when
-  // the block actually wrote to a file.
+  // A slim history page ships tool calls without their arguments, so a
+  // collapsed block could not total its edits (or its writes) until someone
+  // opened the round. Fetch the arguments as soon as an edit lands in the
+  // block; the request is per round and deduped while it is in flight.
+  hydrateEdits() {
+    for (const item of this.items)
+      if (
+        item.kind === 'tool' &&
+        item.argsLoaded === false &&
+        (item.name === 'edit_file' || item.name === 'write_file')
+      )
+        this.view.onNeedBody?.(item, false);
+  }
+
+  // `+12 -3` leads the header's right cluster, and only appears when the block
+  // actually wrote to a file.
   updateLoc() {
     const stats = activityLocStats(this.items);
     const signature = stats ? `${stats.adds}:${stats.dels}` : '';
@@ -899,6 +1153,7 @@ class ActivityBlock {
     this.node.classList.toggle('open', this.expanded);
     this.head.setAttribute('aria-expanded', this.expanded ? 'true' : 'false');
     this.syncHeadHeight();
+    this.hydrateEdits();
     // a running bash row counts its seconds up on every tick
     for (const row of this.rows.values())
       if (isBash(row.item) && row.item.status === STATUS.MAKING) this.updateRow(row, row.item);
@@ -935,7 +1190,11 @@ class ActivityBlock {
       this.inlineShape = null;
       this.title.classList.toggle('single', inline);
       for (const { item, meta, status } of parts) {
-        const shape = el('span', { class: 'activity-shape', title: shapeTitle(item) }, shapeIcon(meta, status));
+        const shape = el(
+          'span',
+          { class: 'activity-shape', title: shapeTitle(item) },
+          shapeIcon(meta, status, this.view.session, shapeIdentity(item)),
+        );
         if (inline) {
           this.inlineShape = shape;
           this.title.appendChild(shape);
@@ -971,14 +1230,18 @@ const TRANSIENT_KINDS = new Set(['pending']);
 
 export class LogView {
 
-  constructor(root, { onUndoTo = null, resolveImage = null } = {}) {
+  constructor(root, { onUndoTo = null, resolveImage = null, onNeedBody = null, session = '' } = {}) {
     this.root = root;
+    // Seeds every shape's hand-drawn variation. The app sets it on attach; a
+    // prepend buffer inherits it from the view it is built from.
+    this.session = session;
     this.nodes = new Map();
     this.blockOf = new Map();
     this.openBlock = null;
     this.transientNode = null;
     this.onUndoTo = onUndoTo;
     this.resolveImage = resolveImage;
+    this.onNeedBody = onNeedBody;
     this.welcome = el(
       'div',
       { class: 'welcome' },
@@ -1071,6 +1334,17 @@ export class LogView {
     this.reset();
     for (const item of items) this.update(item);
     if (!items.length) this.root.appendChild(this.welcome);
+  }
+
+  /** Insert a page of older items above everything else, built in a detached
+   * buffer so historical items never join the live block or its updates. */
+  prepend(items) {
+    if (!items?.length) return;
+    const buffer = new LogView(document.createElement('div'), this);
+    buffer.renderAll(items);
+    // childNodes is live: copy it before moving the run in front of the log.
+    this.root.prepend(...buffer.root.childNodes);
+    for (const map of ['nodes', 'blockOf']) for (const [id, value] of buffer[map]) this[map].set(id, value);
   }
 
   reset() {
