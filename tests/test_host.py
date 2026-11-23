@@ -112,6 +112,84 @@ def test_create_session_creates_missing_workspace(tmp_path) -> None:
     asyncio.run(go())
 
 
+def test_workspace_diff_needs_no_session(tmp_path, monkeypatch) -> None:
+    """A draft chat's /diff: tracking is per repo root, so the workspace
+    endpoint answers with the same payload a session's /diff would — and
+    the rows are labelled for no viewer (nothing is ``mine`` before a
+    session exists)."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            ws = tmp_path / "ws"
+            ws.mkdir()
+            state = WorkspaceState(
+                root=ws, git_dir=ws / ".git", baseline_tree="t" * 40,
+            )
+            seen_scopes: list[str] = []
+
+            async def fake_open(root, *, allow_init=True, persist=True):
+                return state
+
+            async def fake_observe():
+                return "h" * 40
+
+            async def fake_diff(viewer=None, current=None, path=None, scope="all"):
+                assert viewer is None, "a draft has no session to label rows for"
+                seen_scopes.append(scope)
+                return protocol.DiffInfo(
+                    files=[protocol.DiffFileInfo(
+                        path="a.txt", additions=1, deletions=0, is_new=True,
+                        kind="agent",
+                    )],
+                    additions=1,
+                )
+
+            async def fake_text(path, current=None, author=None):
+                return f"diff for {path}"
+
+            state.observe = fake_observe
+            state.diff = fake_diff
+            state.file_diff = fake_text
+            monkeypatch.setattr(host_mod, "open_workspace", fake_open)
+            async with _unix_http(host.unix_socket) as http:
+                whole = await http.get(
+                    "/v1/workspaces/diff", params={"workspace": str(ws)},
+                )
+                per_file = await http.get(
+                    "/v1/workspaces/diff",
+                    params={"workspace": str(ws), "path": "a.txt"},
+                )
+                scoped = await http.get(
+                    "/v1/workspaces/diff",
+                    params={"workspace": str(ws), "scope": "mine"},
+                )
+                missing = await http.get(
+                    "/v1/workspaces/diff",
+                    params={"workspace": str(tmp_path / "nope")},
+                )
+            assert whole.status_code == 200, whole.text
+            assert whole.json()["tracking"] is True
+            assert whole.json()["files"][0]["path"] == "a.txt"
+            assert whole.json()["text"] == ""
+            assert per_file.status_code == 200, per_file.text
+            assert per_file.json()["text"] == "diff for a.txt"
+            # The chip's scope rides the query, exactly as it does on a
+            # session's /diff.
+            assert scoped.status_code == 200, scoped.text
+            assert seen_scopes == ["all", "all", "mine"]
+            # A workspace that isn't there is no error: just nothing tracked.
+            assert missing.status_code == 200, missing.text
+            assert missing.json()["tracking"] is False
+            # Nothing was created or hosted: the panel needs no session.
+            assert host.sessions == {}
+        finally:
+            task.cancel()
+
+    asyncio.run(go())
+
+
 def test_diff_info_includes_text_for_path_requests(tmp_path) -> None:
     """The per-file click-through needs the unified diff text: a path-
     specific /diff request must populate DiffInfo.text, while the summary
@@ -562,7 +640,7 @@ def test_attach_window_and_message_pages_cover_the_history(tmp_path) -> None:
 
             client = await XarnessClient.connect_unix(host.unix_socket, spawn=False)
             try:
-                stream = client.attach(name, message_limit=8)
+                stream = client.attach(name, window="[-8:]")
                 first = await asyncio.wait_for(anext(stream), timeout=5)
                 await stream.aclose()
                 assert isinstance(first, Snapshot)
@@ -571,21 +649,27 @@ def test_attach_window_and_message_pages_cover_the_history(tmp_path) -> None:
                 assert first.message_total == len(full) > len(first.messages)
 
                 collected = list(first.messages)
-                before: int | None = first.message_offset
-                while before:
-                    page = await client.message_page(name, before=before, limit=8)
+                window: str | None = (
+                    f"[{max(0, first.message_offset - 8)}:{first.message_offset}]"
+                    if first.has_more else None
+                )
+                while window:
+                    page = await client.message_page(name, window=window)
                     collected = [*page.messages, *collected]
-                    before = page.start if page.has_more else None
+                    window = (
+                        f"[{max(0, page.start - 8)}:{page.start}]"
+                        if page.has_more else None
+                    )
                 assert page.start == 0 and collected == full
             finally:
                 await client.aclose()
 
             # The plain snapshot route takes the same window parameter.
             async with _unix_http(host.unix_socket) as http:
-                response = await http.get(f"/v1/sessions/{name}", params={"messages": 8})
+                response = await http.get(f"/v1/sessions/{name}", params={"range": "[-8:]"})
                 page = await http.get(
                     f"/v1/sessions/{name}/messages",
-                    params={"limit": 8, "slim": "true"},
+                    params={"range": "[-8:]", "slim": "true"},
                 )
                 body = await http.get(
                     f"/v1/sessions/{name}/messages/1", params={"content": "false"},
@@ -858,6 +942,61 @@ def test_tui_end_to_end_draft_flow(tmp_path) -> None:
                 assert not [e for e in app._flow_model.entries
                             if isinstance(e.item, tflow.LineItem)
                             and e.item.kind == "error"]
+            await client.aclose()
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_tui_sessions_picker_follows_the_pushed_list(tmp_path) -> None:
+    """End to end: an open /sessions picker is fed by GET /v1/events, so a
+    session created by anyone (another client, a subagent) shows up in the
+    modal as it happens, with no listing poll."""
+    from textual.widgets import OptionList
+
+    from xarness.clientlib import XarnessClient
+    from xarness.tui.app import AgentApp
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            await _make_session(host, tmp_path, [[RoundComplete()]])
+            client = await XarnessClient.connect_unix(
+                host.unix_socket, spawn=False,
+            )
+            app = AgentApp(client, workspace=tmp_path / "ws")
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.pause()
+                await app._open_sessions_async()
+                await pilot.pause()
+                picker = app.screen
+                option_list = picker.query_one("#picker-list", OptionList)
+
+                def rows() -> list[str]:
+                    return [
+                        str(option_list.get_option_at_index(index).prompt)
+                        for index in range(option_list.option_count)
+                    ]
+
+                # The picker opened on the listing fetch; its stream then
+                # re-snapshots the same one row.
+                self_rows = [row for row in rows() if row.strip()]
+                assert len(self_rows) == 1, rows()
+                assert "idle" in self_rows[0]
+
+                # A second session appears in the same workspace: the host
+                # pushes its summary, the open modal gains the row.
+                await host.create_session(protocol.CreateSessionRequest(
+                    workspace=str(tmp_path / "ws")))
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    await pilot.pause()
+                    if len([row for row in rows() if row.strip()]) == 2:
+                        break
+                assert len([row for row in rows() if row.strip()]) == 2, rows()
             await client.aclose()
         finally:
             await host.request_shutdown()
@@ -1194,6 +1333,26 @@ def test_idle_session_is_released_and_listed_as_saved(tmp_path, monkeypatch) -> 
     asyncio.run(go())
 
 
+def test_session_listing_takes_a_range(tmp_path) -> None:
+    """``range`` slices the recency-sorted listing; a malformed window is a
+    400 naming the syntax instead of a traceback."""
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            async with _unix_http(host.unix_socket) as http:
+                bad = await http.get("/v1/sessions", params={"range": "nope"})
+                assert bad.status_code == 400
+                assert "range" in bad.json()["detail"]
+                rows = await http.get("/v1/sessions", params={"range": "[:]"})
+                assert rows.status_code == 200 and rows.json() == []
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_concurrent_load_yields_one_session(tmp_path) -> None:
     """Two simultaneous loads of the same saved session must share one
     Session object (no duplicate sandbox / tracking)."""
@@ -1346,6 +1505,7 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
 
             # No git info: totals stay zero, listing still works.
             session.workspace_state = None
+            await host.refresh_stats()
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions, row.tracking) == (0, 0, False)
@@ -1370,19 +1530,22 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
 
             monkeypatch.setattr(gitwork, "tree_diff_stat", fake_diff_stat)
             session.workspace_state = fake_state(name)
+            await host.refresh_stats()
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
             assert (row.additions, row.deletions) == (10, 3)
             assert row.tracking is True
 
-            # A failing stat must not break the listing.
+            # A failing stat keeps the last cached totals and never breaks
+            # the listing.
             async def broken_diff_stat(repo, base, other):
                 raise RuntimeError("git blew up")
 
             monkeypatch.setattr(gitwork, "tree_diff_stat", broken_diff_stat)
+            await host.refresh_stats()
             rows = await host.list_sessions(stats=True)
             row = next(r for r in rows if r.name == name)
-            assert (row.additions, row.deletions) == (0, 0)
+            assert (row.additions, row.deletions) == (10, 3)
 
             # Saved (not hosted) sessions get no totals at all: the
             # persisted numbers would be stale, so they stay blank.
@@ -1405,6 +1568,304 @@ def test_session_listing_stats_fill_pending_diff_totals(tmp_path, monkeypatch) -
             await host.request_shutdown()
             if not task.done():
                 task.cancel()
+
+    asyncio.run(go())
+
+
+def test_hosting_a_session_schedules_its_totals_refresh(
+    tmp_path, monkeypatch,
+) -> None:
+    """A session entering the host has no computed totals yet, so the list
+    is told to recompute at once: a row that showed numbers as saved must not
+    drop to +0 -0 the moment it is opened."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            monkeypatch.setattr(host_mod, "STATS_DEBOUNCE_SECONDS", 0.01)
+            refreshed: list[str] = []
+
+            async def fake_refresh(state):
+                refreshed.append(str(state.root))
+
+            monkeypatch.setattr(host, "_refresh_stats", fake_refresh)
+            host.watch_sessions()  # someone is looking at the list
+            (tmp_path / "ws").mkdir()
+            summary = await host.create_session(protocol.CreateSessionRequest(
+                workspace=str(tmp_path / "ws"), enable_tracking=True,
+            ))
+            await asyncio.sleep(0.1)
+            assert refreshed, "creating a session did not schedule a refresh"
+
+            refreshed.clear()
+            await host.unload_session(summary.name)
+            await host.load_session(summary.name)
+            await asyncio.sleep(0.1)
+            assert refreshed, "loading a session did not schedule a refresh"
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_the_listing_never_runs_git(tmp_path) -> None:
+    """GET /v1/sessions is a pure read: hosted summaries come from memory,
+    saved rows from the metas, and the +/- totals from the cache. A poll
+    used to run one worktree snapshot and N diffs."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [[RoundComplete()]])
+            session = host.sessions[name]
+
+            async def no_git(*args, **kwargs):
+                raise AssertionError("the listing ran git")
+
+            state = WorkspaceState(
+                root=tmp_path, git_dir=tmp_path / ".git", baseline_tree="x",
+                persist=False,
+            )
+            state.observe = no_git
+            state.diff = no_git
+            session.workspace_state = state
+            session.pending_additions, session.pending_deletions = 4, 2
+
+            rows = await host.list_sessions(stats=True)
+            row = next(r for r in rows if r.name == name)
+            assert row.tracking is True
+            assert (row.additions, row.deletions) == (4, 2)
+            assert row.hosted is True
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_a_saved_sessions_row_is_computed_without_hosting_it(
+    tmp_path, monkeypatch,
+) -> None:
+    """A saved row's own totals come from the workspace's saved baseline.
+
+    The listing never runs git, so a client that wants the numbers for one
+    saved row asks for that row: the host computes one diff scoped to this
+    session (and its saved subagents) instead of hosting it. Hovering must
+    never fill the server view with idle sessions nobody opened."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [[RoundComplete()]])
+            await host.unload_session(name)
+            assert name not in host.sessions
+
+            calls: list[str] = []
+
+            async def fake_observe() -> str:
+                return "current"
+
+            async def fake_diff(
+                viewer=None, current=None, path=None, scope="all",
+            ):
+                calls.append(scope)
+                return protocol.DiffInfo(tracking=True, files=[
+                    protocol.DiffFileInfo(
+                        path="mine.py", additions=7, deletions=2, author=name,
+                    ),
+                    protocol.DiffFileInfo(
+                        path="other.py", additions=100, deletions=100,
+                        author="someone-else",
+                    ),
+                ])
+
+            state = WorkspaceState(
+                root=tmp_path / "ws", git_dir=tmp_path / ".git",
+                baseline_tree="x", persist=False,
+            )
+            state.observe = fake_observe
+            state.diff = fake_diff
+            opened: list[Path] = []
+
+            async def fake_open(workspace, **kwargs):
+                opened.append(workspace)
+                return state
+
+            monkeypatch.setattr(host, "open_workspace", fake_open)
+            monkeypatch.setattr(
+                host_mod, "has_workspace_state", lambda workspace: True,
+            )
+
+            row = await host.session_summary(name)
+            assert row is not None
+            assert row.hosted is False and row.state == "saved"
+            assert row.tracking is True
+            # Only this session's rows, not the rest of the workspace's.
+            assert (row.additions, row.deletions) == (7, 2)
+            assert calls == ["mine"]
+            assert opened  # the saved baseline was read…
+            assert name not in host.sessions  # …and nothing was hosted
+
+            # A second peek within the TTL reuses the diff: no new snapshot.
+            calls.clear()
+            again = await host.session_summary(name)
+            assert (again.additions, again.deletions) == (7, 2)
+            assert calls == []
+
+            # A hosted session answers from memory (its totals are pushed).
+            hosted = await host.load_session(name)
+            hosted.pending_additions, hosted.pending_deletions = 3, 1
+            row = await host.session_summary(name)
+            assert row.hosted is True
+            assert (row.additions, row.deletions) == (3, 1)
+
+            assert await host.session_summary("nope") is None
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_session_summary_route_does_not_load_the_session(tmp_path) -> None:
+    """GET /v1/sessions/{name}/summary is the read-only row a hover makes:
+    it answers for a saved session and leaves it saved."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            name = await _make_session(host, tmp_path, [[RoundComplete()]])
+            await host.unload_session(name)
+            async with _unix_http(host.unix_socket) as http:
+                response = await http.get(f"/v1/sessions/{name}/summary")
+                assert response.status_code == 200, response.text
+                row = response.json()
+                assert row["name"] == name
+                assert row["hosted"] is False and row["state"] == "saved"
+                assert name not in host.sessions
+                missing = await http.get("/v1/sessions/nope/summary")
+                assert missing.status_code == 404
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_watch_sessions_pushes_the_list_snapshot_then_deltas(tmp_path) -> None:
+    """GET /v1/events: one snapshot, then the rows that changed — no poll.
+
+    A create, an attach (which changes ``clients_attached``) and an unload
+    each reach the client as they happen."""
+    from xarness.clientlib import XarnessClient
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            client = await XarnessClient.connect_unix(
+                host.unix_socket, spawn=False,
+            )
+            try:
+                stream = client.watch_sessions()
+                first = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(first, protocol.SessionsSnapshot)
+                assert first.sessions == []
+
+                name = await _make_session(host, tmp_path, [[RoundComplete()]])
+                added = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(added, protocol.SessionSummaryChanged)
+                assert added.summary.name == name
+                assert added.summary.hosted is True
+
+                # Attaching is a state change too (clients_attached).
+                session = host.sessions[name]
+                queue = session.subscribe()[1]
+                changed = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(changed, protocol.SessionSummaryChanged)
+                assert changed.summary.clients_attached == 1
+                session.unsubscribe(queue)
+                left = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(left, protocol.SessionSummaryChanged)
+                assert left.summary.clients_attached == 0
+
+                await host.unload_session(name)
+                released = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(released, protocol.SessionSummaryChanged)
+                assert released.summary.name == name
+                assert released.summary.hosted is False
+                assert released.summary.state == "saved"
+                # It is still on disk, so it is still listed as a saved row.
+                listed = await host.list_sessions()
+                assert [(r.name, r.hosted) for r in listed] == [(name, False)]
+
+                # Deleting the saved file is the one thing that removes the
+                # row for good.
+                assert (await host.delete_session(name)).deleted
+                gone = await asyncio.wait_for(anext(stream), timeout=5)
+                assert isinstance(gone, protocol.SessionsRemoved)
+                assert gone.names == [name]
+                assert await host.list_sessions() == []
+            finally:
+                await client.aclose()
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_creating_and_loading_a_session_never_waits_for_mcp(
+    tmp_path, monkeypatch,
+) -> None:
+    """A broken MCP server can take its whole startup timeout: neither the
+    create/load response nor the attach snapshot may wait for it."""
+    from xarness.mcp import McpManager
+    from xarness.session import Session
+
+    release = asyncio.Event()
+
+    async def handshake(self) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(Session, "prepare_mcp", handshake)
+    monkeypatch.setattr(
+        McpManager, "has_enabled_servers", property(lambda self: True),
+    )
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            summary = await asyncio.wait_for(
+                host.create_session(protocol.CreateSessionRequest(
+                    workspace=str(tmp_path / "ws"))),
+                timeout=5,
+            )
+            session = host.sessions[summary.name]
+            assert session._mcp_task is not None
+            assert not session._mcp_task.done()
+
+            name = summary.name
+            await asyncio.wait_for(host.unload_session(name), timeout=5)
+            loaded = await asyncio.wait_for(host.load_session(name), timeout=5)
+            assert loaded.name == name
+            assert loaded._mcp_task is not None
+            assert not loaded._mcp_task.done()
+        finally:
+            await host.request_shutdown()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(go())
 

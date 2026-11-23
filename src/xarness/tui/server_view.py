@@ -106,12 +106,6 @@ def _counted(count: int, noun: str) -> str:
     return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
-def _state(summary: SessionSummary) -> str:
-    """A hosted but inactive session reads ``idle``: ``saved`` is the
-    listing's word for "on disk", not for a warm session the host holds."""
-    return "idle" if summary.state == "saved" else summary.state
-
-
 class ServerDashboard(App[None]):
     """Live host stats, with a stop button.
 
@@ -369,7 +363,11 @@ class ServerDashboard(App[None]):
                             style=p["muted"])
             return Text(_fit(summary.name, width), style=p["text"])
         if key == "state":
-            word, colour = STATE_WORDS.get(_state(summary),
+            # The host's summary is the truth: a hosted session reads idle,
+            # running, waiting, ask or compacting — never saved (that word
+            # is for a session that is only on disk, and this dashboard only
+            # lists hosted ones).
+            word, colour = STATE_WORDS.get(summary.state,
                                            (summary.state, "muted"))
             return Text(word, style=p[colour], justify=align)
         if key in ("in", "out"):

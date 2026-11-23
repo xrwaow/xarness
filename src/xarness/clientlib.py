@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 from pydantic import ValidationError
@@ -206,12 +206,36 @@ class XarnessClient:
             "workspace": workspace, "path": path, "add": add,
         }, model=protocol.RefInfo, many=True)
 
+    @staticmethod
+    def _diff_params(path: str | None, author: str | None) -> dict[str, str]:
+        """The row-selecting query both /diff endpoints share (httpx would
+        send an unset one as an empty string, not omit it)."""
+        return {
+            key: value for key, value in (("path", path), ("author", author))
+            if value
+        }
+
+    async def workspace_diff(
+        self, workspace: str, path: str | None = None,
+        author: str | None = None, scope: protocol.DiffScope = "all",
+    ) -> protocol.DiffInfo:
+        """A workspace's pending changes with no session attached (a draft
+        chat's /diff): tracking is per repo root."""
+        return await self._get(
+            "/v1/workspaces/diff",
+            params={
+                "workspace": workspace, "scope": scope,
+                **self._diff_params(path, author),
+            },
+            model=protocol.DiffInfo,
+        )
+
     # ------------------------------------------------------------------
     # sessions
 
     async def sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
-        stats: bool = False,
+        stats: bool = False, window: str | None = None,
     ) -> list[SessionSummary]:
         params: dict[str, Any] = {}
         if active is not None:
@@ -220,8 +244,21 @@ class XarnessClient:
             params["workspace"] = workspace
         if stats:
             params["stats"] = "true"
+        if window is not None:
+            params["range"] = window
         return await self._get(
             "/v1/sessions", params=params, model=SessionSummary, many=True,
+        )
+
+    async def session_summary(self, name: str) -> SessionSummary:
+        """One session's listing row, with its own pending totals.
+
+        Read-only: unlike :meth:`snapshot` it does not host a saved session,
+        so a client can peek at a row (a hover, a status fetch) without
+        turning it into an idle hosted one."""
+        return await self._get(
+            f"/v1/sessions/{_session_path(name)}/summary",
+            model=SessionSummary,
         )
 
     async def create_session(
@@ -244,18 +281,15 @@ class XarnessClient:
         )
 
     async def message_page(
-        self, name: str, *, before: int | None = None, limit: int | None = None,
-        slim: bool = False,
+        self, name: str, *, window: str | None = None, slim: bool = False,
     ) -> protocol.MessagePage:
-        """One page of older history ending before ``before``: pass the
-        previous page's (or the snapshot's) ``start`` and walk while
-        ``has_more``. ``slim`` leaves the bodies for :meth:`message_body`.
-        Omitted ``limit`` means the host's page size."""
+        """One page of history: ``window`` is a Python-style slice, e.g.
+        ``[-40:]`` for the newest page (the default when omitted). Walk back
+        by asking for ``[start-N:start]`` while ``has_more``. ``slim`` leaves
+        the bodies for :meth:`message_body`."""
         params: dict[str, Any] = {"slim": str(slim).lower()}
-        if before is not None:
-            params["before"] = before
-        if limit is not None:
-            params["limit"] = limit
+        if window is not None:
+            params["range"] = window
         return await self._get(
             f"/v1/sessions/{_session_path(name)}/messages", params=params,
             model=protocol.MessagePage,
@@ -274,12 +308,9 @@ class XarnessClient:
     async def diff(
         self, name: str, path: str | None = None, author: str | None = None,
     ) -> protocol.DiffInfo:
-        params = {
-            key: value for key, value in (("path", path), ("author", author))
-            if value
-        }
         return await self._get(
-            f"/v1/sessions/{_session_path(name)}/diff", params=params or None,
+            f"/v1/sessions/{_session_path(name)}/diff",
+            params=self._diff_params(path, author) or None,
             model=protocol.DiffInfo,
         )
 
@@ -339,45 +370,82 @@ class XarnessClient:
     # ------------------------------------------------------------------
     # attach: SSE with reconnect
 
-    async def attach(
-        self, name: str, *, message_limit: int | None = None,
-    ) -> AsyncIterator[Snapshot | Event]:
-        """Yield a Snapshot, then live Events from one stream connection.
+    @asynccontextmanager
+    async def _stream(self, path: str) -> AsyncIterator[httpx.Response]:
+        """One SSE response, closed on every exit path."""
+        response = await self._request(
+            "GET", path, headers={"Accept": "text/event-stream"}, stream=True,
+        )
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
-        Every attach starts from a fresh Snapshot; ``message_limit`` windows
-        its history (the TUI passes none, keeping the whole transcript).
-        Transport and API errors propagate: the caller owns reconnection."""
-        headers = {"Accept": "text/event-stream"}
-        path = f"/v1/sessions/{_session_path(name)}/events"
-        if message_limit is not None:
-            path = f"{path}?messages={int(message_limit)}"
+    async def _sse_items(
+        self, path: str, snapshot_model: type[Any], event_adapter: Any, *,
+        label: str, frame: str,
+    ) -> AsyncIterator[Any]:
+        """The snapshot frame, then the event frames of one SSE stream.
 
-        @asynccontextmanager
-        async def _response_cm() -> AsyncIterator[httpx.Response]:
-            response = await self._request(
-                "GET", path, headers=headers, stream=True,
-            )
-            try:
-                yield response
-            finally:
-                await response.aclose()
-
-        async with _response_cm() as response:
+        Both host streams (a session's and the session list's) share this
+        shape; only the models and the error wording differ. Unknown frame
+        kinds are ignored (forward compatibility)."""
+        async with self._stream(path) as response:
             if response.status_code != 200:
                 raise ClientError(
-                    f"attach failed: HTTP {response.status_code}: "
+                    f"{label} failed: HTTP {response.status_code}: "
                     f"{self._error_detail(response)}",
                     status=response.status_code,
                 )
             async for kind, data in _read_sse(response):
                 if kind == "snapshot":
-                    yield Snapshot.model_validate(data)
+                    yield snapshot_model.model_validate(data)
                 elif kind == "event":
                     try:
-                        yield protocol.EVENT_ADAPTER.validate_python(data)
+                        yield event_adapter.validate_python(data)
                     except ValidationError as exc:
-                        raise ClientError(f"invalid event frame: {exc}") from None
-                # Unknown frame kinds are ignored (forward compatibility).
+                        raise ClientError(
+                            f"invalid {frame} frame: {exc}",
+                        ) from None
+
+    async def attach(
+        self, name: str, *, window: str | None = None, slim: bool = False,
+    ) -> AsyncIterator[Snapshot | Event]:
+        """Yield a Snapshot, then live Events from one stream connection.
+
+        Every attach starts from a fresh Snapshot; ``window`` selects its
+        history slice (a Python-style range, e.g. ``[-40:]``). Omitted, the
+        whole transcript is sent (the TUI's attach). ``slim`` drops tool
+        bodies and truncates reasoning (rows hydrate on demand).
+        Transport and API errors propagate: the caller owns reconnection."""
+        path = f"/v1/sessions/{_session_path(name)}/events"
+        params: dict[str, str] = {}
+        if window is not None:
+            params["range"] = window
+        if slim:
+            params["slim"] = "true"
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        async for item in self._sse_items(
+            path, Snapshot, protocol.EVENT_ADAPTER,
+            label="attach", frame="event",
+        ):
+            yield item
+
+    async def watch_sessions(
+        self,
+    ) -> AsyncIterator[protocol.SessionsSnapshot | protocol.SessionsEvent]:
+        """Yield the session list snapshot, then its deltas.
+
+        The host-wide counterpart of :meth:`attach` for the home screen and
+        the /sessions picker. Transport and API errors propagate: the caller
+        owns reconnection (a reconnect always gets a fresh snapshot)."""
+        async for item in self._sse_items(
+            "/v1/events", protocol.SessionsSnapshot,
+            protocol.SESSIONS_EVENT_ADAPTER,
+            label="session stream", frame="session event",
+        ):
+            yield item
 
     # ------------------------------------------------------------------
     # plumbing

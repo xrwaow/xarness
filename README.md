@@ -413,9 +413,15 @@ shows the same scope, with a chip clicked in a draft carrying over to the
 session it starts. The chip stays a view filter: `/diff <path>`, `/accept`,
 `/reject` and the panel label's file count still see everything pending.
 
+Tracking belongs to the workspace, not a session, so a draft (right after
+`/new`) can show `/diff` too: the panel reads the workspace's pending
+changes from the host, hosting no session. Nothing is `mine` there (a chat
+that has not started has written nothing), so rows read as another agent's
+work or as drift. It stays off until `/diff` asks for it.
+
 | Command | Action |
 | --- | --- |
-| `/diff` | Show the pending-changes panel; `/diff` again hides it |
+| `/diff` | Show the pending-changes panel; `/diff` again hides it (an open diff included). In a draft chat (after `/new`) it shows the workspace's pending changes — no session needed |
 | `/diff <path>` | Show one file's unified diff (an ignored path or group reads as added) |
 | `/accept` | Re-baseline the workspace at its current state, locking in every pending change (your own drift included): `/diff` resets and `/undo` can no longer revert past this point |
 | `/reject` | Restore the workspace to the baseline — including your own drift — and remove ignored paths the agents created |
@@ -508,7 +514,18 @@ parent's `agent-N` children; another session's children stay hidden. The
 +/- columns are that session's own pending work plus whatever its subagents
 wrote; a session blocked on the ask tool reads `ask` (it wants your answer),
 one blocked on a tool call (including a running subagent) reads `waiting`,
-not `running`.
+not `running`. The state and the two columns belong to the host: `saved`
+means "only on disk", a hosted session reads `idle` even when nobody is
+attached, and the +/- totals are the host's cached figures, refreshed on
+workspace events — a listing request never runs git. Both frontends follow
+`GET /v1/events` (one `snapshot`, then `session_changed` / `sessions_removed`
+frames), so an open `/sessions` picker and the web sidebar update as the host
+changes, with the plain listing as the fallback if the stream drops. A saved
+row has no cached totals (nothing is hosting it); the web sidebar asks for
+that one row on hover (`GET /v1/sessions/{name}/summary`), which computes its
+own pending diff from the workspace's saved baseline — this session and its
+saved subagents only — and does not load it. Opening a session is the only
+thing that hosts it, so a list full of saved sessions stays saved.
 
 Resuming reconnects to the session's change tracking: the tracked state is
 per workspace, so a resumed session measures against the same baseline as
@@ -710,7 +727,12 @@ It covers what the TUI does: streaming answers and reasoning, expandable
 tool rows, the ask/approve prompt, session list and switching, interrupt
 (`Esc` twice, or the **Stop** button), every slash command, the
 diff/accept/reject bar, plan/write mode, model and sandbox pickers, `@` file
-mentions, image attachments and the status line. The layout is the web UI's
+mentions, image attachments and the status line. Opening the bare address
+lands on a **home screen**: what is running, the recent sessions, and the
+folders a new one can start in; the topbar names the folder the first
+message will use, and `/new` returns there. `#s=<name>` opens a session
+directly and stays in the URL, so a reload comes back to it. The layout is
+the web UI's
 own: tool calls are tappable cards with their arguments and output in
 scrollable boxes. The composer is a bottom sheet with **Send** in the input
 row and a slim toolbar under it; the slash palette opens as its top band,

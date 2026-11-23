@@ -64,6 +64,7 @@ from ..protocol import (
     RoundComplete,
     SendMessage,
     SessionDeleted,
+    SessionSummary,
     SetMode,
     SetSandbox,
     SetViewState,
@@ -80,7 +81,10 @@ from . import flow as tflow
 from .confirm_screen import ConfirmScreen
 from .diff_summary import DiffSummary
 from .flow import LineItem, PendingItem, UserItem
-from .list_picker import ListPicker, name_options, session_options, theme_options
+from .list_picker import (
+    ListPicker, merge_session_event, name_options, session_options,
+    theme_options,
+)
 from .refs_screen import RefsScreen
 from .tools_screen import ToolsScreen
 from .transcript import Transcript
@@ -116,8 +120,9 @@ WELCOME_ART = (
 # How long a first Esc stays "armed" waiting for the confirming second one.
 INTERRUPT_ARM_SECONDS = 2.5
 
-# How often an open /sessions picker re-reads the session list.
-SESSIONS_REFRESH_SECONDS = 1.5
+# How long an open /sessions picker waits before retrying its list stream.
+# Only used after a drop or a host restart: the rows themselves are pushed.
+SESSIONS_RECONNECT_SECONDS = 1.5
 
 # How long to wait for a cancel command to unwind before exiting anyway.
 CANCEL_TIMEOUT = 2.0
@@ -396,6 +401,9 @@ class AgentApp(App[None]):
         # assistant's message settles.
         self._hint_entries: list = []
         self._pump_worker: Worker | None = None
+        # The /sessions picker's list stream (GET /v1/events), alive while the
+        # modal is open; None when no picker is up.
+        self._sessions_worker: Worker | None = None
         self._ask_future: asyncio.Future[str | None] | None = None
         self._ask_id: str | None = None
         self._ask_worker: Worker | None = None
@@ -518,6 +526,9 @@ class AgentApp(App[None]):
         if self._command_worker is not None:
             self._command_worker.cancel()
             self._command_worker = None
+        if self._sessions_worker is not None:
+            self._sessions_worker.cancel()
+            self._sessions_worker = None
         if self.client is not None:
             await self.client.aclose()
 
@@ -895,15 +906,20 @@ class AgentApp(App[None]):
         queued = self.view_status.queued
         bar.update_items([q.text for q in queued])
 
-    async def refresh_diff_summary(self) -> None:
+    async def refresh_diff_summary(self, *, force: bool = False) -> None:
         """Recompute the pending-changes bar (hidden when empty or gitless).
         Live updates normally arrive as ``DiffChanged``; this is the attach/
-        history-replaced path."""
-        if self.session_name is None:
-            await self._show_diff_summary(None)
+        history-replaced path. A draft chat has no session stream: its panel
+        is off until ``/diff`` asks for the workspace's set (``force``), so
+        there is nothing to refresh while it is hidden."""
+        try:
+            shown = self.query_one("#diff-summary", DiffSummary).has_class("visible")
+        except NoMatches:
+            return  # app shutting down; DOM already pruned
+        if self.session_name is None and not (shown or force):
             return
         try:
-            info = await self.client.diff(self.session_name)
+            info = await self._load_diff()
         except ClientError:
             info = None  # tracking broken (e.g. repo gone): stay quiet
         await self._show_diff_summary(info)
@@ -1148,6 +1164,8 @@ class AgentApp(App[None]):
     async def _reject_with_confirm(self) -> None:
         """Reject, first warning when drift (the user's own edits) would be
         reverted too."""
+        if self.session_name is None:
+            return  # a draft's /diff panel is not a session's pending set
         info = self._last_diff
         drift = [f for f in (info.files if info else []) if f.kind == "drift"]
         if drift:
@@ -1254,7 +1272,9 @@ class AgentApp(App[None]):
         self._entries = {}
         self._hint_entries = []
         self._refresh_bars()
-        self.call_later(self.refresh_diff_summary)
+        # A fresh draft starts with no pending-changes panel: the one a
+        # session was showing belonged to that session's /diff.
+        self.call_later(self._show_diff_summary, None)
 
     async def _delete_async(self) -> None:
         name = self.session_name
@@ -1271,13 +1291,15 @@ class AgentApp(App[None]):
 
     async def _open_sessions_async(self) -> None:
         entries = []
+        workspace = str(self.workspace) if self.workspace else None
         with self._reporting("/sessions failed: "):
-            # stats: the picker's +/- columns are the live pending-diff totals
-            # of the hosted sessions; without it every row reads as clean.
-            entries = await self.client.sessions(stats=True)
+            # One whole listing: the picker is no longer paged, so a window
+            # would only hide the tail until the stream's snapshot replaces
+            # it. The +/- columns are the host's cached totals; this read
+            # never runs git.
+            entries = await self.client.sessions(workspace=workspace)
         if not entries:
             return
-        workspace = str(self.workspace) if self.workspace else None
         # The picker lists a subagent only under the family of the session
         # it was opened from, so a draft chat shows top-level sessions alone.
         current = self.session_name
@@ -1285,32 +1307,54 @@ class AgentApp(App[None]):
             session_options(entries, workspace, current),
             title="Open session", filterable=True,
         )
-        self.push_screen(screen, self._on_session_selected)
-        self._refresh_sessions_screen(screen, workspace, current)
 
-    @work(group="sessions-refresh", exclusive=True)
-    async def _refresh_sessions_screen(
+        async def closed(name: str | None) -> None:
+            # Picked, cancelled or replaced: either way the modal is gone and
+            # its stream must not outlive it.
+            self._stop_sessions_tail()
+            await self._on_session_selected(name)
+
+        self.push_screen(screen, closed)
+        self._sessions_worker = self._tail_sessions(
+            screen, workspace, current, entries,
+        )
+
+    def _stop_sessions_tail(self) -> None:
+        """Cancel the picker's list stream (closing the SSE response)."""
+        if self._sessions_worker is not None:
+            self._sessions_worker.cancel()
+            self._sessions_worker = None
+
+    @work(group="sessions-tail", exclusive=True, exit_on_error=False)
+    async def _tail_sessions(
         self, screen: ListPicker, workspace: str | None,
-        current: str | None,
+        current: str | None, entries: list[SessionSummary],
     ) -> None:
-        """Keep an open /sessions picker in step with the host.
+        """Keep an open /sessions picker in step with the host's pushed list.
 
-        The rows are a snapshot at open time, but sessions keep running and
-        going idle while the modal is up. Poll the cheap listing endpoint
-        until the picker closes; ``update_options`` preserves the filter and
-        the highlighted row, so this never fights the user."""
+        ``GET /v1/events`` sends one snapshot and then the rows that change,
+        so a session going running → idle (or a subagent appearing, or one
+        being released) lands as it happens instead of at the next poll.
+        Every reconnect re-snapshots; ``update_options`` keeps the filter and
+        the highlighted row, so a refresh never fights the user."""
         while screen in self.screen_stack:
-            await asyncio.sleep(SESSIONS_REFRESH_SECONDS)
+            try:
+                async for item in self.client.watch_sessions():
+                    if screen not in self.screen_stack:
+                        return
+                    entries = merge_session_event(entries, item)
+                    screen.update_options(
+                        session_options(entries, workspace, current)
+                    )
+            except ClientError as exc:
+                if exc.permanent:  # unknown route/schema: retrying cannot help
+                    return
+            except httpx.HTTPError:
+                pass
             if screen not in self.screen_stack:
                 return
-            try:
-                entries = await self.client.sessions(stats=True)
-            except (ClientError, httpx.HTTPError):
-                continue
-            if entries and screen in self.screen_stack:
-                screen.update_options(
-                    session_options(entries, workspace, current)
-                )
+            # A stream that ended (host restart) is retried like a dropped one.
+            await asyncio.sleep(SESSIONS_RECONNECT_SECONDS)
 
     async def _on_session_selected(self, name: str | None) -> None:
         if not name:
@@ -1990,21 +2034,20 @@ class AgentApp(App[None]):
 
     @work(group="diff-view", exclusive=True)
     async def _show_diff_command(self, arg: str) -> None:
-        """Slash /diff: toggle the pending-changes panel — the first /diff
-        expands the per-file list, /diff again hides it entirely. With an
+        """Slash /diff: toggle the pending-changes panel — anything showing
+        (the per-file list, or an open diff) is hidden, otherwise the panel
+        is shown. A draft chat (``/new``) has no session, but tracking lives
+        with the workspace, so its pending changes show here too. With an
         argument, /diff <path> shows that one file's unified diff."""
-        if self.session_name is None:
-            self._error(
-                "/diff: no session attached — send a message first"
-            )
-            return
         widget = self.query_one("#diff-summary", DiffSummary)
         if not arg:
             # Toggle: fully shown file list (no diff open) → hide the panel.
-            if widget.has_class("visible") and widget.has_class("expanded") and not widget.diff_shown:
+            if widget.has_class("visible") and (
+                widget.diff_shown or widget.has_class("expanded")
+            ):
                 await widget.clear()
                 return
-            await self.refresh_diff_summary()
+            await self.refresh_diff_summary(force=True)
             if not widget.has_class("visible"):
                 self._notice("no pending changes to diff")
                 return
@@ -2014,6 +2057,18 @@ class AgentApp(App[None]):
         # so a typed path can resolve to the row it names rather than to the
         # whole file: the pane always shows the row's patch.
         await self._open_diff(arg, None, reload_rows=True, prefix="/diff")
+
+    async def _load_diff(self, path: str | None = None, author: str | None = None):
+        """One DiffInfo: the session's, or a draft chat's workspace (tracking
+        is per repo root, so it needs no session)."""
+        if self.session_name is not None:
+            return await self.client.diff(
+                self.session_name, path=path, author=author,
+            )
+        return await self.client.workspace_diff(
+            self.view_status.workspace or str(Path.cwd()),
+            path=path, author=author, scope=self._selected_diff_scope(),
+        )
 
     async def _open_diff(
         self, path: str, author: str | None, *,
@@ -2025,9 +2080,7 @@ class AgentApp(App[None]):
             await self.refresh_diff_summary()
         key = widget.resolve_key((path, author))
         try:
-            text = (await self.client.diff(
-                self.session_name, path=key[0], author=key[1],
-            )).text or ""
+            text = (await self._load_diff(key[0], key[1])).text or ""
         except ClientError as exc:
             widget.hide_diff()
             self._error(f"{prefix} failed: {exc}")
@@ -2044,8 +2097,12 @@ class AgentApp(App[None]):
 
         The host builds the rows in the chosen granularity, so the panel is
         reloaded from the saved choice rather than re-partitioning rows it
-        already has. A draft chat goes out with the create request instead."""
+        already has. A draft chat has no session to save it on: it goes out
+        with the create request instead, and the workspace endpoint builds
+        its rows now."""
         if self.session_name is None:
+            self._diff_scope_pending = None
+            await self.refresh_diff_summary()
             return
         self._diff_scope_pending = event.scope
         result = await self._send_command(
@@ -2070,8 +2127,6 @@ class AgentApp(App[None]):
             return "all"
 
     async def on_diff_summary_diff_requested(self, event: DiffSummary.DiffRequested) -> None:
-        if self.session_name is None:
-            return
         widget = self.query_one("#diff-summary", DiffSummary)
         if widget.active_diff_key == (event.path, event.author):
             # Same affordance again: close the diff pane only — the file

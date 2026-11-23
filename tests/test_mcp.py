@@ -468,6 +468,81 @@ def _install_http(monkeypatch: pytest.MonkeyPatch, transport) -> None:
     )
 
 
+def test_ensure_mcp_is_one_shared_background_task(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attaching never waits on a handshake: ensure_mcp returns the task
+    instead of awaiting it, and every caller shares the one task."""
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    async def go() -> None:
+        session = Session(
+            name="mcp-test",
+            workspace=tmp_path,
+            profile=ProviderProfile(
+                base_url="http://127.0.0.1:1/v1", model_id="test",
+            ),
+            profile_name="test",
+            api_key=None,
+            config_path=config_path,
+            sandbox=SandboxRuntime(),
+            mcp=McpSettings(servers={"fake": McpServerSettings(
+                command=sys.executable, args=[str(fake_server)],
+            )}),
+        )
+        started = asyncio.Event()
+        start = session.mcp.start
+
+        async def slow_start() -> None:
+            started.set()
+            await asyncio.sleep(0.05)
+            await start()
+
+        session.mcp.start = slow_start  # type: ignore[method-assign]
+        task = session.ensure_mcp()
+        assert task is not None
+        assert session.ensure_mcp() is task  # one task, not one per caller
+        await asyncio.wait_for(started.wait(), 1)
+        # Returned, not waited for: the caller got a live task.
+        assert not task.done()
+        await task
+        assert session.mcp.started
+        await session.mcp.close()
+
+    asyncio.run(go())
+
+
+def test_a_session_without_servers_has_nothing_to_wait_for(tmp_path: Path) -> None:
+    """No server configured: ensure_mcp returns None (no task to yield on,
+    which matters because turn startup is synchronous), and prepare_mcp
+    leaves a replaced tool registry alone."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    async def go() -> None:
+        session = Session(
+            name="no-mcp",
+            workspace=tmp_path,
+            profile=ProviderProfile(
+                base_url="http://127.0.0.1:1/v1", model_id="test",
+            ),
+            profile_name="test",
+            api_key=None,
+            config_path=config_path,
+            sandbox=SandboxRuntime(),
+            mcp=McpSettings(),
+        )
+        marker = ToolRegistry()
+        session.tool_registry = marker
+        assert session.ensure_mcp() is None
+        await session.prepare_mcp()
+        assert session.tool_registry is marker
+
+    asyncio.run(go())
+
+
 def test_parse_server_spec_urls() -> None:
     name, server = parse_server_spec(URL)
     assert name == "example-test"  # from the host, "mcp." dropped

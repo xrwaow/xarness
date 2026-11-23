@@ -405,6 +405,26 @@ class WorkspaceState:
             ignored_files=ignored_files,
         )
 
+    async def diff_info(
+        self, viewer: str | Collection[str] | None = None, *,
+        path: str | None = None, author: str | None = None,
+        scope: DiffScope = "all",
+    ) -> DiffInfo:
+        """The /diff payload: this snapshot buys both the rows and, for a
+        row click-through, that row's unified diff text.
+
+        ``viewer`` is the session (or session family) whose own writes read
+        ``mine``; None labels every row for an anonymous viewer — a draft
+        chat has written nothing."""
+        current = await self.observe()
+        info = await self.diff(viewer, current=current, path=path, scope=scope)
+        if path is not None:
+            info.text = await self.file_diff(
+                path, current=current, author=author,
+            )
+        info.tracking = True
+        return info
+
     async def file_diff(
         self,
         path: str,
@@ -838,6 +858,19 @@ async def open_workspace(
 
 # ----------------------------------------------------------------------
 # workspace refs (/refs): per workspace, in the same row as its state
+
+
+def has_workspace_state(workspace: Path | str) -> bool:
+    """Whether this directory's repo already has a tracked state row.
+
+    A read-only probe: a workspace that was never tracked has no baseline,
+    so a saved session of it has no pending diff to report. Asking for one
+    (a listing hover, a status fetch) must not create tracking as a side
+    effect — that is why the caller checks first."""
+    try:
+        return _row(Path(workspace).expanduser().resolve()) is not None
+    except OSError:
+        return False
 
 
 def load_workspace_refs(workspace: Path | str) -> list[str]:

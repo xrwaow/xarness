@@ -236,7 +236,7 @@ def _meta_block(stored: StoredSession) -> dict[str, Any]:
         "model": stored.profile,
         "sandbox": stored.sandbox_name,
         "parent_id": stored.parent_id,
-        "message_count": len(conversation.visible_messages()),
+        "message_count": conversation.visible_count(),
         "last_user_message_at": conversation.last_user_message_at(),
     }
 

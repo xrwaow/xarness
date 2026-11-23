@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from . import __version__, protocol, session_store
 from .config import (
@@ -52,10 +53,11 @@ from .tools import report_tool_usage
 from .workspace import (
     WorkspaceState,
     change_workspace_ref,
+    has_workspace_state,
     load_workspace_refs,
     open_workspace,
 )
-from .util import utcnow_iso as _utcnow
+from .util import parse_range, same_path, utcnow_iso as _utcnow
 
 LOG = logging.getLogger(__name__)
 
@@ -81,6 +83,15 @@ def _idle_ttl() -> float:
 # shutdown. Small enough that an idle session leaves promptly, cheap enough
 # that the scan (one dict of sessions) never shows up in a profile.
 REAP_INTERVAL_SECONDS = 0.25
+# Trailing debounce for the cached session-list diff totals: a turn can run
+# several mutating tools in a row, and one workspace snapshot/diff answers
+# for every session in that repo.
+STATS_DEBOUNCE_SECONDS = 0.4
+# How long one pending diff answers for a saved session's own total. The
+# listing never computes these; a hover fetches one session's row, and this
+# cache keeps sweeping across several saved rows of one repo (or re-hovering)
+# from running one worktree snapshot each time.
+SAVED_STATS_TTL_SECONDS = 5.0
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
@@ -143,6 +154,18 @@ class Host:
         # The one background loop that evicts inactive sessions and decides
         # when a non-persistent host may exit (see _reap).
         self._reaper: asyncio.Task[None] | None = None
+        # GET /v1/events subscribers: one queue per connected client. The
+        # session list is pushed, not polled, so another session's state
+        # reaches the UI as it changes.
+        self._watchers: list[asyncio.Queue[Any]] = []
+        # Workspace-row ids with a pending cached-stats refresh, and the one
+        # debounce task per workspace (see _schedule_stats).
+        self._stats_dirty: set[int] = set()
+        self._stats_tasks: dict[int, asyncio.Task[None]] = {}
+        # Repo root -> (monotonic time, diff) for the per-session summaries of
+        # saved (unhosted) sessions. Short-lived on purpose: see
+        # SAVED_STATS_TTL_SECONDS.
+        self._saved_stats: dict[str, tuple[float, protocol.DiffInfo]] = {}
 
     # ------------------------------------------------------------------
     # session construction (config + workspace + sandbox)
@@ -313,6 +336,7 @@ class Host:
                     workspace_state, reason=reason))
                 if workspace_state is not None else None
             ),
+            notify_state=self._session_state_changed,
             spawn_subagent=self.spawn_subagent,
         )
 
@@ -330,14 +354,19 @@ class Host:
             view=request.view,
         )
         self.sessions[name] = session
-        # Connect MCP servers once, before the first turn can ask for a
-        # tool schema. A slow/broken server is recorded on its status row;
-        # it never prevents the session from starting.
-        await session.prepare_mcp()
+        # MCP may take its whole startup timeout on a broken server, so it
+        # starts in the background: the create response and the first
+        # snapshot must not wait for a handshake. A turn awaits it.
+        session.ensure_mcp()
         if not request.no_session:
             # Durable from creation: the session shows up as saved in /sessions
             # and survives a host crash before the first turn.
             session._persist()
+        self._broadcast_session(session)
+        # A new row carries no totals until a diff runs; schedule one so a
+        # watching client does not see it appear as +0 -0 while its workspace
+        # has pending work.
+        self._schedule_stats(session.workspace_state)
         if request.first_message:
             await session.execute(
                 protocol.SendMessage(text=request.first_message),
@@ -418,11 +447,15 @@ class Host:
                 (lambda reason=None: self.notify_workspace(state, reason=reason))
                 if state is not None else None
             ),
+            notify_state=self._session_state_changed,
             report_usage=report_tool_usage,
         )
         self.sessions[name] = child
+        child.ensure_mcp()
         if not parent.no_save:
             child._persist()
+        self._broadcast_session(child)
+        self._schedule_stats(child.workspace_state)
         parent._emit_notice(
             f"subagent {session_store.display_name(name)} ({mode}) started, "
             "/sessions to watch")
@@ -439,6 +472,8 @@ class Host:
             # cancels its turn, flushes the save and closes its shell.
             self.sessions.pop(name, None)
             await child.shutdown()
+            # Still on disk: the row falls back to its saved meta.
+            self._broadcast_released(name)
 
     async def load_session(self, name: str) -> Session:
         """Host a saved session (idempotent, safe under concurrent loads)."""
@@ -479,7 +514,14 @@ class Host:
         )
         session = Session.load(name, parts=parts, state=state)
         self.sessions[name] = session
-        await session.prepare_mcp()
+        # Background: a slow/broken MCP server must not delay the attach
+        # snapshot (the first turn awaits the same task).
+        session.ensure_mcp()
+        self._broadcast_session(session)
+        # Opening a saved row must not drop its totals to zero: the row the
+        # client already shows was computed from the saved baseline, this
+        # session's own cache starts empty. One diff fixes the second frame.
+        self._schedule_stats(session.workspace_state)
         return session
 
     async def delete_session(self, name: str) -> protocol.DeleteResult:
@@ -489,6 +531,10 @@ class Host:
                 raise SessionError("wait for the current turn to finish before deleting")
             await self._evict(session)
         deleted = session_store.delete_session(name)
+        if deleted:
+            # Gone for good: the eviction above pushed the saved row, this
+            # takes the row away entirely (saved-only sessions get this too).
+            self._broadcast_removed([name])
         return protocol.DeleteResult(deleted=deleted)
 
     async def unload_session(self, name: str) -> bool:
@@ -511,6 +557,9 @@ class Host:
             return
         self.sessions.pop(session.name, None)
         await session.shutdown(notice=notice)
+        # The session is still saved, so its row does not leave the list: it
+        # becomes the saved meta row (state ``saved``, ``hosted`` false).
+        self._broadcast_released(session.name)
 
     def notify_workspace(
         self, workspace: WorkspaceState, *, reason: str | None = None,
@@ -526,26 +575,30 @@ class Host:
             if reason is not None:
                 session._emit(protocol.CheckpointsChanged(reason=reason))
             session._schedule_diff_changed()
+        # The +/- totals are derived from the workspace event log, so one
+        # snapshot+diff answers for every session here. The listing itself
+        # always reads the cached result (see list_sessions).
+        self._schedule_stats(workspace)
 
     async def list_sessions(
         self, *, active: bool | None = None, workspace: str | None = None,
-        stats: bool = False,
+        stats: bool = False, window: str | None = None,
     ) -> list[SessionSummary]:
-        """One listing of active and saved sessions.
+        """One listing of hosted and saved sessions. Never runs git.
 
-        ``stats`` adds the unaccepted (pending) diff totals each hosted
-        session owns itself: the paths this session wrote explicitly (its
-        ``mine`` rows) plus its subagents' writes (which are ``agent`` to
-        the parent but still its subtree), not the rest of the workspace's
-        pending changes (drift, unrelated agents, bash). The stat itself is
-        computed once per workspace, since every agent in a repo measures
-        against the same baseline and worktree. Saved sessions get no
-        totals: their workspace is usually not open, and opening it just to
-        count pending files would cost a full snapshot. Best-effort — a
-        session whose diff cannot be computed lists with zeroed totals."""
+        ``stats`` is accepted for wire compatibility and ignored: the totals
+        ride along on every summary, since they are cached on the session and
+        including them is free. They are maintained by the host on workspace
+        events — see :meth:`_refresh_stats` — never here: a listing request
+        must not block on a worktree snapshot.
+
+        Saved (not hosted) sessions get no totals: their workspace is
+        usually not open, and guessing what is pending there would cost a
+        full snapshot. ``window`` is a Python-style range over the
+        recency-sorted list (see :func:`xarness.util.parse_range`)."""
         summaries: list[SessionSummary] = []
         for session in self.sessions.values():
-            if workspace is not None and str(session.workspace) != workspace:
+            if not same_path(session.workspace, workspace):
                 continue
             summaries.append(session.summary())
         if active is None or active is False:
@@ -553,41 +606,254 @@ class Host:
             for name, meta in session_store.load_metas().items():
                 if name in hosted_names:
                     continue
-                if workspace is not None and meta.workspace != workspace:
+                if not same_path(meta.workspace, workspace):
                     continue
                 summaries.append(meta)
         if active is True:
             summaries = [s for s in summaries if s.active]
         summaries.sort(key=lambda s: s.last_user_message_at or s.name, reverse=True)
-        if stats:
-            # One snapshot per workspace, not per session: every agent in a
-            # repo measures against the same baseline and the same worktree.
-            # The totals, though, are per session: the files that session
-            # wrote explicitly (``mine``) plus the work of its subagents
-            # (which are ``agent`` to the parent but are still its subtree).
-            children = self._children_by_parent()
-            snapshots: dict[int, str] = {}
-            for summary in summaries:
-                session = self.sessions.get(summary.name)
-                state = session.workspace_state if session is not None else None
-                if state is None:
-                    continue
-                try:
-                    if id(state) not in snapshots:
-                        snapshots[id(state)] = await state.observe()
-                    info = await state.diff(
-                        self._subtree(summary.name, children),
-                        current=snapshots[id(state)],
-                        # One row per author, so a file this session and a
-                        # sibling both wrote reports both sides.
-                        scope="mine",
-                    )
-                except Exception:
-                    continue
-                rows = [f for f in info.files if f.kind == "mine"]
-                summary.additions = sum(f.additions for f in rows)
-                summary.deletions = sum(f.deletions for f in rows)
+        if window is not None:
+            start, stop = parse_range(window, len(summaries))
+            summaries = summaries[start:stop]
         return summaries
+
+    async def session_summary(
+        self, name: str,
+    ) -> protocol.SessionSummary | None:
+        """One listing row, with that session's own pending totals.
+
+        A hosted session answers from memory: its totals are cached and kept
+        current by :meth:`_refresh_stats`. A saved one is *not* hosted to
+        answer — asking for a row (a hover, a status fetch) must never turn a
+        saved session into an idle hosted one. Its workspace's saved baseline
+        is opened instead and one diff is computed for this session's own
+        subtree, subagents included, and cached for a few seconds so sweeping
+        across several rows of one repo costs one snapshot."""
+        session = self.sessions.get(name)
+        if session is not None:
+            return session.summary()
+        meta = session_store.load_meta(name)
+        if meta is None:
+            return None
+        info = await self._saved_workspace_diff(meta.workspace)
+        if info is None:
+            # Never tracked here: no baseline, nothing pending to report.
+            return meta
+        additions, deletions = self._subtree_totals(
+            info, self._subtree(name, self._family_children()),
+        )
+        return meta.model_copy(update={
+            "tracking": info.tracking,
+            "additions": additions,
+            "deletions": deletions,
+        })
+
+    # ------------------------------------------------------------------
+    # pushed session list (GET /v1/events)
+
+    def watch_sessions(self) -> asyncio.Queue[Any]:
+        """Register one session-list subscriber (the API calls this).
+
+        The caller sends the initial snapshot itself (``list_sessions``) and
+        then drains this queue. Registering first and snapshotting second
+        means an update cannot fall in the gap; the client may see one
+        duplicate summary, which is an idempotent upsert."""
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._watchers.append(queue)
+        # Seed the cached totals for every hosted workspace now that someone
+        # is looking at the list (the first frame may carry zeros; the
+        # refresh pushes the real numbers a moment later).
+        for state in self._hosted_workspace_states():
+            self._schedule_stats(state)
+        return queue
+
+    def unwatch_sessions(self, queue: asyncio.Queue[Any]) -> None:
+        if queue in self._watchers:
+            self._watchers.remove(queue)
+
+    def _broadcast(self, event: Any) -> None:
+        """Fan one host-level event out to every list subscriber."""
+        for queue in list(self._watchers):
+            queue.put_nowait(event)
+
+    def _broadcast_session(self, session: Session) -> None:
+        if self._watchers:
+            self._broadcast(protocol.SessionSummaryChanged(
+                summary=session.summary(),
+            ))
+
+    def _broadcast_removed(self, names: list[str]) -> None:
+        if self._watchers and names:
+            self._broadcast(protocol.SessionsRemoved(names=list(names)))
+
+    def _broadcast_released(self, name: str) -> None:
+        """Push the row a session falls back to when the host stops holding it.
+
+        Eviction and unload keep the session file, so the listing still has
+        it — as a saved meta row. A session that was never saved (a
+        ``--no-session`` one) has no row left, so it is removed instead."""
+        if not self._watchers:
+            return
+        meta = session_store.load_meta(name)
+        if meta is None:
+            self._broadcast_removed([name])
+        else:
+            self._broadcast(protocol.SessionSummaryChanged(summary=meta))
+
+    def _session_state_changed(self, session: Session) -> None:
+        """Session callback: push its listing row.
+
+        Mutating tools already call :meth:`notify_workspace`, which schedules
+        the diff-total refresh, so a state change only needs the push. A
+        session the host has already dropped (it emits while shutting down)
+        is skipped: its row was replaced or removed by the teardown path."""
+        if self.sessions.get(session.name) is session:
+            self._broadcast_session(session)
+
+    # ------------------------------------------------------------------
+    # cached pending-diff totals
+
+    def _schedule_stats(self, state: WorkspaceState | None) -> None:
+        """Coalesce one workspace diff refresh for the listing.
+
+        Only worth doing when someone is watching the list (the totals are
+        cosmetic and only live sessions have them). The debounce collapses
+        a burst of tool writes into one snapshot."""
+        if state is None or not self._watchers:
+            return
+        key = id(state)
+        self._stats_dirty.add(key)
+        task = self._stats_tasks.get(key)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (a sync test): the next request can refresh
+        self._stats_tasks[key] = loop.create_task(self._stats_loop(state))
+
+    async def _stats_loop(self, state: WorkspaceState) -> None:
+        try:
+            while id(state) in self._stats_dirty:
+                self._stats_dirty.discard(id(state))
+                await asyncio.sleep(STATS_DEBOUNCE_SECONDS)
+                await self._refresh_stats(state)
+        finally:
+            self._stats_tasks.pop(id(state), None)
+
+    def _hosted_workspace_states(self) -> list[WorkspaceState]:
+        """Every hosted workspace once (sessions in one repo share a state)."""
+        return list({
+            id(session.workspace_state): session.workspace_state
+            for session in self.sessions.values()
+            if session.workspace_state is not None
+        }.values())
+
+    @staticmethod
+    async def _pending_diff(state: WorkspaceState) -> protocol.DiffInfo:
+        """One worktree snapshot and diff: the pending rows this workspace
+        contributes to the listing, with one row per author (``mine``)."""
+        return await state.diff(
+            None, current=await state.observe(), scope="mine",
+        )
+
+    async def refresh_stats(self) -> None:
+        """Recompute the cached listing totals for every hosted workspace.
+
+        Public for tests and for an explicit "refresh now"; the normal path
+        is :meth:`_schedule_stats` from a workspace event. This is the only
+        code that runs a worktree snapshot/diff for the session list."""
+        for state in self._hosted_workspace_states():
+            await self._refresh_stats(state)
+
+    async def _refresh_stats(self, state: WorkspaceState) -> None:
+        """One snapshot+diff for a workspace, fanned out to its sessions.
+
+        One diff answers for every agent in the repo: ``scope="mine"``
+        produces a row per author, so a session's total is the sum of the
+        rows authored by itself or a hosted descendant (the same subtree
+        semantics the old per-session listing computed, without the N
+        git runs). Best-effort: a failing snapshot leaves the last cached
+        values in place."""
+        sessions = [
+            session for session in self.sessions.values()
+            if session.workspace_state is state
+        ]
+        if not sessions:
+            return
+        children = self._children_by_parent()
+        try:
+            info = await self._pending_diff(state)
+        except Exception as exc:  # a git failure must not break the list
+            LOG.warning("session stats refresh failed for %s: %s", state.root, exc)
+            return
+        # The same diff answers a saved session's hover in this repo.
+        self._saved_stats[str(state.root)] = (time.monotonic(), info)
+        for session in sessions:
+            additions, deletions = self._subtree_totals(
+                info, self._subtree(session.name, children),
+            )
+            if (additions, deletions) == (
+                session.pending_additions, session.pending_deletions,
+            ):
+                continue
+            session.pending_additions = additions
+            session.pending_deletions = deletions
+            self._broadcast_session(session)
+
+    async def _saved_workspace_diff(
+        self, workspace: str | None,
+    ) -> protocol.DiffInfo | None:
+        """A pending diff for a saved session's workspace, or None.
+
+        Read-only about the *session*: the workspace's saved tracking state is
+        opened, nothing is hosted. A workspace that was never tracked has no
+        baseline, so it reports nothing rather than creating tracking as a
+        side effect of a hover. The diff is cached for
+        ``SAVED_STATS_TTL_SECONDS`` — it answers for every session in that
+        repo, so a sweep across rows pays for one snapshot."""
+        if not workspace:
+            return None
+        key = str(Path(workspace).expanduser().resolve())
+        now = time.monotonic()
+        cached = self._saved_stats.get(key)
+        if cached is not None and now - cached[0] < SAVED_STATS_TTL_SECONDS:
+            return cached[1]
+        if not Path(key).is_dir() or not has_workspace_state(key):
+            return None
+        try:
+            state = await self.open_workspace(Path(key))
+            if state is None:
+                return None
+            info = await self._pending_diff(state)
+        except Exception as exc:  # a git failure must not break a hover
+            LOG.warning("saved-session stats failed for %s: %s", key, exc)
+            return None
+        self._saved_stats[key] = (now, info)
+        return info
+
+    def _family_children(self) -> dict[str, list[str]]:
+        """Every known parent -> children link, hosted or only on disk, so a
+        saved session's totals include the subagents it left behind."""
+        children = self._children_by_parent()
+        for name, meta in session_store.load_metas().items():
+            if meta.parent_id and name not in self.sessions:
+                children.setdefault(meta.parent_id, []).append(name)
+        return children
+
+    @staticmethod
+    def _subtree_totals(
+        info: protocol.DiffInfo, subtree: set[str],
+    ) -> tuple[int, int]:
+        """Sum the rows authored by ``subtree`` (``scope="mine"`` yields one
+        row per author, so a file two agents wrote is never double-counted)."""
+        additions = deletions = 0
+        for row in info.files:
+            authors = (row.author,) if row.author else row.authors
+            if any(author in subtree for author in authors):
+                additions += row.additions
+                deletions += row.deletions
+        return additions, deletions
 
     def _children_by_parent(self) -> dict[str, list[str]]:
         """Hosted sessions indexed by the parent that spawned them."""
@@ -651,6 +917,28 @@ class Host:
                     continue
                 await session.apply_ref_specs(specs)
         return self._workspace_ref_infos(ws, specs)
+
+    async def workspace_diff(
+        self, workspace: str, *, path: str | None = None,
+        author: str | None = None, scope: protocol.DiffScope = "all",
+    ) -> protocol.DiffInfo:
+        """A workspace's pending changes, hosting no session: tracking is
+        per repo root, so a draft chat's /diff needs none. Rows are labelled
+        for no viewer — a chat that has not started has written nothing."""
+        ws = Path(workspace).expanduser().resolve()
+        if not ws.is_dir():
+            return protocol.DiffInfo(tracking=False)
+        try:
+            state = await self.open_workspace(ws)
+            if state is None:
+                return protocol.DiffInfo(tracking=False)
+            return await state.diff_info(
+                None, path=path, author=author, scope=scope,
+            )
+        except (GitWorktreeError, OSError):
+            # Best-effort, as at session start: a workspace that cannot be
+            # snapshotted just has no pending changes to show.
+            return protocol.DiffInfo(tracking=False)
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(
@@ -787,6 +1075,12 @@ class Host:
             if self._reaper is not None:
                 self._reaper.cancel()
                 self._reaper = None
+            # A pending stats refresh must not outlive the host (and must
+            # not touch a workspace whose session is stopping below).
+            for task in self._stats_tasks.values():
+                task.cancel()
+            self._stats_tasks.clear()
+            self._stats_dirty.clear()
             for one, task in ((server, server_task), (web_server, web_task)):
                 if one is None or task is None:
                     continue

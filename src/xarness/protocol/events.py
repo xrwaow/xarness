@@ -14,12 +14,12 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from ..conversation import Message, ToolStatus, TurnStats, Usage
-from .views import DiffInfo, Snapshot, Status
+from .views import DiffInfo, SessionSummary, Snapshot, Status
 
 # Bumped whenever a wire model changes shape incompatibly. The client's
 # connect-time check shuts down a stale host rather than sending it a
 # command its older command union would reject with a 422.
-PROTOCOL_VERSION = 23
+PROTOCOL_VERSION = 25
 
 # Error convention: every route fails with HTTP 4xx (400 bad request, 404
 # missing session/path), commands included — a rejected command raises
@@ -271,6 +271,54 @@ Event = Annotated[
     Union[StreamEvent, HostEvent],  # type: ignore[misc]
     Field(discriminator="type"),
 ]
+
+# ---------------------------------------------------------------------------
+# host-wide events (GET /v1/events)
+#
+# The per-session /events stream only knows about the one session a client is
+# attached to. The session list (home, sidebar, TUI /sessions) also needs every
+# *other* session's state, and polling the whole listing to discover it made
+# state updates lag by the poll interval. These frames are a separate union on
+# purpose: adding them to ``Event`` would make every session stream's
+# discriminator accept events it can never receive.
+
+
+class SessionsSnapshot(BaseModel):
+    """First frame of GET /v1/events: every session the host lists."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sessions: list[SessionSummary] = Field(default_factory=list)
+
+
+class SessionSummaryChanged(EventBase):
+    """One session's listing row changed (state, usage, totals, …).
+
+    Carries the whole summary rather than a patch: it is small, it is always
+    computed from the live session anyway, and an upsert needs no versioning.
+    """
+
+    type: Literal["session_changed"] = "session_changed"
+    summary: SessionSummary
+
+
+class SessionsRemoved(EventBase):
+    """These rows left the listing entirely: the saved session is gone.
+
+    An unload or an eviction is not a removal — the session file stays, so
+    the host pushes its saved summary instead (``state`` back to ``saved``,
+    ``hosted`` false). Only a delete (or a session that was never saved)
+    removes the row."""
+
+    type: Literal["sessions_removed"] = "sessions_removed"
+    names: list[str] = Field(default_factory=list)
+
+
+SessionsEvent = Annotated[
+    Union[SessionSummaryChanged, SessionsRemoved],
+    Field(discriminator="type"),
+]
+SESSIONS_EVENT_ADAPTER = TypeAdapter(SessionsEvent)
 
 Snapshot.model_rebuild()
 EVENT_ADAPTER = TypeAdapter(Event)

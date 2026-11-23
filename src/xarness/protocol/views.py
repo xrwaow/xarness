@@ -216,6 +216,10 @@ class Snapshot(BaseModel):
     message_offset: int = 0
     message_total: int = 0
     has_more: bool = False
+    # The bodies were stripped (see ``slim_message``): tool output, tool
+    # arguments and all but the head of the reasoning. A client that opens a
+    # row hydrates it from GET …/messages/{index}.
+    slim: bool = False
 
 
 class MessagePage(BaseModel):
@@ -265,6 +269,13 @@ class SessionSummary(BaseModel):
     state: Literal[
         "idle", "running", "compacting", "ask", "waiting", "saved",
     ] = "saved"
+    # True while the host holds the Session in memory. A hosted session that
+    # is not running reads ``idle``; only a saved-on-disk one reads ``saved``.
+    # Clients use this to tell "warm but idle" from "not loaded".
+    hosted: bool = False
+    # A turn is in flight, blocked on a tool/ask, or a client is attached.
+    # This is the listing's "live" grouping; it is deliberately not
+    # "hosted" (the reaper releases warm idle sessions, hosted or not).
     active: bool = False
     clients_attached: int = 0
     model: str | None = None

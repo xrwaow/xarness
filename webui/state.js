@@ -85,14 +85,15 @@ export class Transcript {
     this.cancelled = false;
   }
 
-  load(snapshot) {
+  load(snapshot, lazy = snapshot?.slim === true) {
     this.startRound();
     // A snapshot may be just the newest window; building it like any page and
     // filling this.toolBlocks keeps its indexes global (and the live round
-    // finds a persisted call).
+    // finds a persisted call). `lazy` means the frame was slim: tool bodies
+    // and most reasoning are fetched per round on expand.
     const live = snapshot?.status?.state === 'running';
     this.items = this.buildMessages(
-      snapshot?.messages || [], live, this.toolBlocks, snapshot?.message_offset || 0,
+      snapshot?.messages || [], live, this.toolBlocks, snapshot?.message_offset || 0, lazy,
     );
     this.loadPartial(snapshot?.partial_round);
     return this.items;

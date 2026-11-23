@@ -42,11 +42,12 @@ Slash commands (`COMMANDS` in `src/xarness/tui/app.py`): `tools`, `model`,
 
 | Feature | Backend |
 | --- | --- |
-| attach / reconnect / rebuild | `GET /v1/sessions/{name}/events?messages=N` (SSE; first frame `snapshot` — a turn-aligned window of the newest N messages — then `event`) |
-| load earlier messages | `GET …/messages?before=&limit=&slim=true` (a `MessagePage`; autoloaded near the top) |
+| attach / reconnect / rebuild | `GET /v1/sessions/{name}/events?range=[-40:]&slim=true` (SSE; first frame `snapshot` — a turn-aligned window of the newest N messages, tool bodies left for hydration — then `event`) |
+| load earlier messages | `GET …/messages?range=[<start-40>:<start>]&slim=true` (a `MessagePage`; autoloaded near the top) |
 | expand a block / row | `GET …/messages/{index}?content=false` (headers) / `content=true` (the round's output) |
 | send message (no local echo) | `POST …/commands` `{type:"send_message"}` |
 | draft chat → first session | `POST /v1/sessions` `{workspace?, model?, view}` (then attach) |
+| home: live / recent / folders | `GET /v1/events` (SSE: `snapshot`, then `session_changed` / `sessions_removed`), `GET /v1/workspaces` |
 | interrupt (double Esc / Stop button) | `{type:"cancel"}` |
 | steer queue: discard / send now | `{type:"discard_queued"}` / `{type:"flush_queued"}` |
 | ask tool answer / skip | `{type:"answer_ask", ask_id, answers}`; `AskResolved` closes it |
@@ -59,10 +60,11 @@ Slash commands (`COMMANDS` in `src/xarness/tui/app.py`): `tools`, `model`,
 | `/tools` | `GET …/tools`; `{type:"set_mcp_server_scope"}`, `{type:"set_mcp_tool_enabled"}`; `GET …/tools` again to refresh |
 | `/new` | detach locally (no request — the old session keeps running) |
 | `/delete` | `DELETE /v1/sessions/{name}` |
-| `/diff`, file rows, `/diff <path>` | `GET …/diff`, `GET …/diff?path=&author=` |
-| diff scope chip | `{type:"set_view_state", view:{diff_scope}}` |
+| `/diff`, file rows, `/diff <path>` | `GET …/diff`, `GET …/diff?path=&author=`; in a draft `GET /v1/workspaces/diff?workspace=&scope=` (tracking is per workspace, so no session is needed) |
+| diff scope chip | `{type:"set_view_state", view:{diff_scope}}` (a draft refetches the workspace endpoint instead) |
 | `/accept`, `/reject` (+ drift confirm) | `{type:"accept"}` / `{type:"reject"}` |
-| `/sessions` | `GET /v1/sessions?stats=true` (polled while visible) |
+| `/sessions` | `GET /v1/events` (same stream; `GET /v1/sessions` is the fallback poll) |
+| one row's saved totals (hover) | `GET /v1/sessions/{name}/summary` (read-only: a saved session is not hosted to answer) |
 | status bar / bars | `StatusChanged.status`, snapshot `status` |
 | `@` file mention | `GET /v1/workspaces/files?workspace=&q=` |
 | image attach | `PUT …/images/{sha256}` then `send_message.images` |
@@ -115,7 +117,7 @@ small additions, none changing an existing route or shape:
 
 ```
 webui/
-  index.html          shell: topbar, sidebar/drawer, log, composer, status bar
+  index.html          shell: floating head, sidebar/drawer, log, composer, status bar
   style.css           palette variables, mobile-first layout, desktop @media
   app.js              wiring: state machine, events, keys, sessions, diff, ask
   api.js              typed-ish fetch client + SSE reader with reconnect
@@ -136,7 +138,9 @@ lines, which is both smaller and safe by construction. No CDN at runtime.
 
 Mobile-first: single column, `100dvh` flex column, the log is the only
 scrolling box, the composer is pinned with `env(safe-area-inset-bottom)`,
-16px input text, ≥44px tap targets. The sidebar is a slide-over drawer
+16px input text, ≥44px tap targets. The menu, session name and folder float
+at the top-left of the conversation over a short gradient instead of sitting
+in a full-width topbar. The sidebar is a slide-over drawer
 behind a hamburger + scrim. Approve/answer controls live directly above the
 input (thumb-reachable). `@media (min-width: 768px)` keeps the sidebar
 visible, caps the message column and adds per-row metadata.
@@ -476,8 +480,14 @@ activity, answer — the prose is the separator.
   (message index and call id, never the in-memory id), so a reload redraws the
   same shapes and none of that art is stored anywhere.
 - **The header is the run's summary.** Two tallies only: how many times the
-  model thought and how many tools it ran, so it reads `Thought 9 times, ran 6
-  tools`. The per-tool breakdown lives in the expanded rows. Below the
+  model thought and how many tools it ran, so it reads `Thought 9 times, Ran 6
+  tools`. A run of one has nothing to tally, so it just names its own state:
+  `Thinking` until the reasoning stops and `Thought` after; `Running` until
+  the call returns and `Ran` after. A longer run counts only what has settled,
+  and the activity still in flight joins the line in the present tense (`, …
+  Running`) until it is done — `Thought 2 times, Ran 1 tool, Running`, then
+  `Thought 2 times, Ran 2 tools`. The per-tool breakdown lives in the expanded
+  rows. Below the
   summary is **one SVG per activity, in the order it ran**, wrapping onto as
   many lines as it needs — not a `×N` over a grouped shape. A run of one (a
   single thought or a single call before the answer) keeps its shape on the
@@ -565,14 +575,16 @@ loads itself as the reader reaches the top of the log — no button. A page is
 *also slim*: tool arguments and output are dropped and reasoning keeps its
 first 160 chars, so scrolling through an old chat is cheap.
 
-- `GET …/events?messages=N` / `GET /v1/sessions/{name}?messages=N` window the
-  snapshot (`message_offset`, `message_total`, `has_more`; no `messages` =
-  the whole history, the TUI's attach). `GET …/messages?before=&limit=&slim=`
-  returns one older `MessagePage`; pass its `start` back as `before` and walk
-  while `has_more`. Read-only, no command lock.
+- `GET …/events?range=…` / `GET /v1/sessions/{name}?range=…` window the
+  snapshot (`message_offset`, `message_total`, `has_more`; no `range` =
+  the whole history, the TUI's attach). `GET …/messages?range=&slim=`
+  returns one older `MessagePage`; pass `[start-N:start]` to walk while
+  `has_more`. Read-only, no command lock. The window is a Python-style
+  slice (`[-40:]` is the newest 40; a negative bound counts from the end).
 - `session.history_page` cuts only at user messages, so a tool call is never
   separated from its result (which would render as `interrupted`) and a
-  turn's footer stays with it; a turn bigger than `limit` ships whole.
+  turn's footer stays with it; a window that starts mid-turn grows back to
+  that turn's user message.
 - Why slim is enough: a collapsed activity block draws shapes, counts,
   LOC/usage totals, so it needs names, statuses and the head of the
   reasoning — not the text. Expanding the block fetches its rounds' headers
@@ -628,3 +640,249 @@ glyph.
   `tool-body`, `pill`, `thinking-body`) went with them; `.tool-name`'s
   weight moved into the `/tools` sheet's own rule. The service-worker cache
   name moved to `xarness-ui-v47`.
+
+## Popup round: dialogs that belong to the same surface
+
+The transcript rows got their idiom last round; the popups behind `/` had
+not. They were an old layer: a palette that was a card inside a card, a
+Cancel bar on every picker, and a help sheet drawn with hand-padded
+monospace columns — the visual equivalent of aligning a table with spaces.
+
+- **The palette is a band, not a card.** It carried `background: surface`
+  and a 13px top radius inside the composer panel's 14px one, and each row
+  was an 8px-radius filled box: three nested rounded rectangles for a list
+  of commands. The fill and radius are gone — the band shows the panel it
+  sits in, closed by one hairline — and rows are full-bleed with a flat
+  background on hover. No left bar on the selected row: it was the same
+  second-line mistake as round 1's duplicated connector. Selection is the
+  row's fill plus its brighter name, nothing else.
+- **Two columns, one grid.** The command and its description used to be a
+  flex row, so every description started at a different x. The row is now a
+  grid with a fixed `10ch` command column (measured in the mono font it
+  renders, so the column really is ten characters), and a file mention —
+  which has no description — takes the full width instead.
+- **The foot teaches the call, not the row.** It repeated the selected
+  row's description 30px under the same description. It now shows the
+  usage line (`/filter [add|remove] <path>`) for the command under the
+  cursor, plus the keys that work while the palette is open; the `args`
+  column left the row entirely, where on a phone it was hidden anyway.
+  A command that takes no arguments collapses the strip.
+- **Pickers dismiss one way.** Every picker had a header ✕, a backdrop, an
+  Esc handler *and* a full-width Cancel button — the loudest control in the
+  sheet repeated the quietest three. The button is gone; the ✕ is 44px on a
+  phone. Info sheets keep a Close button (thumb reach) but no longer paint it
+  in the accent colour, which made "close" look like the main action.
+- **The current row is readable in both themes.** `aria-current` only
+  changed the name's colour, and in the light theme `--highlight` (#000) and
+  `--text` (#1c1c1e) are nearly the same colour, so on the current session
+  the marker vanished. It is now heavier as well as brighter, and the row
+  you are on is painted selected from the moment the picker opens instead of
+  waiting for the first pointer move.
+- **The model row stopped eating its own name.** `Claude Sonnet 4.5` was
+  squeezed to 45px — five characters — because the raw model id took 110px
+  of a 345px row and rendered the same string in lower case. The id is gone
+  below 560px; effort and vision stay, and the name has room.
+- **Sections are structure.** An uppercase word floated above a gap. It now
+  rides a hairline that runs to the sheet's edge (`::after`), so `live` and
+  `saved` read as division rather than decoration. The sheet's head got the
+  same hairline: the body scrolls under the title and there was nothing
+  between them.
+- **Help is a definition list.** The shortcut list was one `<pre>` whose
+  columns were runs of spaces; at 390px the lines wrapped in the middle of
+  the description and the alignment collapsed into noise. It is a `<dl>`
+  grid now — keys in the mono face, descriptions in prose, columns sized by
+  the widest key — and the command list is a second `<dl>` of `name`,
+  `usage` (accent) and description. The notes are a paragraph instead of
+  hand-wrapped `\n`, and the sentence about "every Thought for pill" is
+  gone: that pill stopped existing last round.
+- Redundant words went with the boxes: `/filter`'s remove rows said `✕` and
+  `remove`; the field label stopped shouting in uppercase.
+
+The service-worker cache name moved to `xarness-ui-v48`.
+
+## Rail round: one stroke through the live tail
+
+- The connector stopped at the last shape and the eight-line live tail below
+  it started bare, so the thread the shapes draw broke at exactly the part
+  that is still streaming. The tail now carries the same 1px stroke at the
+  connector's x — `8px - (--row-icon-w + --row-gap)`, so it lands on the
+  same pixel whether the phone gap (6px) or the desktop gap (8px) is in
+  play. It is the block's rail continued, not a border on the tail's own
+  edge: that edge was the second vertical line round 1 removed. When the
+  tail is on screen the last row's stroke falls to the panel edge and the
+  tail's top margin goes to 0, so the line is unbroken from the header to
+  the last line of the tail.
+- The block header no longer lights up under the pointer, and the block no
+  longer draws a border when it opens. The header is a title, not a card:
+  the shapes and the sticky header already say what is open, and a second
+  surface behind the same text was noise. Row headers keep their hover —
+  they are the thing you tap.
+
+The service-worker cache name moved to `xarness-ui-v49`.
+
+## Summary round: present tense while it runs
+
+- The header said `Thinking` for a single thought even after it had finished,
+  and `ran 1 tool` for a single call whether it was still running or not. A run
+  of one now names its own state: `Thinking`/`Thought` and `Running`/`Ran`.
+- A longer run tallied the activity in flight as if it were done, so `ran 2
+  tools` appeared while the second call was still on the wire and `Thought 9
+  times` counted a thought that had only just started. Only settled activities
+  are tallied now; the last one joins the line as `Thinking`/`Running` and bumps
+  its tally when it settles.
+
+The service-worker cache name moved to `xarness-ui-v50`.
+
+## Home round: a landing page instead of the last session
+
+- A bare address used to reopen the most recent session, which is the wrong
+  answer for a bookmark or a phone home-screen icon: it decided for you. The
+  bare URL is now the home screen. `#s=<name>` still opens a conversation
+  directly, and every attach writes that hash, so a reload of a chat still
+  lands in the chat (a reload of the home stays on the home).
+- The home screen carries what a landing page owes: **live** sessions (the
+  ones the host is still hosting, with their state and the folder they are
+  working in), **recent** ones (saved, newest first, with `all` when there are
+  more than fit), and **folders** — the known workspaces from
+  `GET /v1/workspaces`, plus whichever folder the draft will use when it is
+  not in that list. A folder row selects the folder; it does not start a
+  session, because the first message is what starts it. `another folder…`
+  takes a path (the host creates it if it is missing).
+- The draft's folder is now named instead of "draft": the topbar subtitle,
+  the status tooltip, the sidebar's workspace row and a line on the home
+  screen all show the path the first message will start in. It is the picked
+  folder, else the newest session's workspace, else the most-used known one.
+  The client sends exactly that path in `POST /v1/sessions`, so the label and
+  the session cannot disagree.
+- `/new` is the home screen too. It used to append "started a fresh chat" to
+  an otherwise empty log, which removed the ascii banner; now the banner is
+  the page, the notice is a toast, and the transcript stays empty until the
+  first round lands.
+- A detached page is not a disconnected one. The old state reuse showed the
+  red `closed` dot while the host was perfectly reachable; it is a green
+  `ready` now, and a notice addressed to a draft (a command that needs a
+  session, a failed start) goes to a toast instead of a log nobody is
+  looking at.
+- The home screen is a document, not a dashboard: no cards, no tiles. The
+  banner is a dim watermark, section labels stay in the uppercase mono of the
+  sidebar, rows are full-bleed lines with a hover fill — the same vocabulary
+  as the transcript, so the two surfaces do not look like different apps.
+
+The service-worker cache name moved to `xarness-ui-v51`.
+
+## Sidebar round: a column on the desktop, a drawer on the phone
+
+- On a wide screen the sessions panel is now a real column: open by default,
+  it pushes the conversation instead of covering it, with no scrim and no
+  drop shadow. Collapsing it slides the column out and remembers the choice
+  (`xarness.sidebar`); the phone always starts closed and closes the drawer
+  after picking a session, a new chat, or a footer action.
+- The drawer animates transform and scrim opacity (with `visibility` keeping
+  the closed panel out of the tab order), fades a shadow in while open, and
+  closes on Escape. `inert`/`aria-hidden` follow the state, focus moves to the
+  close button on open and back to the menu button on close, and the menu
+  button shows its expanded state.
+- Styling follows the rest of the shell: the hamburger and close mark are
+  1.6px stroke SVGs like send/stop, the header lines up with the topbar, the
+  selected row gets an accent wash and a brighter name, the empty list has
+  its own prose line, and the footer respects the bottom safe area.
+
+The service-worker cache name moved to `xarness-ui-v52`.
+
+## Floating-head round: no topbar, branches under their parent
+
+- The full-width topbar is gone. The menu button, session name and folder sit
+  at the top-left of the conversation over a short `bg`-to-transparent
+  gradient; the connection dot stays at the right edge of that same line.
+  The log and the home document pad past the 48px line, and sticky activity
+  headers pin just below it instead of under it. The sidebar now starts at
+  the top of the window, so its `sessions` head lines up with the menu.
+- Sessions are drawn as a tree: a parent is followed immediately by its
+  subagents, indented behind a 1px branch rail, instead of the children
+  drifting through the flat recent list. Orphans whose parent is gone stay
+  visible as roots. The same order drives the sidebar, the home lists and the
+  `/sessions` picker; home parents carry a muted `2 agents` count and the
+  recent list still limits itself by parent chats, so subagents do not crowd
+  real sessions out.
+- A subagent is named by its branch when open: `agent-3` in the title and
+  `subagent · <folder>` in the subtitle, rather than the parent id leaking
+  into both.
+
+The service-worker cache name moved to `xarness-ui-v53`.
+
+## Diff header count follows the scope chip
+
+- The pending-diff header used to label itself from every row in the diff, so
+  "Edited N files" behaved like the all-agents scope no matter which chip state
+  was showing. The count is now taken from the same scope-aware set that feeds
+  the +/− totals: this session's own rows while the chip reads `agent`, every
+  session's rows while it is dimmed. Auto and drift rows stay in their own
+  sections and never count, and the `· N ignored` suffix is unchanged.
+
+The service-worker cache name moved to `xarness-ui-v54`.
+
+## Tab badge: the page state on the icon
+
+- The page keeps the artwork as its tab icon but adds a dot in the icon's
+  bottom-right corner, drawn on a 64px canvas over `icons/icon-192.png` and
+  swapped in through the `<link id="favicon">` as a PNG data URL. Nothing is
+  added to the page itself: the tab is the one place a background session can
+  still report from.
+- The dot is gray at rest, the theme's `accent` while `ask_user` is waiting on
+  an answer, and `success` green while a turn is `running`/`compacting`. It is
+  painted from the same `status`/`ask` reads that drive the composer bars, so
+  it holds its color instead of animating; a repaint only happens when the
+  color, `data-theme` or `prefers-color-scheme` actually change.
+
+The service-worker cache name moved to `xarness-ui-v55`.
+
+## Pushed-list round: the host owns the row, the page only patches it
+
+- `GET /v1/sessions` is a pure read now: no snapshot, no diff, no git. The
+  pending +/− totals are cached on each hosted session and refreshed by the
+  host off a workspace event, debounced into one `observe` + one `diff` per
+  repo and fanned out to every session in it. The `stats` flag stays on the
+  wire for older clients and does nothing. A poll that used to run one
+  snapshot and N diffs under the workspace lock is now a dict walk.
+- The list is pushed: `GET /v1/events` sends one `SessionsSnapshot`, then
+  `session_changed` frames (one summary) and `sessions_removed` (names) as
+  they happen — a create, a turn starting, a tool waiting, a pending ask,
+  `clients_attached` moving, an unload or an eviction (both push the saved
+  meta row: the file is still there, so the row only changes clothes), and a
+  delete (which removes it). A reconnect always re-snapshots; there is no
+  delta replay to get wrong. The web sidebar follows it and keeps the 5s
+  poll as the fallback while the stream is down; the TUI's `/sessions`
+  picker follows the same stream for exactly as long as the modal is open
+  (closing it cancels the worker and the response), and neither pages a
+  window any more — the stream carries the whole list, so the sidebar's
+  scroll trigger and the picker's `on_end` fetch are gone.
+- The `state` word is the host's: `saved` means "on disk, not hosted", and a
+  hosted session reads `idle` — the web page's warm rows used to say `saved`.
+  `hosted` is on the summary for clients that need the distinction without
+  inferring it from `active`.
+- Rows are patched, not rebuilt. The sidebar compares a structure signature
+  (names, parents, order, live/saved grouping) and, when only a word, an age
+  or a +/− total changed, rewrites that row's nodes in place. The home
+  document's signature is structure only, so a stats tick no longer rebuilds
+  every row. Picking a row paints the pushed title/status before the stream's
+  first frame lands.
+- Hovering no longer opens anything. The sidebar used to warm a row with
+  `GET /v1/sessions/{name}?range=[-1:]`, and that request *hosts* the session:
+  sweeping the list left a server view full of idle sessions nobody opened.
+  A hover on a saved row now makes one read-only `GET …/summary`, which
+  computes that row's own pending totals from the workspace's saved
+  baseline — one scoped diff for this session and its saved subagents, never
+  the repo-wide fan-out, cached five seconds per repo so a sweep costs one
+  snapshot. Hosted rows get their totals from the pushed stream instead, and
+  opening a session (a click) is the only thing that hosts it.
+- The attach frame takes `slim=true`: headers and prose, empty tool bodies and
+  arguments, hydrated per row as before. Loading a conversation was never the
+  slow part; the frames are.
+- MCP no longer gates anything on the read path. A session starts its servers
+  in the background after create/load (`ensure_mcp` returns the shared task,
+  never awaits it), so a broken server costs its `startup_timeout` in the
+  background instead of a minute of "connecting". The first turn and `/tools`
+  await that same task; a session with no server configured has nothing to
+  await at all.
+
+The service-worker cache name moved to `xarness-ui-v59`.

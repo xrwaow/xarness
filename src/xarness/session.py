@@ -105,7 +105,7 @@ from .sandbox import (
 )
 from .session_store import StoredSession
 from .tools import DEFAULT_TIMEOUT, build_registry
-from .util import utcnow_iso as _utcnow
+from .util import parse_range, utcnow_iso as _utcnow
 from .workspace import (
     _EXPLICIT_WRITES,
     WorkspaceState,
@@ -158,28 +158,34 @@ def _merge_steer(items: list[_QueuedSteer]) -> tuple[str, list[ImageRef] | None,
 
 LOG = logging.getLogger(__name__)
 
-# One page of history when the client doesn't ask for a size: a screenful,
+# One page of history when the client doesn't ask for a window: a screenful,
 # small enough that a long chat opens as fast as a short one.
 HISTORY_PAGE = 40
+# The window GET …/messages defaults to: the newest page.
+DEFAULT_HISTORY_WINDOW = f"[-{HISTORY_PAGE}:]"
 
 
 def history_page(
-    messages: list[Message], *, before: int | None = None,
-    limit: int | None = HISTORY_PAGE,
+    messages: list[Message], *, window: str = DEFAULT_HISTORY_WINDOW,
 ) -> tuple[int, int]:
-    """The ``[start, end)`` slice for one page ending at ``before``.
+    """The ``[start, end)`` slice ``window`` selects, aligned to whole turns.
 
-    Pages cut only at user messages (turn starts), so a tool call is never
-    separated from its result and a turn's footer stays with it; a turn
-    bigger than ``limit`` therefore ships whole. ``limit=None`` is the whole
-    history (the TUI's attach), ``before=None`` the newest page."""
-    end = len(messages) if before is None else max(0, min(before, len(messages)))
-    if limit is None:
-        return 0, end
-    # 0 is always a boundary: an old save need not open with a user message.
-    floor = end - max(1, limit)
-    starts = [i for i, m in enumerate(messages) if m.role == "user" and 0 < i <= floor]
-    return max(starts, default=0), end
+    ``window`` is a Python-style range (see :func:`xarness.util.parse_range`),
+    e.g. ``[-40:]`` or ``[10:20]``; ``"[:]"`` is the whole history. A window
+    that would start mid-turn starts at that turn's user message instead, so
+    a tool call is never separated from its result and a turn's footer stays
+    with it: a window therefore ships *at least* what it asked for. The end
+    is taken literally (clients walk back with the ``start`` a page
+    returned, which is a turn boundary already).
+    """
+    start, end = parse_range(window, len(messages))
+    if 0 < start < end:
+        start = max(
+            (index for index in range(start, 0, -1)
+             if messages[index].role == "user"),
+            default=0,
+        )
+    return start, end
 
 
 # Characters of reasoning a slim page keeps: enough for a row's snippet and
@@ -236,6 +242,9 @@ class SessionParts:
     # Called after a workspace event so every agent in the repo refreshes
     # its diff; injected by the host (None outside it).
     notify_workspace: Callable[[str | None], None] | None = None
+    # Called whenever this session's listing row could have changed; the
+    # host fans it out on the session-list stream (None outside it).
+    notify_state: Callable[["Session"], None] | None = None
     # Starts one subagent session for this one and returns its final message;
     # injected by the host, and None for a subagent itself (no nesting).
     spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None
@@ -271,6 +280,7 @@ class Session:
         parent_id: str | None = None,
         workspace_refs: list[str] | None = None,
         notify_workspace: Callable[[str | None], None] | None = None,
+        notify_state: Callable[["Session"], None] | None = None,
         subagent_model: str | None = None,
         spawn_subagent: Callable[["Session", str, str], Awaitable[str]] | None = None,
         report_usage: Callable[[Usage], None] | None = None,
@@ -369,6 +379,16 @@ class Session:
         # becomes a no-op and nothing is ever written to the session store.
         self.no_save = no_save
         self._notify_workspace_cb = notify_workspace
+        # Told whenever the listing row could have changed (state, pending
+        # ask, attached clients). The host fans it out to GET /v1/events
+        # subscribers; None outside the host (tests, direct use).
+        self._notify_state_cb = notify_state
+        # Cached pending-diff totals for the /sessions +/- columns. The host
+        # maintains these from workspace events (one git diff per workspace,
+        # fanned out to every session in it); the listing itself never runs
+        # git. See Host.refresh_stats.
+        self.pending_additions = 0
+        self.pending_deletions = 0
         # Content-addressed image blobs for this session's messages.
         self.images = session_store.SessionImageStore(
             self.name, persist=not no_save,
@@ -381,6 +401,9 @@ class Session:
         self._persist_task: asyncio.Task[None] | None = None
         self._diff_task: asyncio.Task[None] | None = None
         self._diff_dirty = False
+        # One shared MCP-startup task (see ensure_mcp): attaching and
+        # loading must never wait on a server handshake.
+        self._mcp_task: asyncio.Task[None] | None = None
         # The tool call currently executing (if any). A session whose model
         # has handed off to a tool is waiting on it, not generating: /sessions
         # shows that as "waiting" (a subagent call can run for minutes).
@@ -442,13 +465,53 @@ class Session:
     async def prepare_mcp(self) -> None:
         """Connect the configured MCP servers once, then rebuild the tools.
 
-        Called by the host before a session can be used, and again from
-        :meth:`tools_info` so a client that attaches to an old session sees
-        live availability rather than an empty listing."""
-        if self.mcp.started or self._closed:
+        Never call this on the attach path: a broken server can take its
+        whole ``startup_timeout`` to fail, and the snapshot/status payload
+        does not need a started server. Use :meth:`ensure_mcp` (a shared
+        background task) and await it where a tool schema is actually
+        needed — a turn, or ``/tools``."""
+        # Nothing to connect: leave the registry alone. Rebuilding it would
+        # only reproduce the current tool set, and a caller that replaced
+        # ``tool_registry`` (tests, a custom host) would lose its tools.
+        if (
+            self.mcp.started or self._closed
+            or not self.mcp.has_enabled_servers
+        ):
             return
         await self.mcp.start()
         self._rebuild_tools()
+
+    def ensure_mcp(self) -> asyncio.Task[None] | None:
+        """Start MCP in the background exactly once; returns the shared task.
+
+        ``None`` means there is nothing to wait for — no server is enabled,
+        MCP is already up, or the session is closed. Callers await the
+        returned task where a tool schema is needed (a turn, ``/tools``);
+        the host fires it off right after a session is loaded or created so
+        the servers are usually up by then, and attaching never awaits it.
+
+        Returning ``None`` rather than a finished task matters: awaiting a
+        finished task still yields to the loop, and turn startup is
+        synchronous on purpose (see ``_start_turn``)."""
+        if self.mcp.started or self._closed or not self.mcp.has_enabled_servers:
+            return None
+        task = self._mcp_task
+        if task is not None and not task.done():
+            return task
+        task = asyncio.get_running_loop().create_task(self._start_mcp())
+        self._mcp_task = task
+        return task
+
+    async def _start_mcp(self) -> None:
+        """Run :meth:`prepare_mcp` in the background, swallowing failures.
+
+        No status event: ``Status`` carries no tool information, the tool
+        list is fetched by whoever opens /tools, and the first turn awaits
+        this task before it builds its request."""
+        try:
+            await self.prepare_mcp()
+        except Exception as exc:  # never kill the session over a server
+            LOG.warning("MCP startup failed for %s: %s", self.name, exc)
 
     async def tools_info(self) -> protocol.ToolsInfo:
         """The effective tools (built-ins plus enabled MCP tools) and every
@@ -456,7 +519,8 @@ class Session:
 
         Server processes are started lazily here too, so opening /tools is
         enough to make a newly configured server available."""
-        await self.prepare_mcp()
+        if (task := self.ensure_mcp()) is not None:
+            await task
         return protocol.ToolsInfo(
             tools=[
                 protocol.ToolInfo(
@@ -568,6 +632,10 @@ class Session:
         self._compacting = False
         await self._cancel_and_wait(self._diff_task)
         self._diff_task = None
+        # A background MCP handshake must not outlive the session (and the
+        # owner closes the servers right below).
+        await self._cancel_and_wait(self._mcp_task)
+        self._mcp_task = None
         await self._flush_persist()
         # Close the sandbox shell here (not only on host eviction) so every
         # path — explicit unload, delete, eviction, shutdown — releases it.
@@ -626,19 +694,24 @@ class Session:
             state = "ask"
         elif self._executing_tool is not None:
             state = "waiting"
-        # Active derives from the same predicate the grace loop uses — a
-        # hosted but fully idle session (no stream, no ask, no running
-        # turn) is not active; it is released and listed as saved.
+        # Active derives from the same predicate the grace loop uses. This
+        # object is a live Session, so it is hosted by definition — a fully
+        # idle warm session reads ``idle``, not ``saved``; only the meta row
+        # of a released session says saved.
         active = self.is_active
         return SessionSummary(
             name=self.name, workspace=str(self.workspace),
-            state=state if active else "saved",
+            state=state, hosted=True,
             active=active, clients_attached=self.clients_attached,
             model=self.profile_name, sandbox=self.sandbox.name,
             last_user_message_at=self.last_user_message_at(),
-            message_count=len(self.conversation.visible_messages()),
+            # O(1): no copy of the visible slice. Called on every state
+            # broadcast now.
+            message_count=self.conversation.visible_count(),
             parent_id=self.parent_id,
             tracking=self.workspace_state is not None,
+            additions=self.pending_additions,
+            deletions=self.pending_deletions,
         )
 
     # ------------------------------------------------------------------
@@ -665,22 +738,26 @@ class Session:
             self.partial_round.apply(event)
 
     def subscribe(
-        self, *, message_limit: int | None = None,
+        self, *, window: str | None = None, slim: bool = False,
     ) -> tuple[Snapshot, asyncio.Queue[Event]]:
         """Build the attach snapshot and register a subscriber.
 
         Synchronous on purpose: no await between building the snapshot and
         registering the queue, so the stream cannot move in between (no
-        gap, no duplicate). ``message_limit`` windows the history exactly as
-        :meth:`snapshot` does."""
-        snapshot = self.snapshot(message_limit=message_limit)
+        gap, no duplicate). ``window``/``slim`` window the history exactly
+        as :meth:`snapshot` does."""
+        snapshot = self.snapshot(window=window, slim=slim)
         queue: asyncio.Queue[Event] = asyncio.Queue()
         self._subscribers.append(queue)
+        # Attaching changes ``clients_attached`` and can make a warm idle
+        # session active; the listing gets that without waiting for a poll.
+        self._notify_state()
         return snapshot, queue
 
     def unsubscribe(self, queue: asyncio.Queue[Event]) -> None:
         if queue in self._subscribers:
             self._subscribers.remove(queue)
+            self._notify_state()
 
 
     @property
@@ -740,13 +817,17 @@ class Session:
             other_clients=others,
         )
 
-    def snapshot(self, *, message_limit: int | None = None) -> Snapshot:
+    def snapshot(
+        self, *, window: str | None = None, slim: bool = False,
+    ) -> Snapshot:
         """Client-facing state (synchronous; see :meth:`subscribe`).
 
-        ``message_limit`` windows ``messages`` to the newest page(s) of the
-        history and says where the window starts; ``None`` keeps the whole
-        history (the TUI's attach)."""
-        page = self.message_page(limit=message_limit)
+        ``window`` selects the ``messages`` slice (a Python-style range, see
+        :func:`history_page`) and says where it starts; ``None`` keeps the
+        whole history (the TUI's attach). ``slim`` strips the tool bodies
+        and truncates reasoning, so a first frame is headers + prose and a
+        row hydrates on demand."""
+        page = self.message_page(window=window or "[:]", slim=slim)
         return Snapshot(
             messages=page.messages,
             status=self.status(),
@@ -754,16 +835,19 @@ class Session:
             message_offset=page.start,
             message_total=page.total,
             has_more=page.has_more,
+            slim=page.slim,
         )
 
     def message_page(
-        self, *, before: int | None = None, limit: int | None = HISTORY_PAGE,
-        slim: bool = False,
+        self, *, window: str | None = None, slim: bool = False,
     ) -> MessagePage:
-        """One page of older history (see :func:`history_page`). ``slim``
-        drops the bodies (see :func:`slim_message`)."""
+        """One page of history (see :func:`history_page`); a missing
+        ``window`` is the newest page. ``slim`` drops the bodies (see
+        :func:`slim_message`)."""
         messages = self.conversation.messages
-        start, end = history_page(messages, before=before, limit=limit)
+        start, end = history_page(
+            messages, window=window or DEFAULT_HISTORY_WINDOW,
+        )
         page = messages[start:end]
         return MessagePage(
             messages=[slim_message(m) for m in page] if slim else page,
@@ -877,8 +961,19 @@ class Session:
             await asyncio.wait(alive)
 
     def _emit_status(self) -> None:
-        """Push the current status to every client."""
+        """Push the current status to every client, and to the host's
+        session-list watchers (the summary carries the state word)."""
         self._emit(protocol.StatusChanged(status=self.status()))
+        self._notify_state()
+
+    def _notify_state(self) -> None:
+        """Tell the host the listing row may have changed.
+
+        Sync and cheap on purpose: it is called from state transitions that
+        happen inside the loop (and from subscribe/unsubscribe). The host
+        turns each call into a summary frame for the session list."""
+        if self._notify_state_cb is not None:
+            self._notify_state_cb(self)
 
     def _emit_notice(self, text: str, level: protocol.Level = "info") -> None:
         self._emit(protocol.Notice(text=text, level=level))
@@ -1482,6 +1577,8 @@ class Session:
         # it shows an empty transcript instead of the interrupted turn.
         self._persist()
         self._emit(protocol.MessageAdded(message=message))
+        # ``last_user_message_at`` is the listing's recency key.
+        self._notify_state()
 
     def _begin_turn(
         self, text: str, images: list[ImageRef] | None, before_tree: str | None,
@@ -1655,6 +1752,12 @@ class Session:
         _start_turn, synchronously before the task existed."""
         self._reset_partial()
         turn_start = time.monotonic()
+        # The tool schema must be final before the first request. MCP startup
+        # runs in the background from load time (see ensure_mcp), so this is
+        # normally already done; attaching never waits on it. No await at all
+        # when there is nothing to start, so a turn begins in this first step.
+        if (mcp := self.ensure_mcp()) is not None:
+            await mcp
         # Time the model spent producing its rounds, measured as it happens
         # (see _close_out_turn). Everything else — tools, compaction,
         # queueing, teardown — is waiting, i.e. idle.
@@ -1855,6 +1958,7 @@ class Session:
         record = None if ws is None else await self._observe(ws, call)
         self._executing_tool = call.name or call_id
         self._executing_calls += 1
+        self._notify_state()
         try:
             result = await self.tool_registry.call(
                 call.name, call.arguments_json, output_sink=sink,
@@ -1864,6 +1968,7 @@ class Session:
             self._executing_calls = max(0, self._executing_calls - 1)
             if self._executing_calls == 0:
                 self._executing_tool = None
+                self._notify_state()
         # A command's change is measured from its before/after snapshots, so
         # it is recorded whatever the exit status: a failing command still
         # leaves its writes on disk. Explicit writes keep the success gate.
@@ -2277,21 +2382,12 @@ class Session:
         if ws is None:
             return protocol.DiffInfo(tracking=False)
         try:
-            # A row click-through needs both the stat row and the text;
-            # snapshot the workspace once and share the sha between them.
-            current = await ws.observe()
-            info = await ws.diff(
-                self.name, current=current, path=path,
+            return await ws.diff_info(
+                self.name, path=path, author=author,
                 scope=self.view.diff_scope,
             )
-            if path is not None:
-                info.text = await ws.file_diff(
-                    path, current=current, author=author,
-                )
         except GitWorktreeError as exc:
             # Git failures raise instead of reporting tracking=False: a
             # transient index.lock (concurrent snapshots) must not make
             # clients believe tracking disappeared.
             raise SessionError(f"diff failed: {exc}") from exc
-        info.tracking = True
-        return info

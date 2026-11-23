@@ -25,8 +25,13 @@ from textual.widgets import Input, Label, OptionList
 from textual.widgets.option_list import Option
 
 from .. import theme
-from ..protocol import SessionSummary
-from ..util import format_duration, parse_iso
+from ..protocol import (
+    SessionSummary,
+    SessionsRemoved,
+    SessionsSnapshot,
+    SessionSummaryChanged,
+)
+from ..util import format_duration, parse_iso, same_path
 
 # State word per session state, colored with this palette key; states not
 # listed here (saved / not loaded) get no state word. "ask" is a session
@@ -121,16 +126,6 @@ def innermost_dir(workspace: str | None) -> str:
     return Path(workspace).name or workspace
 
 
-def _same_path(a: str, b: Path | None) -> bool:
-    """True when saved workspace ``a`` resolves to the same directory as ``b``."""
-    if b is None:
-        return True  # no workspace filter: everything matches
-    try:
-        return Path(a).resolve() == b
-    except OSError:
-        return False
-
-
 def name_options(names: Sequence[str], current: str | None = None) -> list[Option]:
     """Plain rows for the /model, /theme, ... pickers."""
     return [
@@ -168,6 +163,25 @@ def theme_options(
     return options
 
 
+def merge_session_event(
+    entries: Sequence[SessionSummary], event: object,
+) -> list[SessionSummary]:
+    """Fold one ``GET /v1/events`` frame into the listing.
+
+    A snapshot replaces the rows; a summary upserts one (the host sends it
+    whole, so no patching); a removal drops names. Future frame kinds leave
+    the list alone."""
+    if isinstance(event, SessionsSnapshot):
+        return list(event.sessions)
+    if isinstance(event, SessionsRemoved):
+        gone = set(event.names)
+        return [entry for entry in entries if entry.name not in gone]
+    if isinstance(event, SessionSummaryChanged):
+        summary = event.summary
+        return [*(e for e in entries if e.name != summary.name), summary]
+    return list(entries)
+
+
 def session_options(
     entries: Sequence[SessionSummary], workspace: str | None,
     current: str | None = None,
@@ -195,7 +209,7 @@ def session_options(
     resolved = Path(workspace).resolve() if workspace else None
     entries = [
         entry for entry in entries
-        if _same_path(entry.workspace or "", resolved)
+        if same_path(entry.workspace or "", resolved)
     ]
     by_name = {entry.name: entry for entry in entries}
     # Without its family a child row would read as a stray ``agent-N`` at
@@ -224,18 +238,13 @@ def session_options(
     # is right-aligned, the workspace dir left-aligned, the session's own
     # unaccepted (``mine``) +/- totals in fixed +/- sub-columns (blank for
     # tracked-but-clean or untracked sessions), state word flush right.
-    live_names = {summary.name for summary in active}
     rows_data = []
     for summary in [*active, *saved]:
         tracked = summary.tracking and (summary.additions or summary.deletions)
-        # A saved child kept live only because another member of its group
-        # is active is idle, not an old on-disk session: show that state.
-        state = "idle" if (summary.name in live_names
-                           and summary.state == "saved") else summary.state
         rows_data.append((
             summary,
             _title(summary),
-            state,
+            summary.state,
             relative_time(summary.last_user_message_at),
             innermost_dir(summary.workspace),
             f"+{summary.additions}" if tracked and summary.additions else "",

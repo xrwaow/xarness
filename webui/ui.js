@@ -79,7 +79,7 @@ export function showPicker({ title, rows, text = '', note = '', footer = '', cla
     if (!nodes.length) return;
     selected = (index + nodes.length) % nodes.length;
     nodes.forEach((node, at) => node.classList.toggle('selected', at === selected));
-    nodes[selected].scrollIntoView({ block: 'nearest' });
+    nodes[selected].scrollIntoView?.({ block: 'nearest' });
     if (focus) nodes[selected].focus({ preventScroll: true });
   };
   for (const row of rows) {
@@ -133,14 +133,18 @@ export function showPicker({ title, rows, text = '', note = '', footer = '', cla
     }
   };
   sheet.addEventListener('keydown', onKey);
+  // No Cancel button: Esc, the backdrop and the header ✕ all dismiss a picker,
+  // and a full-width bar would read as the sheet's main action.
   return openSheet({
     title,
     text,
     body,
-    buttons: [{ label: 'Cancel', value: null }],
+    buttons: [],
     onOpen: (finish) => {
       finishSheet = finish;
-      if (nodes[selected]) nodes[selected].focus({ preventScroll: true });
+      // paint the current row as selected before the pointer moves, so the
+      // first arrow key is a visible step from somewhere
+      select(selected, { focus: true });
     },
   })
     .finally(() => sheet.removeEventListener('keydown', onKey))
@@ -199,7 +203,7 @@ export function showInfo({ title, text = '', body = null }) {
     title,
     text,
     body,
-    buttons: [{ label: 'Close', value: null, primary: true }],
+    buttons: [{ label: 'Close', value: null }],
     enterConfirms: true,
   });
 }

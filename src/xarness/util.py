@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # a leaf module: no runtime dependency on the models
@@ -60,3 +61,59 @@ def parse_iso(stamp: str | None) -> datetime | None:
         return datetime.fromisoformat(stamp)
     except ValueError:
         return None
+
+
+class RangeError(ValueError):
+    """A malformed ``range`` query value (the API answers 400)."""
+
+
+def same_path(left: object, right: object) -> bool:
+    """Whether two workspace spellings name the same directory.
+
+    Saved metas may record a symlink or a relative ``--workspace``; the
+    clients and the host must agree on which checkout that is. ``None`` on
+    either side means "no filter" (match) and "no workspace" (no match).
+    """
+    if not right:
+        return True
+    if not left:
+        return False
+    try:
+        return Path(str(left)).resolve() == Path(str(right)).resolve()
+    except OSError:
+        return False
+
+
+def parse_range(spec: str | None, total: int) -> tuple[int, int]:
+    """Resolve a Python-style ``range=[start:stop]`` against ``total``.
+
+    ``None``/``""``/``"[:]"`` is the whole collection; a negative bound
+    counts from the end (``[-10:]`` is the newest ten), exactly like a
+    slice. Bounds clamp to ``[0, total]`` and an inverted window is empty,
+    so a client can walk ``[-N:]``, then ``[start-N:start]``, … without
+    booking offsets.
+    """
+    text = (spec or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if not text:
+        return 0, total
+    if text.count(":") != 1:
+        raise RangeError(
+            f"bad range {spec!r}: expected [start:stop], e.g. [-10:]"
+        )
+
+    def bound(part: str, default: int) -> int:
+        if not part.strip():
+            return default
+        try:
+            value = int(part)
+        except ValueError:
+            raise RangeError(
+                f"bad range {spec!r}: {part.strip()!r} is not an integer"
+            ) from None
+        return value + total if value < 0 else value
+
+    start, stop = text.split(":")
+    start = min(max(bound(start, 0), 0), total)
+    return start, min(max(bound(stop, total), start), total)

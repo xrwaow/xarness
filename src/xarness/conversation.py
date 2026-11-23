@@ -458,6 +458,10 @@ class Conversation(BaseModel):
     def visible_messages(self) -> list[Message]:
         return self.messages[self.visible_index():]
 
+    def visible_count(self) -> int:
+        """Size of the visible slice, without copying it."""
+        return len(self.messages) - self._visible_from
+
     @property
     def open_turn(self) -> TurnCheckpoint | None:
         """The still-open turn's checkpoint (``closed`` not yet set), or

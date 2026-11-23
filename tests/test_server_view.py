@@ -89,7 +89,7 @@ def _host() -> FakeHost:
                 "build-api/agent-1", state="waiting", parent_id="build-api",
                 message_count=5,
             ),
-            _summary("scratch-notes", state="saved", active=False,
+            _summary("scratch-notes", state="idle", active=False,
                      model="deepseek", message_count=2),
         ],
         {

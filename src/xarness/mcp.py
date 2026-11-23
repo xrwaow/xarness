@@ -271,6 +271,14 @@ class McpManager:
             ))
         return out
 
+    @property
+    def has_enabled_servers(self) -> bool:
+        """Whether :meth:`start` has anything to connect.
+
+        Lets a caller skip the whole startup (and the tool-registry rebuild
+        that follows it) when no server is switched on for this session."""
+        return any(self._enabled(name) for name in self._servers)
+
     def connected_server_names(self) -> list[str]:
         """Servers whose tools the model currently has (for the prompt)."""
         return [

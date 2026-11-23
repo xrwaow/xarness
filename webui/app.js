@@ -3,10 +3,10 @@
  * DOM in `render.js`, HTTP in `api.js`. */
 import { api, ApiError } from './api.js';
 import { byId, el, replace, toast } from './dom.js';
-import { LogView } from './render.js';
+import { LogView, BANNER } from './render.js';
 import { diffTree } from './diff.js';
 import { Transcript, formatTokens } from './state.js';
-import { COMMANDS, commandUsage, findCommand } from './commands.js';
+import { COMMANDS, findCommand } from './commands.js';
 import { showConfirm, showInfo, showPicker, showPrompt, sheetSection } from './ui.js';
 import { sha256Hex } from './sha256.js';
 
@@ -14,6 +14,11 @@ const RECONNECT_MIN = 250,
   RECONNECT_MAX = 4000;
 const INTERRUPT_ARM_SECONDS = 2.5,
   SESSIONS_REFRESH_MS = 5000;
+// A hovered saved row fetches its own pending totals (the listing never runs
+// git). Debounced so sweeping the list does not fire a request per row, and
+// cached per row: the same numbers stay valid for half a minute.
+const HOVER_MS = 120,
+  SAVED_STATS_TTL_MS = 30000;
 const STALL_MS = 12000,
   WATCHDOG_MS = 4000,
   PROBE_TIMEOUT_MS = 5000,
@@ -31,7 +36,7 @@ const STORAGE = {
   theme: 'xarness.theme',
   model: 'xarness.model',
   workspace: 'xarness.workspace',
-  session: 'xarness.session',
+  sidebar: 'xarness.sidebar',
 };
 const THEMES = {
   'ayu-darker': { mode: 'dark', swatches: ['#121212', '#bfbdb6', '#d2a6fe', '#aad84c', '#ef7177'] },
@@ -39,6 +44,11 @@ const THEMES = {
 };
 const DIFF_BADGE = { mine: 'agent', agent: 'agent', auto: 'auto', drift: 'drift' };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Resolve a CSS custom property to a color the canvas can use.
+const cssColor = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#8a8986';
+// The tab icon is the artwork plus a badge: the page's own state at a glance
+// from a background tab. Geometry is a fraction of the icon's square.
+const FAVICON = { size: 64, dot: 0.135, ring: 0.045, cx: 0.79, cy: 0.8, backdrop: '#121212' };
 const commandRow = (command) => ({
   id: command.name,
   label: `/${command.name}`,
@@ -178,6 +188,45 @@ const byRecent = (a, b) =>
   (Date.parse(a.last_user_message_at || a.updated_at || 0) || 0);
 const sessionLabel = (entry) => (entry.parent_id ? `↳ ${entry.name.split('/').pop()}` : entry.name);
 const sessionWhen = (entry) => relativeTime(entry.last_user_message_at || entry.updated_at);
+const bySectionThenRecent = (a, b) => (a.active !== b.active ? (a.active ? -1 : 1) : byRecent(a, b));
+/** Parent sessions with their subagent children directly underneath. A child
+ * whose parent is no longer in the list stays a root, so it is never lost. */
+function sessionGroups(sessions) {
+  const known = new Set(sessions.map((entry) => entry.name)),
+    children = new Map();
+  for (const entry of sessions) {
+    if (!entry.parent_id || !known.has(entry.parent_id)) continue;
+    const list = children.get(entry.parent_id) || [];
+    list.push(entry);
+    children.set(entry.parent_id, list);
+  }
+  for (const list of children.values()) list.sort(byRecent);
+  const seen = new Set(),
+    groups = [];
+  const walk = (root, rows = [], depth = 0) => {
+    if (seen.has(root.name)) return;
+    seen.add(root.name);
+    rows.push({ entry: root, depth });
+    for (const child of children.get(root.name) || []) walk(child, rows, depth + 1);
+    return { root, rows };
+  };
+  // Orphans (their parent is not listed) stay visible as roots.
+  const roots = sessions.filter((entry) => !entry.parent_id || !known.has(entry.parent_id));
+  roots.sort(bySectionThenRecent);
+  for (const root of roots) groups.push(walk(root));
+  // Defensive: a cycle in the parent links still shows every session once.
+  for (const entry of sessions) {
+    if (!seen.has(entry.name)) groups.push(walk(entry));
+  }
+  return groups;
+}
+/** The fields that make a list need rebuilding (rather than patched in
+ * place). Each surface adds the fields it draws. */
+const groupShape = (groups, fields) =>
+  groups.map((group) => [
+    group.root.active,
+    group.rows.map(({ entry, depth }) => [entry.name, depth, ...fields(entry, group)]),
+  ]);
 
 class App {
 
@@ -185,10 +234,18 @@ class App {
     Object.assign(this, {
       transcript: new Transcript(),
       status: null,
+      // The listing row of the session being attached, shown until its
+      // snapshot lands (see viewStatus).
+      pending: null,
       session: null,
       config: null,
       sessions: [],
+      workspaces: [],
+      // Bumped by every poll so a slow older response cannot replace a newer
+      // list (see pollSessions).
+      sessionsSeq: 0,
       connState: 'connecting',
+      wide: window.matchMedia('(min-width: 768px)'),
       workspace: localStorage.getItem(STORAGE.workspace) || null,
       draftMode: 'write',
       draftModel: localStorage.getItem(STORAGE.model) || null,
@@ -200,6 +257,9 @@ class App {
       diffScope: 'all',
       diffScopePending: null,
       ask: null,
+      faviconCanvas: null,
+      faviconBase: null,
+      faviconKey: null,
       streamAbort: null,
       attachSeq: 0,
       lastActivity: 0,
@@ -228,7 +288,17 @@ class App {
       scrollQueued: false,
       lastNotice: '',
       lastNoticeAt: 0,
+      homeSig: null,
+      sessionNodes: new Map(),
+      homeNodes: new Map(),
+      listAbort: null,
+      listLive: false,
+      // Saved rows' totals, fetched one row at a time on hover (the listing
+      // never runs git): name -> when it was fetched (ms).
+      savedStats: new Map(),
+      hoverTimer: null,
       log: byId('log'),
+      home: byId('home'),
       input: byId('input'),
       diffView: byId('diffview'),
     });
@@ -243,29 +313,47 @@ class App {
     const storedToken = localStorage.getItem(STORAGE.token);
     if (storedToken) api.setToken(storedToken);
     this.applyTheme(localStorage.getItem(STORAGE.theme));
+    this.initSidebar();
     this.bindEvents();
     this.watchPointer();
     this.renderTitle();
     this.renderStatus();
     this.renderBars();
+    this.initFavicon();
     this.syncAttachments();
     this.setConn('connecting');
     this.view.renderAll([]);
-    await this.connect();
-    this.pollSessions();
+    // Timers and listeners go up before connecting: with a `#s=` URL
+    // `connect()` starts an event stream that lives as long as the session
+    // is attached, so anything awaited after it would never run and the
+    // sidebar would stay empty until some other action kicked a poll.
     setInterval(() => this.tick(), TICK_MS);
-    setInterval(() => this.pollSessions(), SESSIONS_REFRESH_MS);
+    // The list is pushed (GET /v1/events); the poll is only the fallback
+    // while that stream is down. The home screen's folder counts are not on
+    // the wire, so they get a slow nudge from the same timer.
+    setInterval(() => {
+      if (this.listLive) {
+        if (!this.session) void this.refreshWorkspaces().then(() => this.renderHome());
+      } else {
+        this.pollSessions();
+      }
+    }, SESSIONS_REFRESH_MS);
     setInterval(() => this.checkStalled(), WATCHDOG_MS);
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) this.pollSessions();
+      if (!document.hidden && !this.listLive) this.pollSessions();
     });
     window.addEventListener('hashchange', () => {
       const name = this.sessionFromHash();
-      if (name && name !== this.session) this.attach(name);
+      if (name) {
+        if (name !== this.session) this.attach(name);
+      } else if (this.session) this.detach();
     });
     if ('serviceWorker' in navigator)
       navigator.serviceWorker.register('service-worker.js', { updateViaCache: 'none' }).catch(() => {});
     if (!this.coarsePointer?.matches) this.input.focus();
+    await this.connect();
+    void this.watchSessions();
+    this.pollSessions();
   }
 
   async connect() {
@@ -296,31 +384,19 @@ class App {
   }
 
   async openCurrent() {
-    const name = this.sessionFromHash() || this.session;
-    if (name) this.attach(name);
-    else await this.resumeLast();
-  }
-
-  async resumeLast() {
-    let entries = this.sessions;
-    if (!entries.length) {
-      try {
-        entries = await api.sessions({ workspace: this.workspace || undefined });
-        this.sessions = entries;
-        this.renderSessions();
-      } catch {
-        return false;
-      }
+    // A bare URL is the home screen: running and recent sessions, and the
+    // folders a new one can start in. Only `#s=` opens a conversation.
+    const name = this.sessionFromHash();
+    // `attach` is a long-lived reconnect loop, not a one-shot load: await it
+    // and this function (and `connect`, and `start`) never returns. Every
+    // other caller fires it and forgets it; do the same here.
+    if (name) void this.attach(name);
+    else if (!this.session) {
+      // Fill the landing lists before the first paint so the home screen never
+      // flashes empty on the way in.
+      await this.pollSessions();
+      this.detach();
     }
-    if (!entries.length) return false;
-    const remembered = localStorage.getItem(STORAGE.session);
-    const chosen =
-      entries.find((entry) => entry.name === remembered) ||
-      entries.find((entry) => entry.active) ||
-      [...entries].sort(byRecent)[0];
-    if (!chosen) return false;
-    void this.attach(chosen.name);
-    return true;
   }
 
   async loadConfig() {
@@ -357,9 +433,14 @@ class App {
     node.dataset.state = state;
     byId('token-btn').hidden = !api.token && state !== 'unauthed';
     const text =
-      { connecting: 'connecting', open: 'live', offline: 'reconnecting…', closed: 'idle', unauthed: 'token needed' }[
-        state
-      ] || state;
+      {
+        connecting: 'connecting',
+        open: 'live',
+        ready: 'ready',
+        offline: 'reconnecting…',
+        closed: 'idle',
+        unauthed: 'token needed',
+      }[state] || state;
     byId('conn-label').textContent = label || text;
   }
   // ------------------------------------------------------------- events
@@ -368,15 +449,33 @@ class App {
     on('menu-btn', 'click', () => this.toggleSidebar());
     on('close-sidebar', 'click', () => this.toggleSidebar(false));
     on('scrim', 'click', () => this.toggleSidebar(false));
-    on('new-chat', 'click', () => this.newChat());
+    on('new-chat', 'click', () => {
+      this.newChat();
+      this.closeDrawer();
+    });
     on('send', 'click', () => this.submit());
     on('stop', 'click', () => this.interrupt(true));
     on('jump', 'click', () => this.scrollToLatest());
-    on('tools-btn', 'click', () => this.openTools());
-    on('model-btn', 'click', () => this.pickModel());
-    on('theme-btn', 'click', () => this.pickTheme());
-    on('help-btn', 'click', () => this.openHelp());
-    on('token-btn', 'click', () => this.tokenMenu());
+    on('tools-btn', 'click', () => {
+      this.openTools();
+      this.closeDrawer();
+    });
+    on('model-btn', 'click', () => {
+      this.pickModel();
+      this.closeDrawer();
+    });
+    on('theme-btn', 'click', () => {
+      this.pickTheme();
+      this.closeDrawer();
+    });
+    on('help-btn', 'click', () => {
+      this.openHelp();
+      this.closeDrawer();
+    });
+    on('token-btn', 'click', () => {
+      this.tokenMenu();
+      this.closeDrawer();
+    });
     this.input.addEventListener('input', () => {
       this.resizeInput();
       this.updatePalette();
@@ -399,15 +498,58 @@ class App {
     document.addEventListener('keydown', (event) => this.onGlobalKey(event));
   }
 
-  toggleSidebar(open = null) {
-    const sidebar = byId('sidebar');
-    const next = open === null ? !sidebar.classList.contains('open') : open;
-    sidebar.classList.toggle('open', next);
-    byId('scrim').hidden = !next;
-    byId('menu-btn').setAttribute('aria-expanded', String(next));
+  // ------------------------------------------------------------- sidebar
+  initSidebar() {
+    const stored = localStorage.getItem(STORAGE.sidebar);
+    const open = this.wide.matches ? stored !== 'closed' : false;
+    this.setSidebar(open, { focus: false, persist: false });
+    const onChange = (event) => {
+      const want = event.matches ? localStorage.getItem(STORAGE.sidebar) !== 'closed' : false;
+      this.setSidebar(want, { focus: false, persist: false });
+    };
+    if (this.wide.addEventListener) this.wide.addEventListener('change', onChange);
+    else this.wide.addListener(onChange);
+  }
+
+  sidebarOpen() {
+    return byId('sidebar').classList.contains('open');
+  }
+
+  toggleSidebar(open = null, options) {
+    this.setSidebar(open === null ? !this.sidebarOpen() : open, options);
+  }
+
+  setSidebar(open, { focus = true, persist = true } = {}) {
+    const sidebar = byId('sidebar'),
+      main = byId('main'),
+      menu = byId('menu-btn');
+    // The menu lives in the main column, which is inert while the phone drawer
+    // is open: make it focusable again before returning focus to it.
+    if (!open) main.inert = false;
+    // Move the pointer's focus out before the panel leaves the tab order, so
+    // closing never strands focus on an invisible control.
+    if (!open && sidebar.contains(document.activeElement)) menu.focus({ preventScroll: true });
+    sidebar.classList.toggle('open', open);
+    sidebar.inert = !open;
+    sidebar.setAttribute('aria-hidden', String(!open));
+    document.documentElement.dataset.sidebar = open ? 'open' : 'closed';
+    byId('scrim').classList.toggle('open', open);
+    main.inert = open && !this.wide.matches;
+    menu.setAttribute('aria-expanded', String(open));
+    if (persist && this.wide.matches) localStorage.setItem(STORAGE.sidebar, open ? 'open' : 'closed');
+    if (open && focus && !this.wide.matches) byId('close-sidebar').focus({ preventScroll: true });
+  }
+
+  closeDrawer() {
+    if (!this.wide.matches && this.sidebarOpen()) this.setSidebar(false);
   }
 
   onGlobalKey(event) {
+    if (event.key === 'Escape' && !this.wide.matches && this.sidebarOpen()) {
+      event.preventDefault();
+      this.setSidebar(false);
+      return;
+    }
     if (event.key === 'Escape' && this.diffPatch) {
       event.preventDefault();
       this.closePatch();
@@ -443,6 +585,12 @@ class App {
   }
 
   onInputKey(event) {
+    if (event.key === 'Escape' && !this.wide.matches && this.sidebarOpen()) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.setSidebar(false);
+      return;
+    }
     const paletteOpen = !byId('palette').hidden && this.paletteRows.length > 0;
     const touchFirst = this.coarsePointer ? this.coarsePointer.matches : this.touchFirst;
     if (event.key === 'Enter') {
@@ -515,6 +663,9 @@ class App {
     else delete document.documentElement.dataset.theme;
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) meta.setAttribute('content', !theme || THEMES[theme].mode === 'dark' ? '#121212' : '#fafafa');
+    // the tab badge takes its colors from the palette the theme just changed
+    this.faviconKey = null;
+    this.syncFavicon();
   }
 
   handleTheme(arg) {
@@ -607,50 +758,176 @@ class App {
   // ---------------------------------------------------------- sessions
   async pollSessions() {
     if (document.hidden) return;
+    // Fallback only: the live path is GET /v1/events. A slow earlier poll
+    // must not replace a newer list.
+    const seq = ++this.sessionsSeq;
+    let sessions;
     try {
-      this.sessions = await api.sessions({ stats: true });
-      this.renderSessions();
+      sessions = await api.sessions();
     } catch {
-      /* retry next poll */
+      return; /* retry next poll */
+    }
+    if (seq !== this.sessionsSeq) return;
+    this.setSessions(sessions);
+    if (this.session) return;
+    await this.refreshWorkspaces();
+    this.renderHome();
+  }
+
+  /** Replace the listing and repaint both surfaces. The sequence bump makes
+   * an in-flight poll that started earlier stale: a pushed frame is always
+   * newer than a listing response. */
+  setSessions(sessions) {
+    this.sessionsSeq += 1;
+    this.sessions = sessions;
+    this.homeSig = null;
+    const groups = sessionGroups(sessions);
+    this.renderSessions(groups);
+    this.renderHome(groups);
+  }
+
+  /** The host-wide session-list stream: one snapshot, then deltas. State
+   * changes arrive as they happen instead of at the next poll. */
+  async watchSessions() {
+    let backoff = RECONNECT_MIN;
+    while (!this.listAbort?.signal.aborted) {
+      const controller = new AbortController();
+      this.listAbort = controller;
+      try {
+        await api.watchSessions({
+          signal: controller.signal,
+          onOpen: () => {
+            this.listLive = true;
+            backoff = RECONNECT_MIN;
+          },
+          onSnapshot: (snapshot) => this.applySessionSnapshot(snapshot.sessions || []),
+          onEvent: (event) => this.applySessionsEvent(event),
+        });
+        if (controller.signal.aborted) return;
+        throw new ApiError('the host closed the session stream', null);
+      } catch (error) {
+        this.listLive = false;
+        if (error?.name === 'AbortError' || controller.signal.aborted) return;
+        // Unauthorized means connect() is already asking for a token (or
+        // gave up); keep retrying quietly instead of spamming the log.
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, RECONNECT_MAX);
+      }
     }
   }
 
-  renderSessions() {
+  applySessionSnapshot(sessions) {
+    this.setSessions(sessions);
+    if (!this.session && !this.workspaces.length)
+      void this.refreshWorkspaces().then(() => this.renderHome());
+  }
+
+  applySessionsEvent(event) {
+    if (event?.type === 'session_changed' && event.summary) this.upsertSummary(event.summary);
+    else if (event?.type === 'sessions_removed' && event.names) {
+      const gone = new Set(event.names);
+      this.setSessions(this.sessions.filter((entry) => !gone.has(entry.name)));
+    }
+  }
+
+  /** Upsert one listing row from a pushed summary. Existing DOM is patched
+   * in place; only a membership/order change rebuilds the lists. */
+  upsertSummary(summary) {
+    const index = this.sessions.findIndex((entry) => entry.name === summary.name);
+    if (index >= 0) this.sessions[index] = summary;
+    else this.sessions.push(summary);
+    this.setSessions(this.sessions);
+  }
+
+  async refreshWorkspaces() {
+    try {
+      this.workspaces = await api.workspaces();
+    } catch {
+      /* folders are a nicety; the session list still stands */
+    }
+  }
+
+  updateSessionRow(entry) {
+    const node = this.sessionNodes.get(entry.name);
+    if (!node) return false;
+    node.dataset.active = String(!!entry.active);
+    if (entry.name === this.session) node.setAttribute('aria-current', 'true');
+    else node.removeAttribute('aria-current');
+    this.patchRow(node, entry);
+    const adds = node.querySelector('.session-meta .adds');
+    if (adds) adds.textContent = `+${entry.additions}`;
+    const dels = node.querySelector('.session-meta .dels');
+    if (dels) dels.textContent = `-${entry.deletions}`;
+    return true;
+  }
+
+  /** The live cells every session row shares (sidebar and home). */
+  patchRow(node, entry) {
+    const state = node.querySelector('.session-state');
+    if (state) {
+      state.textContent = entry.state;
+      state.dataset.state = entry.state;
+    }
+    const age = node.querySelector('.age');
+    if (age) age.textContent = sessionWhen(entry);
+  }
+
+  renderSessions(groups = sessionGroups(this.sessions)) {
     const host = byId('session-list');
-    replace(host);
-    const sorted = [...this.sessions].sort((a, b) => (a.active !== b.active ? (a.active ? -1 : 1) : byRecent(a, b)));
-    if (!sorted.length) {
-      host.appendChild(el('div', { class: 'session-group', text: 'no sessions yet — send a message to start one' }));
+    const signature = JSON.stringify(
+      groupShape(groups, (entry) => [
+        !!entry.parent_id,
+        entry.workspace,
+        entry.model,
+        !!(entry.tracking && (entry.additions || entry.deletions)),
+      ]),
+    );
+    if (host.dataset.signature === signature) {
+      for (const entry of this.sessions) this.updateSessionRow(entry);
       return;
     }
-    const render = (entries, label) => {
-      if (!entries.length) return;
+    host.dataset.signature = signature;
+    const top = host.scrollTop;
+    replace(host);
+    this.sessionNodes.clear();
+    if (!groups.length) {
+      host.appendChild(el('div', { class: 'session-empty', text: 'no sessions yet — send a message to start one' }));
+      return;
+    }
+    const render = (items, label) => {
+      if (!items.length) return;
       host.appendChild(el('div', { class: 'session-group', text: label }));
-      for (const entry of entries) host.appendChild(this.sessionRow(entry));
+      for (const group of items)
+        for (const { entry, depth } of group.rows) {
+          const row = this.sessionRow(entry, depth);
+          this.sessionNodes.set(entry.name, row);
+          host.appendChild(row);
+        }
     };
-    render(
-      sorted.filter((entry) => entry.active),
-      'live',
-    );
-    render(
-      sorted.filter((entry) => !entry.active),
-      'saved',
-    );
+    render(groups.filter((group) => group.root.active), 'live');
+    render(groups.filter((group) => !group.root.active), 'saved');
+    host.scrollTop = top;
   }
 
-  sessionRow(entry) {
+  sessionRow(entry, depth = 0) {
     const tracked = entry.tracking && (entry.additions || entry.deletions),
       state = entry.state;
     return el(
       'button',
       {
-        class: `session-row${entry.parent_id ? ' session-child' : ''}`,
+        class: `session-row${depth ? ' session-child' : ''}`,
         type: 'button',
         role: 'listitem',
-        dataset: { active: String(!!entry.active) },
+        dataset: { name: entry.name, active: String(!!entry.active), depth: String(depth) },
         'aria-current': entry.name === this.session ? 'true' : null,
-        title: entry.name,
-        on: { click: () => this.attach(entry.name) },
+        title: entry.parent_id ? `${entry.name}\nsubagent of ${entry.parent_id}` : entry.name,
+        on: {
+          click: () => {
+            this.attach(entry.name);
+            this.closeDrawer();
+          },
+          pointerenter: () => this.hoverSaved(entry),
+        },
       },
       el(
         'span',
@@ -661,7 +938,7 @@ class App {
       el(
         'span',
         { class: 'session-meta' },
-        el('span', { text: sessionWhen(entry) }),
+        el('span', { class: 'age', text: sessionWhen(entry) }),
         entry.workspace ? el('span', { class: 'ws', text: innermostDir(entry.workspace) }) : null,
         entry.model ? el('span', { text: entry.model }) : null,
         tracked && entry.additions ? el('span', { class: 'adds', text: `+${entry.additions}` }) : null,
@@ -672,22 +949,37 @@ class App {
   }
 
   async openSessions() {
-    const sorted = [...this.sessions].sort((a, b) => (a.active !== b.active ? (a.active ? -1 : 1) : byRecent(a, b)));
-    const liveCount = sorted.filter((entry) => entry.active).length;
-    const rows = sorted.map((entry, index) => {
-      const live = index < liveCount,
-        state = live ? entry.state : 'saved';
-      return {
-        id: entry.name,
-        label: sessionLabel(entry),
-        current: entry.name === this.session,
-        section: index === 0 && liveCount ? 'live' : index === liveCount && liveCount < sorted.length ? 'saved' : null,
-        meta: [
-          { text: sessionWhen(entry), class: 'age' },
-          { text: state, class: 'state', state },
-        ],
-      };
-    });
+    // The stream keeps the list current; fall back to one fetch when it is
+    // down (the sheet is an explicit "show me the list", so it may as well
+    // try rather than show what the last poll happened to return).
+    let sessions = this.sessions;
+    if (!this.listLive) {
+      try {
+        sessions = await api.sessions();
+      } catch {
+        /* keep the list we have */
+      }
+    }
+    const groups = sessionGroups(sessions),
+      rows = [];
+    let live = null;
+    for (const group of groups) {
+      const groupLive = !!group.root.active;
+      for (const { entry } of group.rows) {
+        const section = groupLive === live ? null : groupLive ? 'live' : 'saved';
+        live = groupLive;
+        rows.push({
+          id: entry.name,
+          label: sessionLabel(entry),
+          current: entry.name === this.session,
+          section,
+          meta: [
+            { text: sessionWhen(entry), class: 'age' },
+            { text: entry.state, class: 'state', state: entry.state },
+          ],
+        });
+      }
+    }
     const choice = await showPicker({
       title: 'Sessions',
       text: rows.length ? '' : 'no sessions yet',
@@ -696,15 +988,47 @@ class App {
     });
     if (choice && choice !== this.session) this.attach(choice);
   }
+  /** A saved row's pending totals are not in the listing (that read never
+   * runs git), so one read-only per-session summary fetches them for this
+   * row alone and patches it in place. Nothing here hosts a session: a
+   * hosted row is kept current by the pushed stream instead. */
+  hoverSaved(entry) {
+    if (!entry || entry.hosted) return;
+    const fetched = this.savedStats.get(entry.name);
+    if (fetched && Date.now() - fetched < SAVED_STATS_TTL_MS) return;
+    clearTimeout(this.hoverTimer);
+    this.hoverTimer = setTimeout(async () => {
+      const row = this.sessions.find((item) => item.name === entry.name);
+      if (!row || row.hosted) return;  // opened meanwhile: the stream owns it
+      this.savedStats.set(entry.name, Date.now());
+      let summary;
+      try {
+        summary = await api.sessionSummary(entry.name);
+      } catch {
+        this.savedStats.delete(entry.name);
+        return;
+      }
+      const index = this.sessions.findIndex((item) => item.name === summary.name);
+      if (index < 0 || this.sessions[index].hosted) return;
+      this.sessions[index] = { ...this.sessions[index], ...summary };
+      // The structure signature carries "has +/-" so the row is rebuilt with
+      // the columns when the totals stop being zero, else patched in place.
+      this.renderSessions();
+    }, HOVER_MS);
+  }
+
   // --------------------------------------------------------- attach/SSE
   async attach(name) {
     if (!name) return;
     this.abortStream();
     this.session = name;
     this.view.session = name;
-    localStorage.setItem(STORAGE.session, name);
+    this.setView('chat');
     this.setHash(name);
-    this.renderTitle();
+    // The pushed listing row paints the header until the snapshot lands.
+    this.status = null;
+    this.pending = this.sessions.find((entry) => entry.name === name) || null;
+    this.renderChrome();
     this.resetDiff();
     this.diffScopePending = null;
     this.renderDiffBar();
@@ -722,7 +1046,10 @@ class App {
       try {
         await api.stream(name, {
           signal: controller.signal,
-          messageWindow: HISTORY_PAGE,
+          messageRange: `[-${HISTORY_PAGE}:]`,
+          // Headers + prose first; a row's tool output/args hydrate when it
+          // is opened (the history pages already work this way).
+          slim: true,
           onOpen: () => {
             this.touchStream();
             this.setConn('open');
@@ -749,12 +1076,8 @@ class App {
           return;
         }
         if (error instanceof ApiError && error.permanent) {
-          this.addLine(`cannot open ${name}: ${error.message}`, 'error');
-          this.setConn('closed');
-          this.session = null;
-          localStorage.removeItem(STORAGE.session);
-          this.setHash(null);
-          this.renderTitle();
+          toast(`cannot open ${name}: ${error.message}`);
+          this.detach();
           return;
         }
         this.setConn('offline', 'reconnecting…');
@@ -803,8 +1126,8 @@ class App {
     this.abortStream();
     this.session = null;
     this.view.session = '';
-    localStorage.removeItem(STORAGE.session);
     this.status = null;
+    this.pending = null;
     this.setHash(null);
     this.resetDiff();
     this.ask = null;
@@ -813,27 +1136,262 @@ class App {
     this.pendingItem = null;
     this.hintItems = [];
     this.transcript = new Transcript();
-    this.setConn('closed');
-    this.renderTitle();
+    // No stream is open, but the host is still reachable: ready, not the red
+    // "closed" the old detached state used.
+    if (this.connState !== 'offline' && this.connState !== 'unauthed') this.setConn('ready');
+    this.homeSig = null;
+    this.renderSessions();
+    this.renderChrome();
+    this.renderHome();
+    this.pollSessions();
   }
 
   newChat() {
     const previous = this.session;
     this.detach();
     this.view.renderAll([]);
-    if (previous)
-      this.addLine(
-        'started a fresh chat — the previous session keeps running in the background (/sessions to go back)',
-      );
-    this.renderStatus();
-    this.renderBars();
+    if (previous) toast('left the chat — it keeps running in the background');
     this.input.focus();
+  }
+
+  // ---------------------------------------------------------------- home
+  setView(view) {
+    byId('main').dataset.view = view;
+  }
+
+  /** The folder the first message of a draft will start the session in: the
+   * one picked on the home screen, else the folder of the most recent
+   * session, else the most-used known folder. */
+  startWorkspace() {
+    if (this.workspace) return this.workspace;
+    const latest = this.sessions.reduce(
+      (best, entry) => (!best || byRecent(entry, best) < 0 ? entry : best),
+      null,
+    );
+    return latest?.workspace || this.knownFolders()[0]?.path || null;
+  }
+
+  knownFolders() {
+    return [...this.workspaces].sort(
+      (a, b) => b.session_count - a.session_count || a.path.localeCompare(b.path),
+    );
+  }
+
+  setWorkspace(path) {
+    this.workspace = path || null;
+    if (path) localStorage.setItem(STORAGE.workspace, path);
+    else localStorage.removeItem(STORAGE.workspace);
+    this.homeSig = null;
+    this.renderChrome();
+    this.renderHome();
+    // A draft's /diff panel belongs to the folder it was opened for.
+    if (!this.session && this.diff) void this.refreshDiff();
+    this.input.focus();
+  }
+
+  async pickWorkspacePath() {
+    const path = await showPrompt({
+      title: 'New session folder',
+      label: 'Path',
+      value: this.startWorkspace() || '',
+      placeholder: '/home/you/code/project',
+      note: 'The host creates the folder if it does not exist yet.',
+    });
+    if (path) this.setWorkspace(path);
+  }
+
+  // Every known folder, plus the one the draft will actually use when it is
+  // not in that list (a picked path, or an older session's workspace).
+  folderList(start = this.startWorkspace()) {
+    const rows = new Map();
+    for (const ws of this.knownFolders()) rows.set(ws.path, Math.max(rows.get(ws.path) || 0, ws.session_count));
+    if (start) rows.set(start, rows.get(start) || 0);
+    return [...rows].map(([path, count]) => ({ path, count }));
+  }
+
+  homeSection(label, rows, action = null) {
+    return el(
+      'section',
+      { class: 'home-section' },
+      el(
+        'div',
+        { class: 'home-head' },
+        el('h2', { class: 'home-label', text: label }),
+        action
+          ? el('button', { class: 'home-more', type: 'button', text: action.label, on: { click: action.run } })
+          : null,
+      ),
+      ...rows,
+    );
+  }
+
+  /** One row of the home document: a mark, a name and line, and trailing
+   * meta. Sessions and folders differ only in what those cells say. */
+  homeRow({ cls = 'home-row', dataset, title, current, run, mark = null, name, sub, meta }) {
+    return el(
+      'button',
+      {
+        class: cls,
+        type: 'button',
+        dataset,
+        title,
+        'aria-current': current ? 'true' : null,
+        on: { click: run },
+      },
+      mark === null ? null : el('span', { class: 'home-mark', 'aria-hidden': 'true', text: mark }),
+      el(
+        'span',
+        { class: 'home-row-main' },
+        el('span', { class: 'home-row-name', text: name }),
+        sub ? el('span', { class: 'home-row-sub', text: sub }) : null,
+      ),
+      meta,
+    );
+  }
+
+  homeSessionRow(entry, depth = 0, childCount = 0) {
+    // The folder is what a person recognises a chat by; the host's opaque
+    // session name stays on the second line (with the model) rather than
+    // being the loudest thing on the page. Subagents sit under their parent
+    // and name their branch instead of repeating the parent's folder.
+    const child = !!entry.parent_id,
+      name = child ? entry.name.split('/').pop() : sessionLabel(entry),
+      folder = innermostDir(entry.workspace);
+    return this.homeRow({
+      cls: `home-row${child ? ' home-child' : ''}`,
+      dataset: { name: entry.name, ...(child ? { depth: String(depth) } : {}) },
+      title: `${entry.name}${entry.parent_id ? `\nsubagent of ${entry.parent_id}` : entry.workspace ? `\n${entry.workspace}` : ''}`,
+      run: () => this.attach(entry.name),
+      mark: child ? '↳' : null,
+      name: child ? name : folder || name,
+      sub: [child ? 'subagent' : name, entry.model].filter(Boolean).join(' · '),
+      meta: el(
+        'span',
+        { class: 'home-row-meta' },
+        !child && childCount
+          ? el('span', { class: 'agents', text: `${childCount} agent${childCount === 1 ? '' : 's'}` })
+          : null,
+        el('span', { class: 'session-state', dataset: { state: entry.state }, text: entry.state }),
+        el('span', { class: 'age', text: sessionWhen(entry) }),
+      ),
+    });
+  }
+
+  homeFolderRow(folder, start = this.startWorkspace()) {
+    const selected = folder.path === start,
+      count = folder.count ? `${folder.count} ${folder.count === 1 ? 'session' : 'sessions'}` : '';
+    return this.homeRow({
+      current: selected,
+      title: folder.path,
+      run: () => this.setWorkspace(folder.path),
+      mark: selected ? '▸' : '',
+      name: innermostDir(folder.path) || folder.path,
+      sub: folder.path,
+      meta: count ? el('span', { class: 'home-row-meta', text: count }) : null,
+    });
+  }
+
+  /** Patch the live cells of the already-built home rows (state, age).
+   * Called on every pushed summary whose structure did not change. */
+  updateHomeRows() {
+    for (const entry of this.sessions) {
+      const node = this.homeNodes.get(entry.name);
+      if (node) this.patchRow(node, entry);
+    }
+  }
+
+  /** The landing view for a bare URL and for /new: what is running, what to
+   * resume, and the folders a fresh session can start in. */
+  renderHome(groups = null) {
+    if (this.session) {
+      this.setView('chat');
+      return;
+    }
+    this.setView('home');
+    groups ??= sessionGroups(this.sessions);
+    const start = this.startWorkspace(),
+      active = groups.filter((group) => group.root.active),
+      recent = groups.filter((group) => !group.root.active);
+    const sig = JSON.stringify({
+      // Structure only: state, totals and ages are patched in place below,
+      // so a pushed state change never rebuilds the home DOM.
+      sessions: groupShape(groups, (entry, group) => [
+        entry.parent_id,
+        entry.workspace,
+        entry.model,
+        entry.tracking,
+        group.rows.length,
+      ]),
+      workspaces: this.workspaces.map((ws) => [ws.path, ws.session_count, ws.active_sessions]),
+      start,
+    });
+    if (sig === this.homeSig) {
+      this.updateHomeRows();
+      return;
+    }
+    this.homeSig = sig;
+    this.homeNodes.clear();
+
+    const rows = (items) =>
+      items.flatMap((group) =>
+        group.rows.map(({ entry, depth }) => {
+          const node = this.homeSessionRow(entry, depth, group.rows.length - 1);
+          this.homeNodes.set(entry.name, node);
+          return node;
+        }),
+      );
+    const left = [];
+    if (active.length) left.push(this.homeSection('live', rows(active)));
+    if (recent.length) {
+      const shown = recent.slice(0, 6);
+      left.push(
+        this.homeSection(
+          'recent',
+          rows(shown),
+          recent.length > 6 ? { label: 'all', run: () => this.openSessions() } : null,
+        ),
+      );
+    }
+
+    const folderRows = this.folderList(start).map((folder) => this.homeFolderRow(folder, start));
+    folderRows.push(this.homeRow({
+      cls: 'home-row home-other',
+      run: () => this.pickWorkspacePath(),
+      mark: '+',
+      name: 'another folder…',
+    }));
+
+    const panel = el(
+      'div',
+      { class: 'home-inner' },
+      el(
+        'header',
+        { class: 'home-brand' },
+        el('pre', { class: 'home-art', 'aria-hidden': 'true', text: BANNER }),
+        el('p', { class: 'home-tag', text: 'chat with your coding agent' }),
+      ),
+      el(
+        'p',
+        { class: 'home-start' },
+        el('span', { text: 'first message starts a new session in' }),
+        el('b', { text: start || 'the host\u2019s folder', title: start || '' }),
+      ),
+      el(
+        'div',
+        { class: 'home-grid' },
+        left.length ? el('div', { class: 'home-column' }, ...left) : null,
+        el('div', { class: 'home-column' }, this.homeSection('folders', folderRows)),
+      ),
+    );
+    const scroll = this.home.scrollTop;
+    replace(this.home, panel);
+    this.home.scrollTop = scroll;
   }
 
   async deleteCurrent() {
     const name = this.session;
     if (!name) {
-      this.addLine('no session to delete', 'warn');
+      toast('no session to delete');
       return;
     }
     const ok = await showConfirm({
@@ -850,12 +1408,13 @@ class App {
       return;
     }
     this.newChat();
-    this.addLine('deleted: saved session removed — your files are untouched');
+    toast('session deleted — your files are untouched');
     this.pollSessions();
   }
 
   loadSnapshot(snapshot, keepStatus = false) {
     this.status = snapshot.status || (keepStatus ? this.status : null);
+    this.pending = null;
     // A snapshot is the newest window (an older host sends no fields: all of it).
     this.setHistory(snapshot.message_offset || 0, !!snapshot.has_more);
     this.view.renderAll(this.transcript.load(snapshot));
@@ -863,10 +1422,7 @@ class App {
     this.pendingItem = null;
     this.hintItems = [];
     this.syncCompacting(this.status?.state || 'idle');
-    this.renderTitle();
-    this.renderStatus();
-    this.renderBars();
-    this.renderInfo();
+    this.renderChrome();
     this.syncAsk();
     this.refreshDiff();
     this.scrollToLatest();
@@ -892,7 +1448,10 @@ class App {
     if (this.log.scrollTop > LOAD_EARLIER_PX) return;
     this.loadingEarlier = true;
     try {
-      const page = await api.messages(name, { before: this.historyOffset, slim: true }),
+      const page = await api.messages(name, {
+          range: `[${Math.max(0, this.historyOffset - HISTORY_PAGE)}:${this.historyOffset}]`,
+          slim: true,
+        }),
         messages = page.messages || [];
       if (this.session !== name) return;
       const height = this.log.scrollHeight,
@@ -987,8 +1546,7 @@ class App {
     if (type === 'session_deleted') {
       const name = this.session;
       this.detach();
-      this.view.renderAll([]);
-      this.addLine(`session ${name} was deleted`);
+      toast(`session ${name} was deleted`);
       this.pollSessions();
       return;
     }
@@ -1079,6 +1637,12 @@ class App {
     if (this.lastNotice === text && Date.now() - this.lastNoticeAt < 1500) return;
     this.lastNotice = text;
     this.lastNoticeAt = Date.now();
+    // There is no transcript to write to on the home screen: a notice about
+    // a draft (or a command that needs a session) still has to be seen.
+    if (!this.session) {
+      toast(text);
+      return;
+    }
     this.sync(this.transcript.addLine(text, level));
   }
 
@@ -1209,11 +1773,14 @@ class App {
   // -------------------------------------------------------------- status
   get viewStatus() {
     if (this.status) return this.status;
+    // Between a tap and its snapshot, the pushed listing row stands in: the
+    // title, model, folder and state are known before the transcript is.
     const config = this.config,
-      target = this.draftModel || config?.default_model || null;
+      pending = this.pending,
+      target = pending?.model || this.draftModel || config?.default_model || null;
     const entry = (config?.models || []).find((model) => model.name === target);
     return {
-      state: 'idle',
+      state: pending?.state === 'compacting' ? 'compacting' : pending && !['idle', 'saved'].includes(pending.state) ? 'running' : 'idle',
       mode: this.draftMode,
       model_name: target || '',
       model_display_name: entry?.display_name || config?.default_model_display_name || '—',
@@ -1222,12 +1789,12 @@ class App {
       max_context: entry?.max_context || 128000,
       supports_vision: entry?.supports_vision || false,
       sandbox_name: config?.default_sandbox || null,
-      workspace: this.workspace,
+      workspace: pending?.workspace || this.startWorkspace(),
       usage_total: { input_tokens: 0, output_tokens: 0 },
       last_usage: { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0 },
       queued: [],
       pending_ask: null,
-      clients_attached: 0,
+      clients_attached: pending?.clients_attached || 0,
       filter_list: [],
       refs: [],
       tools: [],
@@ -1235,8 +1802,17 @@ class App {
     };
   }
 
+  /** The header, footer and sidebar's live values, in one pass
+   * (``renderStatus`` refreshes the title). */
+  renderChrome() {
+    this.renderStatus();
+    this.renderBars();
+    this.renderInfo();
+  }
+
   renderStatus() {
     const status = this.viewStatus;
+    this.syncFavicon();
     const used = (status.last_usage?.input_tokens || 0) + (status.last_usage?.output_tokens || 0);
     const max = status.max_context || 0,
       percentLeft = max ? Math.max(0, Math.round(100 * (1 - used / max))) : 100;
@@ -1292,7 +1868,7 @@ class App {
   renderInfo() {
     const status = this.viewStatus;
     const rows = [
-      ['session', shortName(this.session) || 'draft (no session yet)'],
+      ['session', shortName(this.session) || 'new (not started)'],
       ['workspace', status.workspace || 'host cwd'],
       ['model', `${status.model_display_name || '—'}${status.model_name ? ` (${status.model_name})` : ''}`],
       ['effort', status.cot_strength || 'medium'],
@@ -1314,17 +1890,104 @@ class App {
 
   renderTitle() {
     const status = this.viewStatus,
-      dir = innermostDir(status.workspace) || 'draft';
-    document.title = `xarness ${this.session ? shortName(this.session) : dir}`;
-    byId('title').textContent = this.session ? shortName(this.session) : 'new chat';
-    byId('title').title = this.session || 'new chat';
-    byId('subtitle').textContent = dir;
+      folder = status.workspace || '',
+      dir = innermostDir(folder),
+      subagent = this.session?.includes('/') ? this.session.split('/').pop() : null,
+      name = this.session ? subagent || shortName(this.session) : 'new chat';
+    document.title = `xarness ${this.session ? name : dir || 'new chat'}`;
+    byId('title').textContent = name;
+    byId('title').title = this.session || folder || 'new chat';
+    // Attached, the subtitle is the folder's short name. A draft names the
+    // folder its first message will start the session in, not the word
+    // "draft": the status bar and the composer are already showing values.
+    byId('subtitle').textContent = this.session
+      ? subagent
+        ? `subagent · ${dir || 'the host\u2019s folder'}`
+        : dir
+      : folder || 'the host\u2019s folder';
+    byId('subtitle').title = subagent ? `${this.session} · ${folder}` : folder;
+  }
+
+  // ------------------------------------------------------------ tab badge
+  /** The browser tab icon is the artwork plus a dot in its bottom-right
+   * corner: gray at rest, green while a turn runs, and the theme's accent
+   * while `ask_user` waits on an answer. It is the one status a background
+   * tab can still show. */
+  initFavicon() {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = FAVICON.size;
+    this.faviconCanvas = canvas;
+    this.faviconBase = new Image();
+    // repaint with the artwork once it decodes; until then the badge sits on
+    // the plain panel color
+    this.faviconBase.onload = () => {
+      this.faviconKey = null;
+      this.syncFavicon();
+    };
+    this.faviconBase.src = 'icons/icon-192.png';
+    // following the system theme repaints without a /theme command
+    matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+      this.faviconKey = null;
+      this.syncFavicon();
+    });
+    this.faviconKey = null;
+    this.syncFavicon();
+  }
+
+  syncFavicon() {
+    const canvas = this.faviconCanvas;
+    if (!canvas) return;
+    const status = this.viewStatus,
+      state = this.ask ? 'asking' : status.state === 'running' || status.state === 'compacting' ? 'running' : 'idle',
+      theme = document.documentElement.dataset.theme || '',
+      scheme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+      key = `${state}:${theme}:${scheme}`;
+    if (key === this.faviconKey) return;
+    this.faviconKey = key;
+    const color = state === 'asking' ? cssColor('--accent') : state === 'running' ? cssColor('--success') : cssColor('--muted');
+    this.paintFavicon(color);
+  }
+
+  /** Draw the artwork and the badge at FAVICON.size. The ring is the icon's
+   * own backdrop, so the dot reads as attached rather than painted over. */
+  paintFavicon(color) {
+    const canvas = this.faviconCanvas,
+      ctx = canvas?.getContext('2d'),
+      size = FAVICON.size;
+    if (!ctx) return;
+    ctx.clearRect(0, 0, size, size);
+    const base = this.faviconBase;
+    ctx.imageSmoothingQuality = 'high';
+    if (base?.complete && base.naturalWidth) ctx.drawImage(base, 0, 0, size, size);
+    else {
+      ctx.fillStyle = FAVICON.backdrop;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === 'function') ctx.roundRect(0, 0, size, size, size * 0.187);
+      else ctx.rect(0, 0, size, size);
+      ctx.fill();
+    }
+    const cx = size * FAVICON.cx,
+      cy = size * FAVICON.cy,
+      r = size * FAVICON.dot;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + size * FAVICON.ring, 0, Math.PI * 2);
+    ctx.fillStyle = FAVICON.backdrop;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    const link = document.getElementById('favicon');
+    if (!link) return;
+    link.type = 'image/png';
+    link.href = canvas.toDataURL('image/png');
   }
 
   renderBars() {
     const status = this.viewStatus,
       running = status.state === 'running' || status.state === 'compacting';
     byId('stop').hidden = !running;
+    this.syncFavicon();
     byId('inputbar').dataset.plan = String(status.mode === 'plan');
     this.input.placeholder = this.ask ? 'Type your answer…  (Enter: send · Esc: skip)' : 'Send a message…';
     this.renderSteer();
@@ -1457,10 +2120,19 @@ class App {
 
   async refreshDiff() {
     try {
-      this.showDiffSummary(this.session ? await api.diff(this.session) : null);
+      this.showDiffSummary(await this.loadDiff());
     } catch {
       this.showDiffSummary(null);
     }
+  }
+
+  /** One DiffInfo: the attached session's, or — in a draft chat — the
+   * workspace's own (tracking is per repo root, so it needs no session). */
+  loadDiff({ path, author } = {}) {
+    if (this.session) return api.diff(this.session, { path, author });
+    const workspace = this.startWorkspace();
+    if (!workspace) return Promise.resolve(null);
+    return api.workspaceDiff(workspace, { path, author, scope: this.diffScope });
   }
 
   showDiffSummary(info) {
@@ -1492,8 +2164,6 @@ class App {
     }
     bar.hidden = false;
     bar.classList.toggle('open', this.diffOpen);
-    const count = info.files.length,
-      label = `Edited ${count} file${count === 1 ? '' : 's'}`;
     const files = info.files || [],
       groups = info.groups || [],
       scope = this.diffScope;
@@ -1502,6 +2172,10 @@ class App {
     // "agent", every session's rows while "agent" is dimmed. The auto/drift
     // sections never count toward either.
     const inlineFiles = files.filter(isInline);
+    // The label count follows the same scope chip as the +/− totals instead of
+    // counting every row; auto/drift and ignored groups stay out of it.
+    const count = inlineFiles.length,
+      label = `Edited ${count} file${count === 1 ? '' : 's'}`;
     const adds = inlineFiles.reduce((total, file) => total + (file.additions || 0), 0);
     const dels = inlineFiles.reduce((total, file) => total + (file.deletions || 0), 0);
     const head = el(
@@ -1745,7 +2419,11 @@ class App {
     this.diffPatch = null;
     this.renderDiffView();
     this.renderDiffBar();
-    if (!this.session) return;
+    if (!this.session) {
+      // A draft has no session to save the choice on (it rides out on the
+      // create request); the workspace endpoint builds its rows anyway.
+      return this.refreshDiff();
+    }
     this.diffScopePending = scope;
     try {
       await api.command(this.session, { type: 'set_view_state', view: { diff_scope: scope } });
@@ -1760,14 +2438,13 @@ class App {
   }
 
   async openPatch(path, author) {
-    if (!this.session) return;
     if (this.diffPatch?.path === path) {
       this.closePatch();
       return;
     }
     try {
-      const info = await api.diff(this.session, { path, author });
-      if (!String(info.text || '').trim()) {
+      const info = await this.loadDiff({ path, author });
+      if (!info || !String(info.text || '').trim()) {
         this.addLine(`no pending changes for ${path}`, 'warn');
         return;
       }
@@ -1782,19 +2459,14 @@ class App {
   }
 
   async showDiffCommand(arg) {
-    if (!this.session) {
-      this.addLine('/diff: no session attached — send a message first', 'error');
-      return;
-    }
     if (!arg) {
+      // Toggle: anything showing — the file list, or an open patch — hides;
+      // otherwise (re)read the pending set and expand it. A draft chat reads
+      // it from the workspace, since tracking is per repo root.
+      if (this.diffOpen) return this.toggleDiff();
       await this.refreshDiff();
-      if (!this.diff) {
-        this.addLine('no pending changes to diff', 'warn');
-        return;
-      }
-      this.diffOpen = true;
-      this.renderDiffBar();
-      return;
+      if (!this.diff) return this.addLine('no pending changes to diff', 'warn');
+      return this.toggleDiff();
     }
     await this.refreshDiff();
     const file = this.diff?.files.find((entry) => entry.path === arg || entry.path.endsWith(`/${arg}`));
@@ -1853,7 +2525,7 @@ class App {
   async ensureSession() {
     if (this.session) return true;
     const request = {
-      workspace: this.workspace || undefined,
+      workspace: this.startWorkspace() || undefined,
       model: this.draftModel || undefined,
       view: { diff_scope: this.diffScope },
     };
@@ -2099,7 +2771,7 @@ class App {
     const filters = this.viewStatus.filter_list || [];
     const rows = [
       { id: 'add', label: '+ add a path…', detail: filters.length ? 'exclude another path' : 'exclude a path' },
-      ...filters.map((path) => ({ id: `remove:${path}`, label: `✕ ${path}`, detail: 'remove' })),
+      ...filters.map((path) => ({ id: `remove:${path}`, label: `✕ ${path}` })),
     ];
     const choice = await showPicker({
       title: 'Sandbox filters',
@@ -2263,28 +2935,47 @@ class App {
 
   openHelp() {
     const keys = [
-      'Enter            run the highlighted command, else send',
-      'Shift+Enter      newline',
-      'Tab              complete the command, else toggle plan / write',
-      'Esc              close a popup; twice interrupts a running turn',
-      '/                slash commands',
-      '@                mention a workspace file',
-      'Ctrl/Cmd+K       command palette',
-      '↑↓ / ←→          move in the palette and in a picker',
-    ].join('\n');
-    const body = el('div');
-    body.appendChild(el('pre', { class: 'keys', text: keys }));
+      ['Enter', 'run the highlighted command, otherwise send the message'],
+      ['Shift+Enter', 'a new line without sending'],
+      ['Tab', 'complete the command, otherwise toggle plan / write'],
+      ['Esc', 'close a popup; twice interrupts a running turn'],
+      ['/', 'the command palette'],
+      ['@', 'mention a workspace file'],
+      ['Ctrl/Cmd+K', 'the command palette, from anywhere'],
+      ['↑↓', 'move through the palette, a picker or the agent’s options'],
+    ];
+    const body = el('div', { class: 'help' });
+    body.appendChild(
+      el(
+        'dl',
+        { class: 'help-keys' },
+        ...keys.map(([key, what]) => [el('dt', {}, el('kbd', { text: key })), el('dd', { text: what })]),
+      ),
+    );
     body.appendChild(sheetSection('commands'));
-    body.appendChild(el('pre', { class: 'keys', text: COMMANDS.map((command) => commandUsage(command)).join('\n') }));
+    body.appendChild(
+      el(
+        'dl',
+        { class: 'help-cmds' },
+        ...COMMANDS.map((command) => [
+          el('dt', { text: `/${command.name}` }),
+          el(
+            'dd',
+            {},
+            command.usage ? el('span', { class: 'help-args', text: command.usage }) : null,
+            el('span', { text: command.description }),
+          ),
+        ]),
+      ),
+    );
     body.appendChild(sheetSection('notes'));
     body.appendChild(
-      el('pre', {
-        class: 'keys',
+      el('p', {
+        class: 'help-note',
         text:
-          'Every command runs on one Enter; a command that opens a\n' +
-          'picker (/model, /theme, /filter, /sessions, /tools) shows it\n' +
-          'right away. Tab completes the word if you want to type an\n' +
-          'argument. Tool rows and every "Thought for" pill expand on tap.',
+          'Every command runs on one Enter. A command that opens a picker (/model, /theme, /filter, ' +
+          '/sessions, /tools) shows it right away; Tab completes the word if you want to type an ' +
+          'argument. Tool rows in the transcript show what they did inline — tap one to fold it away.',
       }),
     );
     void showInfo({ title: 'xarness web UI', text: 'The same commands and views as the terminal client.', body });
@@ -2374,7 +3065,6 @@ class App {
           },
         },
         el('span', { class: 'palette-name', text: row.label }),
-        row.args ? el('span', { class: 'palette-args', text: row.args }) : null,
         row.detail ? el('span', { class: 'palette-desc', text: row.detail }) : null,
       ),
     );
@@ -2384,16 +3074,15 @@ class App {
     this.scheduleScroll();
   }
 
+  // The foot teaches the selected command's call signature (the row already
+  // says what it does) plus the keys that work while the palette is open.
   renderPaletteFoot(row) {
     const foot = byId('palette-foot');
     if (!foot) return;
-    const hint =
-      this.paletteKind === 'at' ? '↵ insert · ↑↓ choose · esc close' : '↵ run · ⇥ complete · ↑↓ choose · esc close';
+    const hint = this.paletteKind === 'at' ? '↵ insert' : '↵ run · ⇥ complete · esc close';
     replace(
       foot,
-      row?.detail
-        ? el('span', { class: 'palette-note', text: row.detail })
-        : el('span', { class: 'palette-note', text: row?.label || '' }),
+      el('span', { class: 'palette-usage', text: row?.args ? `${row.label} ${row.args}` : '' }),
       el('span', { class: 'palette-hint', text: hint }),
     );
   }

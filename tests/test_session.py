@@ -925,7 +925,7 @@ def test_windowed_snapshot_is_the_newest_whole_turns(tmp_path) -> None:
         session.conversation.add(AssistantMessage(content=f"a{index}"))
     full = list(session.conversation.messages)
 
-    snap = session.snapshot(message_limit=10)
+    snap = session.snapshot(window="[-10:]")
     assert snap.message_total == 120 and snap.has_more
     assert 0 < snap.message_offset < 120 and snap.message_offset % 2 == 0
     assert snap.messages == full[snap.message_offset:] and len(snap.messages) >= 10
@@ -945,13 +945,13 @@ def test_message_pages_walk_the_history_once_in_whole_turns(tmp_path) -> None:
         session.conversation.add(AssistantMessage(content=f"a{index}"))
     full = list(session.conversation.messages)
 
-    page, collected = session.message_page(limit=8), []
+    page, collected = session.message_page(window="[-8:]"), []
     while True:
         assert page.start % 2 == 0, "a page must end on a turn boundary"
         collected = [*page.messages, *collected]
         if not page.has_more:
             break
-        page = session.message_page(before=page.start, limit=8)
+        page = session.message_page(window=f"[{max(0, page.start - 8)}:{page.start}]")
     assert collected == full and page.start == 0
 
 
@@ -967,7 +967,7 @@ def test_slim_pages_leave_the_bodies_for_the_body_endpoint(tmp_path) -> None:
     session.conversation.add(ToolMessage(tool_call_id="c1", content="output"))
     full = list(session.conversation.messages)
 
-    page = session.message_page(limit=10, slim=True)
+    page = session.message_page(window="[-10:]", slim=True)
     assert page.slim and len(page.messages) == 3
     assert page.messages[0] == full[0]
     assistant, result = page.messages[1], page.messages[2]
@@ -987,6 +987,30 @@ def test_slim_pages_leave_the_bodies_for_the_body_endpoint(tmp_path) -> None:
         session.message_body(99)
 
 
+def test_attach_snapshot_takes_the_same_slim_mode_as_a_page(tmp_path) -> None:
+    """The first frame of an attach can be slim: headers and prose, with
+    tool bodies and call arguments left for the hydration requests."""
+    session = make_session([], tmp_path)
+    session.conversation.add(user_message("q0"))
+    call = ToolCall(call_id="c1", name="bash", arguments_json='{"command": "ls"}')
+    session.conversation.add(AssistantMessage(content="answer", tool_calls=[call]))
+    session.conversation.add(ToolMessage(tool_call_id="c1", content="output"))
+
+    snapshot, _queue = session.subscribe(window="[-10:]", slim=True)
+    assert snapshot.slim is True
+    assert [m.role for m in snapshot.messages] == ["user", "assistant", "tool"]
+    assert snapshot.messages[1].content == "answer"
+    assert snapshot.messages[1].tool_calls[0].arguments_json == ""
+    assert snapshot.messages[2].content == ""
+
+    # The default attach is still complete: the TUI takes the whole history
+    # and renders it without a second round trip.
+    full = session.snapshot()
+    assert full.slim is False
+    assert full.messages[2].content == "output"
+    assert full.messages[1].tool_calls[0].arguments_json == '{"command": "ls"}'
+
+
 def test_history_page_keeps_a_tool_call_with_its_result(tmp_path) -> None:
     """Cutting off the tool result would render the call as interrupted, so
     the page takes the whole turn."""
@@ -999,7 +1023,7 @@ def test_history_page_keeps_a_tool_call_with_its_result(tmp_path) -> None:
     session.conversation.add(ToolMessage(tool_call_id="c1", content="ok"))
     messages = list(session.conversation.messages)
 
-    page = session.message_page(limit=2)  # two from the end would split it
+    page = session.message_page(window="[-2:]")  # two from the end would split it
     assert (page.start, page.messages) == (2, messages[2:])
 
 

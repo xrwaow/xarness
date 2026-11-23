@@ -20,6 +20,11 @@ muted) and a shared file is one row per path counting its whole pending
 change, badged with whoever wrote it last; scoped to this session the whole
 word is accent-colored and a shared file becomes one row per author. The chip
 is session state (the host computes the rows), so flipping it refetches.
+
+A draft chat (no session) can show the panel too: tracking belongs to the
+workspace, so ``/diff`` fills it from the workspace endpoint before any
+session exists. Nothing is ``mine`` there, so every row reads as another
+agent's work or as drift.
 """
 
 from __future__ import annotations

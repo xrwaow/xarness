@@ -328,21 +328,42 @@ function shapeIcon(meta, status = 'ok', session = '', identity = '') {
   return svg;
 }
 
+// A thought is over when its reasoning stops, a tool when its call returns.
+function activitySettled(item) {
+  return item.kind === 'thinking' ? !!item.done : item.status !== STATUS.MAKING;
+}
+
 function activitySummary(items) {
   // Two tallies only: how many times it thought and how many tools it ran. The
   // per-tool breakdown lives in the expanded rows, not in this one line.
   let thoughts = 0;
   let tools = 0;
+  let live = null;
   for (const item of items) {
+    if (!activitySettled(item)) {
+      live = item;
+      continue;
+    }
     if (item.kind === 'thinking') thoughts += 1;
     else tools += 1;
   }
+  // A run of one has nothing to tally, so it just names its own state:
+  // Thinking until the reasoning stops, then Thought; Running until the call
+  // returns, then Ran.
+  if (items.length === 1) {
+    const sole = items[0];
+    if (sole.kind === 'thinking') return live ? 'Thinking' : 'Thought';
+    return live ? 'Running' : 'Ran';
+  }
   const parts = [];
-  if (thoughts === 1) parts.push('Thinking');
+  if (thoughts === 1) parts.push('Thought');
   else if (thoughts > 1) parts.push(`Thought ${thoughts} times`);
-  if (tools) parts.push(`ran ${tools} ${tools === 1 ? 'tool' : 'tools'}`);
-  const text = parts.join(', ');
-  return text ? text[0].toUpperCase() + text.slice(1) : '';
+  if (tools === 1) parts.push('Ran 1 tool');
+  else if (tools > 1) parts.push(`Ran ${tools} tools`);
+  // The activity still in flight has not been thought or run yet, so it joins
+  // the line in the present tense instead of bumping a tally.
+  if (live) parts.push(live.kind === 'thinking' ? 'Thinking' : 'Running');
+  return parts.join(', ');
 }
 
 function activityCurrent(item) {
@@ -1223,6 +1244,14 @@ class ActivityBlock {
   }
 }
 
+// The xarness wordmark: four hand-drawn rows, dimmed under the fold so it
+// reads as a watermark, not a logo. Shared by the transcript's empty state
+// and the home screen so there is one banner, not two.
+export const BANNER = `... ...  ....   ... ..  .. ...     ....   ....   ....
+ '|..'  '' .||   ||' ''  ||  ||  .|...|| ||. '  ||. '
+  .|.   .|' ||   ||      ||  ||  ||      . '|.. . '|..
+.|  ||. '|..'|' .||.    .||. ||.  '|...' |'..|' |'..|'`;
+
 // Live-only transcript lines that must not break an activity block in two: they
 // are pushed while a run is in flight and never replayed from the log, so
 // treating them as a boundary would split a segment live and merge it on reload.
@@ -1246,10 +1275,7 @@ export class LogView {
       'div',
       { class: 'welcome' },
       el('pre', {
-        text: `... ...  ....   ... ..  .. ...     ....   ....   ....
- '|..'  '' .||   ||' ''  ||  ||  .|...|| ||. '  ||. '
-  .|.   .|' ||   ||      ||  ||  ||      . '|.. . '|..
-.|  ||. '|..'|' .||.    .||. ||.  '|...' |'..|' |'..|'`,
+        text: BANNER,
       }),
       el('p', { text: 'send a message to start · / for commands · @ for files' }),
     );

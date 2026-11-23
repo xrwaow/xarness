@@ -107,20 +107,37 @@ export class Api {
     return this.get('/v1/workspaces/refs', { workspace });
   }
 
+  /** Pending changes of a workspace, with no session attached (a draft
+   * chat's /diff: tracking is per repo root). */
+  workspaceDiff(workspace, { path, author, scope } = {}) {
+    return this.get('/v1/workspaces/diff', { workspace, path, author, scope });
+  }
+
+  workspaces() {
+    return this.get('/v1/workspaces');
+  }
+
   updateWorkspaceRefs(workspace, path, add) {
     return this.request('POST', '/v1/workspaces/refs', { json: { workspace, path, add } });
   }
 
-  sessions({ active, workspace, stats = false } = {}) {
+  sessions({ active, workspace, stats = false, range } = {}) {
     return this.get('/v1/sessions', {
       active: active === undefined ? undefined : String(active).toLowerCase(),
       workspace,
       stats: stats ? 'true' : undefined,
+      range,
     });
   }
 
   createSession(request) {
     return this.request('POST', '/v1/sessions', { json: request });
+  }
+
+  /** One session's listing row, with its own pending totals. Read-only: a
+   * saved session is not hosted to answer (unlike `snapshot`). */
+  sessionSummary(name) {
+    return this.get(`${sessionPath(name)}/summary`);
   }
 
   deleteSession(name) {
@@ -139,10 +156,11 @@ export class Api {
     return this.request('POST', `${sessionPath(name)}/commands`, { json: command });
   }
 
-  /** One page of older history: pass the previous page's `start` as
-   * `before` and walk while `has_more`; `slim` leaves out the bodies. */
-  messages(name, { before, limit, slim } = {}) {
-    return this.get(`${sessionPath(name)}/messages`, { before, limit, slim });
+  /** One page of history: `range` is a Python-style slice, e.g. `[-40:]`
+   * for the newest page or `[<start-40>:<start>]` to walk back; `slim`
+   * leaves out the bodies. */
+  messages(name, { range, slim } = {}) {
+    return this.get(`${sessionPath(name)}/messages`, { range, slim });
   }
 
   /** One round's text: `content` false fetches the headers only. */
@@ -170,14 +188,28 @@ export class Api {
     return url;
   }
 
-  async stream(name, { signal, messageWindow, onSnapshot = () => {}, onEvent = () => {}, onOpen = () => {} } = {}) {
-    const response = await fetch(`${sessionPath(name)}/events${query({ messages: messageWindow })}`, {
+  async stream(name, { signal, messageRange, slim = false, ...handlers } = {}) {
+    await this.sse(`${sessionPath(name)}/events${query({ range: messageRange, slim })}`, { signal, ...handlers });
+  }
+
+  /** The host-wide session list: one snapshot, then upsert/remove deltas.
+   * Same reconnect contract as `stream`: every (re)connect re-snapshots. */
+  async watchSessions({ signal, ...handlers } = {}) {
+    await this.sse('/v1/events', { signal, ...handlers });
+  }
+
+  async sse(path, { signal, onSnapshot = () => {}, onEvent = () => {}, onOpen = () => {} } = {}) {
+    const response = await fetch(path, {
       headers: this.headers({ Accept: 'text/event-stream' }),
       signal,
       cache: 'no-store',
     });
     if (!response.ok) throw new ApiError(await errorDetail(response), response.status);
     onOpen();
+    await this.readFrames(response, { onSnapshot, onEvent });
+  }
+
+  async readFrames(response, { onSnapshot, onEvent }) {
     if (!response.body) throw new ApiError('the host sent no stream body', 500);
     const reader = response.body.getReader(),
       decoder = new TextDecoder();

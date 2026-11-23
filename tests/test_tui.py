@@ -9,6 +9,7 @@ import json
 import time
 import unittest
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from textual.app import App
 from textual.pilot import Pilot
@@ -58,6 +59,9 @@ class FakeClient:
         self.command_results: dict[str, CommandResult] = {}
         self.unloaded: list[str] = []
         self.session_calls: list[dict] = []
+        # The host-wide list stream the /sessions picker follows.
+        self.session_streams = 0
+        self.sessions_queue: asyncio.Queue = asyncio.Queue()
         self.refs: list[protocol.RefInfo] = []
         self.ref_updates: list[tuple[str, str, bool]] = []
         # The host's answer to "does closing need a choice?". Scripted per
@@ -97,6 +101,18 @@ class FakeClient:
         self.session_calls.append(kwargs)
         return list(getattr(self, "session_list", []))
 
+    async def watch_sessions(self):
+        """One snapshot of ``session_list``, then whatever a test pushes."""
+        self.session_streams += 1
+        yield protocol.SessionsSnapshot(
+            sessions=list(getattr(self, "session_list", [])),
+        )
+        while True:
+            item = await self.sessions_queue.get()
+            if item is None:
+                return
+            yield item
+
     async def config(self):
         return protocol.ConfigInfo(
             models=[dict(_model_info(), name="glm-flash",
@@ -107,7 +123,16 @@ class FakeClient:
             default_model_display_name="GLM Flash",
         )
 
-    async def diff(self, name: str, path: str | None = None) -> DiffInfo:
+    async def diff(
+        self, name: str, path: str | None = None,
+        author: str | None = None,
+    ) -> DiffInfo:
+        return DiffInfo()
+
+    async def workspace_diff(
+        self, workspace: str, path: str | None = None,
+        author: str | None = None, scope: str = "all",
+    ) -> DiffInfo:
         return DiffInfo()
 
     async def tools(self, name: str) -> protocol.ToolsInfo:
@@ -1568,10 +1593,9 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_open_picker_refreshes_while_it_stays_open(self) -> None:
         """Rows are live: a session that goes running -> idle while the
-        picker is open updates without closing it."""
+        picker is open updates without closing it (pushed, not polled)."""
         from textual.widgets import OptionList
 
-        from xarness.tui import app as app_module
         from xarness.tui.list_picker import ListPicker
 
         def summary(state: str) -> SessionSummary:
@@ -1583,33 +1607,57 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
 
         client = FakeClient(make_snapshot())
         client.session_list = [summary("running")]
-        previous_interval = app_module.SESSIONS_REFRESH_SECONDS
-        app_module.SESSIONS_REFRESH_SECONDS = 0.02
-        try:
-            app = make_app(client)
-            async with run_app(app) as pilot:
-                await app._open_sessions_async()
-                await pilot.pause()
-                self.assertIsInstance(app.screen, ListPicker)
-                # The picker's +/- columns come from the host's stats: the
-                # TUI must ask for them or every live row reads as clean.
-                self.assertTrue(client.session_calls)
-                self.assertTrue(all(
-                    call.get("stats") is True for call in client.session_calls
-                ), client.session_calls)
-                option_list = app.screen.query_one("#picker-list", OptionList)
-                self.assertIn("running", str(option_list.get_option_at_index(0).prompt))
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            await app._open_sessions_async()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ListPicker)
+            # The picker's +/- columns come from the host's cached totals,
+            # which every listing carries; the TUI does not ask for stats
+            # (the listing never runs git).
+            self.assertTrue(client.session_calls)
+            self.assertTrue(all(
+                "stats" not in call for call in client.session_calls
+            ), client.session_calls)
+            self.assertTrue(all(
+                "window" not in call for call in client.session_calls
+            ), "the picker is not paged any more")
+            option_list = app.screen.query_one("#picker-list", OptionList)
+            self.assertIn("running", str(option_list.get_option_at_index(0).prompt))
 
-                client.session_list = [summary("idle")]
-                await asyncio.sleep(0.08)
-                await pilot.pause()
-                self.assertIn("idle", str(option_list.get_option_at_index(0).prompt))
-                # The periodic refresh keeps asking for the live diff totals.
-                self.assertTrue(all(
-                    call.get("stats") is True for call in client.session_calls
-                ), client.session_calls)
-        finally:
-            app_module.SESSIONS_REFRESH_SECONDS = previous_interval
+            # The rows are pushed now: one summary frame is enough, with no
+            # further listing request.
+            calls_before = len(client.session_calls)
+            client.sessions_queue.put_nowait(protocol.SessionSummaryChanged(
+                summary=summary("idle"),
+            ))
+            await asyncio.sleep(0.02)
+            await pilot.pause()
+            self.assertIn("idle", str(option_list.get_option_at_index(0).prompt))
+            self.assertEqual(client.session_calls[calls_before:], [])
+            self.assertGreaterEqual(client.session_streams, 1)
+
+    async def test_picker_stream_stops_with_the_picker(self) -> None:
+        """The list stream lives exactly as long as the modal: closing the
+        picker cancels the worker (and closes the SSE response with it)."""
+        from xarness.tui.list_picker import ListPicker
+
+        client = FakeClient(make_snapshot())
+        client.session_list = [SessionSummary(
+            name="s1", state="idle",
+            last_user_message_at="2026-01-01T00:00:00+00:00",
+        )]
+        app = make_app(client)
+        async with run_app(app) as pilot:
+            await app._open_sessions_async()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ListPicker)
+            worker = app._sessions_worker
+            self.assertIsNotNone(worker)
+            app.screen.dismiss(None)
+            await pilot.pause()
+            self.assertIsNone(app._sessions_worker)
+            self.assertTrue(worker.is_cancelled or worker.is_finished)
 
     async def test_sessions_command_scopes_subagents_to_the_current_session(
         self,
@@ -1706,8 +1754,8 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             )
 
         entries = [
-            summary("root", at="00:00:04"),
-            summary("root/agent-1", parent="root", at="00:00:01"),
+            summary("root", state="idle", at="00:00:04"),
+            summary("root/agent-1", parent="root", state="idle", at="00:00:01"),
             summary("root/agent-2", parent="root", state="idle", active=True,
                     at="00:00:03"),
             summary("old", at="00:00:02"),
@@ -1717,16 +1765,16 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             "root", "root/agent-2", "root/agent-1", SPACER_ID, "old",
         ], [str(o.id) for o in options]
         rows = {str(o.id): str(o.prompt) for o in options}
-        assert "idle" in rows["root"]   # promoted, not loaded
+        assert "idle" in rows["root"]   # hosted, warm, not loaded by me
         assert "idle" in rows["root/agent-1"]
         assert "idle" in rows["root/agent-2"]
         assert rows["root/agent-1"].startswith("↳ agent-1")
         assert rows["root/agent-2"].startswith("↳ agent-2")
 
     def test_idle_child_of_an_active_parent_stays_live(self) -> None:
-        """A finished subagent is saved/inactive, but while its parent is
+        """A released subagent reads ``saved``, but while its parent is
         active it belongs above the gap, not with the old sessions."""
-        from xarness.tui.list_picker import SPACER_ID, session_options
+        from xarness.tui.list_picker import STATE_WIDTH, SPACER_ID, session_options
 
         def summary(name, state, active, parent=None, at="00:00:00"):
             return SessionSummary(
@@ -1744,7 +1792,9 @@ class SessionPopupRowTest(unittest.IsolatedAsyncioTestCase):
             "root", "child", SPACER_ID, "old",
         ], [str(o.id) for o in options]
         child_row = next(o for o in options if str(o.id) == "child")
-        self.assertIn("idle", str(child_row.prompt))
+        # Not hosted any more: the host says saved and the row says nothing
+        # (no state word at all, unlike a hosted-but-idle session).
+        self.assertNotIn("idle".rjust(STATE_WIDTH), str(child_row.prompt))
 
     def test_workspace_column_shows_innermost_dir(self) -> None:
         from xarness.tui.list_picker import session_options
@@ -2081,6 +2131,88 @@ def make_diff_stat():
     return DiffInfo(files=[
         DiffFileInfo(path="a.py", additions=2, deletions=1, is_new=False, kind="agent"),
     ])
+
+
+class DraftDiffTest(unittest.IsolatedAsyncioTestCase):
+    """A draft chat's /diff: tracking belongs to the workspace, so the
+    pending-changes panel works before a session exists — off until the user
+    asks for it, and hidden again by /diff (an open patch included)."""
+
+    def _app(self, session_name=None):
+        """A draft app whose client answers with one pending file + patch,
+        and records what it was asked for."""
+        client = FakeClient(make_snapshot())
+        calls: list[tuple] = []
+
+        async def workspace_diff(
+            workspace, path=None, author=None, scope="all",
+        ):
+            calls.append((workspace, path, author, scope))
+            return DiffInfo(
+                files=make_diff_stat().files,
+                text="--- a/a.py\n+++ b/a.py\n@@\n-x\n+y\n",
+            )
+
+        client.workspace_diff = workspace_diff
+        return client, calls, make_app(client, session_name=session_name)
+
+    async def test_a_draft_shows_and_hides_the_workspace_diff(self) -> None:
+        from xarness.tui.widgets import DiffSummary
+
+        client, calls, app = self._app()
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await pilot.pause()
+            # Not on by default: a draft opens with no panel at all.
+            self.assertFalse(summary.has_class("visible"))
+            self.assertEqual(calls, [])
+
+            await app._show_diff_command("").wait()
+            self.assertTrue(summary.has_class("expanded"))
+            self.assertEqual(len(summary.query(".diff-file-row")), 1)
+            # The folder the first message would start in, as the chip says.
+            self.assertEqual(calls, [(str(Path.cwd()), None, None, "all")])
+
+            # A row click opens its patch (the workspace endpoint again).
+            await app._open_diff("a.py", None)
+            self.assertTrue(summary.diff_shown)
+
+            # The chip refetches the workspace instead of saving on a session
+            # it does not have (the choice rides out on create).
+            await summary.toggle_scope()
+            await pilot.pause()
+            self.assertEqual([call[3] for call in calls], ["all", "all", "mine"])
+            self.assertEqual(
+                [c for _, c in client.commands if c.type == "set_view_state"],
+                [],
+            )
+
+            # /diff again hides it, the open patch included.
+            await app._show_diff_command("").wait()
+            self.assertFalse(summary.diff_shown)
+            self.assertFalse(summary.has_class("visible"))
+
+    async def test_new_does_not_carry_the_panel_into_the_draft(self) -> None:
+        """The panel a session was showing belongs to that session: /new
+        returns to a draft with no panel until /diff asks for one."""
+        from xarness.tui.widgets import DiffSummary
+
+        client, calls, app = self._app(session_name="s1")
+
+        async def diff(name, path=None, author=None):
+            return DiffInfo(files=make_diff_stat().files)
+
+        client.diff = diff
+        async with run_app(app, size=(120, 40)) as pilot:
+            summary = app.query_one("#diff-summary", DiffSummary)
+            await app.refresh_diff_summary()
+            await pilot.pause()
+            self.assertTrue(summary.has_class("visible"))
+
+            app._start_new_session()
+            await pilot.pause()
+            self.assertFalse(summary.has_class("visible"))
+            self.assertEqual(calls, [], "a fresh draft fetches nothing")
 
 
 class DraftStatusTest(unittest.IsolatedAsyncioTestCase):

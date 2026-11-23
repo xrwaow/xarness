@@ -19,9 +19,9 @@ import logging
 import mimetypes
 import secrets
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -37,11 +37,22 @@ from .protocol import (
     Snapshot,
     ToolsInfo,
 )
-from .session import HISTORY_PAGE, Session, SessionError
+from .session import Session, SessionError
+from .util import RangeError
 
 # Cap on one uploaded image blob (base64 inflation happens client-side; this
 # bounds the raw bytes the host buffers).
 MAX_IMAGE_UPLOAD = 20 * 1024 * 1024
+
+# Shared OpenAPI text for the list-window parameter.
+# A Python-style slice into a list; negative bounds count from the end.
+Range = Annotated[
+    str | None,
+    Query(alias="range", description=(
+        "Python-style slice into the list, e.g. [-40:] for the newest 40, "
+        "[10:20], or [:5]; negative bounds count from the end."
+    )),
+]
 
 LOG = logging.getLogger(__name__)
 
@@ -80,6 +91,12 @@ def create_app(host: Host, *, token: str | None = None) -> FastAPI:
         """Every SessionError (bad request, unknown session, idle-only
         violations) maps to one 400 with the message — handlers don't need
         their own try/except."""
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(RangeError)
+    async def _range_error_handler(request: Request, exc: RangeError):
+        """A malformed ``range`` query value is the client's mistake: one
+        400 naming the expected syntax, like every other bad request."""
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.exception_handler(Exception)
@@ -180,11 +197,14 @@ def sessions_router(host: Host) -> APIRouter:
     async def list_sessions(
         active: bool | None = None, workspace: str | None = None,
         stats: bool = False,
+        window: Range = None,
     ) -> list[SessionSummary]:
-        """``stats`` adds pending-diff totals per hosted session — one git
-        snapshot each, so it is opt-in (the CLI listing leaves it off)."""
+        """``stats`` is accepted for compatibility and ignored: the pending
+        diff totals are cached on the host and ride along on every row (this
+        route never runs git). ``range`` slices the recency-sorted list
+        (newest first), so a large history can be read a page at a time."""
         return await host.list_sessions(
-            active=active, workspace=workspace, stats=stats,
+            active=active, workspace=workspace, stats=stats, window=window,
         )
 
     @router.post(
@@ -224,15 +244,19 @@ def sessions_router(host: Host) -> APIRouter:
                     "text/event-stream. The first frame is `snapshot` (a "
                     "Snapshot); then `event` frames carrying Event models "
                     "(discriminated on `type`). Reconnects always receive "
-                    "a fresh snapshot (`messages=N` windows its history)."
+                    "a fresh snapshot (`range` windows its history; `slim` "
+                    "drops tool bodies and truncates reasoning — hydrate a "
+                    "row from GET …/messages/{index})."
                 ),
             },
         },
     )
-    async def events(name: str, messages: int | None = None) -> StreamingResponse:
+    async def events(
+        name: str, window: Range = None, slim: bool = False,
+    ) -> StreamingResponse:
         session = await _session_or_load(host, name)
         return StreamingResponse(
-            _event_stream(session, messages),
+            _event_stream(session, window, slim),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -243,14 +267,14 @@ def sessions_router(host: Host) -> APIRouter:
         summary="One page of older history, oldest-first and turn-aligned",
     )
     async def messages(
-        name: str, before: int | None = None, limit: int = HISTORY_PAGE,
-        slim: bool = False,
+        name: str, window: Range = None, slim: bool = False,
     ) -> protocol.MessagePage:
-        """The page in front of a window: pass the snapshot's (or the last
-        page's) ``start`` as ``before`` and walk back while ``has_more``.
-        ``slim`` drops reasoning, arguments and output (expand to fetch)."""
+        """The window ``range`` selects, oldest-first and turn-aligned; a
+        missing ``range`` is the newest page. Walk back with the page's
+        ``start`` (``[start-N:start]``) while ``has_more``. ``slim`` drops
+        reasoning, arguments and output (expand to fetch)."""
         return (await _session_or_load(host, name)).message_page(
-            before=before, limit=limit, slim=slim,
+            window=window, slim=slim,
         )
 
     @router.get(
@@ -364,22 +388,40 @@ def sessions_router(host: Host) -> APIRouter:
         return await session.diff_info(path, author)
 
     @router.get(
+        "/sessions/{name:path}/summary",
+        response_model=protocol.SessionSummary,
+        summary="One session's listing row (saved sessions are not loaded)",
+    )
+    async def session_summary(name: str) -> protocol.SessionSummary:
+        """The row the list would show, with this session's own pending
+        totals — the read a hovering client makes.
+
+        A saved session is answered without hosting it: the totals come from
+        the workspace's saved baseline, scoped to that session and its
+        subagents (never the whole repo's pending change), so peeking at a
+        row does not turn it into an idle hosted session."""
+        summary = await host.session_summary(name)
+        if summary is None:
+            raise HTTPException(
+                status_code=404, detail=f"unknown session: {name}",
+            )
+        return summary
+
+    @router.get(
         "/sessions/{name:path}",
         response_model=Snapshot,
         summary="Snapshot of a session (messages, status, live round)",
     )
-    async def get_session(name: str, messages: int | None = None) -> Snapshot:
+    async def get_session(name: str, window: Range = None) -> Snapshot:
         """The session's snapshot. A saved-but-released session is re-hosted
         on demand (cheap: constructing a Session starts no shell); the
         reaper evicts it again once nothing is attached.
 
-        ``messages`` windows the history like ``GET …/events``; omit it for
+        ``range`` windows the history like ``GET …/events``; omit it for
         the whole transcript. Fixed suffixes (``/events``, ``/images/..``,
         ``/quit``, ``/diff``, ``/messages``) are registered first: their
         ``:path`` also matches here, and first match wins."""
-        return (await _session_or_load(host, name)).snapshot(
-            message_limit=messages,
-        )
+        return (await _session_or_load(host, name)).snapshot(window=window)
 
     @router.delete(
         "/sessions/{name:path}",
@@ -413,6 +455,21 @@ def meta_router(host: Host) -> APIRouter:
     ) -> list[protocol.RefInfo]:
         return await host.update_workspace_refs(body)
 
+    @router.get(
+        "/workspaces/diff",
+        response_model=protocol.DiffInfo,
+        summary="Pending changes of a workspace (no session needed)",
+    )
+    async def workspace_diff(
+        workspace: str, path: str | None = None, author: str | None = None,
+        scope: protocol.DiffScope = "all",
+    ) -> protocol.DiffInfo:
+        """A draft chat's /diff: tracking lives with the repo root, so the
+        panel works before a session exists."""
+        return await host.workspace_diff(
+            workspace, path=path, author=author, scope=scope,
+        )
+
     @router.get("/health", response_model=ServerInfo, summary="Host health and protocol version")
     async def health() -> ServerInfo:
         return host.server_info()
@@ -439,6 +496,31 @@ def meta_router(host: Host) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         return host.config_info()
 
+    @router.get(
+        "/events",
+        summary="SSE stream of the session list: one snapshot, then deltas",
+        response_class=StreamingResponse,
+        responses={
+            200: {
+                "description": (
+                    "text/event-stream. The first frame is `snapshot` (a "
+                    "SessionsSnapshot: every listed session, cached diff "
+                    "totals included); then `event` frames carrying "
+                    "SessionSummaryChanged / SessionsRemoved, discriminated "
+                    "on `type`. Never runs git: totals are maintained by the "
+                    "host from workspace events. Reconnects receive a fresh "
+                    "snapshot."
+                ),
+            },
+        },
+    )
+    async def events() -> StreamingResponse:
+        return StreamingResponse(
+            _sessions_stream(host),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @router.get("/workspaces", response_model=list[protocol.WorkspaceInfo], summary="Known workspace directories")
     async def workspaces() -> list[protocol.WorkspaceInfo]:
         return host.workspaces()
@@ -458,23 +540,52 @@ def meta_router(host: Host) -> APIRouter:
     return router
 
 
+async def _sessions_stream(host: Host) -> AsyncIterator[str]:
+    """SSE frames for the session list: one full snapshot, then deltas.
+
+    Registering the queue before building the snapshot means neither can
+    miss an update in between; the overlap is an idempotent upsert on the
+    client. The snapshot is a plain read (cached totals), so the first frame
+    is immediate even on a big repo."""
+    queue = host.watch_sessions()
+    try:
+        yield _sse("snapshot", protocol.SessionsSnapshot(
+            sessions=await host.list_sessions(),
+        ))
+        async for frame in _queue_frames(queue):
+            yield frame
+    finally:
+        host.unwatch_sessions(queue)
+
+
 async def _event_stream(
-    session: Session, message_limit: int | None = None,
+    session: Session, window: str | None = None, slim: bool = False,
 ) -> AsyncIterator[str]:
     """SSE frames: a fresh snapshot first, then live events. Reconnects
     always re-snapshot: on a local unix socket the only real disconnect is
     host death, and replaying deltas across a history rewrite would corrupt
-    the transcript. ``message_limit`` windows that snapshot."""
-    snapshot, queue = session.subscribe(message_limit=message_limit)
+    the transcript. ``window`` selects that snapshot's history slice and
+    ``slim`` its bodies."""
+    snapshot, queue = session.subscribe(window=window, slim=slim)
     yield _sse("snapshot", snapshot)
     try:
-        while True:
-            event = await queue.get()
-            yield _sse("event", event)
-            if isinstance(event, protocol.SessionDeleted):
-                break
+        async for frame in _queue_frames(queue, (protocol.SessionDeleted,)):
+            yield frame
     finally:
         session.unsubscribe(queue)
+
+
+async def _queue_frames(
+    queue: asyncio.Queue[Any], stop_on: tuple[type, ...] = (),
+) -> AsyncIterator[str]:
+    """The `event` half of an SSE stream: one frame per subscriber queue
+    item, ending when a ``stop_on`` event has been sent (a deleted session
+    has nothing left to stream)."""
+    while True:
+        event = await queue.get()
+        yield _sse("event", event)
+        if stop_on and isinstance(event, stop_on):
+            return
 
 
 def _sse(event_name: str, payload: Any) -> str:
