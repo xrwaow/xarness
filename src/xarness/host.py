@@ -95,6 +95,11 @@ SAVED_STATS_TTL_SECONDS = 5.0
 
 # Seconds a client waits for a freshly spawned host's socket to appear.
 SPAWN_TIMEOUT = 15.0
+# How often those waits re-check. A socket appears as soon as uvicorn
+# binds (milliseconds), so a coarse sleep only adds latency to every
+# client's first command; the check itself is one connect() to a path
+# that usually does not exist yet.
+SOCKET_POLL_SECONDS = 0.01
 
 # Defaults for the browser-facing listener (``xarness --web``). Loopback by
 # default: reaching the agent's shell from the network is a deliberate choice.
@@ -1363,7 +1368,7 @@ def _wait_for_socket(timeout: float) -> None:
     while time.monotonic() < deadline:
         if _socket_alive_at(SOCKET_PATH):
             return
-        time.sleep(0.1)
+        time.sleep(SOCKET_POLL_SECONDS)
     raise TimeoutError(f"host socket did not appear within {timeout}s: {SOCKET_PATH}")
 
 
@@ -1384,7 +1389,7 @@ def stop_host(
         if not _socket_alive_at(socket_path):
             socket_path.unlink(missing_ok=True)
             return
-        time.sleep(0.1)
+        time.sleep(SOCKET_POLL_SECONDS)
     raise TimeoutError(f"stale host (pid {pid}) did not exit within {timeout}s")
 
 

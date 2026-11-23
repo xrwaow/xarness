@@ -23,6 +23,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # The suite is written to be process-isolated (tmp_path, patched
+    # HOST_DIR/sockets, per-test state dirs), so xdist is the cheapest
+    # speed-up available: ~5x on a 12-core box.
+    "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",
 ]
 
 [project.scripts]
@@ -36,4 +41,11 @@ packages = ["src/xarness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Fast by default; `pytest -n0 ...` is the serial/debug escape hatch.
+addopts = "-n auto --dist load"
+# A hung test should fail, not sit in a 30s wait or block a worker.
+timeout = 180
+markers = [
+    "slow: real containers or end-to-end host/TUI flows; skip with -m 'not slow'",
+]
 

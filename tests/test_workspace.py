@@ -1,6 +1,8 @@
 """Workspace tracking: events, per-viewer labels, auto groups, accept/reject."""
 
 import asyncio
+import atexit
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -27,6 +29,28 @@ async def open_state(path: Path, **kwargs) -> WorkspaceState:
     return state
 
 
+_TEMPLATE_REPO: Path | None = None
+
+
+def _template_repo() -> Path:
+    """A committed repo to copy for each test (five git subprocesses saved
+    per ``make_repo``; the copy is ~2ms and each test gets its own)."""
+    global _TEMPLATE_REPO
+    if _TEMPLATE_REPO is None:
+        root = Path(tempfile.mkdtemp(prefix="xarn-workspace-template-"))
+        atexit.register(shutil.rmtree, root, ignore_errors=True)
+        repo = root / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main", ".")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+        (repo / "app.py").write_text("line1\nline2\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        _TEMPLATE_REPO = repo
+    return _TEMPLATE_REPO
+
+
 class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -35,13 +59,7 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
 
     def make_repo(self) -> Path:
         repo = self.base / "repo"
-        repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main", ".")
-        _git(repo, "config", "user.email", "t@t")
-        _git(repo, "config", "user.name", "t")
-        (repo / "app.py").write_text("line1\nline2\n")
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "init")
+        shutil.copytree(_template_repo(), repo)
         return repo
 
     async def kinds(self, state: WorkspaceState, viewer=None):

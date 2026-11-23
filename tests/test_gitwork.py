@@ -4,7 +4,9 @@ checkpoints, revert, diff) and the run_bash git-command filter.
 Uses a real temp git repo (git is a hard dependency of the feature anyway).
 """
 
+import atexit
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -44,14 +46,21 @@ def _git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> 
     return result.stdout
 
 
-class GitworkTest(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.base = Path(self._tmp.name)
+_TEMPLATE_REPO: Path | None = None
 
-    def make_repo(self) -> Path:
-        repo = self.base / "repo"
+
+def _template_repo() -> Path:
+    """A committed repo to copy for each test.
+
+    ``git init`` + config + add + commit is five subprocesses (~10ms); a
+    ``copytree`` of the same repo is ~2ms, and 39 tests here build one.
+    The template is built once per process and copied fresh so a test can
+    never see another's edits."""
+    global _TEMPLATE_REPO
+    if _TEMPLATE_REPO is None:
+        root = Path(tempfile.mkdtemp(prefix="xarn-gitwork-template-"))
+        atexit.register(shutil.rmtree, root, ignore_errors=True)
+        repo = root / "repo"
         repo.mkdir()
         _git(repo, "init", "-q", "-b", "main", ".")
         _git(repo, "config", "user.email", "t@t")
@@ -61,6 +70,19 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         (repo / "pkg" / "mod.py").write_text("a = 1\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "init")
+        _TEMPLATE_REPO = repo
+    return _TEMPLATE_REPO
+
+
+class GitworkTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def make_repo(self) -> Path:
+        repo = self.base / "repo"
+        shutil.copytree(_template_repo(), repo)
         return repo
 
     # ------------------------------------------------------------------

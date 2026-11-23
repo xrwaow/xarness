@@ -923,9 +923,24 @@ per session/mode, so adding tools doesn't touch widget code.
 
 ```sh
 uv sync                          # create/refresh the project env
-uv run pytest                    # full suite
+uv run pytest                    # full suite, split across cores (pytest -n auto)
+uv run pytest -n0                # whole suite in one process, for debugging
+uv run pytest -n0 -x tests/test_tui.py -k Wordmark         # one area, fail fast
 uv run pytest -q tests/test_sandbox.py -k ContainerExec   # real bwrap runs
 ```
+
+`pytest-xdist` and `pytest-timeout` are dev dependencies (see
+`pyproject.toml`). The suite is process-isolated (temp workspaces, patched
+host/socket dirs, per-test state dirs), so `-n auto` is safe and is the
+default in `addopts`; `-n0` is the escape hatch when you want one traceback
+stream. `make test`, `make test-fast`, `make test-serial` and
+`make test-smoke` wrap the same commands.
+
+`tests/conftest.py` carries a few test-only shims: it shortens
+Textual's idle polling, disables asyncio's per-test debug mode (which
+otherwise captures a stack trace per callback), skips uvicorn's fixed 100ms
+shutdown sleeps, and shares Textual's parsed stylesheet across app
+instances. Those shims are test-only and restored at session end.
 
 The container tests need `bwrap` and skip themselves when nested sandboxing is
 unavailable. Everything else fakes `bwrap` and inspects the argv instead.

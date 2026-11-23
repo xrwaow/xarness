@@ -498,6 +498,10 @@ pre.md-code { margin: 0.6em 0; padding: 0; overflow-x: auto; font-family: var(--
   color: var(--text);
 }
 .activity.open .activity-head { min-height: 0; }
+/* A lone activity puts its shape on the summary line, so the header is one
+   line: drop the tap-height floor, or the empty bottom shows up as extra
+   distance between the block and the markdown after it. */
+.activity-head:has(.activity-title.single) { min-height: 0; }
 /* Keep the block header in view while its expanded activity list scrolls,
    and the open row's header below it while that row's body scrolls. */
 .activity.open > .activity-head { position: sticky; top: var(--head-h); z-index: 3; background: var(--bg); }

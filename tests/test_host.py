@@ -44,6 +44,10 @@ def _isolate(tmp_path, monkeypatch):
     # the grace period, not how long it is in production.
     monkeypatch.setattr(host_mod, "GRACE_SECONDS", 0.3)
     monkeypatch.setattr(host_mod, "REAP_INTERVAL_SECONDS", 0.02)
+    # Three windows that only exist to coalesce production traffic; a test
+    # asserts what the refresh *does*, not that it waited 0.4s first.
+    monkeypatch.setattr(host_mod, "STATS_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr(host_mod, "SAVED_STATS_TTL_SECONDS", 0.05)
     monkeypatch.setenv("XARNESS_TEST_KEY", "test-key")
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
@@ -67,9 +71,23 @@ def make_host(tmp_path) -> Host:
 
 
 async def _serve(host: Host):
-    task = asyncio.get_running_loop().create_task(host.serve())
-    while not host.unix_socket.exists():
-        await asyncio.sleep(0.02)
+    """Start a host and return once listeners are bound.
+
+    ``serve`` already reports readiness via ``on_ready``; polling the
+    socket file cost 10ms of wall time per test and hid startup failures
+    behind a fixed wait."""
+    ready = asyncio.Event()
+    task = asyncio.get_running_loop().create_task(host.serve(on_ready=ready.set))
+    ready_wait = asyncio.ensure_future(ready.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {ready_wait, task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        ready_wait.cancel()
+    if task in done:
+        # Started and exited (or failed) before reporting ready.
+        task.result()
     return task
 
 
@@ -347,6 +365,7 @@ def test_host_survives_client_disconnect(tmp_path) -> None:
     asyncio.run(go())
 
 
+@pytest.mark.slow
 def test_grace_exit_with_no_active_session(tmp_path) -> None:
     async def go():
         host = make_host(tmp_path)
@@ -899,6 +918,7 @@ def test_default_preset_resolves_model(tmp_path) -> None:
     assert name == "glm-flash" and profile.model_id == "z-ai/glm-5.3-flash"
 
 
+@pytest.mark.slow
 def test_tui_end_to_end_draft_flow(tmp_path) -> None:
     """The full stack: TUI (pilot) -> clientlib -> host API -> Session turn."""
     from xarness.clientlib import XarnessClient
@@ -1126,6 +1146,7 @@ def test_load_session_uses_saved_workspace_sandbox_and_baseline(tmp_path, monkey
     asyncio.run(go())
 
 
+@pytest.mark.slow
 def test_host_stays_alive_while_a_client_is_attached(tmp_path, monkeypatch) -> None:
     """An open event stream counts as active: the host must not exit during
     the grace window while a client is attached to a session, even with no
