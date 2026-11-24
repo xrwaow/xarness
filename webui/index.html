@@ -29,31 +29,35 @@
   </head>
   <body>
     <div class="app" id="app">
+      <header class="main-head">
+        <button
+          id="menu-btn"
+          class="icon-btn menu-btn"
+          type="button"
+          aria-label="Sessions and status"
+          aria-controls="sidebar"
+          aria-expanded="false"
+        >
+          <svg
+            viewBox="0 0 20 20"
+            width="18"
+            height="18"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          >
+            <path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h8.5" />
+          </svg>
+        </button>
+        <div class="head-title">
+          <span class="head-name" id="title">new chat</span>
+          <span class="head-sub" id="subtitle"></span>
+        </div>
+      </header>
       <div class="body">
-        <aside class="sidebar" id="sidebar" aria-label="Sessions and status">
-          <div class="sidebar-head">
-            <span class="sidebar-title">sessions</span>
-            <button class="btn btn-ghost" id="new-chat" type="button" title="Start a fresh chat (/new)">+ new</button>
-            <button
-              class="icon-btn close-sidebar"
-              id="close-sidebar"
-              type="button"
-              aria-label="Close the sessions panel"
-            >
-              <svg
-                viewBox="0 0 20 20"
-                width="16"
-                height="16"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-              >
-                <path d="m5 5 10 10M15 5 5 15" />
-              </svg>
-            </button>
-          </div>
+        <aside class="sidebar" id="sidebar" aria-label="Sessions and status" tabindex="-1">
           <div class="session-list" id="session-list" role="list"></div>
           <div class="sidebar-foot">
             <div class="info" id="info"></div>
@@ -68,37 +72,6 @@
         </aside>
         <div class="scrim" id="scrim" aria-hidden="true"></div>
         <main class="main" id="main" data-view="home">
-          <header class="main-head">
-            <button
-              id="menu-btn"
-              class="icon-btn menu-btn"
-              type="button"
-              aria-label="Sessions and status"
-              aria-controls="sidebar"
-              aria-expanded="false"
-            >
-              <svg
-                viewBox="0 0 20 20"
-                width="18"
-                height="18"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-              >
-                <path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h8.5" />
-              </svg>
-            </button>
-            <div class="head-title">
-              <span class="head-name" id="title">new chat</span>
-              <span class="head-sub" id="subtitle"></span>
-            </div>
-            <span class="conn" id="conn" data-state="connecting" role="status">
-              <span class="conn-dot" aria-hidden="true"></span>
-              <span class="conn-label" id="conn-label">connecting</span>
-            </span>
-          </header>
           <div class="logwrap">
             <div class="log" id="log" role="log" aria-live="polite" aria-label="Conversation" tabindex="0"></div>
             <div class="home" id="home" aria-label="Home"></div>

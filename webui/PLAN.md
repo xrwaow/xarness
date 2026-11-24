@@ -481,9 +481,11 @@ activity, answer — the prose is the separator.
   same shapes and none of that art is stored anywhere.
 - **The header is the run's summary.** Two tallies only: how many times the
   model thought and how many tools it ran, so it reads `Thought 9 times, Ran 6
-  tools`. A run of one has nothing to tally, so it just names its own state:
-  `Thinking` until the reasoning stops and `Thought` after; `Running` until
-  the call returns and `Ran` after. A longer run counts only what has settled,
+  tools`. A run of one has nothing to tally, so it names the activity itself:
+  `Thinking` until the reasoning stops and `Thought` after; for a tool,
+  `Running read_file · src/app.py` until the call returns and `Ran …` after
+  (the row would have carried that name and argument, and a solo call has no
+  row). A longer run counts only what has settled,
   and the activity still in flight joins the line in the present tense (`, …
   Running`) until it is done — `Thought 2 times, Ran 1 tool, Running`, then
   `Thought 2 times, Ran 2 tools`. The per-tool breakdown lives in the expanded
@@ -522,7 +524,9 @@ activity, answer — the prose is the separator.
   hidden once the block ends, but stays visible while the header is expanded
   during a live run.
 - **Expand for the run, click a row for the item.** Tapping the header lists
-  every activity as shape · name · arguments · state. The connector is carried
+  every activity as shape · name · arguments · state. A block with only one
+  activity has no rows to list, so its header opens that activity directly
+  (see below). The connector is carried
   entirely by the rows, so it starts a few pixels *below* the shapes row
   instead of poking up into the header, and the successive row lines overlap
   the 1px row gap so the stroke stays unbroken. Each row's shape paints above
@@ -886,3 +890,180 @@ The service-worker cache name moved to `xarness-ui-v55`.
   await at all.
 
 The service-worker cache name moved to `xarness-ui-v59`.
+
+## Quiet round: the toggle belongs to the thing it opens
+
+- **A block that is one activity has no list.** Tapping its header opened a
+  one-row list that repeated the activity the header already named. The tap is
+  the activity's now: open shows the whole thought, closed leaves just the
+  header, and a tap while it runs closes the stream instead of stacking a row
+  below it. It starts open while it streams and keeps whatever the reader left
+  it as when it settles; a thought opened after it has settled reads from the
+  top rather than from an old tail. The eight-line window is the body, and it
+  gets `50dvh` once the stream is over.
+- **A solo tool opens its own body, not a row around it.** A block with one
+  call had the same two taps: header → one-row list → row → content. The header
+  is the row now: once the call has settled, tapping it renders the terminal /
+  file / patch exactly where the row's body would have been, on the live tail's
+  rail and indent. While the call is still running the eight-line tail keeps
+  the spot (it follows the output as it streams, which a rebuilt body could
+  not do cheaply); a tool opened during the run swaps to its real body when it
+  settles. The hidden list is still updated so hydration and line totals keep
+  working.
+- **The live tail no longer drags itself to the bottom.** The pin was only
+  ever updated by a scroll event, and a programmatic/user scroll the browser
+  had not reported yet read as "at the bottom" — one more reasoning line and
+  the reader's place was gone. The pin is sampled right before the text is
+  replaced. A scroll inside a nested box (that tail, a tool's output) also
+  never reaches the log's own handler, so it could not take follow away
+  either; a capturing listener on the log notices an upward scroll of a
+  descendant and detaches, and the jump button says so.
+- **An open row does not narrate itself.** A thinking row whose body is
+  streaming no longer repeats its last line in the row header on every delta;
+  the name and state stay, and the snippet comes back when the thought settles.
+- **The session meta has no model name.** The model is in the composer foot
+  and in `/model`; on a 280px row it was a third thing competing with the age
+  and the folder. The list signature drops it too, so a model switch no longer
+  rebuilds every row.
+- **The diff bar is patched, not rebuilt.** A `diff_changed` frame used to
+  throw away every row; now one node per row (keyed by kind + path + author) is
+  reused, moved into order only when it is out of place, and rewritten in
+  place. Scroll position, hover and focus survive an update, and folding or
+  unfolding `auto`/`drift` with the reader scrolled down no longer jumps to the
+  top.
+- **The column is centered on the window, not on what is left of it.** Opening
+  the desktop sessions panel used to re-center the log and the composer inside
+  the narrower column, so the input slid sideways by half the panel. It now
+  compensates by exactly that half (sampled frame by frame while the panel
+  slides, since its real edge is what counts), and the CSS clamps the shift so
+  a narrow window keeps an 8px gap to the panel instead of sliding under it.
+- **The sidebar has no header of its own.** `sidebar-head` is gone: the first
+  group line (`live`, or `saved` when nothing is live) is the header, at the
+  height of the floating `main-head`, and it carries `+ new`. The menu button
+  opens and closes the panel; the drawer still closes on the scrim, Esc, or
+  picking a row, and focus lands on `+ new` when it opens on a phone.
+
+The service-worker cache name moved to `xarness-ui-v60`.
+
+## Quiet round: no bar, and nothing jumps under the pointer
+
+- **There is no header bar.** `main-head` was an absolutely positioned strip
+  inside `<main>`, so it only ever covered the conversation: opening the
+  sessions panel left the title floating over the right-hand column and gave
+  the panel a little band of its own. The menu and the title are now just a
+  pinned cluster in the top-left corner of the page (the menu as a chip, the
+  title as the panel's header), and the conversation runs to the top of the
+  window on a desktop instead of being cut off below a band. On a phone there
+  is no gutter for the controls to sit in, so the first line starts under them
+  and later lines fade out beneath. The cluster keeps the pointer only on its
+  controls, so the log stays reachable around it. With the panel collapsed on
+  a desktop only the menu remains (the reference rail is a bare `☰`): the
+  title is the panel's header, so it comes back with it instead of lying over
+  the conversation. The title is capped at the panel's width, and the
+  connection chip keeps the window's corner in both states instead of being
+  pushed out of the panel by a long name (or teleporting across the window
+  when the panel closes).
+- **A narrow desktop still gives the first line room.** The column is centered
+  on the window, so below about 976px its left edge (and the corner chip) would
+  run under the pinned controls. Only in that range does the log
+  start a header's height down, like the phone; on a wide window the column
+  begins beside the controls and the conversation keeps the very top.
+- **The panel is a surface, not an overlay.** It runs the full height of the
+  window with a background of its own (`--sidebar-bg`, a little lighter than
+  the page in dark and a little darker in light) and its edge continues from
+  the bottom of the page to the very top — behind the pinned menu and title,
+  which therefore read as the panel's own header. Its rows start under them.
+- **The panel slides both ways.** The phone rule `.sidebar.open` repeats a
+  `transform` transition, and its specificity beat the desktop panel's
+  `margin-left` one: closing animated, opening snapped. The desktop override
+  repeats the margin transition.
+- **Sticky block headers pin flush at the top.** Sticky offsets are measured
+  from the log's content box, so `top: 0` left the header floating a gutter
+  lower with text sliding through the gap above it. `--pin-at` is where a
+  header stops (under the pinned controls, never through them), `--log-top` is
+  where the first line starts, and `--log-stick` is the difference — the value
+  a sticky `top` needs — so a pinned header lands at `--pin-at` and an open
+  row's header offsets from the block header the same way.
+- **Tapping a block never moves it.** Anchoring does not reliably pick the
+  header as the thing to hold when the list under it grows or shrinks, so
+  expanding one shot the view up and collapsing one pulled its rows out from
+  under the pointer. The tap records the header's position and the log's
+  scroll is corrected by however far it drifted — both directions, not just
+  the collapse case — and the correction is reported to the app so it is not
+  mistaken for the reader leaving the bottom.
+- **The jump button only appears when the reader really left.** A live tail
+  that is cleared, hidden, or swapped for a shorter activity drops its own
+  `scrollTop`, and the nested-scroll listener read that as an upward scroll:
+  every new tool call or thought put "jump to latest" on screen while the
+  reader was still at the bottom. A nested upward move only counts inside a
+  gesture window (a wheel, touch, pointer or key press on the log); a tail
+  being rebuilt is not one.
+- **The split scope chip renders as `agent` again.** `replaceChildren` takes
+  nodes, not an array: passing the two spans as one array stringified them
+  into `[object HTMLSpanElement],[object HTMLSpanElement]` next to the diff
+  totals.
+- **A reachable host always ships the current app.** The worker fetches the
+  shell with `cache: 'no-store'` and keeps its cache for offline only, so an
+  open tab cannot keep running yesterday's `app.js` after a reload.
+
+The service-worker cache name moved to `xarness-ui-v62`.
+
+## Round: no status chip, and a dated history
+
+- **The connection chip is gone from the corner.** `setConn` still keeps
+  `connState` for reconnects and the watchdog, and it still reveals the token
+  action when the host asks for one, but there is no dot or label in the
+  header any more.
+- **The menu is bare.** The chip background and the `aria-expanded` fill are
+  gone; `☰` floats over the page with only the normal hover/focus feedback
+  from `.icon-btn`. No colour change when the panel opens.
+- **The title keeps its name and folder when the panel is closed.** The
+  desktop rule that hid `.head-title` with the panel is removed. On a wide
+  window the centered column starts past the cluster, so the conversation
+  keeps the top; below 1340px, where the column would run under the pinned
+  title, the collapsed log starts one header down (the same room the phone
+  uses). The name is still capped at the panel's width and ellipsizes.
+- **Saved sessions are filed by date.** The sidebar is `live` first, then
+  `today`, `yesterday`, `last week`, `older`. Buckets are local calendar days,
+  not elapsed hours, so they flip at midnight; a session uses
+  `last_user_message_at` and falls back to `updated_at`. The bucket is part
+  of the list's structure signature, so the DOM is rebuilt when a session
+  crosses midnight. The sessions picker uses the same five headings.
+- **The diff panel runs to the top too.** `diffview` was still offset by
+  `--top-h`, a leftover from the header bar. It is now `top: 0` on both the
+  desktop side sheet and the phone full-width sheet, with the safe-area inset
+  moved into its own header so the close button clears the notch.
+- **The queued bar sits over the composer.** `.composer > .steerbar` also
+  matched the old `margin: 8px 0` shorthand, which out-specified the shared
+  composer-column rule and reset its centered left margin to zero, so the bar
+  stuck to the left edge while the input was centered. It now sets only the
+  vertical margins, so the steer (and ask) bars share the column's width and
+  offset, directly above the input.
+
+The service-worker cache name moved to `xarness-ui-v63`.
+
+## Round: scrolling away sticks, and nothing slides over a pinned header
+
+- **A gesture up detaches at once.** `selfScrollAt` is stamped by every follow
+  jump, and the 150ms "this scroll was ours" window therefore never expired
+  while output streamed: the reader's wheel was swallowed and a jump already
+  queued by the last delta dragged the log back down. A wheel, touch or key
+  gesture upward now clears the follow in the handler itself, and the window
+  only ignores scrolls that no gesture is asking for, so a flick back to the
+  bottom still re-attaches mid-stream.
+- **A tool's output no longer swallows the wheel.** The in-conversation scroll
+  boxes (`.tool-code`, `.tool-cmd`, `.tool-diff`, `.activity-lines`) drop
+  `overscroll-behavior: contain`: at their edge the scroll chains to the log
+  instead of stopping dead.
+- **A pinned header pins where the content starts.** Sticky offsets are measured
+  from the log's content box, so pinning at `--pin-at` left a band of the log's
+  own top padding scrolling above the header: a block's rows slid over the
+  pinned summary that sits below them. `--pin-at`/`--log-stick` are gone. The
+  log's top edge is `--log-top` itself (a `top`, not padding), so scrolled
+  content is clipped there and a sticky header pins flush at `0`, right under
+  the floating controls, with nothing passing above it.
+- **An opened block drops the wall of shapes.** Its rows already carry every
+  shape in order; pinned, the wall would only stand in front of them and make
+  the header two rows taller.
+
+The service-worker cache name moved to `xarness-ui-v64`.

@@ -1,6 +1,6 @@
 /* App-shell cache. Never touches /v1/*: API responses and event streams must
  * always come from the host. */
-const CACHE = 'xarness-ui-v59';
+const CACHE = 'xarness-ui-v64';
 const SHELL = [
   './',
   'index.html',
@@ -50,7 +50,7 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       (async () => {
         try {
-          const response = await fetch(request);
+          const response = await fetch(request, { cache: 'no-store' });
           const cache = await caches.open(CACHE);
           cache.put('index.html', response.clone()).catch(() => {});
           return response;
@@ -66,7 +66,9 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     (async () => {
       try {
-        const response = await fetch(request);
+        // No-store: a cached app.js is a stale UI, and this path only runs when
+        // the host is reachable. The shell cache is the offline fallback.
+        const response = await fetch(request, { cache: 'no-store' });
         if (response.ok && response.type === 'basic') {
           const cache = await caches.open(CACHE);
           cache.put(request, response.clone()).catch(() => {});

@@ -43,6 +43,9 @@ const THEMES = {
   'one-light': { mode: 'light', swatches: ['#fafafa', '#000000', '#7c4dff', '#50a14f', '#e45649'] },
 };
 const DIFF_BADGE = { mine: 'agent', agent: 'agent', auto: 'auto', drift: 'drift' };
+/** A `<button>` row with one `<span>` per class, built on first sight. */
+const diffRowNode = (node, cls, parts) =>
+  node ?? el('button', { class: cls, type: 'button' }, ...parts.map((part) => el('span', { class: part })));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Resolve a CSS custom property to a color the canvas can use.
 const cssColor = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#8a8986';
@@ -189,6 +192,19 @@ const byRecent = (a, b) =>
 const sessionLabel = (entry) => (entry.parent_id ? `↳ ${entry.name.split('/').pop()}` : entry.name);
 const sessionWhen = (entry) => relativeTime(entry.last_user_message_at || entry.updated_at);
 const bySectionThenRecent = (a, b) => (a.active !== b.active ? (a.active ? -1 : 1) : byRecent(a, b));
+const startOfDay = (d, days = 0) => new Date(d.getFullYear(), d.getMonth(), d.getDate() - days).getTime();
+/** Which heading a saved session falls under: local calendar days, not elapsed
+ * hours, so "today" flips at midnight. */
+function sessionBucket(entry, now = Date.now()) {
+  const stamp = Date.parse(entry.last_user_message_at || entry.updated_at || 0) || 0,
+    day = new Date(now);
+  if (!stamp) return 'older';
+  if (stamp >= startOfDay(day)) return 'today';
+  if (stamp >= startOfDay(day, 1)) return 'yesterday';
+  return stamp >= startOfDay(day, 7) ? 'week' : 'older';
+}
+const SESSION_BUCKETS = [['today', 'today'], ['yesterday', 'yesterday'], ['week', 'last week'], ['older', 'older']];
+const SESSION_BUCKET_LABELS = Object.fromEntries(SESSION_BUCKETS);
 /** Parent sessions with their subagent children directly underneath. A child
  * whose parent is no longer in the list stays a root, so it is never lost. */
 function sessionGroups(sessions) {
@@ -254,6 +270,8 @@ class App {
       diffOpen: false,
       diffPatch: null,
       diffExpanded: new Set(),
+      // One DOM node per diff row, keyed by what it shows (see renderDiffBar).
+      diffNodes: new Map(),
       diffScope: 'all',
       diffScopePending: null,
       ask: null,
@@ -306,6 +324,9 @@ class App {
       onUndoTo: (id) => this.undoTo(id),
       resolveImage: (image) => this.resolveImage(image),
       onNeedBody: (item, content) => this.hydrate(item, content),
+      // A block that keeps its header still while it expands moves the log
+      // itself; that scroll is not the reader leaving the bottom.
+      onSelfScroll: () => (this.selfScrollAt = performance.now()),
     });
   }
   // ---------------------------------------------------------------- boot
@@ -427,32 +448,17 @@ class App {
     history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
   }
   // ------------------------------------------------------------ DOM refs
-  setConn(state, label = null) {
+  setConn(state) {
+    // No chip in the corner any more: the state is kept for reconnects, and the
+    // only place it still surfaces is the token action.
     this.connState = state;
-    const node = byId('conn');
-    node.dataset.state = state;
     byId('token-btn').hidden = !api.token && state !== 'unauthed';
-    const text =
-      {
-        connecting: 'connecting',
-        open: 'live',
-        ready: 'ready',
-        offline: 'reconnecting…',
-        closed: 'idle',
-        unauthed: 'token needed',
-      }[state] || state;
-    byId('conn-label').textContent = label || text;
   }
   // ------------------------------------------------------------- events
   bindEvents() {
     const on = (id, event, fn, opts) => byId(id).addEventListener(event, fn, opts);
     on('menu-btn', 'click', () => this.toggleSidebar());
-    on('close-sidebar', 'click', () => this.toggleSidebar(false));
     on('scrim', 'click', () => this.toggleSidebar(false));
-    on('new-chat', 'click', () => {
-      this.newChat();
-      this.closeDrawer();
-    });
     on('send', 'click', () => this.submit());
     on('stop', 'click', () => this.interrupt(true));
     on('jump', 'click', () => this.scrollToLatest());
@@ -489,11 +495,45 @@ class App {
       }
     });
     on('log', 'scroll', () => this.onScroll(), { passive: true });
-    const gesture = () => this.userScrolled();
+    // A scroll inside a nested box (a live tail, a tool's output) never reaches
+    // the log's handler, but it is still the reader taking over. Only a real
+    // gesture counts: a tail that is cleared or swapped for a shorter activity
+    // also drops its scrollTop, and that is not the reader leaving.
+    this.nestedScroll = new WeakMap();
+    this.log.addEventListener(
+      'scroll',
+      ({ target: node }) => {
+        if (node === this.log) return;
+        const previous = this.nestedScroll.get(node);
+        this.nestedScroll.set(node, node.scrollTop);
+        if (previous > node.scrollTop + 1 && performance.now() < this.userScrollUntil) this.detachFollow();
+      },
+      { capture: true, passive: true },
+    );
+    // A gesture the reader drives. An upward one stops following right here:
+    // waiting for the scroll event loses the race against the jump a
+    // last-in-flight delta has already queued, and that jump would drag the
+    // log back to the bottom under the reader's hands.
+    const gesture = (event) => {
+      if (event.type === 'touchstart') {
+        this.touchY = event.touches[0]?.clientY ?? null;
+        return this.userScrolled(false);
+      }
+      if (event.type === 'touchmove') {
+        const y = event.touches[0]?.clientY ?? null,
+          up = y !== null && y > (this.touchY ?? y) + 2;
+        this.touchY = y;
+        return this.userScrolled(up);
+      }
+      const up =
+        (event.type === 'wheel' && event.deltaY < 0) ||
+        (event.type === 'keydown' && ['ArrowUp', 'PageUp', 'Home'].includes(event.key));
+      this.userScrolled(up);
+    };
     for (const event of ['wheel', 'touchstart', 'touchmove', 'pointerdown'])
       this.log.addEventListener(event, gesture, { passive: true });
     this.log.addEventListener('keydown', (event) => {
-      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) gesture();
+      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) gesture(event);
     });
     document.addEventListener('keydown', (event) => this.onGlobalKey(event));
   }
@@ -509,6 +549,7 @@ class App {
     };
     if (this.wide.addEventListener) this.wide.addEventListener('change', onChange);
     else this.wide.addListener(onChange);
+    window.addEventListener('resize', () => this.syncColumnShift());
   }
 
   sidebarOpen() {
@@ -537,7 +578,28 @@ class App {
     main.inert = open && !this.wide.matches;
     menu.setAttribute('aria-expanded', String(open));
     if (persist && this.wide.matches) localStorage.setItem(STORAGE.sidebar, open ? 'open' : 'closed');
-    if (open && focus && !this.wide.matches) byId('close-sidebar').focus({ preventScroll: true });
+    const landing = sidebar.querySelector('.session-new') || sidebar.querySelector('.session-row') || sidebar;
+    if (open && focus && !this.wide.matches) landing.focus({ preventScroll: true });
+    this.watchColumnShift();
+  }
+
+  /** The panel takes a column of the window while the conversation stays
+   * centered on the window itself: the column shifts by half the panel's real
+   * edge (it is animated by a margin), so its center lands where it was. The
+   * CSS clamps the shift when the remaining width cannot hold both. */
+  syncColumnShift() {
+    const root = document.documentElement,
+      shift = this.wide.matches ? Math.max(0, byId('sidebar').getBoundingClientRect().right) / 2 : 0;
+    if (shift) root.style.setProperty('--col-shift', `${Math.round(shift)}px`);
+    else root.style.removeProperty('--col-shift');
+  }
+
+  /** Follow the panel's edge for the length of its transition (its margin
+   * animates for 200ms; 40 frames is comfortably past that). */
+  watchColumnShift(frames = 40) {
+    cancelAnimationFrame(this.columnRaf);
+    this.syncColumnShift();
+    if (frames > 1) this.columnRaf = requestAnimationFrame(() => this.watchColumnShift(frames - 1));
   }
 
   closeDrawer() {
@@ -874,14 +936,12 @@ class App {
 
   renderSessions(groups = sessionGroups(this.sessions)) {
     const host = byId('session-list');
-    const signature = JSON.stringify(
-      groupShape(groups, (entry) => [
-        !!entry.parent_id,
-        entry.workspace,
-        entry.model,
-        !!(entry.tracking && (entry.additions || entry.deletions)),
-      ]),
-    );
+    const hasDiff = (entry) => !!(entry.tracking && (entry.additions || entry.deletions));
+    const signature = JSON.stringify([
+      groupShape(groups, (entry) => [!!entry.parent_id, entry.workspace, hasDiff(entry)]),
+      // the bucket changes at midnight even when the membership does not
+      groups.map((group) => sessionBucket(group.root)),
+    ]);
     if (host.dataset.signature === signature) {
       for (const entry of this.sessions) this.updateSessionRow(entry);
       return;
@@ -891,12 +951,25 @@ class App {
     replace(host);
     this.sessionNodes.clear();
     if (!groups.length) {
-      host.appendChild(el('div', { class: 'session-empty', text: 'no sessions yet — send a message to start one' }));
+      host.appendChild(
+        el(
+          'div',
+          { class: 'session-empty' },
+          el('span', { text: 'no sessions yet — send a message to start one' }),
+          this.newChatButton(),
+        ),
+      );
       return;
     }
+    // The panel has no header of its own: the first group line doubles as one,
+    // so the new-chat action sits on it instead of in a bar above the list.
+    let headed = false;
     const render = (items, label) => {
       if (!items.length) return;
-      host.appendChild(el('div', { class: 'session-group', text: label }));
+      const head = el('div', { class: `session-group${headed ? '' : ' first'}` }, el('span', { class: 'group-label', text: label }));
+      if (!headed) head.appendChild(this.newChatButton());
+      headed = true;
+      host.appendChild(head);
       for (const group of items)
         for (const { entry, depth } of group.rows) {
           const row = this.sessionRow(entry, depth);
@@ -904,9 +977,23 @@ class App {
           host.appendChild(row);
         }
     };
+    // Running sessions stay together at the top; everything else is filed by
+    // when it was last used, so the list reads like a chat history.
     render(groups.filter((group) => group.root.active), 'live');
-    render(groups.filter((group) => !group.root.active), 'saved');
+    const saved = groups.filter((group) => !group.root.active);
+    for (const [key, label] of SESSION_BUCKETS)
+      render(saved.filter((group) => sessionBucket(group.root) === key), label);
     host.scrollTop = top;
+  }
+
+  newChatButton() {
+    return el('button', {
+      class: 'session-new',
+      type: 'button',
+      text: '+ new',
+      title: 'Start a fresh chat (/new)',
+      on: { click: () => (this.newChat(), this.closeDrawer()) },
+    });
   }
 
   sessionRow(entry, depth = 0) {
@@ -940,7 +1027,6 @@ class App {
         { class: 'session-meta' },
         el('span', { class: 'age', text: sessionWhen(entry) }),
         entry.workspace ? el('span', { class: 'ws', text: innermostDir(entry.workspace) }) : null,
-        entry.model ? el('span', { text: entry.model }) : null,
         tracked && entry.additions ? el('span', { class: 'adds', text: `+${entry.additions}` }) : null,
         tracked && entry.deletions ? el('span', { class: 'dels', text: `-${entry.deletions}` }) : null,
         entry.parent_id ? el('span', { text: 'subagent' }) : null,
@@ -962,12 +1048,12 @@ class App {
     }
     const groups = sessionGroups(sessions),
       rows = [];
-    let live = null;
+    let shown = null;
     for (const group of groups) {
-      const groupLive = !!group.root.active;
+      const name = group.root.active ? 'live' : SESSION_BUCKET_LABELS[sessionBucket(group.root)];
       for (const { entry } of group.rows) {
-        const section = groupLive === live ? null : groupLive ? 'live' : 'saved';
-        live = groupLive;
+        const section = name === shown ? null : name;
+        shown = name;
         rows.push({
           id: entry.name,
           label: sessionLabel(entry),
@@ -1080,7 +1166,7 @@ class App {
           this.detach();
           return;
         }
-        this.setConn('offline', 'reconnecting…');
+        this.setConn('offline');
         if (!announced) {
           this.addLine(
             this.stalled
@@ -1657,14 +1743,28 @@ class App {
     this.scheduleScroll();
   }
   // ------------------------------------------------------------ scrolling
-  userScrolled() {
+  /** The reader is steering: a downward gesture only opens the window in which
+   * the log can re-attach at the bottom, an upward one stops following now. */
+  userScrolled(up = false) {
     this.userScrollUntil = performance.now() + 400;
+    if (up) this.detachFollow();
+  }
+
+  /** The reader went up: stop following the output (the jump button says so). */
+  detachFollow() {
+    if (!this.followOutput) return;
+    this.followOutput = false;
+    byId('jump').hidden = false;
   }
 
   onScroll() {
     const now = performance.now();
     const distance = this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight;
-    if (now - this.selfScrollAt < 150) {
+    // A scroll we caused ourselves (the follow jump, an expanding block keeping
+    // its header still) says nothing about the reader: only a gesture makes a
+    // scroll inside that window count, so a flick back to the bottom still
+    // re-attaches while output keeps streaming.
+    if (now - this.selfScrollAt < 150 && !(now < this.userScrollUntil)) {
       byId('jump').hidden = this.followOutput;
       return;
     }
@@ -2153,15 +2253,80 @@ class App {
     this.renderDiffBar();
   }
 
+  /** The bar's chrome and rows are built once and patched from then on: a
+   * `diff_changed` frame arrives on every file change, and rebuilding the list
+   * under the reader threw away their place. One node per row (keyed by what
+   * it shows) is reused and rewritten in place. */
+  ensureDiffBar() {
+    if (this.diffHead) return;
+    this.diffLabel = el('span', { class: 'diff-label-text' });
+    this.diffIgnored = el('span', { class: 'dim' });
+    this.diffScopeEl = el('button', {
+      class: 'diff-scope',
+      type: 'button',
+      title: 'Toggle whose changes this counts (every session / this session)',
+      on: { click: (event) => (event.stopPropagation(), this.toggleDiffScope()) },
+    });
+    this.diffScopeSig = null;
+    this.diffAdds = el('span', { class: 'adds' });
+    this.diffDels = el('span', { class: 'dels' });
+    this.diffHead = el(
+      'div',
+      {
+        class: 'diff-head',
+        role: 'button',
+        tabindex: '0',
+        on: {
+          click: () => this.toggleDiff(),
+          keydown: (event) => {
+            if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
+            event.preventDefault();
+            this.toggleDiff();
+          },
+        },
+      },
+      el('span', { class: 'diff-label' }, this.diffLabel, this.diffIgnored),
+      el('span', { class: 'diff-spacer' }),
+      this.diffScopeEl,
+      this.diffAdds,
+      this.diffDels,
+    );
+    this.diffList = el('div', { class: 'diff-list' });
+    this.diffHint = el(
+      'div',
+      { class: 'diff-hint' },
+      'Run ', el('span', { class: 'cmd', text: '/accept' }), ' to lock these in, ',
+      el('span', { class: 'cmd', text: '/reject' }), ' to discard them.',
+    );
+    this.diffBody = el('div', { class: 'diff-body' }, this.diffList, this.diffHint);
+    this.diffNodes.clear();
+    replace(byId('diffbar'), this.diffHead, this.diffBody);
+  }
+
+  /** Put `nodes` under `host` in order, touching only the ones out of place.
+   * Moving a node that is already where it belongs would reset the list's
+   * scroll for no reason. */
+  setChildren(host, nodes) {
+    for (let i = 0; i < nodes.length; i += 1) {
+      const node = nodes[i];
+      if (host.childNodes[i] !== node) host.insertBefore(node, host.childNodes[i] || null);
+    }
+    while (host.childNodes.length > nodes.length) host.removeChild(host.lastChild);
+  }
+
   renderDiffBar() {
     const bar = byId('diffbar'),
       info = this.diff;
     if (!info) {
+      if (bar.hidden) return;
       bar.hidden = true;
-      replace(bar);
       bar.classList.remove('open');
+      replace(bar);
+      this.diffHead = this.diffBody = this.diffList = this.diffHint = null;
+      this.diffNodes.clear();
       return;
     }
+    this.ensureDiffBar();
     bar.hidden = false;
     bar.classList.toggle('open', this.diffOpen);
     const files = info.files || [],
@@ -2178,166 +2343,130 @@ class App {
       label = `Edited ${count} file${count === 1 ? '' : 's'}`;
     const adds = inlineFiles.reduce((total, file) => total + (file.additions || 0), 0);
     const dels = inlineFiles.reduce((total, file) => total + (file.deletions || 0), 0);
-    const head = el(
-      'div',
-      {
-        class: 'diff-head',
-        role: 'button',
-        tabindex: '0',
-        'aria-expanded': String(this.diffOpen),
-        title: this.diffOpen ? 'Hide the pending file list' : 'Show the pending file list',
-        on: {
-          click: () => this.toggleDiff(),
-          keydown: (event) => {
-            if (event.target !== event.currentTarget) return;
-            if (event.key !== 'Enter' && event.key !== ' ') return;
-            event.preventDefault();
-            this.toggleDiff();
-          },
-        },
-      },
-      el(
-        'span',
-        { class: 'diff-label' },
-        label,
-        info.ignored_files ? el('span', { class: 'dim', text: ` · ${info.ignored_files} ignored` }) : null,
-      ),
-      el('span', { class: 'diff-spacer' }),
-      el(
-        'button',
-        {
-          class: 'diff-scope',
-          type: 'button',
-          title: 'Toggle whose changes this counts (every session / this session)',
-          on: {
-            click: (event) => {
-              event.stopPropagation();
-              this.toggleDiffScope();
-            },
-          },
-        },
-        this.diffScope === 'all'
-          ? [el('span', { class: 'hi', text: 'age' }), el('span', { class: 'dim', text: 'nt' })]
-          : el('span', { class: 'hi', text: 'agent' }),
-      ),
-      el('span', { class: 'adds', text: `+${adds}` }),
-      el('span', { class: 'dels', text: `-${dels}` }),
-    );
-    const body = el('div', { class: 'diff-body' });
-    if (this.diffOpen) {
-      const sectionOf = (kind) => (kind === 'mine' || kind === 'agent' ? 'agent' : kind);
-      const sections = scope === 'all' ? ['auto', 'drift'] : ['agent', 'auto', 'drift'];
-      const sectionFiles = (section) => files.filter((file) => sectionOf(file.kind) === section && !isInline(file));
-      const sectionGroups = (section) =>
-        groups.filter((group) => sectionOf(group.kind) === section && !isInline(group));
-      const leadingFiles = files.filter(isInline),
-        leadingGroups = groups.filter(isInline);
-      const columnWidth = (field, sign) => {
-        let width = 1;
-        for (const file of files) width = Math.max(width, `${sign}${file[field] || 0}`.length);
-        for (const entries of [leadingFiles, ...sections.map(sectionFiles)]) {
-          const sum = entries.reduce((total, file) => total + (file[field] || 0), 0);
-          width = Math.max(width, `${sign}${sum}`.length);
-        }
-        return width;
-      };
-      const list = el('div', { class: 'diff-list' });
-      list.style.setProperty('--add-w', `${columnWidth('additions', '+')}ch`);
-      list.style.setProperty('--del-w', `${columnWidth('deletions', '-')}ch`);
-      for (const file of leadingFiles) list.appendChild(this.diffRow(file));
-      for (const group of leadingGroups) list.appendChild(this.diffGroupRow(group));
-      if (leadingFiles.length || leadingGroups.length) list.appendChild(el('div', { class: 'diff-divider' }));
-      for (const section of sections) {
-        const sectioned = sectionFiles(section),
-          grouped = sectionGroups(section),
-          expanded = this.diffExpanded.has(section);
-        const ignored = grouped.reduce((total, group) => total + (group.files || 0), 0);
-        const adds = sectioned.reduce((total, file) => total + (file.additions || 0), 0);
-        const dels = sectioned.reduce((total, file) => total + (file.deletions || 0), 0);
-        const empty = !sectioned.length && !grouped.length;
-        list.appendChild(
-          el(
-            'button',
-            {
-              class: `diff-section ${section}${expanded ? ' expanded' : ''}${empty ? ' empty' : ''}`,
-              type: 'button',
-              'aria-expanded': String(expanded),
-              title: expanded ? `Fold ${section}` : `Unfold ${section}`,
-              on: { click: () => this.toggleDiffSection(section) },
-            },
-            el('span', { class: 'name', text: section }),
-            el('span', { class: 'spacer' }),
-            el('span', { class: 'count', text: ignored ? `${ignored} files` : '' }),
-            el('span', { class: 'adds', text: `+${adds}` }),
-            el('span', { class: 'dels', text: `-${dels}` }),
-          ),
-        );
-        if (!expanded) continue;
-        for (const file of sectioned) list.appendChild(this.diffRow(file));
-        for (const group of grouped) list.appendChild(this.diffGroupRow(group));
-      }
-      if (!files.length && !groups.length)
-        list.appendChild(el('div', { class: 'diff-empty', text: 'no pending changes' }));
-      body.appendChild(list);
-      body.appendChild(
-        el(
-          'div',
-          { class: 'diff-hint' },
-          'Run ',
-          el('span', { class: 'cmd', text: '/accept' }),
-          ' to lock these in, ',
-          el('span', { class: 'cmd', text: '/reject' }),
-          ' to discard them.',
-        ),
-      );
+    this.diffHead.setAttribute('aria-expanded', String(this.diffOpen));
+    this.diffHead.title = this.diffOpen ? 'Hide the pending file list' : 'Show the pending file list';
+    this.diffLabel.textContent = label;
+    this.diffIgnored.textContent = info.ignored_files ? ` · ${info.ignored_files} ignored` : '';
+    if (this.diffScopeSig !== scope) {
+      this.diffScopeSig = scope;
+      const chip = scope === 'all' ? [['hi', 'age'], ['dim', 'nt']] : [['hi', 'agent']];
+      this.diffScopeEl.replaceChildren(...chip.map(([cls, text]) => el('span', { class: cls, text })));
     }
-    replace(bar, head, body);
+    this.diffAdds.textContent = `+${adds}`;
+    this.diffDels.textContent = `-${dels}`;
+    if (!this.diffOpen) {
+      this.setChildren(this.diffList, []);
+      return;
+    }
+    const sectionOf = (kind) => (kind === 'mine' || kind === 'agent' ? 'agent' : kind);
+    const sections = scope === 'all' ? ['auto', 'drift'] : ['agent', 'auto', 'drift'];
+    const sectionFiles = (section) => files.filter((file) => sectionOf(file.kind) === section && !isInline(file));
+    const sectionGroups = (section) =>
+      groups.filter((group) => sectionOf(group.kind) === section && !isInline(group));
+    const leadingFiles = files.filter(isInline),
+      leadingGroups = groups.filter(isInline);
+    const columnWidth = (field, sign) => {
+      let width = 1;
+      for (const file of files) width = Math.max(width, `${sign}${file[field] || 0}`.length);
+      for (const entries of [leadingFiles, ...sections.map(sectionFiles)]) {
+        const sum = entries.reduce((total, file) => total + (file[field] || 0), 0);
+        width = Math.max(width, `${sign}${sum}`.length);
+      }
+      return width;
+    };
+    this.diffList.style.setProperty('--add-w', `${columnWidth('additions', '+')}ch`);
+    this.diffList.style.setProperty('--del-w', `${columnWidth('deletions', '-')}ch`);
+    const used = new Set(),
+      nodes = [],
+      // Reuse the node that already shows this key: only its first sight builds.
+      keep = (key, make) => {
+        used.add(key);
+        const node = make(this.diffNodes.get(key) || null);
+        this.diffNodes.set(key, node);
+        nodes.push(node);
+      },
+      fileRow = (file) =>
+        keep(`file:${file.kind}:${file.path}:${file.author ?? ''}`, (node) => this.diffRow(file, node)),
+      groupRow = (group) => keep(`group:${group.kind}:${group.prefix}`, (node) => this.diffGroup(group, node));
+    leadingFiles.forEach(fileRow);
+    leadingGroups.forEach(groupRow);
+    if (leadingFiles.length || leadingGroups.length) keep('divider', () => el('div', { class: 'diff-divider' }));
+    for (const section of sections) {
+      const rows = sectionFiles(section),
+        folders = sectionGroups(section),
+        expanded = this.diffExpanded.has(section);
+      keep(`section:${section}`, (node) => this.diffSection(section, rows, folders, node));
+      if (!expanded) continue;
+      rows.forEach(fileRow);
+      folders.forEach(groupRow);
+    }
+    if (!files.length && !groups.length)
+      keep('empty', () => el('div', { class: 'diff-empty', text: 'no pending changes' }));
+    // A row that left the diff leaves the cache too: the key is the identity.
+    for (const key of this.diffNodes.keys()) if (!used.has(key)) this.diffNodes.delete(key);
+    this.setChildren(this.diffList, nodes);
+  }
+
+  /** A row is built the first time it is seen, then patched in place: the node
+   * that already shows `file` is the one that keeps its place and its focus. */
+  diffRow(file, node = null) {
+    node = diffRowNode(node, 'diff-row', ['path', 'new', 'shared', 'badge', 'adds', 'dels']);
+    const [path, isNew, shared, badge, adds, dels] = node.children,
+      kind = file.kind === 'mine' ? 'mine' : file.kind,
+      share = file.author === null && file.authors?.length > 1;
+    node.title = file.path;
+    node.onclick = () => this.openPatch(file.path, file.author ?? null);
+    if (this.diffPatch?.path === file.path) node.setAttribute('aria-current', 'true');
+    else node.removeAttribute('aria-current');
+    path.textContent = file.path;
+    isNew.textContent = 'new';
+    isNew.hidden = !file.is_new;
+    shared.hidden = !share;
+    if (share) shared.textContent = String(file.authors.length);
+    badge.className = `badge ${kind}`;
+    badge.textContent = DIFF_BADGE[file.kind] || file.kind;
+    adds.textContent = `+${file.additions || 0}`;
+    dels.textContent = `-${file.deletions || 0}`;
+    return node;
+  }
+
+  diffGroup(group, node = null) {
+    node = diffRowNode(node, 'diff-row diff-group', ['path', 'badge', 'count']);
+    const [path, badge, count] = node.children;
+    node.title = group.prefix;
+    node.onclick = () => this.openPatch(group.prefix, null);
+    if (this.diffPatch?.path === group.prefix) node.setAttribute('aria-current', 'true');
+    else node.removeAttribute('aria-current');
+    path.textContent = group.prefix;
+    badge.className = `badge ${group.kind}`;
+    badge.textContent = DIFF_BADGE[group.kind] || group.kind;
+    count.textContent = `${group.files} files`;
+    return node;
+  }
+
+  /** A section header: `rows` are its files, `folders` the groups it hides. */
+  diffSection(section, rows, folders, node = null) {
+    node = diffRowNode(node, 'diff-section', ['name', 'spacer', 'count', 'adds', 'dels']);
+    const expanded = this.diffExpanded.has(section),
+      empty = !rows.length && !folders.length,
+      count = folders.reduce((total, group) => total + (group.files || 0), 0),
+      sum = (field) => rows.reduce((total, file) => total + (file[field] || 0), 0),
+      [name, , countEl, adds, dels] = node.children;
+    node.className = `diff-section ${section}${expanded ? ' expanded' : ''}${empty ? ' empty' : ''}`;
+    node.title = expanded ? `Fold ${section}` : `Unfold ${section}`;
+    node.setAttribute('aria-expanded', String(expanded));
+    node.onclick = () => this.toggleDiffSection(section);
+    name.textContent = section;
+    countEl.textContent = count ? `${count} files` : '';
+    adds.textContent = `+${sum('additions')}`;
+    dels.textContent = `-${sum('deletions')}`;
+    return node;
   }
 
   toggleDiffSection(section) {
     if (this.diffExpanded.has(section)) this.diffExpanded.delete(section);
     else this.diffExpanded.add(section);
     this.renderDiffBar();
-  }
-
-  diffRow(file) {
-    const current = this.diffPatch?.path === file.path,
-      kind = file.kind === 'mine' ? 'mine' : file.kind;
-    return el(
-      'button',
-      {
-        class: 'diff-row',
-        type: 'button',
-        'aria-current': current ? 'true' : null,
-        title: file.path,
-        on: { click: () => this.openPatch(file.path, file.author ?? null) },
-      },
-      el('span', { class: 'path', text: file.path }),
-      file.is_new ? el('span', { class: 'new', text: 'new' }) : null,
-      file.author === null && file.authors?.length > 1
-        ? el('span', { class: 'shared', text: String(file.authors.length) })
-        : null,
-      el('span', { class: `badge ${kind}`, text: DIFF_BADGE[file.kind] || file.kind }),
-      el('span', { class: 'adds', text: `+${file.additions || 0}` }),
-      el('span', { class: 'dels', text: `-${file.deletions || 0}` }),
-    );
-  }
-
-  diffGroupRow(group) {
-    const current = this.diffPatch?.path === group.prefix;
-    return el(
-      'button',
-      {
-        class: 'diff-row diff-group',
-        type: 'button',
-        title: group.prefix,
-        'aria-current': current ? 'true' : null,
-        on: { click: () => this.openPatch(group.prefix, null) },
-      },
-      el('span', { class: 'path', text: group.prefix }),
-      el('span', { class: `badge ${group.kind}`, text: DIFF_BADGE[group.kind] || group.kind }),
-      el('span', { class: 'count', text: `${group.files} files` }),
-    );
   }
 
   closePatch() {

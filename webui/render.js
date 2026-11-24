@@ -347,13 +347,23 @@ function activitySummary(items) {
     if (item.kind === 'thinking') thoughts += 1;
     else tools += 1;
   }
-  // A run of one has nothing to tally, so it just names its own state:
-  // Thinking until the reasoning stops, then Thought; Running until the call
-  // returns, then Ran.
+  // A run of one has nothing to tally, so it names the activity itself. There
+  // is no row to carry the tool's name and argument, so the header does: a
+  // single call would otherwise read just `Ran`.
   if (items.length === 1) {
     const sole = items[0];
     if (sole.kind === 'thinking') return live ? 'Thinking' : 'Thought';
-    return live ? 'Running' : 'Ran';
+    const name = displayName(sole.name);
+    const failed = !live && toolFailed(sole);
+    const verb = live ? 'Running' : failed ? 'Failed' : 'Ran';
+    let detail = failed ? '' : toolDetail(sole.name, sole.args, sole.output);
+    // The block's right cluster already carries the edit counts, the way a
+    // row's did: the header only needs the path beside the tool's name.
+    if (detail && (sole.name === 'edit_file' || sole.name === 'write_file')) {
+      const counted = DIFF_COUNTS_RE.exec(detail);
+      if (counted) detail = counted[2] || '';
+    }
+    return detail ? `${verb} ${name} · ${detail}` : `${verb} ${name}`;
   }
   const parts = [];
   if (thoughts === 1) parts.push('Thought');
@@ -846,7 +856,11 @@ function renderToolBody(item, body) {
  * activity and its state) plus an eight-line window on what the current
  * activity is writing. Expanded it lists every activity as shape · name ·
  * arguments; each row opens its own body (the terminal, the code, the
- * patch). */
+ * patch).
+ *
+ * A block with a single activity is the exception: there is no run to list, so
+ * the tap belongs to the activity itself. A thought opens its reasoning, a tool
+ * opens the terminal / file / patch the row would have opened. */
 class ActivityBlock {
 
   constructor(view) {
@@ -855,6 +869,9 @@ class ActivityBlock {
     this.rows = new Map();
     this.expanded = false;
     this.closed = false;
+    // A solo activity's header opens the activity itself. `null` means nobody
+    // has said either way: the text follows the stream, shown while it runs.
+    this.soloMode = null;
     this.previewPinned = true;
     this.previewItemId = null;
     this.shapes = el('span', { class: 'activity-shapes' });
@@ -884,7 +901,12 @@ class ActivityBlock {
     this.list = el('div', { class: 'activity-list', role: 'list' });
     this.panel = el('div', { class: 'activity-panel' }, this.list);
     this.lines = el('pre', { class: 'activity-lines', 'aria-label': 'current activity' });
-    this.preview = el('div', { class: 'activity-preview' }, this.lines);
+    // A solo tool's opened body goes here (the eight-line window is only the
+    // live tail); the two share the preview's rail and margin.
+    this.body = el('div', { class: 'activity-body' });
+    this.bodyItemId = null;
+    this.bodySignature = null;
+    this.preview = el('div', { class: 'activity-preview' }, this.lines, this.body);
     this.node = el('section', { class: 'item item-activity activity' }, this.head, this.panel, this.preview);
     if (typeof ResizeObserver === 'function') {
       this.headObserver = new ResizeObserver(() => this.syncHeadHeight());
@@ -905,23 +927,55 @@ class ActivityBlock {
     return this.items[this.items.length - 1] || null;
   }
 
-  // Collapsing a block that has been scrolled past pulls its whole list out of
-  // the document, so the log's scroll height drops under the current position
-  // and the conversation snaps to wherever that leaves it. The head is pinned at
-  // the top while the block scrolls by, so put it back there once the list is
-  // gone: same click target, same place on screen.
+  /** One activity and nothing else: there is no run to list, only its content. */
+  get solo() {
+    return this.items.length === 1;
+  }
+
+  /** The block is still working: a tool is running or a thought is streaming. */
+  isLive() {
+    const status = this.closed || !this.last ? 'ok' : activityStatus(this.last);
+    return status === 'thinking' || status === 'running';
+  }
+
+  /** Whether a solo activity's content is on screen right now. */
+  get soloVisible() {
+    if (!this.solo || this.soloMode === 'closed') return false;
+    return this.soloMode === 'open' || this.isLive();
+  }
+
+  // Toggling changes the height of the log under the header, and the browser's
+  // own anchoring moves the scroll to match — when it moves at all. The header
+  // is the thing that was tapped, so it must stay put: measure it before the
+  // change, then correct the log's scroll by however far it drifted.
   toggleExpanded() {
+    // A solo activity has nothing to list: open shows its content, closed hides
+    // it, and a tap while it runs closes the stream.
+    if (this.solo) {
+      const show = !this.soloVisible;
+      this.soloMode = show ? 'open' : 'closed';
+      this.refresh();
+      // A settled thought reads from its beginning; a live tail follows the end.
+      if (show && !this.isLive()) {
+        this.previewPinned = false;
+        this.lines.scrollTop = 0;
+      }
+      return;
+    }
     const log = this.node.closest('.log');
-    const pinned = !!log && this.head.getBoundingClientRect().top <= log.getBoundingClientRect().top + 1;
+    const anchor = this.head.getBoundingClientRect().top;
     this.expanded = !this.expanded;
     this.refresh();
     if (this.expanded)
       for (const item of this.items)
         if (item.textLoaded === false || item.argsLoaded === false)
           this.view.onNeedBody?.(item, false);
-    if (!pinned) return;
-    const drift = this.node.getBoundingClientRect().top - log.getBoundingClientRect().top;
-    if (drift) log.scrollTop += drift;
+    if (!log) return;
+    const drift = this.head.getBoundingClientRect().top - anchor;
+    if (drift) {
+      log.scrollTop += drift;
+      this.view.onSelfScroll?.();
+    }
   }
 
   add(item) {
@@ -1020,7 +1074,8 @@ class ActivityBlock {
   }
 
   syncHeadHeight() {
-    this.node.style.setProperty('--activity-head-h', this.expanded ? `${this.head.offsetHeight}px` : '0px');
+    const open = this.node.classList.contains('open');
+    this.node.style.setProperty('--activity-head-h', open ? `${this.head.offsetHeight}px` : '0px');
   }
 
   /** Elapsed time for a bash row: live while it runs, frozen once it settles. */
@@ -1073,7 +1128,9 @@ class ActivityBlock {
     row.node.dataset.status = status;
     if (item.kind === 'thinking') {
       row.name.textContent = item.done ? 'Thought' : 'Thinking';
-      row.args.textContent = thinkingSnippet(item);
+      // While the row is open its body streams the same reasoning: the snippet
+      // would only echo its last line and move every delta.
+      row.args.textContent = item.expanded && !item.done ? '' : thinkingSnippet(item);
       row.loc.replaceChildren();
       if (item.done) {
         const stats = [];
@@ -1169,10 +1226,34 @@ class ActivityBlock {
     this.usage.title = `${shown.approximate ? '~' : ''}${shown.input_tokens} tokens in, ${shown.output_tokens} out`;
   }
 
+  // A solo tool's body is rebuilt only when its text changes: streaming deltas
+  // arrive many times a second, and replacing the whole terminal each time
+  // would throw the reader's place away.
+  renderSoloBody(item) {
+    const signature = `${item.status}:${item.args.length}:${item.output.length}`;
+    if (this.bodyItemId === item.id && this.bodySignature === signature) return;
+    this.bodyItemId = item.id;
+    this.bodySignature = signature;
+    this.body.replaceChildren();
+    renderToolBody(item, this.body);
+  }
+
+  clearSoloBody() {
+    if (this.bodySignature === null && !this.body.childElementCount) return;
+    this.body.replaceChildren();
+    this.bodyItemId = null;
+    this.bodySignature = null;
+  }
+
   refresh() {
-    const last = this.last;
-    this.node.classList.toggle('open', this.expanded);
-    this.head.setAttribute('aria-expanded', this.expanded ? 'true' : 'false');
+    const last = this.last,
+      solo = this.solo,
+      // A solo activity's "open" is its content being on screen: it starts open
+      // while it streams, and the reader's tap decides after that.
+      open = solo ? this.soloVisible : this.expanded;
+    this.node.classList.toggle('solo', solo);
+    this.node.classList.toggle('open', open);
+    this.head.setAttribute('aria-expanded', open ? 'true' : 'false');
     this.syncHeadHeight();
     this.hydrateEdits();
     // a running bash row counts its seconds up on every tick
@@ -1230,17 +1311,37 @@ class ActivityBlock {
     const current = activityCurrent(last);
     this.head.title = `${current.name}${current.detail ? ` · ${current.detail}` : ''}`;
 
-    const text = activityPreviewText(last);
-    this.preview.hidden = !text;
+    // A settled solo tool shows its actual body (the terminal, the file, the
+    // patch) instead of a one-row list. While it is live the eight-line tail is
+    // the content: it follows the output as it streams, which a rebuilt body
+    // could not do cheaply.
+    const bodyShown = solo && open && last?.kind === 'tool' && activitySettled(last);
+    if (bodyShown) {
+      if (last.outputLoaded === false || last.argsLoaded === false) this.view.onNeedBody?.(last, true);
+      this.renderSoloBody(last);
+    } else this.clearSoloBody();
+    this.lines.hidden = bodyShown;
+    const hasBody = bodyShown && this.body.childElementCount > 0;
+    const text = bodyShown ? '' : activityPreviewText(last),
+      wasHidden = this.preview.hidden;
+    this.preview.hidden = solo ? !open || (!hasBody && !text) : !text;
     if (this.previewItemId !== (last?.id ?? null)) {
       this.previewItemId = last?.id ?? null;
       this.previewPinned = true;
     }
     if (this.lines.textContent !== text) {
+      // Sample the pin now, not only in the scroll listener: a reader who
+      // scrolled the tail up must stay there when the next line lands, even if
+      // that scroll event has not been delivered yet. A hidden box measures
+      // nothing, so coming back to a live stream goes to its tail.
       const offset = this.lines.scrollTop;
+      this.previewPinned = wasHidden ? this.isLive() : this.lines.scrollHeight - offset - this.lines.clientHeight <= 4;
       this.lines.textContent = text;
       this.lines.scrollTop = this.previewPinned ? this.lines.scrollHeight : offset;
-    } else if (this.previewPinned) this.lines.scrollTop = this.lines.scrollHeight;
+    } else if (this.previewPinned || (wasHidden && !this.preview.hidden && this.isLive())) {
+      this.previewPinned = true;
+      this.lines.scrollTop = this.lines.scrollHeight;
+    }
   }
 }
 
@@ -1259,7 +1360,7 @@ const TRANSIENT_KINDS = new Set(['pending']);
 
 export class LogView {
 
-  constructor(root, { onUndoTo = null, resolveImage = null, onNeedBody = null, session = '' } = {}) {
+  constructor(root, { onUndoTo = null, resolveImage = null, onNeedBody = null, onSelfScroll = null, session = '' } = {}) {
     this.root = root;
     // Seeds every shape's hand-drawn variation. The app sets it on attach; a
     // prepend buffer inherits it from the view it is built from.
@@ -1271,6 +1372,9 @@ export class LogView {
     this.onUndoTo = onUndoTo;
     this.resolveImage = resolveImage;
     this.onNeedBody = onNeedBody;
+    // Tells the app that a scroll it is about to see came from here, not the
+    // reader, so the follow state (and its jump button) is left alone.
+    this.onSelfScroll = onSelfScroll;
     this.welcome = el(
       'div',
       { class: 'welcome' },
