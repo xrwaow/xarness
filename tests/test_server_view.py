@@ -6,14 +6,13 @@ stop button's confirmation path.
 """
 
 import asyncio
-from types import SimpleNamespace
 
+from textual.geometry import Offset
 from textual.screen import Screen
 from textual.selection import Selection
-from textual.geometry import Offset
 from textual.widgets import DataTable, Static
 
-from xarness.conversation import Usage
+from xarness import protocol
 from xarness.protocol import ServerInfo, ServerStats, SessionSummary
 from xarness.tui.confirm_screen import ConfirmScreen
 from xarness.tui.server_view import ServerDashboard
@@ -22,23 +21,16 @@ from xarness.tui.server_view import ServerDashboard
 class FakeHost:
     """Just the slice of Host the dashboard touches."""
 
-    def __init__(
-        self,
-        summaries: list[SessionSummary],
-        usages: dict[str, Usage] | None = None,
-    ) -> None:
-        usages = usages or {}
-        self.sessions = {
-            summary.name: SimpleNamespace(
-                usage_total=usages.get(summary.name, Usage()),
-            )
-            for summary in summaries
-        }
+    attached = False
+
+    def __init__(self, summaries: list[SessionSummary]) -> None:
         self._summaries = summaries
         self._stop = asyncio.Event()
         self.shutdown_requested = False
         self.ready = False
         self.web = None
+        self.urls: list[str] = []
+        self.token: str | None = None
 
     def stats(self) -> ServerStats:
         return ServerStats(
@@ -49,15 +41,14 @@ class FakeHost:
             ),
             started_at="2026-01-01T00:00:00+00:00",
             clients_attached=sum(s.clients_attached for s in self._summaries),
-            total_input_tokens=sum(
-                u.input_tokens for u in
-                (s.usage_total for s in self.sessions.values())
-            ),
-            total_output_tokens=sum(
-                u.output_tokens for u in
-                (s.usage_total for s in self.sessions.values())
-            ),
+            total_input_tokens=sum(s.input_tokens for s in self._summaries),
+            total_output_tokens=sum(s.output_tokens for s in self._summaries),
             sessions=list(self._summaries),
+        )
+
+    def web_info(self) -> protocol.WebInfo:
+        return protocol.WebInfo(
+            active=bool(self.urls), urls=list(self.urls), token=self.token,
         )
 
     async def serve(self, *, web=None, on_ready=None) -> None:
@@ -81,23 +72,22 @@ def _summary(name: str, **kwargs) -> SessionSummary:
     return SessionSummary(name=name, **fields)
 
 
-def _host() -> FakeHost:
-    return FakeHost(
+def _host(*, attached: bool = False) -> FakeHost:
+    host = FakeHost(
         [
-            _summary("build-api", clients_attached=2, message_count=18),
+            _summary("build-api", clients_attached=2, message_count=18,
+                     input_tokens=12_345, output_tokens=4_567),
             _summary(
                 "build-api/agent-1", state="waiting", parent_id="build-api",
-                message_count=5,
+                message_count=5, input_tokens=3_100, output_tokens=900,
             ),
             _summary("scratch-notes", state="idle", active=False,
-                     model="deepseek", message_count=2),
+                     model="deepseek", message_count=2,
+                     input_tokens=120, output_tokens=40),
         ],
-        {
-            "build-api": Usage(input_tokens=12_345, output_tokens=4_567),
-            "build-api/agent-1": Usage(input_tokens=3_100, output_tokens=900),
-            "scratch-notes": Usage(input_tokens=120, output_tokens=40),
-        },
     )
+    host.attached = attached
+    return host
 
 
 def _cell(table: DataTable, name: str, column: str) -> str:
@@ -111,13 +101,10 @@ def _text(widget: Static) -> str:
 def test_dashboard_lists_sessions_clients_and_per_session_tokens() -> None:
     async def go() -> None:
         host = _host()
+        host.urls = ["http://127.0.0.1:8765/", "http://192.168.1.42:8765/"]
+        host.token = "tok-abc123"
         listener = object()
-        app = ServerDashboard(
-            host,
-            web=listener,
-            urls=["http://127.0.0.1:8765/", "http://192.168.1.42:8765/"],
-            token="tok-abc123",
-        )
+        app = ServerDashboard(host, web=listener)
         async with app.run_test(size=(110, 32)) as pilot:
             await pilot.pause()
             # The listener is handed to the host, not just drawn: without
@@ -157,9 +144,9 @@ def test_dashboard_lists_sessions_clients_and_per_session_tokens() -> None:
 
 def test_no_token_means_the_loopback_note() -> None:
     async def go() -> None:
-        app = ServerDashboard(
-            _host(), urls=["http://127.0.0.1:8765/"], token=None,
-        )
+        host = _host()
+        host.urls = ["http://127.0.0.1:8765/"]
+        app = ServerDashboard(host)
         async with app.run_test(size=(100, 24)) as pilot:
             await pilot.pause()
             targets = _text(app.query_one("#head", Static))
@@ -175,9 +162,10 @@ def test_the_token_can_be_selected_and_survives_a_repaint() -> None:
     redrawn every half second, so a selection in it must survive that."""
 
     async def go() -> None:
-        app = ServerDashboard(
-            _host(), urls=["http://127.0.0.1:8765/"], token="tok-abc123",
-        )
+        host = _host()
+        host.urls = ["http://127.0.0.1:8765/"]
+        host.token = "tok-abc123"
+        app = ServerDashboard(host)
         async with app.run_test(size=(100, 20)) as pilot:
             await pilot.pause()
             head = app.query_one("#head", Static)
@@ -195,19 +183,83 @@ def test_the_token_can_be_selected_and_survives_a_repaint() -> None:
     asyncio.run(go())
 
 
-def test_stop_button_asks_then_stops_the_host() -> None:
+def test_attaching_leaves_the_host_serving() -> None:
+    """`q` and the headless button close the view; the phone keeps working
+    and the shell gets its prompt back."""
+
     async def go() -> None:
-        host = _host()
-        app = ServerDashboard(host)
-        async with app.run_test(size=(100, 24)) as pilot:
-            await pilot.pause()
-            await pilot.click("#stop-host")
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmScreen)
+        for action in ("q", "headless"):
+            host = _host(attached=True)
+            app = ServerDashboard(host)
+            async with app.run_test(size=(110, 24)) as pilot:
+                await pilot.pause()
+                assert "attached" in _text(app.query_one("#head", Static))
+                assert app.query("#hint").nodes == []
+                assert [b.label.plain for b in app.query("#footer Button")] == [
+                    "q headless", "ctrl+c exit",
+                ]
+                if action == "q":
+                    await pilot.press("q")
+                else:
+                    await pilot.click("#headless")
+                await pilot.pause()
+            assert not app.stopped
             assert not host.shutdown_requested
-            await pilot.press("y")
+
+    asyncio.run(go())
+
+
+def test_the_exit_button_asks_then_stops_the_host() -> None:
+    """The destructive button is the same confirmation whether the host is
+    this command's or an attached one (where it goes over the socket)."""
+
+    async def go() -> None:
+        for attached in (False, True):
+            host = _host(attached=attached)
+            app = ServerDashboard(host)
+            async with app.run_test(size=(110, 24)) as pilot:
+                await pilot.pause()
+                # A host this command started has nothing to leave behind:
+                # one button, and `q` owns the same confirmation.
+                expected = ["q headless", "ctrl+c exit"] if attached else [
+                    "q stop host",
+                ]
+                assert [
+                    b.label.plain for b in app.query("#footer Button")
+                ] == expected
+                await pilot.click("#exit")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                assert not host.shutdown_requested
+                await pilot.press("y")
+                await pilot.pause()
+            assert app.stopped
+            assert host.shutdown_requested
+
+    asyncio.run(go())
+
+
+def test_a_connected_dashboard_shows_the_listener_it_enabled() -> None:
+    """Attached mode learns the URLs and token from the answer that put the
+    listener up: `--token` may have been generated host-side, not here."""
+
+    class EnabledHost(FakeHost):
+        attached = True
+
+        def web_info(self) -> protocol.WebInfo:
+            return protocol.WebInfo(
+                active=True, bind="0.0.0.0", port=9000,
+                urls=["http://127.0.0.1:9000/"], token="made-by-the-host",
+            )
+
+    async def go() -> None:
+        app = ServerDashboard(EnabledHost(_host()._summaries))
+        async with app.run_test(size=(110, 24)) as pilot:
             await pilot.pause()
-        assert host.shutdown_requested
+            head = _text(app.query_one("#head", Static))
+            assert "http://127.0.0.1:9000/" in head
+            assert "made-by-the-host" in head
+            app.exit()
 
     asyncio.run(go())
 
@@ -270,16 +322,14 @@ def test_live_updates_repaint_cells_and_add_new_sessions() -> None:
             await pilot.pause()
             table = app.query_one(DataTable)
             # A turn spends tokens: the same row is updated in place.
-            host.sessions["build-api"].usage_total = Usage(
+            host._summaries[0] = _summary(
+                "build-api", clients_attached=2, message_count=18,
                 input_tokens=99_000, output_tokens=1,
             )
             app._paint()
             assert _cell(table, "build-api", "in") == "99.0k"
             # A new session shows up without restarting the dashboard.
             host._summaries.append(_summary("late-session"))
-            host.sessions["late-session"] = SimpleNamespace(
-                usage_total=Usage(),
-            )
             app._paint()
             assert "late-session" in [key.value for key in table.rows]
             app.exit()

@@ -646,6 +646,8 @@ xarness --sessions                   # list active sessions
 xarness --kill                       # close all active sessions and stop the host (sessions stay saved)
 xarness --server                     # foreground host + live dashboard
 xarness --web                        # the same host, plus a browser UI (see below)
+xarness --web --headless             # turn the browser UI on, return to the shell
+xarness --web --host 0.0.0.0 --replace  # move a running host's browser listener
 ```
 
 The boolean flags all take an explicit value (`--network true`, `--gpu
@@ -677,11 +679,31 @@ Any of `--host`, `--port` or `--token` also turns on the browser listener
 the bearer token the browser asks for once. With `--host 0.0.0.0` it shows
 both `http://127.0.0.1:<port>/` and the machine's LAN address.
 
-**Stopping.** The `stop host` button (bottom right) asks once, then shuts
-the host down; `q` and `ctrl+c` do the same, and `ctrl+c` copies a text
-selection first, so a long token can be selected and copied. Sessions stay
-saved on disk. When stdout is not a terminal (a pipe, a service manager)
-the dashboard is skipped and the host prints its one-line stats instead.
+Against a host that is already running, the same flags add the listener to
+*it* over the unix socket instead of starting another host: its sessions and
+the turns they are running keep going, and the dashboard attaches. From
+there:
+
+| | |
+| --- | --- |
+| `q` | **headless** — the view closes, the browser UI and the host keep serving (the TUI is unaffected) |
+| `ctrl+c` | ask once, then stop the host (sessions stay saved on disk) |
+
+The footer holds these two as buttons, each labelled with its key (`q
+headless`, `ctrl+c exit`), so there is no separate line of chords. `ctrl+c`
+copies a text selection first, so a long token can be selected and copied
+before it means stop. Same address with another `--token` retunes the token
+in place, no rebind; another `--host`/`--port` is refused unless `--replace`
+asks for the move. `--headless` skips the dashboard entirely: the listener
+is turned on, the URLs and token are printed, and the shell comes back with
+the host serving (it is spawned if none was running).
+
+**Stopping a host this command started.** The `q stop host` button (bottom
+right) asks once, then shuts the host down; `ctrl+c` does the same, and
+copies a text selection first, so a long token can be selected and copied.
+Sessions stay saved on disk. When stdout is not a terminal (a pipe, a
+service manager) the dashboard is skipped and the host prints its one-line
+stats instead.
 
 ## Web UI
 
@@ -697,15 +719,18 @@ xarness --web --host 0.0.0.0 --token s3cret    # choose the token yourself
 ```
 
 `--web` runs a host in the foreground with a TCP listener beside the usual
-unix socket. It refuses to start while another host is running —
-`xarness --kill` first. The dashboard shows the URLs and the stop button
-ends the host (`q` / `ctrl+c`, with one confirmation). Binding anything but
-loopback generates a bearer token, shown on the dashboard's token line: the
-UI asks for it once and keeps it in this browser's `localStorage`; the
-sidebar's **token** button shows, changes or forgets it. The static files
-are public (they are what asks for the token), every `/v1/*` call needs the
-header, and the unix-socket app the TUI talks to is unchanged — same routes,
-no token.
+unix socket. If a host is already running (a TUI started it, or another
+`--server`), the listener is added to *that* host and its sessions keep
+running; nothing is killed and no second host is spawned. The dashboard
+shows the URLs: `q` closes the view and leaves the UI up, `ctrl+c` stops the
+host with one confirmation — both keys are on the footer's buttons.
+`--headless` does the first part and returns to the shell
+without a dashboard. Binding anything but loopback generates a bearer
+token, shown on the dashboard's token line: the UI asks for it once and
+keeps it in this browser's `localStorage`; the sidebar's **token** button
+shows, changes or forgets it. The static files are public (they are what
+asks for the token), every `/v1/*` call needs the header, and the
+unix-socket app the TUI talks to is unchanged — same routes, no token.
 
 **From a phone.** Run `xarness --web --host 0.0.0.0 --workspace ~/code/project`
 on the machine with your code, open `http://<that-machine's-LAN-IP>:8765/` on
@@ -767,10 +792,11 @@ time:
 1. **The listener is loopback-only.** Plain `xarness --web` binds
    `127.0.0.1` on purpose (a network-reachable agent shell is a deliberate
    choice). Its dashboard ends with `(loopback only, no token — a phone
-   needs --host 0.0.0.0)`. Start it again with `--host 0.0.0.0`; the
-   dashboard then lists both a `127.0.0.1` and a LAN URL, and both must
-   load locally. URLs appear only once both listeners are actually up, so
-   a URL on screen is a URL on a socket.
+   needs --host 0.0.0.0)`. Run `xarness --web --host 0.0.0.0` (on a running
+   host, add `--replace` to move the loopback listener) and the dashboard
+   then lists both a `127.0.0.1` and a LAN URL, and both must load
+   locally. URLs appear only once the listeners are actually up, so a URL
+   on screen is a URL on a socket.
 2. **Check what is actually listening**:
 
    ```sh

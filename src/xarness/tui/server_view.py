@@ -16,7 +16,7 @@ printer instead (see :func:`xarness.host.run_foreground`).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from rich.text import Text
@@ -27,7 +27,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
 from .. import theme
-from ..protocol import ServerStats, SessionSummary
+from ..protocol import ServerStats, SessionSummary, WebInfo
 from ..util import format_elapsed, format_tokens
 from .confirm_screen import ConfirmScreen
 from .list_picker import STATE_WORDS, flatten_sessions, relative_time
@@ -37,9 +37,11 @@ from .list_picker import STATE_WORDS, flatten_sessions, relative_time
 
 
 class _HostView(Protocol):
-    sessions: Mapping[str, Any]
+    attached: bool
 
     def stats(self) -> ServerStats: ...
+
+    def web_info(self) -> WebInfo: ...
 
     async def serve(
         self, *, web: Any = ..., on_ready: Callable[[], None] | None = ...,
@@ -106,13 +108,23 @@ def _counted(count: int, noun: str) -> str:
     return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
+def _key(chord: str, option: str) -> Text:
+    """A footer button's label: the key chord in the accent color, the
+    option it runs in the button's own color."""
+    return Text.assemble((chord, f"bold {theme.PALETTE['accent2']}"),
+                         f" {option}")
+
+
 class ServerDashboard(App[None]):
-    """Live host stats, with a stop button.
+    """Live host stats, with a way out.
 
     ``web`` is the browser listener to hand the host (``None`` for the unix
-    socket alone); ``urls`` and ``token`` describe it in the header, so the
-    token is on screen for the whole run instead of scrolling away at
-    startup."""
+    socket alone). Once it is up, ``web_info`` supplies its URLs and token,
+    which stay in the header for the whole run instead of scrolling away at
+    startup. ``attached`` means the host is somebody else's (a TUI's, say):
+    ``q`` then only closes the view — the browser UI this view put up and
+    the host with its sessions keep serving — while ``ctrl+c`` asks once and
+    stops everything."""
 
     # The TUI's stylesheet: the palette variables and the modal chrome the
     # stop confirmation needs. The dashboard's own few rules are `CSS` — an
@@ -139,27 +151,33 @@ class ServerDashboard(App[None]):
     DataTable > .datatable--odd-row { background: $c-surface; }
     DataTable > .datatable--even-row { background: $c-bg; }
     DataTable > .datatable--hover { background: $c-border; }
-    /* The stop target, one row tall in the palette's error color like the
-       confirm modal's buttons. Two rows: the rule, then the button. */
+    /* The way out, one row tall in the palette's error color like the
+       confirm modal's buttons. Two rows: the rule, then the buttons. */
     #footer {
         height: 2; padding: 0 1; background: $c-bg;
-        border-top: solid $c-border; align-vertical: middle;
+        border-top: solid $c-border;
+        align-horizontal: right; align-vertical: middle;
     }
-    #hint { width: 1fr; height: 1; color: $c-muted; content-align: left middle; }
-    #stop-host {
-        width: auto; min-width: 12; height: 1; padding: 0 2; border: none;
-        background: $c-surface; color: $c-error; text-style: bold;
+    #footer Button {
+        width: auto; min-width: 10; height: 1; padding: 0 2; border: none;
+        background: $c-surface; color: $c-muted; text-style: bold;
     }
-    #stop-host:hover, #stop-host:focus, #stop-host.-active {
+    #footer Button:hover, #footer Button:focus, #footer Button.-active {
+        background: $c-border; color: $c-text;
+    }
+    /* The destructive one stays in the palette's error color, like the
+       confirm modal's buttons. */
+    #exit { color: $c-error; }
+    #exit:hover, #exit:focus, #exit.-active {
         background: $c-error; color: $c-bg;
     }
-    #stop-host:disabled { background: $c-surface; color: $c-muted; }
+    #footer Button:disabled { background: $c-surface; color: $c-muted; }
     """
 
     BINDINGS = [
-        Binding("q", "stop", "Stop host"),
-        Binding("ctrl+c", "copy_or_stop", "Copy / stop", priority=True),
-        Binding("ctrl+q", "stop", "Stop host", priority=True, system=True),
+        Binding("q", "leave", "Headless"),
+        Binding("ctrl+c", "copy_or_exit", "Exit", priority=True),
+        Binding("ctrl+q", "leave", "Leave", priority=True, system=True),
     ]
 
     def __init__(
@@ -167,30 +185,31 @@ class ServerDashboard(App[None]):
         host: "_HostView",
         *,
         web: Any = None,
-        urls: Sequence[str] = (),
-        token: str | None = None,
     ) -> None:
         super().__init__()
         self.host = host
+        # A host this app started (``--server``) ends with it; an attached
+        # one (``--web`` against a live host) belongs to somebody else, so
+        # leaving here only closes the view.
+        self.attached = host.attached
         # Opaque here: the dashboard forwards it to Host.serve, which knows
         # how to bind it.
         self.web = web
-        self.urls = tuple(urls)
-        self.token = token
+        # Filled from host.web_info() once the listener is really up.
+        self.urls: tuple[str, ...] = ()
+        self.token: str | None = None
         # The last read of the host's stats: the caller prints its final
         # line after the dashboard exits. `error` is why the host exited by
         # itself, when it did (a failed bind, a live socket) — the caller
         # turns it into one clear error line instead of a traceback.
         self.stats: ServerStats | None = None
         self.error: BaseException | None = None
-        self._stopping = False
+        # Set by the confirmation that stopped the host; it also says which
+        # of the two ways out this view took.
+        self._leaving = False
         # Named for the host, not the app: Textual's App already owns
         # `_ready`, and its own bool is not this one.
         self._host_ready = False
-        # Per-session token totals for the current frame, from the live
-        # Session objects: ``usage_total`` is what the TUI's status bar
-        # shows.
-        self._usage: dict[str, tuple[int, int]] = {}
 
     def get_css_variables(self) -> dict[str, str]:
         return {**super().get_css_variables(), **theme.CSS_VARIABLES}
@@ -205,13 +224,19 @@ class ServerDashboard(App[None]):
             id="empty",
         )
         yield DataTable(id="sessions")
+        # The buttons are the hint: each carries the key that runs it, so
+        # there is no second line spelling the same chords out.
         with Horizontal(id="footer"):
-            yield Static(id="hint")
-            yield Button("stop host", id="stop-host")
+            if self.attached:
+                yield Button(_key("q", "headless"), id="headless")
+                yield Button(_key("ctrl+c", "exit"), id="exit")
+            else:
+                yield Button(_key("q", "stop host"), id="exit")
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        # A display, not a focus target: no cursor, and tab lands on stop.
+        # A display, not a focus target: no cursor, and tab lands on the
+        # footer buttons.
         table.cursor_type = "none"
         table.show_cursor = False
         table.can_focus = False
@@ -227,12 +252,18 @@ class ServerDashboard(App[None]):
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001 — one line, no traceback
-            self.error = exc
+            # A leave we asked for tears the connection down under the poll
+            # loop: that is the exit, not an error to report.
+            if not self._leaving:
+                self.error = exc
         finally:
             self.exit()
 
     def _on_ready(self) -> None:
-        """Both listeners are up: drop the ``starting`` note and repaint."""
+        """Both listeners are up: take their URLs and token, drop the
+        ``starting`` note and repaint."""
+        info = self.host.web_info()
+        self.urls, self.token = tuple(info.urls), info.token
         self._host_ready = True
         self._paint()
 
@@ -242,20 +273,18 @@ class ServerDashboard(App[None]):
     def _paint(self) -> None:
         try:
             stats = self.host.stats()
-            usage = {
-                name: (session.usage_total.input_tokens,
-                       session.usage_total.output_tokens)
-                for name, session in self.host.sessions.items()
-            }
         except Exception:  # noqa: BLE001 — a torn-down host is not an error
             return
-        self.stats, self._usage = stats, usage
+        self.stats = stats
         self.query_one("#head", Static).update(self._head_text(stats))
         self._paint_table(stats)
-        self.query_one("#hint", Static).update(self._hint_text())
-        button = self.query_one("#stop-host", Button)
-        button.disabled = self._stopping
-        button.label = "stopping…" if self._stopping else "stop host"
+        leaving = self._leaving
+        for button in self.query("#footer Button"):
+            button.disabled = leaving
+        # The one piece of feedback left once the hint line is gone: the
+        # destructive button says what it is doing.
+        if leaving:
+            self.query_one("#exit", Button).label = "stopping…"
 
     def _head_text(self, stats: ServerStats) -> Text:
         """Where the host is, then what it is doing — one block, one rule."""
@@ -271,6 +300,9 @@ class ServerDashboard(App[None]):
         if not self._host_ready:
             header.append(" · ", style=p["border"])
             header.append("starting…", style=p["warning"])
+        elif self.attached:
+            header.append(" · ", style=p["border"])
+            header.append("attached", style=p["muted"])
         lines = [
             header,
             Text.assemble(("socket  ", p["muted"]),
@@ -317,17 +349,6 @@ class ServerDashboard(App[None]):
         )
         return text
 
-    def _hint_text(self) -> Text:
-        p = theme.PALETTE
-        if self._stopping:
-            return Text("stopping the host — sessions stay saved on disk",
-                        style=p["warning"])
-        return Text.assemble(
-            ("q", f"bold {p['accent2']}"), (" stop", p["muted"]),
-            ("  ·  ", p["border"]),
-            ("ctrl+c", f"bold {p['accent2']}"), (" stop / copy", p["muted"]),
-        )
-
     # ------------------------------------------------------------------
     # session table
 
@@ -371,8 +392,7 @@ class ServerDashboard(App[None]):
                                            (summary.state, "muted"))
             return Text(word, style=p[colour], justify=align)
         if key in ("in", "out"):
-            tokens = self._usage.get(summary.name, (0, 0))
-            spent = tokens[1] if key == "out" else tokens[0]
+            spent = summary.output_tokens if key == "out" else summary.input_tokens
             return Text(_fit(format_tokens(spent), width) if spent else "–",
                         style=p["text" if spent else "muted"], justify=align)
         if key == "clients":
@@ -388,12 +408,17 @@ class ServerDashboard(App[None]):
                     style=p["muted"], justify=align)
 
     # ------------------------------------------------------------------
-    # stopping
+    # leaving
 
-    def action_copy_or_stop(self) -> None:
+    @property
+    def stopped(self) -> bool:
+        """Whether the host went down with this view, not just the view."""
+        return not self.attached or self._leaving
+
+    def action_copy_or_exit(self) -> None:
         """ctrl+c copies a selection first (the token is selectable), then
-        means "stop the host" — the only thing leaving this screen can do.
-        With the stop confirmation open it cancels that, like escape."""
+        means stop the host. With the confirmation open it cancels that,
+        like escape."""
         selected = self.screen.get_selected_text()
         if selected:
             self.copy_to_clipboard(selected)
@@ -401,10 +426,23 @@ class ServerDashboard(App[None]):
         if isinstance(self.screen, ModalScreen):
             self.screen.dismiss(None)
             return
-        self.action_stop()
+        self.action_exit()
 
-    def action_stop(self) -> None:
-        if self._stopping or isinstance(self.screen, ModalScreen):
+    def action_leave(self) -> None:
+        """``q``: close the view. An attached host keeps serving the browser
+        UI (headless); a host this app started ends with it, so that path
+        asks before stopping."""
+        if self._leaving or isinstance(self.screen, ModalScreen):
+            return
+        if self.attached:
+            self.exit()
+        else:
+            self.action_exit()
+
+    def action_exit(self) -> None:
+        """ctrl+c / the exit button: stop the host. Running turns are
+        cancelled, every session stays saved on disk."""
+        if self._leaving or isinstance(self.screen, ModalScreen):
             return
         stats = self.stats
         if stats is None or not stats.sessions:
@@ -424,14 +462,25 @@ class ServerDashboard(App[None]):
         )
 
     def _on_stop_choice(self, choice: bool | None) -> None:
-        if not choice or self._stopping:
+        if not choice or self._leaving:
             return
-        self._stopping = True
+        self._leaving = True
         self._paint()
-        self.run_worker(self.host.request_shutdown(), exclusive=False,
+        self.run_worker(self._stop_host(), exclusive=False,
                         name="host-shutdown")
 
+    async def _stop_host(self) -> None:
+        """Ask the host to stop, then leave."""
+        await self.host.request_shutdown()
+        # An owned host's `serve` returns on its own and exits the app; an
+        # attached one only has this poll loop, which has nothing left to
+        # poll.
+        if self.attached:
+            self.exit()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "stop-host":
-            event.stop()
-            self.action_stop()
+        event.stop()
+        if event.button.id == "headless":
+            self.action_leave()
+        elif event.button.id == "exit":
+            self.action_exit()

@@ -258,6 +258,39 @@ class ServerInfo(BaseModel):
     unix_socket: str | None = None
 
 
+class WebInfo(BaseModel):
+    """GET /v1/server/web: the browser listener, when one is up.
+
+    Served on the unix socket only: ``token`` is that listener's own gate,
+    so a client reaching it over TCP can never read or rotate it."""
+
+    active: bool = False
+    bind: str | None = None
+    port: int | None = None
+    urls: list[str] = Field(default_factory=list)
+    token: str | None = None
+
+
+class WebUpdate(BaseModel):
+    """PUT /v1/server/web: bind a browser listener, or retune the one up.
+
+    ``replace`` is what moves a listener already bound elsewhere; without it
+    a different address is refused, so a phone holding the printed URL does
+    not lose it to a stray ``--port``. ``token`` None keeps the current one
+    (or lets the host generate one when the address is not loopback)."""
+
+    bind: str | None = None
+    port: int | None = None
+    token: str | None = None
+    replace: bool = False
+
+
+class StopResult(BaseModel):
+    """POST /v1/server/stop: the host is on its way down (sessions saved)."""
+
+    stopping: bool = True
+
+
 class SessionSummary(BaseModel):
     """One row of GET /sessions (active or saved)."""
 
@@ -284,6 +317,10 @@ class SessionSummary(BaseModel):
     # Last write to disk: the listing's idea of "recently used".
     updated_at: str | None = None
     message_count: int = 0
+    # What the session has spent so far: the dashboard's in/out columns (and
+    # the reason they work against a host the dashboard does not run).
+    input_tokens: int = 0
+    output_tokens: int = 0
     parent_id: str | None = None
     tracking: bool = False
     # The session's own pending (unaccepted) ``mine`` totals: only paths

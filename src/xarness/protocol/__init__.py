@@ -111,9 +111,12 @@ from .views import (  # noqa: F401
     Snapshot,
     State,
     Status,
+    StopResult,
     ToolInfo,
     ToolsInfo,
     ViewState,
+    WebInfo,
+    WebUpdate,
     WorkspaceInfo,
     WorkspaceRefUpdate,
 )

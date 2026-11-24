@@ -83,6 +83,9 @@ def _idle_ttl() -> float:
 # shutdown. Small enough that an idle session leaves promptly, cheap enough
 # that the scan (one dict of sessions) never shows up in a profile.
 REAP_INTERVAL_SECONDS = 0.25
+# How often the attached dashboard re-reads a host it does not run: the
+# stats cross the unix socket, so it polls instead of reading objects.
+DASHBOARD_POLL_SECONDS = 0.5
 # Trailing debounce for the cached session-list diff totals: a turn can run
 # several mutating tools in a row, and one workspace snapshot/diff answers
 # for every session in that repo.
@@ -123,9 +126,12 @@ class WebListen:
         return self.bind in ("127.0.0.1", "localhost", "::1")
 
 
-
 class Host:
     """Owns sessions and the unix-socket listener."""
+
+    # The dashboard's cue that this object is not this process's own host
+    # (see :class:`AttachedHost`).
+    attached = False
 
     def __init__(
         self,
@@ -156,6 +162,15 @@ class Host:
         self._started_at = time.monotonic()
         self._started_at_wall = _utcnow()
         self._shutdown_event = asyncio.Event()
+        # The uvicorn servers this host owns, keyed by name, and the tasks
+        # this host is itself stopping (a listener exiting unbidden sets
+        # _shutdown_event instead).
+        self._listeners: dict[str, tuple[Any, asyncio.Task[None]]] = {}
+        self._stopping: set[asyncio.Task[None]] = set()
+        self._listener_lock = asyncio.Lock()
+        # The browser listener, when one is up: host state rather than a
+        # `serve` argument, because `--web` can add it to a running host.
+        self.web: WebListen | None = None
         # The one background loop that evicts inactive sessions and decides
         # when a non-persistent host may exit (see _reap).
         self._reaper: asyncio.Task[None] | None = None
@@ -961,12 +976,8 @@ class Host:
             host=self.server_info(),
             started_at=self._started_at_wall,
             clients_attached=sum(s.clients_attached for s in sessions),
-            total_input_tokens=sum(
-                s.usage_total.input_tokens for s in self.sessions.values()
-            ),
-            total_output_tokens=sum(
-                s.usage_total.output_tokens for s in self.sessions.values()
-            ),
+            total_input_tokens=sum(s.input_tokens for s in sessions),
+            total_output_tokens=sum(s.output_tokens for s in sessions),
             sessions=sessions,
         )
 
@@ -1033,6 +1044,84 @@ class Host:
         ]
 
     # ------------------------------------------------------------------
+    # listeners
+
+    def web_info(self) -> protocol.WebInfo:
+        """The browser listener as it is right now, token included (the
+        unix-socket app only: over TCP that token is the gate's own key)."""
+        web = self.web
+        if web is None:
+            return protocol.WebInfo()
+        return protocol.WebInfo(
+            active=True, bind=web.bind, port=web.port,
+            urls=_web_urls(web), token=web.token,
+        )
+
+    async def enable_web(
+        self, web: WebListen, *, replace: bool = False,
+    ) -> protocol.WebInfo:
+        """Bind the browser listener, or retune the one that is up.
+
+        The same address only takes a new token (``None`` keeps the current
+        one, so a bare ``--web`` cannot unarm it); a different address needs
+        ``replace``. A moving listener validates its new address first (on an
+        ephemeral port, since the old one still holds the real one), so a bad
+        address leaves the host serving."""
+        async with self._listener_lock:
+            current = self.web
+            if current is not None and (web.bind, web.port) == (
+                current.bind, current.port
+            ):
+                self.web = WebListen(
+                    web.bind, web.port,
+                    current.token if web.token is None else web.token,
+                )
+            else:
+                if current is not None and not replace:
+                    raise RuntimeError(
+                        f"the browser UI is already on "
+                        f"{current.bind}:{current.port} — pass --replace to "
+                        "move it",
+                    )
+                # The token policy for a listener added at runtime: off
+                # loopback, an unauthenticated listener is made to demand one.
+                web = web_listen(bind=web.bind, port=web.port, token=web.token)
+                # A move shares the port with the listener it replaces, so
+                # validate the address itself on an ephemeral port; a fresh
+                # listener probes the exact address it is about to take.
+                _probe_bind(web.bind, 0 if current is not None else web.port)
+                if current is not None:
+                    await self._stop_listener(self._listeners.pop("web"))
+                # Set first: the app's token gate reads it on the very first
+                # request, and a failed start clears it again below.
+                self.web = web
+                try:
+                    server, task = await _start_web_server(self)
+                except BaseException:
+                    self.web = None
+                    raise
+                self._record("web", server, task)
+        return self.web_info()
+
+    def _record(self, name: str, server: Any, task: asyncio.Task[None]) -> None:
+        """Own a bound listener; one that exits unbidden ends the host."""
+        self._listeners[name] = (server, task)
+        task.add_done_callback(
+            lambda task: task in self._stopping or self._shutdown_event.set(),
+        )
+
+    async def _stop_listener(
+        self, listener: tuple[Any, asyncio.Task[None]],
+    ) -> None:
+        server, task = listener
+        self._stopping.add(task)
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+
+    # ------------------------------------------------------------------
     # lifecycle
 
     async def serve(
@@ -1051,21 +1140,14 @@ class Host:
         actually up — printing a URL before that would advertise something
         a failed bind never served."""
         HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-        if web is not None:
-            # Probe the TCP address before binding anything else: a bad
-            # ``--host`` should cost one clear line, not a half-started host.
-            _probe_bind(web.bind, web.port)
         server, server_task = await _start_unix_server(self)
-        web_server = web_task = None
-        if web is not None:
-            web_server, web_task = await _start_web_server(
-                self, web.bind, web.port, web.token,
-            )
-        self._reaper = asyncio.get_running_loop().create_task(self._reap())
-        if on_ready is not None:
-            on_ready()
-        listeners = (server_task, web_task)
+        self._record("unix", server, server_task)
         try:
+            if web is not None:
+                await self.enable_web(web)
+            self._reaper = asyncio.get_running_loop().create_task(self._reap())
+            if on_ready is not None:
+                on_ready()
             while True:
                 if stats_interval is not None:
                     stats = self.stats()
@@ -1074,7 +1156,7 @@ class Host:
                         f"{_format_stats(stats)}",
                         flush=True,
                     )
-                if await self._wait_for_stop(listeners, stats_interval):
+                if await self._wait_for_stop(stats_interval):
                     break
         finally:
             if self._reaper is not None:
@@ -1086,43 +1168,29 @@ class Host:
                 task.cancel()
             self._stats_tasks.clear()
             self._stats_dirty.clear()
-            for one, task in ((server, server_task), (web_server, web_task)):
-                if one is None or task is None:
-                    continue
-                one.should_exit = True
-                try:
-                    await asyncio.wait_for(task, timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    task.cancel()
+            for listener in list(self._listeners.values()):
+                await self._stop_listener(listener)
+            self._listeners.clear()
+            self.web = None
             for session in list(self.sessions.values()):
                 await session.stop()
             if self.unix_socket.exists():
                 self.unix_socket.unlink()
 
-    async def _wait_for_stop(self, listeners, timeout: float | None) -> bool:
+    async def _wait_for_stop(self, timeout: float | None) -> bool:
         """Whether the host should tear down: shutdown was requested, or a
         listener exited on its own.
 
         uvicorn turns SIGINT/SIGTERM into a clean exit of *its* server, and
         with two listeners the other one would keep the process alive (a
-        Ctrl-C that closes the port but never returns). Waiting on the
-        listener tasks as well fixes that for ``--server`` and ``--web``
-        alike."""
-        shutdown = asyncio.ensure_future(self._shutdown_event.wait())
-        waiters = [shutdown, *(t for t in listeners if t is not None)]
+        Ctrl-C that closes the port but never returns). The done callback
+        that _record installs turns that exit into _shutdown_event, whether
+        the listener was bound at startup or added later by ``--web``."""
         try:
-            done, _ = await asyncio.wait(
-                waiters, timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            shutdown.cancel()
-        if self._shutdown_event.is_set():
-            return True
-        if done:
-            self._shutdown_event.set()
-            return True
-        return False
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     async def _reap(self) -> None:
         """The host's one lifecycle loop: evict inactive sessions and, for a
@@ -1167,15 +1235,26 @@ class Host:
                 del inactive[name]
             if warm or any(s.is_active for s in self.sessions.values()):
                 quiet_since = None
-            elif self.persistent:
+            elif self.persistent or self.web is not None:
+                # A browser listener is a reason to stay: it outlives the
+                # sessions, and a UI pointed at a dead port is worse than an
+                # idle process. `--kill` still ends it.
                 quiet_since = None
             elif quiet_since is None:
                 quiet_since = now
             elif now - quiet_since >= GRACE_SECONDS:
                 self._shutdown_event.set()
 
-    async def request_shutdown(self) -> None:
-        self._shutdown_event.set()
+    async def request_shutdown(self, delay: float = 0) -> None:
+        """Stop the host; a delay lets a caller's HTTP response go out first
+        (``POST /v1/server/stop`` would otherwise close the connection the
+        answer is written to)."""
+        if delay:
+            asyncio.get_running_loop().call_later(
+                delay, self._shutdown_event.set,
+            )
+        else:
+            self._shutdown_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -1198,19 +1277,25 @@ async def _start_unix_server(host: Host):
     return await _serve_uvicorn(config, wait_for=lambda: host.unix_socket)
 
 
-async def _start_web_server(
-    host: Host, bind: str, port: int, token: str | None,
-):
+async def _start_web_server(host: Host):
     """Second listener: the same app (API + the web UI's static files) on
-    TCP, so a browser can reach it. The token gates ``/v1/*`` only when one
-    was given."""
+    TCP, so a browser can reach it.
+
+    The bearer token is read from ``host.web`` on every request, which is
+    what lets ``enable_web`` retune it without rebinding. It gates ``/v1/*``
+    when set (one is always set off loopback — see :func:`web_listen`).
+    """
     import uvicorn
 
     from .api import create_app
-    app = create_app(host, token=token)
-    _probe_bind(bind, port)
+    web = host.web
+    assert web is not None
+    app = create_app(
+        host, admin=False,
+        auth=lambda: host.web.token if host.web is not None else None,
+    )
     config = uvicorn.Config(
-        app, host=bind, port=port, log_level="warning",
+        app, host=web.bind, port=web.port, log_level="warning",
     )
     try:
         return await _serve_uvicorn(config, wait_for=lambda: None)
@@ -1219,8 +1304,8 @@ async def _start_web_server(
         # port in between): uvicorn answers with a raw ``sys.exit`` from
         # inside its task, so say it in one line instead of a traceback.
         raise RuntimeError(
-            f"cannot listen on {bind}:{port} ({_bind_reason(exc)}) — check "
-            "--host/--port, or that the port is free",
+            f"cannot listen on {web.bind}:{web.port} ({_bind_reason(exc)}) — "
+            "check --host/--port, or that the port is free",
         ) from None
 
 
@@ -1297,12 +1382,16 @@ async def _serve_uvicorn(config, *, wait_for):
 # client-side helpers: auto-start and connect
 
 
-def connect_or_spawn(*, timeout: float = SPAWN_TIMEOUT) -> Path:
+def connect_or_spawn(
+    *, timeout: float = SPAWN_TIMEOUT, cwd: Path | None = None,
+) -> Path:
     """Make sure a host is running; return the socket path.
 
     Connection refused on a stale socket counts as "no host": the stale
     file is removed and a host is spawned. An exclusive startup lock keeps
-    racing clients from spawning two hosts — the loser retries connecting."""
+    racing clients from spawning two hosts — the loser retries connecting.
+    ``cwd`` is the directory a spawned host starts in (sessions the web UI
+    creates land there; nothing to change when a host is already up)."""
     HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     if _socket_alive():
         return SOCKET_PATH
@@ -1325,7 +1414,7 @@ def connect_or_spawn(*, timeout: float = SPAWN_TIMEOUT) -> Path:
             [sys.executable, "-m", "xarness.host"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True, cwd="/",
+            start_new_session=True, cwd="/" if cwd is None else str(cwd),
         )
         _wait_for_socket(timeout)
         return SOCKET_PATH
@@ -1393,29 +1482,35 @@ def stop_host(
     raise TimeoutError(f"stale host (pid {pid}) did not exit within {timeout}s")
 
 
+def run_host(
+    web: "WebListen | None" = None, *, replace: bool = False,
+    headless: bool = False, workspace: Path | None = None,
+) -> None:
+    """``xarness --server`` / ``--web``: attach to a live host, or run one.
+
+    ``headless`` (or asking for a listener while a host is up) hands the
+    listener to that host over its unix socket; ``workspace`` is where
+    sessions created through the web UI land."""
+    if web is not None and (headless or _socket_alive()):
+        attach_web(web, replace=replace, headless=headless, workspace=workspace)
+        return
+    if web is not None and workspace is not None:
+        # The web UI creates sessions in the host's cwd; chdir so
+        # --workspace means the same thing it does for the TUI.
+        workspace.mkdir(parents=True, exist_ok=True)
+        os.chdir(workspace)
+    run_foreground(web=web)
+
+
 def run_foreground(*, web: "WebListen | None" = None) -> None:
-    """``xarness --server``: run the host in the foreground, persistent.
+    """Run the persistent host in the foreground (a bare ``--server``).
 
-    With a terminal attached the host's dashboard is the display: sessions,
-    clients and per-session token spend, plus the browser listener's URLs
-    and token when ``web`` is given. Piped or under a service manager it
-    keeps the old behaviour — one stats line per interval — because escape
-    sequences in a log file are worse than lines.
-
-    ``web`` is what ``xarness --web`` passes; ``--server --host/--port/
-    --token`` builds the same listener. A live host is never shared: a bare
-    ``--server`` prints the running host's stats, while asking for the web
-    listener fails (that host has no listener to add one to)."""
+    With a terminal attached the dashboard is the display; piped or under a
+    service manager the host prints one stats line per interval instead —
+    escape sequences in a log file are worse than lines. ``web`` is the
+    browser listener the dashboard hands to :meth:`Host.serve`."""
     HOST_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     if _socket_alive():
-        if web is not None:
-            print(
-                f"error: a host is already running (socket {SOCKET_PATH}).\n"
-                "  It has no web listener. Stop it first (`xarness --kill`), then "
-                "run the command again.",
-                file=sys.stderr,
-            )
-            raise SystemExit(2)
         _print_live_stats()
         return
     lock_handle = open(LOCK_PATH, "a")
@@ -1438,7 +1533,10 @@ def run_foreground(*, web: "WebListen | None" = None) -> None:
             print("\n".join(_host_intro(host.server_info())), flush=True)
             asyncio.run(host.serve(
                 stats_interval=1.0 if web is None else 10.0,
-                web=web, on_ready=_banner(web) if web is not None else None,
+                web=web,
+                on_ready=(
+                    lambda: _web_banner(host.web_info(), Path.cwd())
+                ) if web is not None else None,
             ))
         except KeyboardInterrupt:
             pass
@@ -1460,20 +1558,100 @@ def _interactive() -> bool:
         return False
 
 
-def _run_dashboard(host: Host, *, web: "WebListen | None") -> None:
-    """Run the foreground host inside the dashboard, then report its exit.
+class AttachedHost:
+    """A host already running in another process, seen through its socket.
+
+    This is the dashboard's host view for ``--web`` against a live host: it
+    enables the listener, then polls stats and sends shutdown over the wire
+    instead of touching local objects."""
+
+    attached = True
+
+    def __init__(self, web: WebListen, *, replace: bool = False) -> None:
+        self.web = web
+        self.replace = replace
+        self.info: protocol.WebInfo | None = None
+        self._stats: ServerStats | None = None
+        self._client: Any = None
+
+    def web_info(self) -> protocol.WebInfo:
+        return self.info or protocol.WebInfo()
+
+    def stats(self) -> ServerStats:
+        """The last polled frame; there is no host object to read."""
+        if self._stats is None:
+            raise RuntimeError("connecting to the host…")
+        return self._stats
+
+    async def serve(self, *, web=None, on_ready=None) -> None:
+        from .clientlib import XarnessClient
+
+        client = self._client = await XarnessClient.connect_unix(spawn=False)
+        try:
+            self.info = await client.enable_web(
+                bind=self.web.bind, port=self.web.port,
+                token=self.web.token, replace=self.replace,
+            )
+            if on_ready is not None:
+                on_ready()
+            while True:
+                self._stats = await client.stats()
+                await asyncio.sleep(DASHBOARD_POLL_SECONDS)
+        finally:
+            await client.aclose()
+
+    async def request_shutdown(self) -> None:
+        if self._client is not None:
+            await self._client.stop_host()
+
+
+def attach_web(
+    web: WebListen, *, replace: bool = False, headless: bool = False,
+    workspace: Path | None = None,
+) -> None:
+    """``--web`` against a host that is already running.
+
+    Nothing is stopped: the listener is added to the live host, so its
+    sessions keep going. On a terminal the dashboard attaches; piped (or
+    ``--headless``) the URLs and token are printed and the shell comes back.
+    ``web.token is None`` keeps the token of a listener on that address, or
+    lets the host generate one off loopback."""
+    if _interactive() and not headless:
+        _run_dashboard(AttachedHost(web, replace=replace))
+        return
+    from .clientlib import ClientError, XarnessClient
+
+    async def _enable() -> protocol.WebInfo:
+        # Spawns a host when none is running: --headless on a quiet machine
+        # is how a browser gets one at all.
+        client = await XarnessClient.connect_unix(spawn_cwd=workspace)
+        try:
+            return await client.enable_web(
+                bind=web.bind, port=web.port, token=web.token, replace=replace,
+            )
+        finally:
+            await client.aclose()
+
+    try:
+        info = asyncio.run(_enable())
+    except ClientError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    _web_banner(info)
+
+
+def _run_dashboard(
+    host: Any, *, web: "WebListen | None" = None,
+) -> None:
+    """Run the host (or a view of one) inside the dashboard, then report its
+    exit.
 
     The app starts ``host.serve`` on its own event loop; a startup failure
     (a live socket, a bad bind) surfaces through ``error`` instead of a
     traceback from a task."""
     from .tui.server_view import ServerDashboard
 
-    view = ServerDashboard(
-        host,
-        web=web,
-        urls=_web_urls(web) if web is not None else (),
-        token=web.token if web is not None else None,
-    )
+    view = ServerDashboard(host, web=web)
     try:
         view.run()
     except KeyboardInterrupt:
@@ -1488,7 +1666,8 @@ def _run_dashboard(host: Host, *, web: "WebListen | None") -> None:
         print(f"error: {reason}", file=sys.stderr)
         raise SystemExit(2)
     if view.stats is not None:
-        print(f"host stopped · {_format_stats(view.stats)}", flush=True)
+        left = "host stopped" if view.stopped else "host left running"
+        print(f"{left} · {_format_stats(view.stats)}", flush=True)
 
 
 def _format_stats(stats: ServerStats) -> str:
@@ -1564,28 +1743,27 @@ def _web_urls(web: WebListen) -> list[str]:
     return [f"http://{web.bind}:{web.port}/"]
 
 
-def _banner(web: WebListen):
-    """A callable that prints where the UI is, once it is really there."""
+def _web_banner(info: protocol.WebInfo, workspace: Path | None = None) -> None:
+    """Print where the UI is, once it is really there.
 
-    def announce() -> None:
-        print("xarness web UI:", flush=True)
-        for url in _web_urls(web):
-            print(f"  {url}", flush=True)
-        print(f"  workspace: {Path.cwd()}", flush=True)
-        if web.token:
-            print(
-                f"  token:     {web.token}\n"
-                "  (enter it once in the UI; it is not stored on the host)",
-                flush=True,
-            )
-        else:
-            print(
-                "  (loopback only, no token — a phone needs "
-                "`--host 0.0.0.0`)",
-                flush=True,
-            )
-
-    return announce
+    ``workspace`` is the directory sessions get created in — printed for a
+    host this command started, where it is this shell's cwd."""
+    print("xarness web UI:", flush=True)
+    for url in info.urls:
+        print(f"  {url}", flush=True)
+    if workspace is not None:
+        print(f"  workspace: {workspace}", flush=True)
+    if info.token:
+        print(
+            f"  token:     {info.token}\n"
+            "  (enter it once in the UI; it is not stored on the host)",
+            flush=True,
+        )
+    else:
+        print(
+            "  (loopback only, no token — a phone needs `--host 0.0.0.0`)",
+            flush=True,
+        )
 
 
 def web_listen(

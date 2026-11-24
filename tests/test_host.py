@@ -1208,6 +1208,132 @@ def test_web_listen_generates_a_token_only_off_loopback() -> None:
     assert host_mod.web_listen(bind="127.0.0.1", token="s3cret").token == "s3cret"
 
 
+def test_web_listener_is_added_to_a_running_host(tmp_path) -> None:
+    """``--web`` against a live host: the listener is bound on that host,
+    its sessions stay hosted, and the token can be retuned in place —
+    nothing is stopped and nothing is rebound for a token change."""
+
+    def free_port() -> int:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        port = free_port()
+
+        async def get(headers: dict[str, str] | None = None) -> httpx.Response:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", timeout=5.0,
+            ) as http:
+                try:
+                    return await http.get("/v1/health", headers=headers)
+                finally:
+                    await http.aclose()
+
+        try:
+            name = await _make_session(host, tmp_path, [[]])
+            info = await host.enable_web(host_mod.web_listen(
+                bind="127.0.0.1", port=port, token="s3cret",
+            ))
+            assert info.active and info.port == port and info.token == "s3cret"
+            # The session was not disturbed by adding a listener.
+            assert name in host.sessions
+            # The listener is real, and it demands the token.
+            assert (await get()).status_code == 401
+            assert (await get({"Authorization": "Bearer s3cret"})).status_code == 200
+
+            # Host control stays on the unix socket: a client holding the web
+            # token cannot read or rotate that token.
+            async with _unix_http(host.unix_socket) as unix:
+                assert (await unix.get("/v1/server/web")).json()["token"] == "s3cret"
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", timeout=5.0,
+            ) as http:
+                denied = await http.get(
+                    "/v1/server/web",
+                    headers={"Authorization": "Bearer s3cret"},
+                )
+                assert denied.status_code == 404
+
+            # Same address: a token change, no rebind. A bare --web keeps it.
+            await host.enable_web(host_mod.web_listen(
+                bind="127.0.0.1", port=port, token="new-token",
+            ))
+            assert (await get({"Authorization": "Bearer s3cret"})).status_code == 401
+            assert (await get(
+                {"Authorization": "Bearer new-token"},
+            )).status_code == 200
+            info = await host.enable_web(host_mod.web_listen(
+                bind="127.0.0.1", port=port,
+            ))
+            assert info.token == "new-token"
+
+            # A move has to be asked for, and a bad address fails before the
+            # working listener is dropped.
+            with pytest.raises(RuntimeError, match="--replace"):
+                await host.enable_web(host_mod.web_listen(
+                    bind="127.0.0.1", port=free_port(), token="new-token",
+                ))
+            with pytest.raises(RuntimeError, match="cannot listen"):
+                await host.enable_web(host_mod.web_listen(
+                    bind="203.0.113.9", port=port, token="new-token",
+                ), replace=True)
+            assert host.web is not None and host.web.bind == "127.0.0.1"
+            assert name in host.sessions
+
+            # Moving to a wider bind on the same port works: the probe does
+            # not trip over the listener it is about to replace.
+            info = await host.enable_web(host_mod.web_listen(
+                bind="0.0.0.0", port=port, token="new-token",
+            ), replace=True)
+            assert info.bind == "0.0.0.0"
+            assert (await get(
+                {"Authorization": "Bearer new-token"},
+            )).status_code == 200
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_the_stop_endpoint_shuts_the_host_down(tmp_path) -> None:
+    """``POST /v1/server/stop`` is what an attached dashboard's exit uses:
+    it answers first, then the host tears down."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        async with _unix_http(host.unix_socket) as unix:
+            stopped = await unix.post("/v1/server/stop")
+        assert stopped.json() == {"stopping": True}
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
+def test_a_web_listener_keeps_an_otherwise_idle_host_alive(tmp_path) -> None:
+    """A browser pointed at a port must not find it dead after the grace
+    period: the listener is a reason to stay."""
+
+    async def go():
+        host = make_host(tmp_path)
+        task = await _serve(host)
+        try:
+            await host.enable_web(host_mod.web_listen(
+                bind="127.0.0.1", port=0, token="t",
+            ))
+            await asyncio.sleep(host_mod.GRACE_SECONDS * 3)
+            assert not host._shutdown_event.is_set()
+        finally:
+            await host.request_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+
+
 def test_start_unix_server_refuses_to_unlink_a_live_socket(tmp_path) -> None:
     import socket as socket_mod
 

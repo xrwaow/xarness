@@ -18,6 +18,7 @@ import json
 import logging
 import mimetypes
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
 
@@ -27,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, protocol, session_store
 from .config import ConfigError
-from .host import Host
+from .host import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, Host, WebListen
 from .images import sniff_mime
 from .protocol import (
     CommandResult,
@@ -69,13 +70,23 @@ def webui_dir() -> Path | None:
     return next((path for path in WEBUI_DIRS if (path / "index.html").is_file()), None)
 
 
-def create_app(host: Host, *, token: str | None = None) -> FastAPI:
+def create_app(
+    host: Host, *, auth: Callable[[], str | None] | None = None,
+    admin: bool = True,
+) -> FastAPI:
     """Build the FastAPI app.
 
-    ``token`` is only given to the TCP listener ``xarness --web`` starts: the
+    ``auth`` is only given to the TCP listener ``xarness --web`` starts: the
     web UI is reachable from the network, so it must prove it was told the
-    token the host printed. The unix-socket app (the TUI's) passes none and
-    is unauthenticated exactly as before."""
+    token the host printed. It returns the token *at request time*, which is
+    what lets the listener retune it without a rebind. The unix-socket app
+    (the TUI's, this CLI's) passes none and is unauthenticated exactly as
+    before — its directory is 0700 and the socket 0600.
+
+    ``admin`` mounts the host-control routes (the browser listener's address
+    and token). Only the unix-socket app has them: a client holding the web
+    token must not be able to read, rotate or drop the gate that token is.
+    """
     app = FastAPI(
         title="xarness",
         version=__version__,
@@ -114,26 +125,32 @@ def create_app(host: Host, *, token: str | None = None) -> FastAPI:
 
     app.include_router(sessions_router(host))
     app.include_router(meta_router(host))
-    if token:
-        _require_token(app, token)
+    if admin:
+        # Host control serves the browser listener's token: unix socket only.
+        app.include_router(host_router(host))
+    if auth is not None:
+        _require_token(app, auth)
     # Mounts must come last: a mount at "/" matches every remaining path, so
     # it would shadow the API routes registered above it.
     _mount_webui(app)
     return app
 
 
-def _require_token(app: FastAPI, token: str) -> None:
+def _require_token(app: FastAPI, token_of: Callable[[], str | None]) -> None:
     """Bearer-token gate for the API routes of a network-reachable app.
 
     Only ``/v1/*`` is gated: the static UI itself is public (it is what asks
-    for the token), and the OpenAPI docs carry no data."""
+    for the token), and the OpenAPI docs carry no data. A listener without a
+    token is loopback-only (see :func:`web_listen`) and stays open exactly
+    as it always was."""
 
     @app.middleware("http")
     async def _check_token(request: Request, call_next):
         if request.url.path.startswith("/v1"):
+            token = token_of()
             header = request.headers.get("authorization", "")
             scheme, _, value = header.partition(" ")
-            if (
+            if token is not None and (
                 scheme.lower() != "bearer"
                 or not secrets.compare_digest(value.strip(), token)
             ):
@@ -536,6 +553,49 @@ def meta_router(host: Host) -> APIRouter:
             return await search_files(Path(workspace), q)
         except OSError:
             return []
+
+    return router
+
+
+def host_router(host: Host) -> APIRouter:
+    """Host control: the browser listener and stopping the host.
+
+    Unix socket only (see :func:`create_app`): these can read the web token,
+    rotate it, or drop the listener that token guards."""
+    router = APIRouter(prefix="/v1/server", tags=["server"])
+
+    @router.get(
+        "/web", response_model=protocol.WebInfo,
+        summary="The browser listener: address, URLs and token",
+    )
+    async def web_info() -> protocol.WebInfo:
+        return host.web_info()
+
+    @router.put(
+        "/web", response_model=protocol.WebInfo,
+        summary="Add the browser listener, or change its token",
+    )
+    async def update_web(body: protocol.WebUpdate) -> protocol.WebInfo:
+        web = WebListen(
+            bind=body.bind or DEFAULT_WEB_HOST,
+            port=DEFAULT_WEB_PORT if body.port is None else body.port,
+            token=body.token,
+        )
+        try:
+            return await host.enable_web(web, replace=body.replace)
+        except RuntimeError as exc:
+            # A bad address, a taken port, or a move that was not asked for:
+            # the host is unchanged, and the message says why.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @router.post(
+        "/stop", response_model=protocol.StopResult,
+        summary="Stop the host; sessions stay saved on disk",
+    )
+    async def stop_host() -> protocol.StopResult:
+        # Delayed so this response goes out before the listeners close.
+        await host.request_shutdown(delay=0.1)
+        return protocol.StopResult()
 
     return router
 

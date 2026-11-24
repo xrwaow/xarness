@@ -31,6 +31,7 @@ from .protocol import (
     CommandResult,
     Event,
     ServerInfo,
+    ServerStats,
     SessionSummary,
     Snapshot,
 )
@@ -126,19 +127,21 @@ class XarnessClient:
     @classmethod
     async def connect_unix(
         cls, socket_path: Path | None = None, *, spawn: bool = True,
-        check_version: bool = True,
+        check_version: bool = True, spawn_cwd: Path | None = None,
     ) -> "XarnessClient":
         """Connect over the host's unix socket, auto-starting the host.
 
         The protocol version is checked against /health; on a mismatch with
         no active sessions the stale host is shut down and respawned.
         ``check_version=False`` skips that guard — used by ``--kill``, which
-        must reach a too-old host precisely to clear its sessions."""
+        must reach a too-old host precisely to clear its sessions.
+        ``spawn_cwd`` is where a newly spawned host runs (see
+        :func:`xarness.host.connect_or_spawn`)."""
         from .host import SOCKET_PATH, connect_or_spawn
         if spawn:
             # connect_or_spawn forks/waits on subprocesses — blocking work
             # that must not stall the event loop this coroutine serves.
-            await asyncio.to_thread(connect_or_spawn)
+            await asyncio.to_thread(connect_or_spawn, cwd=spawn_cwd)
         path = socket_path or SOCKET_PATH
         http = httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=str(path)),
@@ -177,6 +180,28 @@ class XarnessClient:
 
     async def health(self) -> ServerInfo:
         return await self._get("/v1/health", model=ServerInfo)
+
+    async def stats(self) -> ServerStats:
+        """The host's live stats — what a dashboard it does not run paints."""
+        return await self._get("/v1/server/stats", model=ServerStats)
+
+    async def enable_web(
+        self, *, bind: str, port: int, token: str | None = None,
+        replace: bool = False,
+    ) -> protocol.WebInfo:
+        """Add the browser listener to the running host, or retune it.
+
+        Unix socket only: over TCP the token would be the gate handing out
+        its own key."""
+        return await self._put("/v1/server/web", {
+            "bind": bind, "port": port, "token": token, "replace": replace,
+        }, model=protocol.WebInfo)
+
+    async def stop_host(self) -> protocol.StopResult:
+        """Ask the host to shut down; every session stays saved on disk."""
+        return await self._post(
+            "/v1/server/stop", {}, model=protocol.StopResult,
+        )
 
     async def config(self) -> protocol.ConfigInfo:
         return await self._get("/v1/config", model=protocol.ConfigInfo)

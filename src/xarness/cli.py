@@ -151,6 +151,18 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard) on any other address.",
     )
     parser.add_argument(
+        "--replace", action="store_true",
+        help="With --host/--port against a host that already serves the "
+        "browser UI: move its listener there instead of refusing. Its "
+        "sessions keep running.",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Turn the browser UI on (the --web flags) and return to the "
+        "shell: no dashboard, the host keeps serving. Spawns a host when "
+        "none is running.",
+    )
+    parser.add_argument(
         "--network", type=_bool_arg, default=None, metavar="true|false",
         help="Force network access for sandboxed tool commands on or off "
         "(--network false = offline: UV_OFFLINE and no net namespace); not "
@@ -176,7 +188,7 @@ def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
     args = build_parser().parse_args(argv)
-    if args.server or args.web:
+    if args.server or args.web or args.headless:
         _run_host(args)
         return
     if args.sessions:
@@ -189,31 +201,32 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _run_host(args: argparse.Namespace) -> None:
-    """``--server`` / ``--web``: the foreground host, dashboard in front.
+    """``--server`` / ``--web`` / ``--headless``: the foreground host.
 
     Any of ``--host/--port/--token`` also turns on the browser listener, so
     ``--server --host 0.0.0.0`` does what it reads like; ``--web`` is the
-    same with that listener's defaults."""
-    import os
+    same with that listener's defaults. ``run_host`` decides whether to run
+    a host or hand the listener to one already running."""
+    from .host import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, WebListen, run_host
 
-    from .host import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, run_foreground, web_listen
-
-    web = None
     # `None` is what "flag absent" means here, so `--port 0` still asks for
     # the listener; a plain truthiness test would read it as absent.
-    if args.web or (args.host, args.port, args.token) != (None, None, None):
-        web = web_listen(
-            bind=DEFAULT_WEB_HOST if args.host is None else args.host,
-            port=DEFAULT_WEB_PORT if args.port is None else args.port,
-            token=args.token,
-        )
-        if args.workspace is not None:
-            # The web UI creates sessions in the host's cwd; chdir so
-            # --workspace means the same thing it does for the TUI.
-            workspace = args.workspace.expanduser().resolve()
-            workspace.mkdir(parents=True, exist_ok=True)
-            os.chdir(workspace)
-    run_foreground(web=web)
+    asked = args.web or args.headless or (
+        args.host, args.port, args.token
+    ) != (None, None, None)
+    web = WebListen(
+        DEFAULT_WEB_HOST if args.host is None else args.host,
+        DEFAULT_WEB_PORT if args.port is None else args.port,
+        args.token,
+    ) if asked else None
+    workspace = (
+        None if args.workspace is None
+        else args.workspace.expanduser().resolve()
+    )
+    run_host(
+        web, replace=args.replace, headless=args.headless,
+        workspace=workspace,
+    )
 
 
 def _print_sessions() -> None:

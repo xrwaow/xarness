@@ -708,6 +708,8 @@ class Session:
             # O(1): no copy of the visible slice. Called on every state
             # broadcast now.
             message_count=self.conversation.visible_count(),
+            input_tokens=self.usage_total.input_tokens,
+            output_tokens=self.usage_total.output_tokens,
             parent_id=self.parent_id,
             tracking=self.workspace_state is not None,
             additions=self.pending_additions,

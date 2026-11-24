@@ -94,12 +94,50 @@ def test_server_host_flags_enable_the_browser_listener(monkeypatch) -> None:
     cli.main(["--server", "--host", "0.0.0.0", "--port", "9000"])
     web = seen["web"]
     assert web.bind == "0.0.0.0" and web.port == 9000
-    assert web.token  # reachable from the LAN, so it demands one
+    # Off loopback the token is generated host-side (see web_listen), not
+    # here, so a --token-less attach can keep the listener's existing one.
+    assert web.token is None
 
     cli.main(["--web", "--token", "s3cret"])
     web = seen["web"]
     assert web.bind == "127.0.0.1" and web.port == 8765
     assert web.token == "s3cret"
+
+
+def test_server_flags_against_a_live_host_add_the_listener(monkeypatch) -> None:
+    """A running host keeps its sessions: ``--web`` hands the listener to
+    it instead of starting (or killing) another host."""
+    from xarness import host as host_mod
+
+    seen: dict = {}
+    monkeypatch.setattr(host_mod, "_socket_alive", lambda: True)
+    monkeypatch.setattr(
+        host_mod, "attach_web",
+        lambda web, *, replace=False, headless=False, workspace=None: seen.update(
+            web=web, replace=replace, headless=headless,
+        ),
+    )
+    monkeypatch.setattr(
+        host_mod, "run_foreground",
+        lambda *, web=None: seen.update(foreground=web),
+    )
+    cli.main(["--web", "--host", "0.0.0.0", "--replace"])
+    assert seen["web"].bind == "0.0.0.0"
+    assert seen["replace"] is True
+    assert seen["headless"] is False
+    assert "foreground" not in seen
+
+    # `--headless` runs the same listener path and returns to the shell.
+    seen.clear()
+    cli.main(["--headless"])
+    assert seen["headless"] is True
+    assert seen["web"].port == 8765
+    assert "foreground" not in seen
+
+    # A bare --server against one still just reports it.
+    seen.clear()
+    cli.main(["--server"])
+    assert seen["foreground"] is None
 
 
 def test_chat_startup_creates_a_starter_config(tmp_path, monkeypatch) -> None:
