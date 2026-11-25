@@ -605,6 +605,56 @@ class GitworkTest(unittest.IsolatedAsyncioTestCase):
         assert state.index_path.is_file()
         assert repo not in state.index_path.parents  # never inside the repo
 
+    async def test_a_pruned_blob_does_not_wedge_later_snapshots(self):
+        """The index can outlive the objects it names.
+
+        The user's store prunes the harness's unreachable snapshots (``git
+        gc --prune=now``, ``git repack -ad``), and an excluded path's pinned
+        index entry then names a blob that is gone. `write-tree` refuses the
+        whole tree for it, and because the freeze re-pins the same sha on
+        every attempt the workspace stayed broken for good: every turn's
+        before-snapshot failed.
+        """
+        repo = self.make_repo()
+        state = await open_state(repo)
+        baseline = repo / "speed" / "00_baseline.py"
+        baseline.parent.mkdir()
+        baseline.write_text("print('hi')\n")
+        assert "speed/00_baseline.py" in _git(
+            repo, "ls-tree", "-r", "--name-only", await state.refresh(),
+        ).splitlines()
+
+        # Grows past the limit: excluded, and its old blob stays pinned.
+        baseline.write_text("x = 1\n" * 200_000)
+        await state.refresh()
+        assert "speed/00_baseline.py" in state.oversized
+
+        # The user prunes the store: every unreachable blob is gone.
+        for entry in (repo / ".git" / "objects").iterdir():
+            shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+
+        tree = await state.refresh()  # used to raise: invalid object ...
+        names = _git(repo, "ls-tree", "-r", "--name-only", tree).splitlines()
+        assert "speed/00_baseline.py" not in names
+        assert "app.py" in names  # the rest is still tracked, not wedged
+
+        # And the healed index keeps working, pruned store or not.
+        tree = await state.refresh()
+        assert "app.py" in _git(repo, "ls-tree", "-r", "--name-only", tree)
+
+    async def test_a_corrupt_snapshot_index_is_rebuilt(self):
+        """The index is a cache: when git refuses it, rebuild it instead of
+        failing every snapshot of the workspace."""
+        repo = self.make_repo()
+        state = await open_state(repo)
+        await state.refresh()
+        state.index_path.write_bytes(b"not a git index\n")
+
+        tree = await state.refresh()
+        names = _git(repo, "ls-tree", "-r", "--name-only", tree).splitlines()
+        assert "app.py" in names
+        assert state.index_path.is_file()
+
     # ------------------------------------------------------------------
     # keeping a workspace's big files out of argv
 

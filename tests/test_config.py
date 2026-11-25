@@ -216,7 +216,9 @@ def test_sandbox_settings_defaults() -> None:
     # On by default; `xarness --network false` (or a sandbox profile) turns
     # it off, and the sandbox then sets UV_OFFLINE and drops the net namespace.
     assert settings.allow_network is True
-    assert settings.gpu_access is False
+    # GPU device/sysfs binds are on by default; `xarness --gpu false` (or a
+    # profile's gpu_access: false) keeps them out of the container.
+    assert settings.gpu_access is True
     assert settings.allow_git_write is False  # secure by default
     assert settings.use_sandbox is True
     assert settings.enable_tracking is True

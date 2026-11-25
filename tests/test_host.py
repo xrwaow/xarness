@@ -1099,7 +1099,7 @@ def test_cli_overrides_beat_the_sandbox_profile(tmp_path) -> None:
         assert plain_settings is not None
         assert plain_settings.use_sandbox is True
         assert plain_settings.allow_network is True
-        assert plain_settings.gpu_access is False
+        assert plain_settings.gpu_access is True
         assert plain_settings.enable_tracking is True
 
     asyncio.run(go())

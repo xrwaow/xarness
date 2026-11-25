@@ -193,7 +193,7 @@ the persistent shell restarts with the new mounts on its next command.
 Network and GPU access are fixed at launch: `xarness --network false
 --gpu false` runs the sandbox fully offline and without device access (each
 flag takes an explicit `true`/`false`; leave it out to keep the sandbox
-profile's setting — `allow_network: true`, `gpu_access: false`).
+profile's setting — `allow_network: true`, `gpu_access: true`).
 `--enable_tracking false` turns change tracking off for the session (no
 checkpoints, diff bar or undo/revert), and `--sandbox false` runs the tools
 unsandboxed (a host shell instead of the container).
@@ -614,8 +614,8 @@ Config is JSON at `~/.config/xarness/config.json`. The layout is sectioned:
   and never round-trips into saved session settings.
 - `sandboxes` — named sandbox profiles. `default` is the base; other
   profiles inherit from it and list only overrides. Fields include
-  `allow_network`, `gpu_access`, `allow_git_write`, `use_sandbox`,
-  `enable_tracking`, `auto_include_refs`, `filter_list`, and
+  `allow_network` and `gpu_access` (both on by default), `allow_git_write`,
+  `use_sandbox`, `enable_tracking`, `auto_include_refs`, `filter_list`, and
   `default_timeout`.
 - `presets` — named `{model, sandbox}` pairs; `defaults.preset` chooses one.
   A preset may also carry `subagent_model`: the model its subagents run.

@@ -34,6 +34,10 @@ objects — and which object store they land in depends on the workspace
     them — taking an open session's checkpoints with it. ``/diff`` and
     ``/undo`` then fail against the missing baseline until the workspace
     re-baselines (``/accept``, a fresh session, or the row being rebuilt).
+    Snapshots themselves keep working: the persistent snapshot index is a
+    cache, so a pinned entry whose blob was pruned is dropped and a
+    ``write-tree`` git still refuses rebuilds the index from scratch (see
+    :func:`snapshot_tree`) instead of wedging every later turn.
     ``git fsck`` reports the objects as dangling and they never travel
     with clone/fetch/push.
   - **no repo** (``--no-init-repo`` not given): a private store under
@@ -598,20 +602,52 @@ async def _git_run(
 
 async def _index_state(
     root: Path, env: dict[str, str],
-) -> tuple[set[str], list[str]]:
-    """The snapshot index's paths and those marked assume-unchanged: one
-    listing serves both recognising a new path and lifting last snapshot's
-    freeze before looking for changes."""
-    out = await _git_run(root, env, ["ls-files", "-v", "-z"])
-    indexed: set[str] = set()
+) -> tuple[dict[str, str], list[str]]:
+    """The snapshot index's paths (with their blob shas) and those marked
+    assume-unchanged: one listing serves recognising a new path, knowing
+    which blob a frozen path keeps, and lifting last snapshot's freeze
+    before looking for changes."""
+    out = await _git_run(root, env, ["ls-files", "-s", "-v", "-z"])
+    indexed: dict[str, str] = {}
     frozen: list[str] = []
     for entry in out.split("\0"):
         if not entry:
             continue
-        indexed.add(entry[2:])
-        if entry[0].islower():  # a lowercase tag means assume-unchanged
-            frozen.append(entry[2:])
+        # ``<tag> <mode> <sha> <stage>\t<path>`` (the tag only with -v).
+        meta, _, path = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) < 4:
+            continue
+        indexed[path] = fields[2]
+        if fields[0].islower():  # a lowercase tag means assume-unchanged
+            frozen.append(path)
     return indexed, frozen
+
+
+async def _missing_blobs(
+    root: Path, env: dict[str, str], shas: Iterable[str],
+) -> set[str]:
+    """Which of ``shas`` the object store no longer holds, in one git call.
+
+    The snapshot index is a cache that can outlive the objects it names: the
+    user's own store prunes the harness's unreachable blobs (``git gc
+    --prune=now``, ``git repack -ad``), or the workspace's ``.git`` is
+    replaced while the index under the state dir survives. A best-effort
+    check: when ``cat-file`` itself fails, assume the blobs are there."""
+    shas = sorted(set(shas))
+    if not shas:
+        return set()
+    rc, out, _ = await _run_git(
+        ["cat-file", "--batch-check"], cwd=root, env=env,
+        input_bytes="".join(f"{sha}\n" for sha in shas).encode(),
+    )
+    if rc != 0:
+        return set()
+    missing: set[str] = set()
+    for sha, line in zip(shas, out.splitlines()):
+        if line.endswith(" missing"):
+            missing.add(sha)
+    return missing
 
 
 async def _unfreeze(
@@ -628,7 +664,8 @@ async def _unfreeze(
 
 
 async def _freeze(
-    root: Path, env: dict[str, str], paths: Iterable[str], indexed: set[str],
+    root: Path, env: dict[str, str], paths: Iterable[str],
+    indexed: dict[str, str],
 ) -> tuple[tuple[str, ...], str]:
     """Pin ``paths`` in the index so ``git add`` neither reads nor hashes them.
 
@@ -637,12 +674,19 @@ async def _freeze(
     (``execve`` fails with E2BIG). The index can. An indexed path — a tracked
     file that grew past the limit — is marked assume-unchanged and keeps its
     previous blob, which is what /undo needs; a new one is seeded with the
-    empty blob and dropped again by the caller. Returns the seeded paths and
-    the null sha to drop them with."""
+    empty blob and dropped again by the caller. A path whose kept blob is
+    *gone* (the store pruned it, the index outlived a re-init) is seeded the
+    same way: its old content cannot be written to the tree, and leaving the
+    dangling sha pinned would make every later ``write-tree`` fail. Returns
+    the placeholder paths and the null sha to drop them with."""
     live = [p for p in dict.fromkeys(paths) if _is_regular(root / p)]
     if not live:
         return (), ""
     seeded = [p for p in live if p not in indexed]
+    missing = await _missing_blobs(
+        root, env, (indexed[p] for p in live if p in indexed),
+    )
+    seeded += [p for p in live if indexed.get(p) in missing]
     empty = ""
     if seeded:
         empty = (await _git_run(root, env, ["hash-object", "-w", "--stdin"])).strip()
@@ -750,13 +794,38 @@ async def snapshot_tree(
                     root, env, ["update-index", "-z", "--index-info"],
                     "".join(f"0 {null_sha} 0\t{p}\0" for p in seeded).encode(),
                 )
-        return (await _git_run(root, env, ["write-tree"])).strip()
+        return await _write_tree(root, env)
 
     with _reusable_index() as index_file:
         # A persistent index is shared by every snapshot of the workspace:
         # the caller's workspace lock (WorkspaceState.lock) serializes the
         # add/write-tree sequence, or two snapshots race on index.lock.
-        return await _capture(index_file)
+        try:
+            return await _capture(index_file)
+        except GitWorktreeError:
+            if index is None:
+                raise
+            # The persistent index is a pure cache, and it can go bad under
+            # us: it names blobs the store pruned, or a workspace whose
+            # `.git` was replaced left it pointing at another object store.
+            # Such an entry may be one `write-tree` refuses (and that the
+            # freeze above pins again on every attempt), which would wedge
+            # every later snapshot of the workspace — the caller's lock makes
+            # the retry safe. Rebuild from scratch once; a failure that
+            # survives a fresh index is a real one.
+            try:
+                Path(index_file).unlink()
+            except FileNotFoundError:
+                pass
+            return await _capture(index_file)
+
+
+async def _write_tree(root: Path, env: dict[str, str]) -> str:
+    """Record the index as a tree, reporting git's reason when it refuses."""
+    rc, out, err = await _run_git(["write-tree"], cwd=root, env=env)
+    if rc != 0:
+        raise GitWorktreeError(f"git write-tree failed: {err.strip()}")
+    return out.strip()
 
 
 async def tree_entry(

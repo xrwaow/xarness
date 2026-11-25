@@ -191,7 +191,10 @@ class SandboxSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     allow_network: bool = True
-    gpu_access: bool = False
+    # On by default: GPU work is the common case and the driver userland is
+    # already reachable (bound read-only from /usr/lib(64)). `--gpu false`
+    # turns the device/sysfs binds off.
+    gpu_access: bool = True
     # Off by default; on disables the git guard entirely (the agent manages
     # git itself) — tracking guarantees no longer hold.
     allow_git_write: bool = False

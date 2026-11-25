@@ -707,8 +707,17 @@ class ContainerMountsTest(SandboxArgvTest):
     # GPU
 
     def test_gpu_off_has_no_dev_binds(self):
-        argv = self.argv()
+        argv = self.argv(gpu_access=False)
         self.assertNotIn("--dev-bind", argv)
+
+    def test_gpu_on_by_default(self):
+        """The default profile exposes the host GPU (SandboxSettings mirrors
+        it), so a bare SandboxConfig binds the device nodes."""
+        self.assertTrue(self.config().gpu_access)
+        gpu_nodes = _existing_gpu_nodes()
+        bound = {src for flag, src, dest in argv_binds(self.argv())
+                 if flag == "--dev-bind"}
+        self.assertEqual(bound, {str(p) for p in gpu_nodes})
 
     def test_gpu_access_binds_device_nodes_and_sysfs(self):
         gpu_nodes = _existing_gpu_nodes()

@@ -368,9 +368,10 @@ class SandboxConfig:
     allow_network: bool = False
     # Expose the host's GPU device nodes (/dev/dri, /dev/kfd, /dev/nvidia*)
     # and the sysfs/proc bits drivers enumerate through, so CUDA/ROCm work
-    # inside the container. Off by default; driver userland ships in
-    # /usr/lib(64), which is already bound read-only.
-    gpu_access: bool = False
+    # inside the container. On by default (matching SandboxSettings);
+    # `--gpu false` turns it off. Driver userland ships in /usr/lib(64),
+    # which is already bound read-only.
+    gpu_access: bool = True
     # False = tools run as a user-level stateful bash on the host (an
     # unsandboxed mode): no bwrap container, no mount isolation. Documented
     # in the config; the TUI shows a visible marker when it is off.
